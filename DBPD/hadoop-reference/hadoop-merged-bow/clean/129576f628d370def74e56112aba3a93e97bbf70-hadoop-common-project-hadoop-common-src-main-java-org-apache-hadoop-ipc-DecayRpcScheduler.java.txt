@@ -1,0 +1,253 @@
+HDFS-14403. Cost-based extension to the RPC Fair Call Queue. Contributed by Christopher Gregorian.
+
+- * The decay RPC scheduler counts incoming requests in a map, then
+- * decays the counts at a fixed time interval. The scheduler is optimized
++ * The decay RPC scheduler tracks the cost of incoming requests in a map, then
++ * decays the costs at a fixed time interval. The scheduler is optimized
+-   * Decay factor controls how much each count is suppressed by on each sweep.
++   * Decay factor controls how much each cost is suppressed by on each sweep.
+-  // identity from all previous decay windows: idx 0 for decayed call count and
+-  // idx 1 for the raw call count
+-  private final ConcurrentHashMap<Object, List<AtomicLong>> callCounts =
++  // identity from all previous decay windows: idx 0 for decayed call cost and
++  // idx 1 for the raw call cost
++  private final ConcurrentHashMap<Object, List<AtomicLong>> callCosts =
+-  // Should be the sum of all AtomicLongs in decayed callCounts
+-  private final AtomicLong totalDecayedCallCount = new AtomicLong();
+-  // The sum of all AtomicLongs in raw callCounts
+-  private final AtomicLong totalRawCallCount = new AtomicLong();
++  // Should be the sum of all AtomicLongs in decayed callCosts
++  private final AtomicLong totalDecayedCallCost = new AtomicLong();
++  // The sum of all AtomicLongs in raw callCosts
++  private final AtomicLong totalRawCallCost = new AtomicLong();
+-  private final double decayFactor; // nextCount = currentCount * decayFactor
++  private final double decayFactor; // nextCost = currentCost * decayFactor
++  private final CostProvider costProvider;
+-   * This TimerTask will call decayCurrentCounts until
++   * This TimerTask will call decayCurrentCosts until
+-        sched.decayCurrentCounts();
++        sched.decayCurrentCosts();
++    this.costProvider = this.parseCostProvider(ns, conf);
++  private CostProvider parseCostProvider(String ns, Configuration conf) {
++    List<CostProvider> providers = conf.getInstances(
++        ns + "." + CommonConfigurationKeys.IPC_COST_PROVIDER_KEY,
++        CostProvider.class);
++
++    if (providers.size() < 1) {
++      LOG.info("CostProvider not specified, defaulting to DefaultCostProvider");
++      return new DefaultCostProvider();
++    } else if (providers.size() > 1) {
++      LOG.warn("Found multiple CostProviders; using: {}",
++          providers.get(0).getClass());
++    }
++
++    CostProvider provider = providers.get(0); // use the first
++    provider.init(ns, conf);
++    return provider;
++  }
++
+-   * Decay the stored counts for each user and clean as necessary.
++   * Decay the stored costs for each user and clean as necessary.
+-   * counts current.
++   * costs current.
+-  private void decayCurrentCounts() {
+-    LOG.debug("Start to decay current counts.");
++  private void decayCurrentCosts() {
++    LOG.debug("Start to decay current costs.");
+-      long totalDecayedCount = 0;
+-      long totalRawCount = 0;
++      long totalDecayedCost = 0;
++      long totalRawCost = 0;
+-          callCounts.entrySet().iterator();
++          callCosts.entrySet().iterator();
+-        AtomicLong decayedCount = entry.getValue().get(0);
+-        AtomicLong rawCount = entry.getValue().get(1);
++        AtomicLong decayedCost = entry.getValue().get(0);
++        AtomicLong rawCost = entry.getValue().get(1);
+-        totalRawCount += rawCount.get();
+-        long currentValue = decayedCount.get();
++        totalRawCost += rawCost.get();
++        long currentValue = decayedCost.get();
+-        totalDecayedCount += nextValue;
+-        decayedCount.set(nextValue);
++        totalDecayedCost += nextValue;
++        decayedCost.set(nextValue);
+-        LOG.debug("Decaying counts for the user: {}, " +
+-            "its decayedCount: {}, rawCount: {}", entry.getKey(),
+-            nextValue, rawCount.get());
++        LOG.debug(
++            "Decaying costs for the user: {}, its decayedCost: {}, rawCost: {}",
++            entry.getKey(), nextValue, rawCost.get());
+-          LOG.debug("The decayed count for the user {} is zero " +
++          LOG.debug("The decayed cost for the user {} is zero " +
+-          // might be to have an upper bound on keyspace in callCounts and only
++          // might be to have an upper bound on keyspace in callCosts and only
+-      totalDecayedCallCount.set(totalDecayedCount);
+-      totalRawCallCount.set(totalRawCount);
++      totalDecayedCallCost.set(totalDecayedCost);
++      totalRawCallCost.set(totalRawCost);
+-      LOG.debug("After decaying the stored counts, totalDecayedCount: {}, " +
+-          "totalRawCallCount: {}.", totalDecayedCount, totalRawCount);
++      LOG.debug("After decaying the stored costs, totalDecayedCost: {}, " +
++          "totalRawCallCost: {}.", totalDecayedCost, totalRawCost);
+-      LOG.error("decayCurrentCounts exception: " +
++      LOG.error("decayCurrentCosts exception: " +
+-   * Update the scheduleCache to match current conditions in callCounts.
++   * Update the scheduleCache to match current conditions in callCosts.
+-    for (Map.Entry<Object, List<AtomicLong>> entry : callCounts.entrySet()) {
++    for (Map.Entry<Object, List<AtomicLong>> entry : callCosts.entrySet()) {
+-   * Get the number of occurrences and increment atomically.
+-   * @param identity the identity of the user to increment
+-   * @return the value before incrementation
++   * Adjust the stored cost for a given identity.
++   *
++   * @param identity the identity of the user whose cost should be adjusted
++   * @param costDelta the cost to add for the given identity
+-  private long getAndIncrementCallCounts(Object identity)
+-      throws InterruptedException {
+-    // We will increment the count, or create it if no such count exists
+-    List<AtomicLong> count = this.callCounts.get(identity);
+-    if (count == null) {
+-      // Create the counts since no such count exists.
+-      // idx 0 for decayed call count
+-      // idx 1 for the raw call count
+-      count = new ArrayList<AtomicLong>(2);
+-      count.add(new AtomicLong(0));
+-      count.add(new AtomicLong(0));
++  private void addCost(Object identity, long costDelta) {
++    // We will increment the cost, or create it if no such cost exists
++    List<AtomicLong> cost = this.callCosts.get(identity);
++    if (cost == null) {
++      // Create the costs since no such cost exists.
++      // idx 0 for decayed call cost
++      // idx 1 for the raw call cost
++      cost = new ArrayList<AtomicLong>(2);
++      cost.add(new AtomicLong(0));
++      cost.add(new AtomicLong(0));
+-      List<AtomicLong> otherCount = callCounts.putIfAbsent(identity, count);
+-      if (otherCount != null) {
+-        count = otherCount;
++      List<AtomicLong> otherCost = callCosts.putIfAbsent(identity, cost);
++      if (otherCost != null) {
++        cost = otherCost;
+-    totalDecayedCallCount.getAndIncrement();
+-    totalRawCallCount.getAndIncrement();
++    totalDecayedCallCost.getAndAdd(costDelta);
++    totalRawCallCost.getAndAdd(costDelta);
+-    // been clobbered from callCounts. Nonetheless, we return what
++    // been clobbered from callCosts. Nonetheless, we return what
+-    count.get(1).getAndIncrement();
+-    return count.get(0).getAndIncrement();
++    cost.get(1).getAndAdd(costDelta);
++    cost.get(0).getAndAdd(costDelta);
+-   * Given the number of occurrences, compute a scheduling decision.
+-   * @param occurrences how many occurrences
++   * Given the cost for an identity, compute a scheduling decision.
++   *
++   * @param cost the cost for an identity
+-  private int computePriorityLevel(long occurrences) {
+-    long totalCallSnapshot = totalDecayedCallCount.get();
++  private int computePriorityLevel(long cost) {
++    long totalCallSnapshot = totalDecayedCallCost.get();
+-      proportion = (double) occurrences / totalCallSnapshot;
++      proportion = (double) cost / totalCallSnapshot;
+-    try {
+-      long occurrences = this.getAndIncrementCallCounts(identity);
+-
+-      // Try the cache
+-      Map<Object, Integer> scheduleCache = scheduleCacheRef.get();
+-      if (scheduleCache != null) {
+-        Integer priority = scheduleCache.get(identity);
+-        if (priority != null) {
+-          LOG.debug("Cache priority for: {} with priority: {}", identity,
+-              priority);
+-          return priority;
+-        }
++    // Try the cache
++    Map<Object, Integer> scheduleCache = scheduleCacheRef.get();
++    if (scheduleCache != null) {
++      Integer priority = scheduleCache.get(identity);
++      if (priority != null) {
++        LOG.debug("Cache priority for: {} with priority: {}", identity,
++            priority);
++        return priority;
+-
+-      // Cache was no good, compute it
+-      int priority = computePriorityLevel(occurrences);
+-      LOG.debug("compute priority for " + identity + " priority " + priority);
+-      return priority;
+-
+-    } catch (InterruptedException ie) {
+-      LOG.warn("Caught InterruptedException, returning low priority level");
+-      LOG.debug("Fallback priority for: {} with priority: {}", identity,
+-          numLevels - 1);
+-      return numLevels - 1;
++
++    // Cache was no good, compute it
++    List<AtomicLong> costList = callCosts.get(identity);
++    long currentCost = costList == null ? 0 : costList.get(0).get();
++    int priority = computePriorityLevel(currentCost);
++    LOG.debug("compute priority for {} priority {}", identity, priority);
++    return priority;
++    String user = identityProvider.makeIdentity(schedulable);
++    long processingCost = costProvider.getCost(details);
++    addCost(user, processingCost);
++
+-  public double getDecayFactor() { return decayFactor; }
++  double getDecayFactor() {
++    return decayFactor;
++  }
+-  public long getDecayPeriodMillis() { return decayPeriodMillis; }
++  long getDecayPeriodMillis() {
++    return decayPeriodMillis;
++  }
+-  public double[] getThresholds() { return thresholds; }
++  double[] getThresholds() {
++    return thresholds;
++  }
+-  public void forceDecay() { decayCurrentCounts(); }
++  void forceDecay() {
++    decayCurrentCosts();
++  }
+-  public Map<Object, Long> getCallCountSnapshot() {
++  Map<Object, Long> getCallCostSnapshot() {
+-    for (Map.Entry<Object, List<AtomicLong>> entry : callCounts.entrySet()) {
++    for (Map.Entry<Object, List<AtomicLong>> entry : callCosts.entrySet()) {
+-  public long getTotalCallSnapshot() {
+-    return totalDecayedCallCount.get();
++  long getTotalCallSnapshot() {
++    return totalDecayedCallCost.get();
+-    return callCounts.size();
++    return callCosts.size();
+-    return totalDecayedCallCount.get();
++    return totalDecayedCallCost.get();
+-    return totalRawCallCount.get();
++    return totalRawCallCost.get();
+-  // Get the top N callers' raw call count and scheduler decision
++  // Get the top N callers' raw call cost and scheduler decision
+-        callCounts.entrySet().iterator();
++        callCosts.entrySet().iterator();
+-      Long count = entry.getValue().get(1).get();
+-      if (count > 0) {
+-        topNCallers.offer(new NameValuePair(caller, count));
++      Long cost = entry.getValue().get(1).get();
++      if (cost > 0) {
++        topNCallers.offer(new NameValuePair(caller, cost));
+-      return WRITER.writeValueAsString(getDecayedCallCounts());
++      return WRITER.writeValueAsString(getDecayedCallCosts());
+-  private Map<Object, Long> getDecayedCallCounts() {
+-    Map<Object, Long> decayedCallCounts = new HashMap<>(callCounts.size());
++  private Map<Object, Long> getDecayedCallCosts() {
++    Map<Object, Long> decayedCallCosts = new HashMap<>(callCosts.size());
+-        callCounts.entrySet().iterator();
++        callCosts.entrySet().iterator();
+-      Long decayedCount = entry.getValue().get(0).get();
+-      if (decayedCount > 0) {
+-        decayedCallCounts.put(user, decayedCount);
++      Long decayedCost = entry.getValue().get(0).get();
++      if (decayedCost > 0) {
++        decayedCallCosts.put(user, decayedCost);
+-    return decayedCallCounts;
++    return decayedCallCosts;
+
+INS23 INS31 INS31 INS83 INS83 INS43 INS59 INS83 INS43 INS42 INS44 INS44 INS8 UPD42 INS39 INS42 INS44 MOV8 MOV60 MOV78 MOV39 MOV42 MOV8 UPD42 MOV78 UPD42 UPD66 UPD66 UPD42 UPD42 UPD42 INS42 INS42 INS21 INS42 INS43 INS42 INS43 INS42 INS60 INS25 INS60 INS21 INS41 UPD65 INS39 INS42 INS21 UPD42 INS60 INS60 INS60 INS21 INS60 MOV60 UPD66 UPD66 INS7 INS42 INS42 INS74 INS59 INS27 INS8 INS25 INS43 INS59 INS32 INS42 UPD66 UPD66 UPD66 UPD66 UPD66 INS42 UPD66 MOV74 MOV21 INS32 UPD66 UPD42 UPD66 INS74 INS59 INS43 INS59 INS39 INS59 INS32 MOV74 INS59 UPD42 INS22 INS32 INS43 INS43 INS42 INS32 INS32 INS34 INS21 INS41 INS27 INS8 INS42 INS42 INS32 INS42 INS42 INS42 INS42 UPD45 UPD42 UPD42 UPD42 UPD42 UPD42 INS42 UPD42 UPD42 INS42 UPD42 INS42 MOV32 UPD42 MOV42 INS42 INS43 INS43 INS42 INS32 UPD42 INS16 INS45 INS42 INS42 INS42 INS42 INS32 INS42 INS32 INS42 INS42 INS42 UPD42 UPD42 UPD42 UPD42 UPD42 UPD42 INS42 INS32 UPD42 INS52 INS42 INS52 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS27 INS57 INS42 INS42 INS32 INS14 INS32 INS34 INS21 INS42 INS42 INS34 MOV74 UPD42 UPD42 UPD42 INS42 INS42 INS42 INS42 INS42 INS27 INS34 INS32 UPD42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS45 INS40 INS43 INS42 INS42 INS45 INS43 INS42 INS42 INS32 UPD42 UPD42 UPD42 UPD42 UPD42 UPD42 UPD42 UPD42 UPD42 UPD42 UPD42 UPD42 UPD42 UPD42 INS42 INS33 INS32 UPD42 MOV42 INS42 INS42 UPD42 UPD42 UPD42 UPD42 UPD42 UPD42 UPD42 INS42 INS42 INS42 INS42 INS45 INS32 UPD45 UPD45 UPD42 UPD42 INS42 UPD42 MOV42 INS34 UPD42 INS32 INS42 UPD42 UPD42 UPD42 UPD42 UPD42 UPD42 INS45 MOV32 UPD45 UPD42 UPD42 UPD42 UPD42 UPD42 INS42 INS42 INS34 UPD42 UPD42 UPD42 UPD42 MOV32 UPD45 DEL45 DEL45 DEL27 DEL39 DEL42 DEL42 DEL43 DEL32 DEL41 DEL52 DEL32 DEL45 DEL42 DEL45 DEL42 DEL27 DEL42 DEL43 DEL42 DEL44 DEL42 DEL42 DEL45 DEL32 DEL21 DEL42 DEL42 DEL45 DEL42 DEL42 DEL34 DEL27 DEL32 DEL21 DEL42 DEL34 DEL27 DEL41 DEL8 DEL12 DEL54 DEL8 DEL83 DEL83 DEL83 DEL83 DEL31 DEL83 DEL83 DEL42 DEL42 DEL42 DEL32 DEL42 DEL32 DEL59 DEL60

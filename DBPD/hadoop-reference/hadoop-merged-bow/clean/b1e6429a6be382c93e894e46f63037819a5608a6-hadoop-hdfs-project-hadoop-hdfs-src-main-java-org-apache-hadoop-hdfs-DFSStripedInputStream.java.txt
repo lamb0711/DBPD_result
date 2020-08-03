@@ -1,0 +1,337 @@
+HDFS-8669. Erasure Coding: handle missing internal block locations in DFSStripedInputStream. Contributed by Jing Zhao.
+
++import org.apache.hadoop.io.IOUtils;
+-  private final BlockReader[] blockReaders;
+-  /**
+-   * when initializing block readers, their starting offsets are set to the same
+-   * number: the smallest internal block offsets among all the readers. This is
+-   * because it is possible that for some internal blocks we have to read
+-   * "backwards" for decoding purpose. We thus use this offset array to track
+-   * offsets for all the block readers so that we can skip data if necessary.
+-   */
+-  private final long[] blockReaderOffsets;
+-  private final DatanodeInfo[] currentNodes;
++  private static class BlockReaderInfo {
++    final BlockReader reader;
++    final DatanodeInfo datanode;
++    /**
++     * when initializing block readers, their starting offsets are set to the same
++     * number: the smallest internal block offsets among all the readers. This is
++     * because it is possible that for some internal blocks we have to read
++     * "backwards" for decoding purpose. We thus use this offset array to track
++     * offsets for all the block readers so that we can skip data if necessary.
++     */
++    long blockReaderOffset;
++    LocatedBlock targetBlock;
++    /**
++     * We use this field to indicate whether we should use this reader. In case
++     * we hit any issue with this reader, we set this field to true and avoid
++     * using it for the next stripe.
++     */
++    boolean shouldSkip = false;
++
++    BlockReaderInfo(BlockReader reader, LocatedBlock targetBlock,
++        DatanodeInfo dn, long offset) {
++      this.reader = reader;
++      this.targetBlock = targetBlock;
++      this.datanode = dn;
++      this.blockReaderOffset = offset;
++    }
++
++    void setOffset(long offset) {
++      this.blockReaderOffset = offset;
++    }
++
++    void skip() {
++      this.shouldSkip = true;
++    }
++  }
++
++  private final BlockReaderInfo[] blockReaders;
+-    blockReaders = new BlockReader[groupSize];
+-    blockReaderOffsets = new long[groupSize];
+-    currentNodes = new DatanodeInfo[groupSize];
++    blockReaders = new BlockReaderInfo[groupSize];
+-        DNAddrPair retval = getBestNodeDNAddrPair(targetBlock, null);
+-        if (retval != null) {
+-          currentNodes[i] = retval.info;
+-          blockReaders[i] = getBlockReaderWithRetry(targetBlock,
++        DNAddrPair dnInfo = getBestNodeDNAddrPair(targetBlock, null);
++        if (dnInfo != null) {
++          BlockReader reader = getBlockReaderWithRetry(targetBlock,
+-              retval.addr, retval.storageType, retval.info, target, retry);
+-          blockReaderOffsets[i] = minOffset;
++              dnInfo.addr, dnInfo.storageType, dnInfo.info, target, retry);
++          if (reader != null) {
++            blockReaders[i] = new BlockReaderInfo(reader, targetBlock,
++                dnInfo.info, minOffset);
++          }
++  /**
++   * @throws IOException only when failing to refetch block token, which happens
++   * when this client cannot get located block information from NameNode. This
++   * method returns null instead of throwing exception when failing to connect
++   * to the DataNode.
++   */
+-      currentNodes[i] = null;
++      blockReaders[i] = null;
+-      try {
+-        blockReaders[index].close();
+-      } catch (IOException e) {
+-        DFSClient.LOG.error("error closing blockReader " + index, e);
+-      }
+-      blockReaders[index] = null;
++      IOUtils.cleanup(DFSClient.LOG, blockReaders[index].reader);
++      blockReaders[index].skip();
+-    blockReaderOffsets[index] = 0;
+-    // TODO handle null elements in blks (e.g., NN does not know locations for
+-    // all the internal blocks)
+-          blks);
+-      sreader.readStripe(blks, corruptedBlockMap);
++          blks, corruptedBlockMap);
++      sreader.readStripe();
+-    // TODO handle null elements in blks (e.g., NN does not know locations for
+-    // all the internal blocks)
+-      StripeReader preader = new PositionStripeReader(readService, stripe);
+-      preader.readStripe(blks, corruptedBlockMap);
++      StripeReader preader = new PositionStripeReader(readService, stripe,
++          blks, corruptedBlockMap);
++      preader.readStripe();
++    final LocatedBlock[] targetBlocks;
++    final Map<ExtendedBlock, Set<DatanodeInfo>> corruptedBlockMap;
+-    StripeReader(CompletionService<Void> service, AlignedStripe alignedStripe) {
++    StripeReader(CompletionService<Void> service, AlignedStripe alignedStripe,
++        LocatedBlock[] targetBlocks,
++        Map<ExtendedBlock, Set<DatanodeInfo>> corruptedBlockMap) {
++      this.targetBlocks = targetBlocks;
++      this.corruptedBlockMap = corruptedBlockMap;
+-    /** submit reading chunk task */
+-    abstract void readChunk(final CompletionService<Void> service,
+-        final LocatedBlock block, int chunkIndex,
+-        Map<ExtendedBlock, Set<DatanodeInfo>> corruptedBlockMap);
++    abstract boolean readChunk(final CompletionService<Void> service,
++        final LocatedBlock block, int chunkIndex);
+-    /**
+-     * When seeing first missing block, initialize decode input buffers.
+-     * Also prepare the reading for data blocks outside of the reading range.
+-     */
+-    abstract void prepareDecodeInputs() throws IOException;
++    /** prepare all the data chunks */
++    abstract void prepareDecodeInputs();
+-    /**
+-     * Prepare reading for one more parity chunk.
+-     */
+-    abstract void prepareParityChunk() throws IOException;
++    /** prepare the parity chunk and block reader if necessary */
++    abstract boolean prepareParityChunk(int index) throws IOException;
+-    /** read the whole stripe. do decoding if necessary */
+-    void readStripe(LocatedBlock[] blocks,
+-        Map<ExtendedBlock, Set<DatanodeInfo>> corruptedBlockMap)
+-        throws IOException {
+-      assert alignedStripe.getSpanInBlock() > 0;
+-      for (short i = 0; i < dataBlkNum; i++) {
+-        if (alignedStripe.chunks[i] != null
+-            && alignedStripe.chunks[i].state != StripingChunk.ALLZERO) {
+-          readChunk(service, blocks[i], i, corruptedBlockMap);
++    private void checkMissingBlocks() throws IOException {
++      if (alignedStripe.missingChunksNum > parityBlkNum) {
++        clearFutures(futures.keySet());
++        throw new IOException(alignedStripe.missingChunksNum
++            + " missing blocks, the stripe is: " + alignedStripe);
++      }
++    }
++
++    /**
++     * We need decoding. Thus go through all the data chunks and make sure we
++     * submit read requests for all of them.
++     */
++    private void readDataForDecoding() throws IOException {
++      prepareDecodeInputs();
++      for (int i = 0; i < dataBlkNum; i++) {
++        Preconditions.checkNotNull(alignedStripe.chunks[i]);
++        if (alignedStripe.chunks[i].state == StripingChunk.REQUESTED) {
++          if (!readChunk(service, targetBlocks[i], i)) {
++            alignedStripe.missingChunksNum++;
++          }
++      checkMissingBlocks();
++    }
++
++    void readParityChunks(int num) throws IOException {
++      for (int i = dataBlkNum, j = 0; i < dataBlkNum + parityBlkNum && j < num;
++           i++) {
++        if (alignedStripe.chunks[i] == null) {
++          if (prepareParityChunk(i) && readChunk(service, targetBlocks[i], i)) {
++            j++;
++          } else {
++            alignedStripe.missingChunksNum++;
++          }
++        }
++      }
++      checkMissingBlocks();
++    }
++
++    /** read the whole stripe. do decoding if necessary */
++    void readStripe() throws IOException {
++      for (int i = 0; i < dataBlkNum; i++) {
++        if (alignedStripe.chunks[i] != null &&
++            alignedStripe.chunks[i].state != StripingChunk.ALLZERO) {
++          if (!readChunk(service, targetBlocks[i], i)) {
++            alignedStripe.missingChunksNum++;
++          }
++        }
++      }
++      // There are missing block locations at this stage. Thus we need to read
++      // the full stripe and one more parity block.
++      if (alignedStripe.missingChunksNum > 0) {
++        checkMissingBlocks();
++        readDataForDecoding();
++        // read parity chunks
++        readParityChunks(alignedStripe.missingChunksNum);
++      }
++      // TODO: for a full stripe we can start reading (dataBlkNum + 1) chunks
+-            alignedStripe.missingChunksNum++;
+-            if (alignedStripe.missingChunksNum > parityBlkNum) {
+-              clearFutures(futures.keySet());
+-              throw new IOException("Too many blocks are missing: "
+-                  + alignedStripe);
+-            }
+-
+-            prepareDecodeInputs();
+-            prepareParityChunk();
+-            for (int i = 0; i < alignedStripe.chunks.length; i++) {
+-              StripingChunk chunk = alignedStripe.chunks[i];
+-              if (chunk != null && chunk.state == StripingChunk.REQUESTED) {
+-                readChunk(service, blocks[i], i, corruptedBlockMap);
+-              }
+-            }
++            final int missing = alignedStripe.missingChunksNum;
++            alignedStripe.missingChunksNum++;
++            checkMissingBlocks();
++
++            readDataForDecoding();
++            readParityChunks(alignedStripe.missingChunksNum - missing);
+-        AlignedStripe alignedStripe) {
+-      super(service, alignedStripe);
++        AlignedStripe alignedStripe, LocatedBlock[] targetBlocks,
++        Map<ExtendedBlock, Set<DatanodeInfo>> corruptedBlockMap) {
++      super(service, alignedStripe, targetBlocks, corruptedBlockMap);
+-    void readChunk(final CompletionService<Void> service,
+-        final LocatedBlock block, int chunkIndex,
+-        Map<ExtendedBlock, Set<DatanodeInfo>> corruptedBlockMap) {
++    boolean readChunk(final CompletionService<Void> service,
++        final LocatedBlock block, int chunkIndex) {
++      final StripingChunk chunk = alignedStripe.chunks[chunkIndex];
++      if (block == null) {
++        chunk.state = StripingChunk.MISSING;
++        return false;
++      }
+-      StripingChunk chunk = alignedStripe.chunks[chunkIndex];
++      return true;
+-    void prepareParityChunk() {
+-      for (int i = dataBlkNum; i < dataBlkNum + parityBlkNum; i++) {
+-        if (alignedStripe.chunks[i] == null) {
+-          final int decodeIndex = convertIndex4Decode(i,
+-              dataBlkNum, parityBlkNum);
+-          alignedStripe.chunks[i] =
+-              new StripingChunk(decodeInputs[decodeIndex]);
+-          alignedStripe.chunks[i].addByteArraySlice(0,
+-              (int) alignedStripe.getSpanInBlock());
+-          break;
+-        }
+-      }
++    boolean prepareParityChunk(int index) {
++      Preconditions.checkState(index >= dataBlkNum &&
++          alignedStripe.chunks[index] == null);
++      final int decodeIndex = convertIndex4Decode(index, dataBlkNum,
++          parityBlkNum);
++      alignedStripe.chunks[index] = new StripingChunk(decodeInputs[decodeIndex]);
++      alignedStripe.chunks[index].addByteArraySlice(0,
++          (int) alignedStripe.getSpanInBlock());
++      return true;
+-    final LocatedBlock[] targetBlocks;
+-        AlignedStripe alignedStripe, LocatedBlock[] targetBlocks) {
+-      super(service, alignedStripe);
+-      this.targetBlocks = targetBlocks;
++        AlignedStripe alignedStripe, LocatedBlock[] targetBlocks,
++        Map<ExtendedBlock, Set<DatanodeInfo>> corruptedBlockMap) {
++      super(service, alignedStripe, targetBlocks, corruptedBlockMap);
+-    void readChunk(final CompletionService<Void> service,
+-        final LocatedBlock block, int chunkIndex, Map<ExtendedBlock,
+-        Set<DatanodeInfo>> corruptedBlockMap) {
+-      StripingChunk chunk = alignedStripe.chunks[chunkIndex];
++    boolean readChunk(final CompletionService<Void> service,
++        final LocatedBlock block, int chunkIndex) {
++      final StripingChunk chunk = alignedStripe.chunks[chunkIndex];
++      final BlockReaderInfo readerInfo = blockReaders[chunkIndex];
++      if (readerInfo == null || block == null || readerInfo.shouldSkip) {
++        chunk.state = StripingChunk.MISSING;
++        return false;
++      }
+-      Callable<Void> readCallable = readCell(blockReaders[chunkIndex],
+-          currentNodes[chunkIndex], blockReaderOffsets[chunkIndex],
++      Callable<Void> readCallable = readCell(readerInfo.reader,
++          readerInfo.datanode, readerInfo.blockReaderOffset,
++      return true;
+-      blockReaderOffsets[result.index] =
+-          alignedStripe.getOffsetInBlock() + alignedStripe.getSpanInBlock();
++      blockReaders[result.index].setOffset(alignedStripe.getOffsetInBlock()
++          + alignedStripe.getSpanInBlock());
+-    void prepareDecodeInputs() throws IOException {
++    void prepareDecodeInputs() {
+-            alignedStripe.chunks[i] =
+-                new StripingChunk(decodeInputs[decodeIndex]);
++            alignedStripe.chunks[i] = new StripingChunk(
++                decodeInputs[decodeIndex]);
+-    void prepareParityChunk() throws IOException {
+-      for (int i = dataBlkNum; i < dataBlkNum + parityBlkNum; i++) {
+-        if (alignedStripe.chunks[i] == null) {
+-          final int decodeIndex = convertIndex4Decode(i, dataBlkNum,
+-              parityBlkNum);
+-          decodeInputs[decodeIndex] = ByteBuffer.allocateDirect(
+-              (int) alignedStripe.range.spanInBlock);
+-          alignedStripe.chunks[i] =
+-              new StripingChunk(decodeInputs[decodeIndex]);
+-          if (blockReaders[i] == null) {
+-            prepareParityBlockReader(i);
+-          }
+-          break;
+-        }
++    boolean prepareParityChunk(int index) throws IOException {
++      Preconditions.checkState(index >= dataBlkNum
++          && alignedStripe.chunks[index] == null);
++      if (blockReaders[index] != null && blockReaders[index].shouldSkip) {
++        alignedStripe.chunks[index] = new StripingChunk(StripingChunk.MISSING);
++        // we have failed the block reader before
++        return false;
++      final int decodeIndex = convertIndex4Decode(index, dataBlkNum,
++          parityBlkNum);
++      decodeInputs[decodeIndex] = ByteBuffer.allocateDirect(
++          (int) alignedStripe.range.spanInBlock);
++      alignedStripe.chunks[index] = new StripingChunk(decodeInputs[decodeIndex]);
++      if (blockReaders[index] == null && !prepareParityBlockReader(index)) {
++        alignedStripe.chunks[index] = new StripingChunk(StripingChunk.MISSING);
++        return false;
++      }
++      return true;
+-    private void prepareParityBlockReader(int i) throws IOException {
++    private boolean prepareParityBlockReader(int i) throws IOException {
+-        DNAddrPair retval = getBestNodeDNAddrPair(targetBlock, null);
+-        if (retval != null) {
+-          currentNodes[i] = retval.info;
+-          blockReaders[i] = getBlockReaderWithRetry(targetBlock,
++        DNAddrPair dnInfo = getBestNodeDNAddrPair(targetBlock, null);
++        if (dnInfo != null) {
++          BlockReader reader = getBlockReaderWithRetry(targetBlock,
+-              retval.addr, retval.storageType, retval.info,
++              dnInfo.addr, dnInfo.storageType, dnInfo.info,
+-          blockReaderOffsets[i] = offsetInBlock;
++          if (reader != null) {
++            blockReaders[i] = new BlockReaderInfo(reader, targetBlock,
++                dnInfo.info, offsetInBlock);
++            return true;
++          }
++      return false;
+-      // TODO no copy for data chunks. this depends on HADOOP-12047 for some
+-      // decoders to work
++      // TODO no copy for data chunks. this depends on HADOOP-12047
+
+INS26 INS40 INS55 INS83 INS83 INS42 INS23 INS23 MOV23 INS23 INS23 INS31 INS31 INS31 UPD5 MOV59 INS29 MOV23 INS23 INS31 INS31 INS31 INS31 MOV83 INS43 INS59 INS83 MOV43 INS59 INS39 MOV43 INS59 INS29 INS39 INS59 INS42 INS44 INS44 INS44 INS44 INS8 INS39 INS42 INS44 INS8 INS39 INS42 INS8 INS43 INS65 INS83 INS74 INS59 INS44 MOV44 UPD39 MOV29 MOV83 INS39 INS42 INS44 MOV43 INS83 MOV39 INS42 MOV43 INS8 INS29 INS83 INS39 INS42 MOV43 INS8 INS39 INS42 INS44 MOV43 INS8 MOV44 MOV44 INS44 MOV44 UPD39 UPD39 INS44 INS8 MOV44 MOV44 MOV44 UPD39 UPD39 INS44 INS8 UPD39 INS42 INS42 INS42 UPD42 INS42 INS65 INS42 INS9 MOV43 INS42 INS43 INS42 MOV43 INS42 INS39 INS42 INS21 INS21 INS21 INS21 INS39 INS42 INS21 INS21 INS42 INS42 INS66 INS66 INS66 INS66 MOV8 INS43 INS43 INS74 INS42 INS5 INS42 MOV21 INS21 INS39 INS42 MOV25 INS65 MOV21 INS24 INS21 INS39 INS42 INS24 INS21 INS25 INS5 INS42 INS60 INS25 INS41 INS39 INS42 INS21 MOV60 INS21 MOV21 INS41 INS46 MOV60 INS25 INS41 INS39 INS42 INS21 INS25 MOV60 MOV21 MOV21 MOV25 INS41 INS41 INS66 INS66 INS66 INS42 INS7 INS7 INS7 INS7 INS7 INS7 INS21 INS42 INS42 INS43 INS43 INS43 INS85 INS7 UPD66 UPD66 INS66 INS66 MOV58 INS27 MOV37 INS8 INS32 INS58 INS27 MOV37 INS8 INS32 INS27 INS8 INS43 INS85 INS42 INS42 INS83 MOV43 MOV59 INS27 INS8 INS9 INS32 INS7 INS9 MOV42 MOV42 INS42 INS42 INS83 INS43 INS83 INS43 INS59 INS27 INS8 INS9 INS32 INS32 INS27 INS8 INS27 INS8 INS9 INS9 INS22 INS42 INS22 INS42 INS22 INS42 INS22 INS42 INS22 INS42 INS22 INS9 UPD5 INS32 INS42 INS42 INS42 INS22 INS42 INS42 INS42 INS21 INS25 INS42 INS39 MOV59 INS59 MOV27 INS27 INS25 INS42 UPD39 INS40 MOV34 INS21 INS21 INS21 INS42 INS42 INS33 INS21 INS41 INS42 INS42 INS27 INS2 MOV14 INS42 INS42 INS42 MOV2 INS27 INS40 INS21 INS41 INS2 INS42 MOV27 INS42 INS42 INS27 INS27 INS22 INS21 INS41 INS27 INS38 INS21 INS41 INS52 INS42 INS52 INS42 INS52 INS42 INS52 INS42 INS52 INS42 INS52 INS42 INS43 INS42 INS42 INS40 INS22 UPD42 INS52 INS42 INS32 INS27 INS8 INS42 INS34 INS27 INS42 INS42 MOV27 INS8 INS32 INS32 INS32 INS7 INS9 UPD27 MOV27 INS27 UPD42 INS40 INS42 UPD42 INS27 INS27 INS7 INS9 INS40 INS40 INS40 UPD42 MOV42 MOV40 UPD27 MOV27 INS27 INS2 INS33 INS2 INS42 INS7 INS9 UPD42 UPD42 MOV2 MOV33 INS32 INS7 INS9 INS42 UPD42 MOV2 INS42 INS42 INS42 INS42 INS42 INS42 MOV2 INS22 INS40 INS25 INS42 INS42 INS2 INS33 INS25 INS25 INS42 INS42 INS42 INS40 INS40 INS40 UPD42 UPD42 MOV2 MOV33 INS42 INS33 INS42 INS33 INS40 INS40 UPD42 UPD42 MOV2 MOV33 INS42 INS42 INS42 INS42 INS2 INS14 UPD42 MOV42 UPD42 MOV42 INS2 INS14 UPD42 UPD42 INS60 INS25 UPD42 UPD42 INS60 INS25 INS40 UPD45 INS2 INS42 INS38 INS8 INS40 INS42 INS27 INS8 INS8 INS38 INS8 MOV21 UPD42 UPD42 INS40 INS42 MOV43 INS40 INS40 INS42 MOV43 INS40 INS43 INS59 INS27 INS8 MOV43 INS59 INS27 INS8 INS40 INS42 INS32 INS21 INS32 INS32 INS21 INS21 INS32 INS21 INS60 INS21 INS21 MOV21 INS42 INS42 MOV32 INS42 INS33 MOV21 INS41 INS42 INS32 INS42 INS33 MOV21 INS42 INS42 INS2 INS42 INS37 INS42 INS42 INS42 INS42 INS2 INS42 INS37 INS37 MOV42 MOV42 MOV2 MOV42 INS37 INS83 INS39 INS59 INS32 INS32 UPD40 UPD40 UPD40 INS9 MOV42 MOV42 MOV42 MOV27 UPD40 MOV40 UPD40 MOV40 UPD40 MOV40 MOV42 MOV42 INS42 INS42 INS40 INS42 INS42 INS42 INS40 UPD42 INS40 INS42 INS40 INS42 INS42 UPD42 INS27 MOV2 INS14 MOV2 INS14 INS40 INS42 INS43 INS42 INS42 INS40 INS42 INS43 INS42 INS42 INS40 INS42 INS42 INS42 DEL83 DEL83 DEL39 DEL85 DEL5 DEL83 DEL85 DEL5 DEL23 DEL42 DEL59 DEL42 DEL39 DEL85 DEL5 DEL42 DEL3 DEL7 DEL21 DEL42 DEL85 DEL5 DEL42 DEL3 DEL7 DEL21 DEL42 DEL42 DEL2 DEL42 DEL42 DEL42 DEL2 DEL40 DEL7 DEL21 DEL32 DEL7 DEL21 DEL42 DEL44 DEL40 DEL42 DEL45 DEL42 DEL27 DEL42 DEL32 DEL21 DEL8 DEL12 DEL54 DEL33 DEL7 DEL21 DEL8 DEL42 DEL42 DEL2 DEL34 DEL7 DEL21 DEL42 DEL42 DEL42 DEL42 DEL66 DEL65 DEL29 DEL42 DEL43 DEL42 DEL43 DEL42 DEL43 DEL42 DEL43 DEL74 DEL74 DEL42 DEL44 DEL66 DEL42 DEL31 DEL85 DEL5 DEL42 DEL44 DEL42 DEL42 DEL32 DEL27 DEL6 DEL42 DEL32 DEL21 DEL42 DEL32 DEL21 DEL42 DEL42 DEL42 DEL2 DEL42 DEL42 DEL42 DEL40 DEL27 DEL42 DEL59 DEL60 DEL42 DEL33 DEL27 DEL40 DEL40 DEL27 DEL27 DEL8 DEL25 DEL8 DEL24 DEL39 DEL58 DEL10 DEL8 DEL25 DEL8 DEL24 DEL8 DEL46 DEL42 DEL42 DEL2 DEL42 DEL42 DEL2 DEL2 DEL7 DEL27 DEL32 DEL21 DEL8 DEL39 DEL42 DEL42 DEL59 DEL58 DEL42 DEL27 DEL42 DEL37 DEL27 DEL40 DEL42 DEL2 DEL7 DEL21 DEL10 DEL8 DEL25 DEL8 DEL24 DEL8 DEL42 DEL42 DEL2 DEL42 DEL42 DEL42 DEL2 DEL40 DEL7 DEL21 DEL7 DEL21

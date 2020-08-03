@@ -1,0 +1,259 @@
+HDDS-360. Use RocksDBStore and TableStore for SCM Metadata.
+Contributed by Anu Engineer.
+
++import java.util.Objects;
++import org.apache.hadoop.hdds.scm.metadata.SCMMetadataStore;
++import org.apache.hadoop.hdds.scm.metadata.SCMMetadataStoreRDBImpl;
+- * the datanodes and
+- * create a container, which then can be used to store data.
++ * the datanodes and create a container, which then can be used to store data.
+-  private final SCMSecurityProtocolServer securityProtocolServer;
++  private  SCMSecurityProtocolServer securityProtocolServer;
+-  private final NodeManager scmNodeManager;
+-  private final PipelineManager pipelineManager;
+-  private final ContainerManager containerManager;
+-  private final BlockManager scmBlockManager;
+-  private final SCMStorage scmStorage;
++  private NodeManager scmNodeManager;
++  private PipelineManager pipelineManager;
++  private ContainerManager containerManager;
++  private BlockManager scmBlockManager;
++  private final SCMStorageConfig scmStorageConfig;
++
++  private SCMMetadataStore scmMetadataStore;
+-  private final ReplicationManager replicationManager;
++  private ReplicationManager replicationManager;
+-  private final SCMChillModeManager scmChillModeManager;
+-  private final CertificateServer certificateServer;
++  private SCMChillModeManager scmChillModeManager;
++  private CertificateServer certificateServer;
+-  private StorageContainerManager(OzoneConfiguration conf)
++  public StorageContainerManager(OzoneConfiguration conf)
++    // default empty configurator means default managers will be used.
++    this(conf, new SCMConfigurator());
++  }
++
++
++  /**
++   * This constructor offers finer control over how SCM comes up.
++   * To use this, user needs to create a SCMConfigurator and set various
++   * managers that user wants SCM to use, if a value is missing then SCM will
++   * use the default value for that manager.
++   *
++   * @param conf - Configuration
++   * @param configurator - configurator
++   */
++  public StorageContainerManager(OzoneConfiguration conf,
++                                 SCMConfigurator configurator)
++      throws IOException, AuthenticationException  {
++    Objects.requireNonNull(configurator, "configurator cannot not be null");
++    Objects.requireNonNull(conf, "configuration cannot not be null");
++
+-    scmStorage = new SCMStorage(conf);
+-    if (scmStorage.getState() != StorageState.INITIALIZED) {
+-      throw new SCMException("SCM not initialized.", ResultCodes
+-          .SCM_NOT_INITIALIZED);
++    /**
++     * It is assumed the scm --init command creates the SCM Storage Config.
++     */
++    scmStorageConfig = new SCMStorageConfig(conf);
++    if (scmStorageConfig.getState() != StorageState.INITIALIZED) {
++      LOG.error("Please make sure you have run \'ozone scm --init\' " +
++          "command to generate all the required metadata.");
++      throw new SCMException("SCM not initialized due to storage config " +
++          "failure.", ResultCodes.SCM_NOT_INITIALIZED);
++    /**
++     * Important : This initialization sequence is assumed by some of our tests.
++     * The testSecureOzoneCluster assumes that security checks have to be
++     * passed before any artifacts like SCM DB is created. So please don't
++     * add any other initialization above the Security checks please.
++     */
++
+-      loginAsSCMUser(conf);
+-      certificateServer = initializeCertificateServer(
+-          getScmStorage().getClusterID(), getScmStorage().getScmId());
+-      // TODO: Support Intermediary CAs in future.
+-      certificateServer.init(new SecurityConfig(conf),
+-          CertificateServer.CAType.SELF_SIGNED_CA);
+-      securityProtocolServer = new SCMSecurityProtocolServer(conf,
+-          certificateServer);
++      initializeCAnSecurityProtocol(conf, configurator);
++    // Creates the SCM DBs or opens them if it exists.
++    initalizeMetadataStore(conf, configurator);
++
+-
+-    scmNodeManager = new SCMNodeManager(
+-        conf, scmStorage.getClusterID(), this, eventQueue);
+-    pipelineManager = new SCMPipelineManager(conf, scmNodeManager, eventQueue);
+-    containerManager = new SCMContainerManager(
+-        conf, scmNodeManager, pipelineManager, eventQueue);
+-    scmBlockManager = new BlockManagerImpl(conf, scmNodeManager,
+-        pipelineManager, containerManager, eventQueue);
+-
++    long watcherTimeout =
++        conf.getTimeDuration(ScmConfigKeys.HDDS_SCM_WATCHER_TIMEOUT,
++            HDDS_SCM_WATCHER_TIMEOUT_DEFAULT, TimeUnit.MILLISECONDS);
++    commandWatcherLeaseManager = new LeaseManager<>("CommandWatcher",
++        watcherTimeout);
++    initalizeSystemManagers(conf, configurator);
+-    long watcherTimeout =
+-        conf.getTimeDuration(ScmConfigKeys.HDDS_SCM_WATCHER_TIMEOUT,
+-            HDDS_SCM_WATCHER_TIMEOUT_DEFAULT, TimeUnit.MILLISECONDS);
+-
+-    commandWatcherLeaseManager = new LeaseManager<>("CommandWatcher",
+-        watcherTimeout);
+-    //TODO: support configurable containerPlacement policy
+-    ContainerPlacementPolicy containerPlacementPolicy =
+-        new SCMContainerPlacementCapacity(scmNodeManager, conf);
+-
+-    replicationManager = new ReplicationManager(containerPlacementPolicy,
+-        containerManager, eventQueue, commandWatcherLeaseManager);
+-
+-    scmChillModeManager = new SCMChillModeManager(conf,
+-        containerManager.getContainers(), pipelineManager, eventQueue);
+-
++  }
++  /**
++   * This function initializes the following managers. If the configurator
++   * specifies a value, we will use it, else we will use the default value.
++   *
++   *  Node Manager
++   *  Pipeline Manager
++   *  Container Manager
++   *  Block Manager
++   *  Replication Manager
++   *  Chill Mode Manager
++   *
++   * @param conf - Ozone Configuration.
++   * @param configurator - A customizer which allows different managers to be
++   *                    used if needed.
++   * @throws IOException - on Failure.
++   */
++  private void initalizeSystemManagers(OzoneConfiguration conf,
++                                       SCMConfigurator configurator)
++      throws IOException {
++    if(configurator.getScmNodeManager() != null) {
++      scmNodeManager = configurator.getScmNodeManager();
++    } else {
++      scmNodeManager = new SCMNodeManager(
++          conf, scmStorageConfig.getClusterID(), this, eventQueue);
++    }
++
++    //TODO: support configurable containerPlacement policy
++    ContainerPlacementPolicy containerPlacementPolicy =
++        new SCMContainerPlacementCapacity(scmNodeManager, conf);
++
++    if (configurator.getPipelineManager() != null) {
++      pipelineManager = configurator.getPipelineManager();
++    } else {
++      pipelineManager =
++          new SCMPipelineManager(conf, scmNodeManager, eventQueue);
++    }
++
++    if(configurator.getContainerManager() != null) {
++      containerManager = configurator.getContainerManager();
++    } else {
++      containerManager = new SCMContainerManager(
++          conf, scmNodeManager, pipelineManager, eventQueue);
++    }
++
++    if(configurator.getScmBlockManager() != null) {
++      scmBlockManager = configurator.getScmBlockManager();
++    } else {
++      scmBlockManager = new BlockManagerImpl(conf, this);
++    }
++    if (configurator.getReplicationManager() != null) {
++      replicationManager = configurator.getReplicationManager();
++    }  else {
++      replicationManager = new ReplicationManager(containerPlacementPolicy,
++          containerManager, eventQueue, commandWatcherLeaseManager);
++    }
++    if(configurator.getScmChillModeManager() != null) {
++      scmChillModeManager = configurator.getScmChillModeManager();
++    } else {
++      scmChillModeManager = new SCMChillModeManager(conf,
++          containerManager.getContainers(), pipelineManager, eventQueue);
++    }
++  }
++
++  /**
++   * If security is enabled we need to have the Security Protocol and a
++   * default CA. This function initializes those values based on the
++   * configurator.
++   *
++   * @param conf - Config
++   * @param configurator - configurator
++   * @throws IOException - on Failure
++   * @throws AuthenticationException - on Failure
++   */
++  private void initializeCAnSecurityProtocol(OzoneConfiguration conf,
++                                             SCMConfigurator configurator)
++      throws IOException, AuthenticationException {
++    loginAsSCMUser(conf);
++    if(configurator.getCertificateServer() != null) {
++      this.certificateServer = configurator.getCertificateServer();
++    } else {
++      certificateServer = initializeCertificateServer(
++          getScmStorageConfig().getClusterID(),
++          getScmStorageConfig().getScmId());
++    }
++    // TODO: Support Intermediary CAs in future.
++    certificateServer.init(new SecurityConfig(conf),
++        CertificateServer.CAType.SELF_SIGNED_CA);
++    securityProtocolServer = new SCMSecurityProtocolServer(conf,
++        certificateServer);
++  }
++
++  /**
++   * Init the metadata store based on the configurator.
++   * @param conf - Config
++   * @param configurator - configurator
++   * @throws IOException - on Failure
++   */
++  private void initalizeMetadataStore(OzoneConfiguration conf,
++                                      SCMConfigurator configurator)
++      throws IOException {
++    if(configurator.getMetadataStore() != null) {
++      scmMetadataStore = configurator.getMetadataStore();
++    } else {
++      scmMetadataStore = new SCMMetadataStoreRDBImpl(conf);
++      if (scmMetadataStore == null) {
++        throw new SCMException("Unable to initialize metadata store",
++            ResultCodes.SCM_NOT_INITIALIZED);
++      }
++    }
+-
+-    SCMStorage scmStorage = new SCMStorage(conf);
+-    StorageState state = scmStorage.getState();
++    SCMStorageConfig scmStorageConfig = new SCMStorageConfig(conf);
++    StorageState state = scmStorageConfig.getState();
+-          scmStorage.setClusterId(clusterId);
++          scmStorageConfig.setClusterId(clusterId);
+-        scmStorage.initialize();
++        scmStorageConfig.initialize();
+-                + scmStorage.getStorageDir()
++                + scmStorageConfig.getStorageDir()
+-                + scmStorage.getClusterID());
++                + scmStorageConfig.getClusterID());
+-              + scmStorage.getStorageDir()
++              + scmStorageConfig.getStorageDir()
+-              + scmStorage.getClusterID());
++              + scmStorageConfig.getClusterID());
+-  public SCMStorage getScmStorage() {
+-    return scmStorage;
++  public SCMStorageConfig getScmStorageConfig() {
++    return scmStorageConfig;
++
++    try {
++      scmMetadataStore.stop();
++    } catch (Exception ex) {
++      LOG.error("SCM Metadata store stop failed", ex);
++    }
++
++  /**
++   * Returns the SCM metadata Store.
++   * @return SCMMetadataStore
++   */
++  public SCMMetadataStore getScmMetadataStore() {
++    return scmMetadataStore;
++  }

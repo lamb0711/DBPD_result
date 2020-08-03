@@ -1,0 +1,112 @@
+HDDS-870. Avoid creating block sized buffer in ChunkGroupOutputStream. Contributed by Shashikant Banerjee.
+
++import com.google.common.base.Preconditions;
++import org.apache.hadoop.hdds.protocol.datanode.proto.ContainerProtos;
+-import java.util.ArrayList;
+-import java.util.Objects;
+-import java.util.Collection;
++import java.util.*;
++import java.util.concurrent.ConcurrentHashMap;
++  // Map to track commit index at every server
++  private final ConcurrentHashMap<String, Long> commitInfoMap;
++
++  // create a separate RaftClient for watchForCommit API
++  private RaftClient watchClient;
++
++    commitInfoMap = new ConcurrentHashMap<>();
++    watchClient = null;
++  }
++
++  private void updateCommitInfosMap(
++      Collection<RaftProtos.CommitInfoProto> commitInfoProtos) {
++    // if the commitInfo map is empty, just update the commit indexes for each
++    // of the servers
++    if (commitInfoMap.isEmpty()) {
++      commitInfoProtos.forEach(proto -> commitInfoMap
++          .put(proto.getServer().getAddress(), proto.getCommitIndex()));
++      // In case the commit is happening 2 way, just update the commitIndex
++      // for the servers which have been successfully updating the commit
++      // indexes. This is important because getReplicatedMinCommitIndex()
++      // should always return the min commit index out of the nodes which have
++      // been replicating data successfully.
++    } else {
++      commitInfoProtos.forEach(proto -> commitInfoMap
++          .computeIfPresent(proto.getServer().getAddress(),
++              (address, index) -> {
++                index = proto.getCommitIndex();
++                return index;
++              }));
++    }
++    if (watchClient != null) {
++      closeRaftClient(watchClient);
++    }
++  // gets the minimum log index replicated to all servers
+-  public void watchForCommit(long index, long timeout)
++  public long getReplicatedMinCommitIndex() {
++    OptionalLong minIndex =
++        commitInfoMap.values().parallelStream().mapToLong(v -> v).min();
++    return minIndex.isPresent() ? minIndex.getAsLong() : 0;
++  }
++
++  private void getFailedServer(
++      Collection<RaftProtos.CommitInfoProto> commitInfos) {
++    for (RaftProtos.CommitInfoProto proto : commitInfos) {
++
++    }
++  }
++
++  @Override
++  public long watchForCommit(long index, long timeout)
++    long commitIndex = getReplicatedMinCommitIndex();
++    if (commitIndex >= index) {
++      // return the min commit index till which the log has been replicated to
++      // all servers
++      return commitIndex;
++    }
+-    RaftClient raftClient =
+-        RatisHelper.newRaftClient(rpcType, getPipeline(), retryPolicy);
+-    CompletableFuture<RaftClientReply> replyFuture = raftClient
++    if (watchClient == null) {
++      watchClient =
++          RatisHelper.newRaftClient(rpcType, getPipeline(), retryPolicy);
++    }
++    CompletableFuture<RaftClientReply> replyFuture = watchClient
++    RaftClientReply reply;
+-      replyFuture.get(timeout, TimeUnit.MILLISECONDS);
++      reply = replyFuture.get(timeout, TimeUnit.MILLISECONDS);
+-      closeRaftClient(raftClient);
++      closeRaftClient(watchClient);
+-      raftClient =
++      watchClient =
+-      raftClient
++      reply = watchClient
+-      LOG.info("Could not commit " + index + " to all the nodes."
+-          + "Committed by majority.");
+-    } finally {
+-      closeRaftClient(raftClient);
++      Optional<RaftProtos.CommitInfoProto>
++          proto = reply.getCommitInfos().stream().min(Comparator.comparing(
++          RaftProtos.CommitInfoProto :: getCommitIndex));
++      Preconditions.checkState(proto.isPresent());
++      String address = proto.get().getServer().getAddress();
++      // since 3 way commit has failed, the updated map from now on  will
++      // only store entries for those datanodes which have had successful
++      // replication.
++      commitInfoMap.remove(address);
++      LOG.info(
++          "Could not commit " + index + " to all the nodes. Server " + address
++              + " has failed" + "Committed by majority.");
++    return index;
++
+-    Collection<XceiverClientAsyncReply.CommitInfo> commitInfos =
+-        new ArrayList<>();
+-                reply.getCommitInfos().forEach(e -> {
+-                  XceiverClientAsyncReply.CommitInfo commitInfo =
+-                      new XceiverClientAsyncReply.CommitInfo(
+-                          e.getServer().getAddress(), e.getCommitIndex());
+-                  commitInfos.add(commitInfo);
+-                  asyncReply.setCommitInfos(commitInfos);
++                if (response.getResult() == ContainerProtos.Result.SUCCESS) {
++                  updateCommitInfosMap(reply.getCommitInfos());
+-                });
++                }

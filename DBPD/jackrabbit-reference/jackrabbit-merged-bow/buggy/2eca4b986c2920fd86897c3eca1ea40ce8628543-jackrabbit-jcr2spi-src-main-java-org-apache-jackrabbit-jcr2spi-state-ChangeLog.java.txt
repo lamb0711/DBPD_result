@@ -1,0 +1,444 @@
+JCR-1799 updating events swallowed (CacheBehavior.OBSERVATION)   	
+JCR-1783 incomplete changelog when combining move with removal of new destination parent
+
+git-svn-id: https://svn.apache.org/repos/asf/jackrabbit/trunk@704361 13f79535-47bb-0310-9956-ffa450edef68
+
+-import org.apache.jackrabbit.jcr2spi.operation.AddNode;
+-import org.apache.jackrabbit.jcr2spi.operation.AddProperty;
+-import org.apache.jackrabbit.jcr2spi.hierarchy.NodeEntry;
+-import org.apache.jackrabbit.spi.commons.name.NameConstants;
+-import org.apache.commons.collections.iterators.IteratorChain;
++import org.apache.jackrabbit.jcr2spi.hierarchy.HierarchyEntry;
+-import javax.jcr.nodetype.ConstraintViolationException;
++import javax.jcr.InvalidItemStateException;
++import javax.jcr.nodetype.ConstraintViolationException;
+-import java.util.LinkedHashSet;
+-import java.util.HashSet;
+-import java.util.Collection;
++import java.util.List;
++import java.util.ArrayList;
+-    /**
+-     * Added states
+-     */
+-    private final Set addedStates = new LinkedHashSet();
+-
+-    /**
+-     * Modified states
+-     */
+-    private final Set modifiedStates = new LinkedHashSet();
+-
+-    /**
+-     * Deleted states
+-     */
+-    private final Set deletedStates = new LinkedHashSet();
+-    private Set operations = new LinkedHashSet();
++    private final Set operations;
++
++    private final Set affectedStates;
++     * Create a new change log and populates it with operations and states
++     * that are within the scope of this change set.
++     * @param operations
++     * @param affectedStates
++     * @throws InvalidItemStateException
++     * @throws ConstraintViolationException
+-    ChangeLog(ItemState target) {
++    ChangeLog(ItemState target, Set operations, Set affectedStates)
++            throws InvalidItemStateException, ConstraintViolationException {
++        this.operations = operations;
++        this.affectedStates = affectedStates;
+-     * Add the given operation to the list of operations to be recorded within
+-     * the current update cycle of this ChangeLog.
+-     *
+-     * @param operation
+-     */
+-    public void addOperation(Operation operation) {
+-        operations.add(operation);
+-    }
+-
+-    /**
+-     * A state has been added
+-     *
+-     * @param state state that has been added
+-     */
+-    public void added(ItemState state) {
+-        addedStates.add(state);
+-    }
+-
+-    /**
+-     * A state has been modified. If the state is not a new state
+-     * (not in the collection of added ones), then add
+-     * it to the modified states collection.
+-     *
+-     * @param state state that has been modified
+-     */
+-    public void modified(ItemState state) {
+-        if (!addedStates.contains(state)) {
+-            modifiedStates.add(state);
+-        }
+-    }
+-
+-    /**
+-     * A state has been deleted. If the state is not a new state
+-     * (not in the collection of added ones), then remove
+-     * it from the modified states collection and add it to the
+-     * deleted states collection.
+-     *
+-     * @param state state that has been deleted
+-     */
+-    public void deleted(ItemState state) {
+-        if (!addedStates.remove(state)) {
+-            modifiedStates.remove(state);
+-            deletedStates.add(state);
+-        }
+-    }
+-
+-    /**
+-     * This implementation will call {@link ItemState#persisted(ChangeLog)
+-     * ItemState.refresh(this)} on the target item of this change log.
++     * This implementation will call {@link Operation#persisted() on the
++     * individual operations followed by setting all remaining modified
++     * states to EXISTING.
+-    public void persisted() {
+-        target.persisted(this);
++    public void persisted() throws RepositoryException {
++        List changedMixins = new ArrayList();
++        Operation[] ops = (Operation[]) operations.toArray(new Operation[operations.size()]);
++        for (int i = 0; i < ops.length; i++) {
++            ops[i].persisted();
++            if (ops[i] instanceof SetMixin) {
++                changedMixins.add(((SetMixin) ops[i]).getNodeState());
++            }
++        }
++        // process all remaining states that were not covered by the
++        // operation persistence.
++        for (Iterator it = affectedStates.iterator(); it.hasNext();) {
++            ItemState state = (ItemState) it.next();
++            HierarchyEntry he = state.getHierarchyEntry();
++
++            switch (state.getStatus()) {
++                case Status.EXISTING_MODIFIED:
++                    state.setStatus(Status.EXISTING);
++                    if (state.isNode() && changedMixins.contains(state)) {
++                        // mixin changed for a node -> force reloading upon next
++                        // access in order to be aware of modified uniqueID.
++                        he.invalidate(false);
++                    }
++                    break;
++                case Status.EXISTING_REMOVED:
++                    he.remove();
++                    break;
++                case Status.NEW:
++                    // illegal. should not get here.
++                    log.error("ChangeLog still contains NEW state: " + state.getName());
++                    state.setStatus(Status.EXISTING);
++                    break;
++                case Status.MODIFIED:
++                case Status._UNDEFINED_:
++                case Status.STALE_DESTROYED:
++                case Status.STALE_MODIFIED:
++                    // illegal.
++                    log.error("ChangeLog contains state (" + state.getName() + ") with illegal status " + Status.getName(state.getStatus()));
++                    break;
++                case Status.EXISTING:
++                    if (state.isNode() && changedMixins.contains(state)) {
++                        // mixin changed for a node -> force reloading upon next
++                        // access in order to be aware of modified uniqueID.
++                        he.invalidate(false);
++                    }
++                    // otherwise: ignore. operations already have been completed
++                    break;
++                case Status.INVALIDATED:
++                case Status.REMOVED:
++                    // ignore. operations already have been completed
++                    break;
++            }
++        }
+-        // TODO: check if states are reverted in the correct order
+-        Iterator[] its = new Iterator[] {addedStates(), deletedStates(), modifiedStates()};
+-        IteratorChain chain = new IteratorChain(its);
+-        while (chain.hasNext()) {
+-            ItemState state = (ItemState) chain.next();
+-            state.getHierarchyEntry().revert();
++        Operation[] ops = (Operation[]) operations.toArray(new Operation[operations.size()]);
++        for (int i = ops.length - 1; i >= 0; i--) {
++            ops[i].undo();
++        }
++
++        // process all remaining states that were not covered by the
++        // operation undo.
++        for (Iterator it = affectedStates.iterator(); it.hasNext();) {
++            ItemState state = (ItemState) it.next();
++            switch (state.getStatus()) {
++                case Status.EXISTING_MODIFIED:
++                case Status.EXISTING_REMOVED:
++                case Status.STALE_MODIFIED:
++                case Status.STALE_DESTROYED:
++                    state.getHierarchyEntry().revert();
++                    break;
++                case Status.NEW:
++                    // illegal. should not get here.
++                    log.error("ChangeLog still contains NEW state: " + state.getName());
++                    state.getHierarchyEntry().revert();
++                    break;
++                case Status.MODIFIED:
++                case Status._UNDEFINED_:
++                    // illegal.
++                    log.error("ChangeLog contains state (" + state.getName() + ") with illegal status " + Status.getName(state.getStatus()));
++                    break;
++                case Status.EXISTING:
++                case Status.REMOVED:
++                case Status.INVALIDATED:
++                    // ignore already processed
++                    break;
++            }
+-     * @return <code>true</code> if this changelog is empty.
++     * @return true if no <code>operations</code> are present.
+-     * @return an iterator over all operations.
++     * @return set of operations.
+-    public Iterator getOperations() {
+-        return operations.iterator();
++    public Set getOperations() {
++        return operations;
+-     * Return an iterator over all added states.
+-     *
+-     * @return iterator over all added states.
++     * @return set of the affected states.
+-    public Iterator addedStates() {
+-        return addedStates.iterator();
+-    }
+-
+-    /**
+-     * Return an iterator over all modified states.
+-     *
+-     * @return iterator over all modified states.
+-     */
+-    public Iterator modifiedStates() {
+-        return modifiedStates.iterator();
+-    }
+-
+-    /**
+-     * Return an iterator over all deleted states.
+-     *
+-     * @return iterator over all deleted states.
+-     */
+-    public Iterator deletedStates() {
+-        return deletedStates.iterator();
+-    }
+-
+-    /**
+-     * Returns true, if this change log contains the given <code>ItemState</code>
+-     * in the set of transiently removed states.
+-     *
+-     * @param state
+-     * @return
+-     */
+-    public boolean containsDeletedState(ItemState state) {
+-        return deletedStates.contains(state);
+-    }
+-
+-    /**
+-     * Removes the subset of this changelog represented by the given
+-     * <code>ChangeLog</code> from this changelog.
+-     *
+-     * @param subChangeLog remove all entries (states, operations) present in
+-     * the given changelog from this changelog.
+-     */
+-    public void removeAll(ChangeLog subChangeLog) {
+-        addedStates.removeAll(subChangeLog.addedStates);
+-        modifiedStates.removeAll(subChangeLog.modifiedStates);
+-        deletedStates.removeAll(subChangeLog.deletedStates);
+-
+-        operations.removeAll(subChangeLog.operations);
+-    }
+-
+-    /**
+-     * Adjust this ChangeLog according to the status change with the given
+-     * ItemState:
+-     * Remove all entries and operation related to the given ItemState, that
+-     * are not used any more (respecting the status change).
+-     *
+-     * @param state
+-     */
+-    public void statusChanged(ItemState state, int previousStatus) {
+-        switch (state.getStatus()) {
+-            case (Status.EXISTING):
+-                switch (previousStatus) {
+-                    case Status.EXISTING_MODIFIED:
+-                        // was modified and is now refreshed
+-                        modifiedStates.remove(state);
+-                        break;
+-                    case Status.EXISTING_REMOVED:
+-                        // was removed and is now refreshed
+-                        deletedStates.remove(state);
+-                        break;
+-                    case Status.STALE_MODIFIED:
+-                        // was modified and state and is now refreshed
+-                        modifiedStates.remove(state);
+-                        break;
+-                    case Status.NEW:
+-                        // was new and has been saved now
+-                        addedStates.remove(state);
+-                        break;
+-                }
+-                // TODO: check if correct: changelog gets cleared any way -> no need to remove operations
+-                break;
+-            case Status.EXISTING_MODIFIED:
+-                modified(state);
+-                break;
+-            case (Status.EXISTING_REMOVED):
+-                deleted(state);
+-                // removeAffectedOperations(state);
+-                break;
+-            case (Status.REMOVED):
+-                switch (previousStatus) {
+-                    case Status.EXISTING_REMOVED:
+-                        // was removed and is now saved
+-                        deletedStates.remove(state);
+-                        removeAffectedOperations(state);
+-                        break;
+-                    case Status.NEW:
+-                        newStateRemoved(state);
+-                        break;
+-                }
+-                break;
+-        }
+-    }
+-
+-    private void newStateRemoved(ItemState state) {
+-        NodeEntry parentEntry = state.getHierarchyEntry().getParent();
+-        if (!parentEntry.isAvailable() || Status.isTerminal(parentEntry.getStatus())) {
+-            return; // TODO: check if correct
+-        }
+-        // was new and now removed again
+-        addedStates.remove(state);
+-
+-        // remove any operations performed on the removed state
+-        removeAffectedOperations(state);
+-
+-        /* remove the add-operation as well:
+-           since the affected state of an 'ADD' operation is the parent instead
+-           of the added-state, the set of operations need to be searched for the
+-           parent state && the proper operation type.
+-           SET_MIXIN is considered as a special case of adding a property
+-         */
+-        NodeState parent;
+-        try {
+-            parent = parentEntry.getNodeState();
+-        } catch (RepositoryException e) {
+-            // should never occur
+-            log.error("Internal error:", e);
+-            return;
+-        }
+-        for (Iterator it = operations.iterator(); it.hasNext();) {
+-            Operation op = (Operation) it.next();
+-            if (op instanceof AddNode) {
+-                AddNode operation = (AddNode) op;
+-                if (operation.getParentState() == parent
+-                        && operation.getNodeName().equals(state.getName())) {
+-                    // TODO: this will not work for name name siblings!
+-                    it.remove();
+-                    break;
+-                }
+-            } else if (op instanceof AddProperty) {
+-                AddProperty operation = (AddProperty) op;
+-                if (operation.getParentState() == parent
+-                        && operation.getPropertyName().equals(state.getName())) {
+-                    it.remove();
+-                    break;
+-                }
+-            } else if (op instanceof SetMixin &&
+-                    NameConstants.JCR_MIXINTYPES.equals(state.getName()) &&
+-                    ((SetMixin)op).getNodeState() == parent) {
+-                it.remove();
+-                break;
+-            }
+-        }
+-    }
+-
+-    private void removeAffectedOperations(ItemState state) {
+-        for (Iterator it = operations.iterator(); it.hasNext();) {
+-            Operation op = (Operation) it.next();
+-            if (op.getAffectedItemStates().contains(state)) {
+-                it.remove();
+-            }
+-        }
+-    }
+-
+-    /**
+-     * Make sure that this ChangeLog is totally 'self-contained'
+-     * and independant; items within the scope of this update operation
+-     * must not have 'external' dependencies;
+-     * (e.g. moving a node requires that the target node including both
+-     * old and new parents are saved)
+-     */
+-    public void checkIsSelfContained() throws ConstraintViolationException {
+-        Set affectedStates = new HashSet();
+-        affectedStates.addAll(modifiedStates);
+-        affectedStates.addAll(deletedStates);
+-        affectedStates.addAll(addedStates);
+-
+-        // check if the affected states listed by the operations are all
+-        // listed in the modified,deleted or added states collected by this
+-        // changelog.
+-        Iterator it = getOperations();
+-        while (it.hasNext()) {
+-            Operation op = (Operation) it.next();
+-            Collection opStates = op.getAffectedItemStates();
+-            if (!affectedStates.containsAll(opStates)) {
+-                // need to save the parent as well
+-                String msg = "ChangeLog is not self contained.";
+-                throw new ConstraintViolationException(msg);
+-            }
+-        }
+-    }
+-
+-    /**
+-     * Populates this <code>ChangeLog</code> with operations that are within the
+-     * scope of this change set.
+-     *
+-     * @param operations an Iterator of <code>Operation</code>s which are the
+-     *                   candidates to be included in this <code>ChangeLog</code>.
+-     */
+-    public void collectOperations(Iterator operations) {
+-        Set affectedStates = new HashSet();
+-        affectedStates.addAll(addedStates);
+-        affectedStates.addAll(deletedStates);
+-        affectedStates.addAll(modifiedStates);
+-        while (operations.hasNext()) {
+-            Operation op = (Operation) operations.next();
+-            Iterator states = op.getAffectedItemStates().iterator();
+-            while (states.hasNext()) {
+-                ItemState state = (ItemState) states.next();
+-                if (affectedStates.contains(state)) {
+-                    addOperation(op);
+-                    break;
+-                }
+-            }
+-        }
++    public Set getAffectedStates() {
++        return affectedStates;
+-    public void reset() {
+-        addedStates.clear();
+-        modifiedStates.clear();
+-        deletedStates.clear();
++    void reset() {
++        affectedStates.clear();
+-
+-    //-------------------------------------------------------------< Object >---
+-    /**
+-     * Returns a string representation of this change log for diagnostic
+-     * purposes.
+-     *
+-     * @return a string representation of this change log
+-     */
+-    public String toString() {
+-        StringBuffer buf = new StringBuffer();
+-        buf.append("{");
+-        buf.append("#addedStates=").append(addedStates.size());
+-        buf.append(", #modifiedStates=").append(modifiedStates.size());
+-        buf.append(", #deletedStates=").append(deletedStates.size());
+-        buf.append("}");
+-        return buf.toString();
+-    }
+
+MOV26 MOV26 MOV23 MOV31 UPD40 UPD40 UPD40 UPD40 INS31 INS31 INS83 INS29 UPD42 MOV42 MOV44 MOV44 INS44 INS43 MOV43 MOV8 MOV29 MOV83 MOV39 MOV42 MOV43 INS8 MOV29 UPD83 UPD42 MOV43 INS29 UPD83 UPD39 INS42 MOV8 MOV43 INS42 INS8 MOV43 INS42 INS8 UPD42 MOV65 MOV65 MOV65 MOV65 UPD65 MOV65 UPD65 MOV65 MOV43 UPD42 MOV43 INS42 INS42 INS21 INS21 MOV60 MOV60 INS24 INS24 INS60 INS24 INS65 UPD65 INS41 UPD65 INS41 UPD66 UPD66 UPD42 UPD42 UPD42 UPD42 INS7 INS7 UPD43 INS5 INS58 INS27 INS37 INS8 INS58 MOV32 INS8 INS5 INS59 INS58 INS27 INS37 INS8 INS66 UPD66 INS42 UPD66 INS42 INS22 INS42 INS22 INS42 INS66 INS66 UPD66 UPD42 UPD42 MOV43 INS85 UPD42 INS39 INS59 INS42 INS40 INS42 INS21 INS25 MOV43 INS59 MOV60 MOV60 INS50 MOV43 INS85 INS42 INS11 INS39 INS59 INS42 INS34 INS42 MOV21 MOV43 INS50 UPD42 INS52 INS42 INS52 INS42 UPD42 UPD43 INS5 INS32 INS42 INS34 INS32 MOV62 INS8 INS42 INS32 MOV43 UPD43 INS32 MOV49 INS21 INS25 MOV10 MOV49 MOV21 MOV10 MOV49 MOV21 MOV21 MOV10 MOV49 INS49 INS49 INS49 MOV21 MOV10 MOV49 INS25 MOV10 INS49 INS49 MOV10 INS5 INS32 UPD42 MOV42 INS27 MOV43 MOV32 MOV49 MOV49 MOV49 INS49 MOV21 INS10 MOV49 INS21 INS21 INS10 INS49 INS49 INS21 INS10 INS49 INS49 INS49 INS10 UPD42 MOV43 INS85 INS42 INS42 INS3 INS2 INS42 INS2 INS21 UPD42 MOV42 MOV42 UPD42 UPD42 UPD42 MOV32 UPD42 MOV42 UPD42 MOV42 MOV32 INS27 INS8 INS40 INS40 INS40 INS40 INS32 INS40 INS27 INS8 INS40 INS40 MOV43 INS85 UPD42 MOV42 UPD42 MOV42 INS3 INS40 INS34 INS2 UPD42 UPD42 UPD42 INS40 MOV32 INS32 INS40 INS40 INS32 INS40 INS40 INS40 INS5 INS32 INS42 INS42 INS42 INS42 INS32 MOV43 UPD42 UPD42 UPD40 INS32 INS32 INS21 UPD42 UPD42 UPD42 INS27 UPD42 UPD42 INS40 INS42 INS42 INS27 INS32 INS32 INS21 INS5 INS32 INS42 INS42 MOV43 INS42 UPD42 INS27 MOV32 UPD42 MOV42 INS42 INS42 INS27 MOV43 INS85 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 MOV32 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 MOV42 MOV32 INS45 INS32 INS45 MOV32 INS45 INS32 UPD42 MOV42 UPD42 MOV42 INS42 UPD42 MOV42 MOV42 MOV32 MOV43 INS85 UPD42 MOV42 UPD42 MOV42 INS45 MOV32 UPD42 UPD42 INS45 MOV32 INS45 INS32 UPD42 UPD42 INS9 MOV42 INS42 UPD42 MOV42 INS42 INS32 UPD42 UPD42 INS9 UPD42 MOV42 UPD42 MOV42 MOV32 MOV42 INS42 UPD42 UPD42 INS2 INS42 INS42 DEL40 DEL26 DEL40 DEL26 DEL40 DEL26 DEL40 DEL26 DEL66 DEL65 DEL29 DEL83 DEL83 DEL42 DEL42 DEL43 DEL14 DEL59 DEL23 DEL66 DEL65 DEL29 DEL83 DEL83 DEL42 DEL42 DEL43 DEL14 DEL59 DEL23 DEL42 DEL43 DEL14 DEL66 DEL65 DEL29 DEL42 DEL43 DEL14 DEL66 DEL66 DEL66 DEL42 DEL43 DEL69 DEL66 DEL42 DEL42 DEL43 DEL42 DEL43 DEL32 DEL42 DEL42 DEL42 DEL32 DEL42 DEL42 DEL40 DEL36 DEL32 DEL40 DEL36 DEL29 DEL42 DEL31 DEL29 DEL83 DEL39 DEL42 DEL42 DEL44 DEL42 DEL42 DEL42 DEL32 DEL21 DEL8 DEL31 DEL66 DEL65 DEL29 DEL83 DEL39 DEL42 DEL42 DEL43 DEL42 DEL44 DEL42 DEL42 DEL42 DEL32 DEL21 DEL8 DEL31 DEL66 DEL66 DEL66 DEL65 DEL29 DEL83 DEL39 DEL42 DEL42 DEL44 DEL42 DEL42 DEL42 DEL32 DEL38 DEL42 DEL42 DEL42 DEL32 DEL21 DEL8 DEL25 DEL8 DEL31 DEL66 DEL66 DEL66 DEL66 DEL65 DEL29 DEL83 DEL39 DEL42 DEL42 DEL42 DEL32 DEL38 DEL42 DEL42 DEL42 DEL32 DEL21 DEL42 DEL42 DEL42 DEL32 DEL21 DEL8 DEL25 DEL8 DEL31 DEL42 DEL42 DEL52 DEL32 DEL21 DEL8 DEL31 DEL83 DEL39 DEL42 DEL85 DEL5 DEL42 DEL85 DEL5 DEL42 DEL32 DEL42 DEL32 DEL42 DEL32 DEL4 DEL3 DEL59 DEL60 DEL42 DEL42 DEL32 DEL8 DEL61 DEL8 DEL31 DEL66 DEL65 DEL29 DEL83 DEL39 DEL42 DEL31 DEL66 DEL65 DEL29 DEL83 DEL42 DEL43 DEL42 DEL42 DEL42 DEL32 DEL41 DEL8 DEL31 DEL66 DEL65 DEL66 DEL65 DEL29 DEL83 DEL42 DEL43 DEL42 DEL32 DEL41 DEL8 DEL31 DEL66 DEL65 DEL66 DEL65 DEL29 DEL83 DEL42 DEL43 DEL42 DEL42 DEL42 DEL32 DEL41 DEL8 DEL31 DEL66 DEL65 DEL66 DEL65 DEL29 DEL83 DEL42 DEL43 DEL42 DEL32 DEL41 DEL8 DEL31 DEL66 DEL66 DEL65 DEL42 DEL65 DEL65 DEL29 DEL83 DEL39 DEL42 DEL42 DEL44 DEL42 DEL32 DEL41 DEL8 DEL31 DEL66 DEL66 DEL65 DEL42 DEL66 DEL66 DEL65 DEL29 DEL83 DEL39 DEL42 DEL42 DEL43 DEL42 DEL44 DEL21 DEL42 DEL42 DEL40 DEL32 DEL21 DEL40 DEL32 DEL21 DEL42 DEL42 DEL40 DEL32 DEL21 DEL8 DEL31 DEL66 DEL66 DEL66 DEL66 DEL65 DEL42 DEL65 DEL29 DEL83 DEL39 DEL42 DEL42 DEL44 DEL39 DEL42 DEL44 DEL40 DEL36 DEL49 DEL42 DEL32 DEL21 DEL10 DEL21 DEL10 DEL50 DEL10 DEL42 DEL42 DEL32 DEL21 DEL32 DEL21 DEL10 DEL21 DEL50 DEL50 DEL8 DEL31 DEL42 DEL43 DEL42 DEL44 DEL42 DEL42 DEL45 DEL42 DEL42 DEL32 DEL38 DEL32 DEL32 DEL27 DEL41 DEL8 DEL25 DEL42 DEL42 DEL42 DEL32 DEL21 DEL42 DEL42 DEL32 DEL21 DEL42 DEL43 DEL59 DEL60 DEL42 DEL42 DEL42 DEL32 DEL7 DEL21 DEL8 DEL42 DEL44 DEL41 DEL8 DEL12 DEL54 DEL42 DEL43 DEL40 DEL42 DEL42 DEL43 DEL62 DEL42 DEL43 DEL42 DEL42 DEL43 DEL42 DEL11 DEL59 DEL60 DEL42 DEL42 DEL32 DEL42 DEL27 DEL32 DEL27 DEL42 DEL42 DEL32 DEL21 DEL10 DEL8 DEL25 DEL8 DEL42 DEL42 DEL43 DEL62 DEL42 DEL43 DEL42 DEL42 DEL43 DEL42 DEL11 DEL59 DEL60 DEL32 DEL42 DEL27 DEL42 DEL32 DEL27 DEL42 DEL42 DEL32 DEL21 DEL10 DEL8 DEL25 DEL8 DEL42 DEL27 DEL27 DEL42 DEL42 DEL32 DEL21 DEL10 DEL8 DEL25 DEL25 DEL25 DEL42 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL42 DEL42 DEL32 DEL59 DEL58 DEL42 DEL42 DEL32 DEL42 DEL42 DEL32 DEL42 DEL42 DEL32 DEL21 DEL8 DEL25 DEL8 DEL24 DEL8 DEL66 DEL66 DEL66 DEL66 DEL39 DEL42 DEL42 DEL42 DEL43 DEL14 DEL59 DEL60 DEL42 DEL42 DEL42 DEL32 DEL21 DEL42 DEL42 DEL42 DEL32 DEL21 DEL42 DEL42 DEL42 DEL32 DEL21 DEL42 DEL43 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL42 DEL32 DEL42 DEL42 DEL43 DEL42 DEL42 DEL32 DEL11 DEL59 DEL60 DEL42 DEL43 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL42 DEL42 DEL32 DEL38 DEL42 DEL43 DEL42 DEL45 DEL59 DEL60 DEL42 DEL43 DEL42 DEL14 DEL53 DEL8 DEL25 DEL8 DEL61 DEL8 DEL66 DEL42 DEL66 DEL66 DEL65 DEL39 DEL42 DEL42 DEL43 DEL42 DEL44 DEL42 DEL42 DEL43 DEL14 DEL59 DEL60 DEL42 DEL42 DEL42 DEL32 DEL21 DEL42 DEL42 DEL42 DEL32 DEL21 DEL42 DEL42 DEL42 DEL32 DEL21 DEL42 DEL42 DEL32 DEL42 DEL43 DEL42 DEL42 DEL43 DEL42 DEL42 DEL32 DEL11 DEL59 DEL60 DEL42 DEL43 DEL42 DEL42 DEL42 DEL32 DEL42 DEL32 DEL59 DEL60 DEL42 DEL42 DEL32 DEL42 DEL43 DEL42 DEL42 DEL43 DEL42 DEL42 DEL32 DEL11 DEL59 DEL60 DEL42 DEL42 DEL42 DEL32 DEL42 DEL42 DEL32 DEL21 DEL10 DEL8 DEL25 DEL8 DEL61 DEL8 DEL61 DEL8 DEL83 DEL42 DEL42 DEL32 DEL21 DEL42 DEL42 DEL32 DEL21 DEL66 DEL66 DEL65 DEL66 DEL65 DEL29 DEL83 DEL42 DEL43 DEL42 DEL42 DEL43 DEL42 DEL42 DEL43 DEL14 DEL59 DEL60 DEL42 DEL42 DEL45 DEL32 DEL21 DEL42 DEL42 DEL45 DEL32 DEL42 DEL42 DEL42 DEL32 DEL32 DEL21 DEL42 DEL42 DEL45 DEL32 DEL42 DEL42 DEL42 DEL32 DEL32 DEL21 DEL42 DEL42 DEL45 DEL32 DEL42 DEL42 DEL42 DEL32 DEL32 DEL21 DEL42 DEL42 DEL45 DEL32 DEL21 DEL42 DEL42 DEL32 DEL41 DEL8 DEL31

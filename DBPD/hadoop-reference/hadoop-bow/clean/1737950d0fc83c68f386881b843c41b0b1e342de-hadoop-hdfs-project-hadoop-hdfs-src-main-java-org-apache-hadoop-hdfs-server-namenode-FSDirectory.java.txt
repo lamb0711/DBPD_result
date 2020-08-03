@@ -1,0 +1,152 @@
+HDFS-6987. Move CipherSuite xattr information up to the encryption zone root. Contributed by Zhe Zhang.
+
++import org.apache.hadoop.crypto.CipherSuite;
+-      final INodesInPath inodesInPath = getLastINodeInPath(srcs);
++      final INodesInPath inodesInPath = getINodesInPath(srcs, true);
++      final INode[] inodes = inodesInPath.getINodes();
+-      final INode targetNode = inodesInPath.getLastINode();
++      final INode targetNode = inodes[inodes.length - 1];
+-                isRawPath)}, 0);
++                isRawPath, inodesInPath)}, 0);
+-            isRawPath);
++            isRawPath, inodesInPath);
+-          BlockStoragePolicy.ID_UNSPECIFIED, Snapshot.CURRENT_STATE_ID, false);
++          BlockStoragePolicy.ID_UNSPECIFIED, Snapshot.CURRENT_STATE_ID,
++          false, null);
+-      final INodesInPath inodesInPath = getLastINodeInPath(srcs, resolveLink);
+-      final INode i = inodesInPath.getINode(0);
++      final INodesInPath inodesInPath = getINodesInPath(srcs, resolveLink);
++      final INode[] inodes = inodesInPath.getINodes();
++      final INode i = inodes[inodes.length - 1];
+-          policyId, inodesInPath.getPathSnapshotId(), isRawPath);
++          policyId, inodesInPath.getPathSnapshotId(), isRawPath,
++          inodesInPath);
+-              ezManager.unprotectedAddEncryptionZone(inode.getId(),
+-                  new String(xattr.getValue()));
++              try {
++                final HdfsProtos.ZoneEncryptionInfoProto ezProto =
++                    HdfsProtos.ZoneEncryptionInfoProto.parseFrom(
++                        xattr.getValue());
++                ezManager.unprotectedAddEncryptionZone(inode.getId(),
++                    PBHelper.convert(ezProto.getSuite()),
++                    ezProto.getKeyName());
++              } catch (InvalidProtocolBufferException e) {
++                NameNode.LOG.warn("Error parsing protocol buffer of " +
++                    "EZ XAttr " + xattr.getName());
++              }
+-      boolean needLocation, byte storagePolicy, int snapshot, boolean isRawPath)
++      boolean needLocation, byte storagePolicy, int snapshot,
++      boolean isRawPath, INodesInPath iip)
+-      return createLocatedFileStatus(path, node, storagePolicy, snapshot, isRawPath);
++      return createLocatedFileStatus(path, node, storagePolicy, snapshot,
++          isRawPath, iip);
+-      return createFileStatus(path, node, storagePolicy, snapshot, isRawPath);
++      return createFileStatus(path, node, storagePolicy, snapshot,
++          isRawPath, iip);
+-      int snapshot, boolean isRawPath) throws IOException {
++      int snapshot, boolean isRawPath, INodesInPath iip) throws IOException {
+-         getFileEncryptionInfo(node, snapshot);
++         getFileEncryptionInfo(node, snapshot, iip);
+-      byte storagePolicy, int snapshot, boolean isRawPath) throws IOException {
++      byte storagePolicy, int snapshot, boolean isRawPath,
++      INodesInPath iip) throws IOException {
+-        getFileEncryptionInfo(node, snapshot);
++        getFileEncryptionInfo(node, snapshot, iip);
+-  XAttr createEncryptionZone(String src, String keyName)
++  XAttr createEncryptionZone(String src, CipherSuite suite, String keyName)
+-      return ezManager.createEncryptionZone(src, keyName);
++      return ezManager.createEncryptionZone(src, suite, keyName);
+-    final HdfsProtos.FileEncryptionInfoProto proto = PBHelper.convert(info);
++    final HdfsProtos.PerFileEncryptionInfoProto proto =
++        PBHelper.convertPerFileEncInfo(info);
+-   * Return the FileEncryptionInfo for an INode, or null if the INode is not
+-   * an encrypted file.
++   * This function combines the per-file encryption info (obtained
++   * from the inode's XAttrs), and the encryption info from its zone, and
++   * returns a consolidated FileEncryptionInfo instance. Null is returned
++   * for non-encrypted files.
++   *
++   * @param inode inode of the file
++   * @param snapshotId ID of the snapshot that
++   *                   we want to get encryption info from
++   * @param iip inodes in the path containing the file, passed in to
++   *            avoid obtaining the list of inodes again; if iip is
++   *            null then the list of inodes will be obtained again
++   * @return consolidated file encryption info; null for non-encrypted files
+-  FileEncryptionInfo getFileEncryptionInfo(INode inode, int snapshotId)
+-      throws IOException {
++  FileEncryptionInfo getFileEncryptionInfo(INode inode, int snapshotId,
++      INodesInPath iip) throws IOException {
+-      List<XAttr> xAttrs = XAttrStorage.readINodeXAttrs(inode, snapshotId);
+-      if (xAttrs == null) {
+-        return null;
++      if (iip == null) {
++        iip = getINodesInPath(inode.getFullPathName(), true);
+-      for (XAttr x : xAttrs) {
+-        if (XAttrHelper.getPrefixName(x)
+-            .equals(CRYPTO_XATTR_FILE_ENCRYPTION_INFO)) {
+-          try {
+-            HdfsProtos.FileEncryptionInfoProto proto =
+-                HdfsProtos.FileEncryptionInfoProto.parseFrom(x.getValue());
+-            FileEncryptionInfo feInfo = PBHelper.convert(proto);
+-            return feInfo;
+-          } catch (InvalidProtocolBufferException e) {
+-            throw new IOException("Could not parse file encryption info for " +
+-                "inode " + inode, e);
+-          }
++      EncryptionZone encryptionZone = getEZForPath(iip);
++      if (encryptionZone == null ||
++          encryptionZone.equals(EncryptionZoneManager.NULL_EZ)) {
++        // not an encrypted file
++        return null;
++      } else if(encryptionZone.getPath() == null
++          || encryptionZone.getPath().isEmpty()) {
++        if (NameNode.LOG.isDebugEnabled()) {
++          NameNode.LOG.debug("Encryption zone " +
++              encryptionZone.getPath() + " does not have a valid path.");
+-      return null;
++
++      CipherSuite suite = encryptionZone.getSuite();
++      String keyName = encryptionZone.getKeyName();
++
++      XAttr fileXAttr = unprotectedGetXAttrByName(inode, snapshotId,
++          CRYPTO_XATTR_FILE_ENCRYPTION_INFO);
++
++      if (fileXAttr == null) {
++        NameNode.LOG.warn("Could not find encryption XAttr for file " +
++            inode.getFullPathName() + " in encryption zone " +
++            encryptionZone.getPath());
++        return null;
++      }
++
++      try {
++        HdfsProtos.PerFileEncryptionInfoProto fileProto =
++            HdfsProtos.PerFileEncryptionInfoProto.parseFrom(
++                fileXAttr.getValue());
++        return PBHelper.convert(fileProto, suite, keyName);
++      } catch (InvalidProtocolBufferException e) {
++        throw new IOException("Could not parse file encryption info for " +
++            "inode " + inode, e);
++      }
+-        ezManager.addEncryptionZone(inode.getId(), new String(xattr.getValue()));
++        final HdfsProtos.ZoneEncryptionInfoProto ezProto =
++            HdfsProtos.ZoneEncryptionInfoProto.parseFrom(xattr.getValue());
++        ezManager.addEncryptionZone(inode.getId(),
++            PBHelper.convert(ezProto.getSuite()),
++            ezProto.getKeyName());
++  private XAttr unprotectedGetXAttrByName(INode inode, int snapshotId,
++      String xAttrName)
++      throws IOException {
++    List<XAttr> xAttrs = XAttrStorage.readINodeXAttrs(inode, snapshotId);
++    if (xAttrs == null) {
++      return null;
++    }
++    for (XAttr x : xAttrs) {
++      if (XAttrHelper.getPrefixName(x)
++          .equals(xAttrName)) {
++        return x;
++      }
++    }
++    return null;
++  }
++

@@ -1,0 +1,356 @@
+HADOOP-13146. Refactor RetryInvocationHandler. Contributed by Tsz Wo Nicholas Sze.
+
+-import java.io.IOException;
+-import java.lang.reflect.InvocationHandler;
+-import java.lang.reflect.InvocationTargetException;
+-import java.lang.reflect.Method;
+-import java.lang.reflect.Proxy;
+-import java.util.Collections;
+-import java.util.LinkedList;
+-import java.util.List;
+-import java.util.Map;
+-
++import com.google.common.annotations.VisibleForTesting;
+-import org.apache.hadoop.ipc.Client;
++import org.apache.hadoop.ipc.*;
+-import org.apache.hadoop.ipc.ProtocolTranslator;
+-import org.apache.hadoop.ipc.RPC;
+-import org.apache.hadoop.ipc.RpcConstants;
+-import org.apache.hadoop.ipc.RpcInvocationHandler;
+-import com.google.common.annotations.VisibleForTesting;
++import java.io.IOException;
++import java.lang.reflect.InvocationHandler;
++import java.lang.reflect.InvocationTargetException;
++import java.lang.reflect.Method;
++import java.lang.reflect.Proxy;
++import java.util.Arrays;
++import java.util.Collections;
++import java.util.Map;
+- * This class implements RpcInvocationHandler and supports retry on the client 
+- * side.
++ * A {@link RpcInvocationHandler} which supports client side retry .
+-  private final FailoverProxyProvider<T> proxyProvider;
+-  /**
+-   * The number of times the associated proxyProvider has ever been failed over.
+-   */
+-  private long proxyProviderFailoverCount = 0;
++  private static class Counters {
++    /** Counter for retries. */
++    private int retries;
++    /** Counter for method invocation has been failed over. */
++    private int failovers;
++  }
++
++  private static class ProxyDescriptor<T> {
++    private final FailoverProxyProvider<T> fpp;
++    /** Count the associated proxy provider has ever been failed over. */
++    private long failoverCount = 0;
++
++    private ProxyInfo<T> proxyInfo;
++
++    ProxyDescriptor(FailoverProxyProvider<T> fpp) {
++      this.fpp = fpp;
++      this.proxyInfo = fpp.getProxy();
++    }
++
++    synchronized ProxyInfo<T> getProxyInfo() {
++      return proxyInfo;
++    }
++
++    synchronized T getProxy() {
++      return proxyInfo.proxy;
++    }
++
++    synchronized long getFailoverCount() {
++      return failoverCount;
++    }
++
++    synchronized void failover(long expectedFailoverCount, Method method) {
++      // Make sure that concurrent failed invocations only cause a single
++      // actual failover.
++      if (failoverCount == expectedFailoverCount) {
++        fpp.performFailover(proxyInfo.proxy);
++        failoverCount++;
++      } else {
++        LOG.warn("A failover has occurred since the start of "
++            + proxyInfo.getString(method.getName()));
++      }
++      proxyInfo = fpp.getProxy();
++    }
++
++    boolean idempotentOrAtMostOnce(Method method) throws NoSuchMethodException {
++      final Method m = fpp.getInterface()
++          .getMethod(method.getName(), method.getParameterTypes());
++      return m.isAnnotationPresent(Idempotent.class)
++          || m.isAnnotationPresent(AtMostOnce.class);
++    }
++
++    void close() throws IOException {
++      fpp.close();
++    }
++  }
++
++  private static class RetryInfo {
++    private final long delay;
++    private final RetryAction failover;
++    private final RetryAction fail;
++
++    RetryInfo(long delay, RetryAction failover, RetryAction fail) {
++      this.delay = delay;
++      this.failover = failover;
++      this.fail = fail;
++    }
++
++    static RetryInfo newRetryInfo(RetryPolicy policy, Exception e,
++        Counters counters, boolean idempotentOrAtMostOnce) throws Exception {
++      long maxRetryDelay = 0;
++      RetryAction failover = null;
++      RetryAction retry = null;
++      RetryAction fail = null;
++
++      final Iterable<Exception> exceptions = e instanceof MultiException ?
++          ((MultiException) e).getExceptions().values()
++          : Collections.singletonList(e);
++      for (Exception exception : exceptions) {
++        final RetryAction a = policy.shouldRetry(exception,
++            counters.retries, counters.failovers, idempotentOrAtMostOnce);
++        if (a.action == RetryAction.RetryDecision.FAIL) {
++          fail = a;
++        } else {
++          // must be a retry or failover
++          if (a.action == RetryAction.RetryDecision.FAILOVER_AND_RETRY) {
++            failover = a;
++          } else {
++            retry = a;
++          }
++          if (a.delayMillis > maxRetryDelay) {
++            maxRetryDelay = a.delayMillis;
++          }
++        }
++      }
++
++      return new RetryInfo(maxRetryDelay, failover,
++          failover == null && retry == null? fail: null);
++    }
++  }
++
++  private final ProxyDescriptor<T> proxyDescriptor;
++
+-  private ProxyInfo<T> currentProxy;
+-    this.proxyProvider = proxyProvider;
++    this.proxyDescriptor = new ProxyDescriptor<>(proxyProvider);
+-    this.currentProxy = proxyProvider.getProxy();
++  }
++
++  private RetryPolicy getRetryPolicy(Method method) {
++    final RetryPolicy policy = methodNameToPolicyMap.get(method.getName());
++    return policy != null? policy: defaultPolicy;
+-    throws Throwable {
+-    RetryPolicy policy = methodNameToPolicyMap.get(method.getName());
+-    if (policy == null) {
+-      policy = defaultPolicy;
+-    }
+-    
+-    // The number of times this method invocation has been failed over.
+-    int invocationFailoverCount = 0;
+-    final boolean isRpc = isRpcInvocation(currentProxy.proxy);
++      throws Throwable {
++    final boolean isRpc = isRpcInvocation(proxyDescriptor.getProxy());
+-    int retries = 0;
++    return invoke(method, args, isRpc, callId, new Counters());
++  }
++
++  private Object invoke(final Method method, final Object[] args,
++      final boolean isRpc, final int callId, final Counters counters)
++      throws Throwable {
++    final RetryPolicy policy = getRetryPolicy(method);
++
+-      long invocationAttemptFailoverCount;
+-      synchronized (proxyProvider) {
+-        invocationAttemptFailoverCount = proxyProviderFailoverCount;
+-      }
++      final long failoverCount = proxyDescriptor.getFailoverCount();
+-        Client.setCallIdAndRetryCount(callId, retries);
++        Client.setCallIdAndRetryCount(callId, counters.retries);
+-        Object ret = invokeMethod(method, args);
++        final Object ret = invokeMethod(method, args);
+-        boolean isIdempotentOrAtMostOnce = proxyProvider.getInterface()
+-            .getMethod(method.getName(), method.getParameterTypes())
+-            .isAnnotationPresent(Idempotent.class);
+-        if (!isIdempotentOrAtMostOnce) {
+-          isIdempotentOrAtMostOnce = proxyProvider.getInterface()
+-              .getMethod(method.getName(), method.getParameterTypes())
+-              .isAnnotationPresent(AtMostOnce.class);
+-        }
+-        List<RetryAction> actions = extractActions(policy, ex, retries++,
+-                invocationFailoverCount, isIdempotentOrAtMostOnce);
+-        RetryAction failAction = getFailAction(actions);
+-        if (failAction != null) {
+-          // fail.
+-          if (failAction.reason != null) {
+-            LOG.warn("Exception while invoking " + currentProxy.proxy.getClass()
+-                + "." + method.getName() + " over " + currentProxy.proxyInfo
+-                + ". Not retrying because " + failAction.reason, ex);
+-          }
+-          throw ex;
+-        } else { // retry or failover
+-          // avoid logging the failover if this is the first call on this
+-          // proxy object, and we successfully achieve the failover without
+-          // any flip-flopping
+-          boolean worthLogging = 
+-            !(invocationFailoverCount == 0 && !hasMadeASuccessfulCall);
+-          worthLogging |= LOG.isDebugEnabled();
+-          RetryAction failOverAction = getFailOverAction(actions);
+-          long delay = getDelayMillis(actions);
+-
+-          if (worthLogging) {
+-            String msg = "Exception while invoking " + method.getName()
+-                + " of class " + currentProxy.proxy.getClass().getSimpleName()
+-                + " over " + currentProxy.proxyInfo;
+-
+-            if (invocationFailoverCount > 0) {
+-              msg += " after " + invocationFailoverCount + " fail over attempts"; 
+-            }
+-
+-            if (failOverAction != null) {
+-              // failover
+-              msg += ". Trying to fail over " + formatSleepMessage(delay);
+-            } else {
+-              // retry
+-              msg += ". Retrying " + formatSleepMessage(delay);
+-            }
+-            LOG.info(msg, ex);
+-          }
+-
+-          if (delay > 0) {
+-            Thread.sleep(delay);
+-          }
+-
+-          if (failOverAction != null) {
+-            // Make sure that concurrent failed method invocations only cause a
+-            // single actual fail over.
+-            synchronized (proxyProvider) {
+-              if (invocationAttemptFailoverCount == proxyProviderFailoverCount) {
+-                proxyProvider.performFailover(currentProxy.proxy);
+-                proxyProviderFailoverCount++;
+-              } else {
+-                LOG.warn("A failover has occurred since the start of this method"
+-                    + " invocation attempt.");
+-              }
+-              currentProxy = proxyProvider.getProxy();
+-            }
+-            invocationFailoverCount++;
+-          }
+-        }
++        handleException(method, policy, failoverCount, counters, ex);
+-  /**
+-   * Obtain a retry delay from list of RetryActions.
+-   */
+-  private long getDelayMillis(List<RetryAction> actions) {
+-    long retVal = 0;
+-    for (RetryAction action : actions) {
+-      if (action.action == RetryAction.RetryDecision.FAILOVER_AND_RETRY ||
+-              action.action == RetryAction.RetryDecision.RETRY) {
+-        if (action.delayMillis > retVal) {
+-          retVal = action.delayMillis;
+-        }
++  private void handleException(final Method method, final RetryPolicy policy,
++      final long expectedFailoverCount, final Counters counters,
++      final Exception ex) throws Exception {
++    final RetryInfo retryInfo = RetryInfo.newRetryInfo(policy, ex, counters,
++        proxyDescriptor.idempotentOrAtMostOnce(method));
++    counters.retries++;
++
++    if (retryInfo.fail != null) {
++      // fail.
++      if (retryInfo.fail.reason != null) {
++        LOG.warn("Exception while invoking "
++            + proxyDescriptor.getProxyInfo().getString(method.getName())
++            + ". Not retrying because " + retryInfo.fail.reason, ex);
++      throw ex;
+-    return retVal;
++
++    // retry
++    final boolean isFailover = retryInfo.failover != null;
++
++    log(method, isFailover, counters.failovers, retryInfo.delay, ex);
++
++    if (retryInfo.delay > 0) {
++      Thread.sleep(retryInfo.delay);
++    }
++
++    if (isFailover) {
++      proxyDescriptor.failover(expectedFailoverCount, method);
++      counters.failovers++;
++    }
+-  /**
+-   * Return the first FAILOVER_AND_RETRY action.
+-   */
+-  private RetryAction getFailOverAction(List<RetryAction> actions) {
+-    for (RetryAction action : actions) {
+-      if (action.action == RetryAction.RetryDecision.FAILOVER_AND_RETRY) {
+-        return action;
+-      }
++  private void log(final Method method, final boolean isFailover,
++      final int failovers, final long delay, final Exception ex) {
++    // log info if this has made some successful calls or
++    // this is not the first failover
++    final boolean info = hasMadeASuccessfulCall || failovers != 0;
++    if (!info && !LOG.isDebugEnabled()) {
++      return;
+-    return null;
+-  }
+-  /**
+-   * Return the last FAIL action.. only if there are no RETRY actions.
+-   */
+-  private RetryAction getFailAction(List<RetryAction> actions) {
+-    RetryAction fAction = null;
+-    for (RetryAction action : actions) {
+-      if (action.action == RetryAction.RetryDecision.FAIL) {
+-        fAction = action;
+-      } else {
+-        // Atleast 1 RETRY
+-        return null;
+-      }
++    final StringBuilder b = new StringBuilder()
++        .append("Exception while invoking ")
++        .append(proxyDescriptor.getProxyInfo().getString(method.getName()));
++    if (failovers > 0) {
++      b.append(" after ").append(failovers).append(" failover attempts");
+-    return fAction;
+-  }
++    b.append(isFailover? ". Trying to failover ": ". Retrying ");
++    b.append(delay > 0? "after sleeping for " + delay + "ms.": "immediately.");
+-  private List<RetryAction> extractActions(RetryPolicy policy, Exception ex,
+-                                           int i, int invocationFailoverCount,
+-                                           boolean isIdempotentOrAtMostOnce)
+-          throws Exception {
+-    List<RetryAction> actions = new LinkedList<>();
+-    if (ex instanceof MultiException) {
+-      for (Exception th : ((MultiException) ex).getExceptions().values()) {
+-        actions.add(policy.shouldRetry(th, i, invocationFailoverCount,
+-                isIdempotentOrAtMostOnce));
+-      }
++    if (info) {
++      LOG.info(b.toString(), ex);
+-      actions.add(policy.shouldRetry(ex, i,
+-              invocationFailoverCount, isIdempotentOrAtMostOnce));
++      LOG.debug(b.toString(), ex);
+-    return actions;
+-  private static String formatSleepMessage(long millis) {
+-    if (millis > 0) {
+-      return "after sleeping for " + millis + "ms.";
+-    } else {
+-      return "immediately.";
+-    }
+-  }
+-  
+-      return method.invoke(currentProxy.proxy, args);
++      return method.invoke(proxyDescriptor.getProxy(), args);
+-    proxyProvider.close();
++    proxyDescriptor.close();
+-    return RPC.getConnectionIdForProxy(currentProxy.proxy);
++    return RPC.getConnectionIdForProxy(proxyDescriptor.getProxy());
+-
+
+MOV26 MOV26 MOV26 MOV26 MOV26 MOV26 MOV26 MOV26 MOV26 UPD40 UPD40 INS55 INS55 INS55 INS23 INS31 INS31 INS83 INS83 INS42 MOV23 INS23 INS83 INS83 INS42 INS73 MOV23 INS23 MOV23 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS83 INS83 INS42 INS23 INS23 INS23 INS31 MOV31 INS83 INS83 INS74 INS59 MOV21 INS83 INS43 INS42 INS44 INS8 MOV78 INS83 MOV43 INS42 MOV44 MOV44 MOV44 MOV43 INS8 INS43 INS42 INS44 INS44 INS44 INS44 INS44 INS43 INS39 INS42 INS44 INS43 INS8 INS39 INS42 INS44 INS44 INS44 INS44 UPD66 INS65 UPD66 UPD39 INS29 INS83 INS39 INS59 INS42 INS29 INS83 INS39 INS59 INS42 INS44 INS8 INS83 INS74 INS42 INS8 INS83 INS43 INS42 INS8 INS83 INS39 INS42 INS8 INS83 INS39 INS42 INS44 INS44 INS8 INS39 INS42 INS44 INS43 INS8 INS39 INS42 INS43 INS8 INS83 INS83 INS39 INS59 INS83 INS83 MOV43 INS59 INS83 INS83 MOV43 INS59 INS42 INS44 INS44 MOV44 INS8 UPD83 INS43 INS42 MOV44 INS44 INS44 INS44 MOV43 INS43 UPD43 MOV43 INS42 UPD42 MOV42 INS43 INS42 MOV60 INS41 INS60 MOV60 MOV41 INS42 INS83 INS43 INS42 INS83 INS5 INS42 INS83 INS39 INS42 INS83 INS39 INS42 INS83 INS43 UPD42 MOV42 INS42 INS61 INS83 INS43 INS42 INS83 UPD43 UPD42 INS83 UPD39 UPD42 INS83 INS43 INS42 INS83 INS43 INS42 UPD42 MOV42 INS60 INS21 INS25 INS60 INS21 INS25 INS25 INS83 INS43 INS42 INS83 INS39 INS42 INS83 INS39 INS42 INS83 UPD42 INS83 INS43 INS42 INS60 INS25 INS60 INS25 INS21 INS21 INS25 INS42 UPD42 INS65 UPD42 MOV42 UPD42 INS65 UPD42 MOV42 MOV34 UPD42 INS74 INS42 MOV21 MOV21 UPD43 MOV43 INS43 INS41 INS42 INS41 INS41 INS39 INS42 INS43 INS42 INS25 INS21 INS43 INS42 UPD42 MOV42 MOV60 INS41 INS42 MOV21 INS42 INS42 INS42 INS39 INS42 MOV43 INS42 UPD42 MOV21 MOV21 MOV21 INS42 INS43 INS42 INS43 UPD42 MOV42 INS39 INS42 INS60 INS60 INS60 INS60 INS70 INS42 UPD42 INS42 INS83 INS16 INS83 INS39 INS59 INS32 INS42 INS43 INS85 UPD42 MOV42 INS83 INS43 INS9 INS8 UPD42 MOV42 UPD42 INS42 INS42 INS83 INS43 MOV59 INS37 INS27 MOV8 INS83 INS39 INS59 INS32 INS27 INS8 INS42 INS8 UPD42 MOV42 INS42 INS83 INS39 INS59 INS27 INS8 INS83 INS43 INS59 MOV27 INS8 INS32 INS32 INS42 INS8 INS8 UPD66 INS66 INS66 INS43 INS43 UPD42 INS42 INS42 INS40 INS42 INS42 UPD27 MOV27 INS8 MOV8 INS7 INS42 INS83 INS43 INS27 INS32 INS7 INS7 UPD42 MOV42 UPD42 MOV42 MOV43 INS59 MOV43 INS59 MOV43 INS59 INS83 INS74 INS59 MOV44 INS42 MOV8 INS14 INS14 INS27 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS14 UPD42 MOV42 INS42 UPD42 INS32 INS60 MOV25 INS54 UPD42 MOV42 INS42 INS32 INS40 INS40 INS33 INS25 MOV53 INS42 INS27 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 INS40 INS40 MOV42 INS40 INS34 INS21 INS21 INS21 INS42 INS27 INS38 INS38 INS41 INS42 INS42 INS32 UPD42 INS21 INS42 INS42 INS16 INS42 INS42 INS16 INS21 INS21 UPD42 INS32 INS42 INS42 INS22 UPD42 INS22 INS32 UPD42 INS42 INS21 INS21 INS42 INS32 INS42 UPD42 MOV32 MOV32 INS32 UPD42 MOV42 UPD42 MOV42 INS22 INS42 INS22 INS42 INS22 INS42 UPD42 INS42 INS33 INS42 INS33 INS42 INS33 INS43 INS43 INS42 INS16 UPD42 INS60 INS43 INS42 INS42 INS16 UPD42 INS74 INS42 INS42 INS33 INS42 INS32 INS43 INS42 INS42 INS83 INS39 INS59 INS42 MOV8 INS12 INS42 INS42 INS42 INS42 INS42 INS32 INS27 INS8 INS40 INS33 INS32 INS32 INS37 INS42 INS27 INS42 MOV32 INS32 INS42 INS32 INS32 INS42 INS45 INS45 MOV27 INS27 INS45 INS32 INS32 INS42 INS42 INS52 INS42 INS52 INS42 UPD42 MOV42 UPD42 MOV42 INS32 INS37 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV57 INS42 INS42 MOV57 INS52 INS42 INS52 INS42 INS52 INS42 INS42 INS42 MOV62 MOV32 INS32 INS83 MOV43 INS59 INS27 INS8 INS8 INS42 INS27 INS42 INS33 INS43 INS42 INS42 INS42 INS42 INS32 MOV44 INS8 INS42 INS42 INS42 INS40 INS33 MOV21 INS42 INS42 INS40 INS42 UPD42 MOV42 UPD42 MOV42 INS42 INS40 INS42 INS34 INS14 INS42 INS45 INS32 INS42 MOV32 INS32 INS42 INS45 MOV45 UPD42 MOV42 MOV45 INS42 INS42 INS32 INS42 INS42 INS42 INS32 INS42 INS32 INS42 INS42 INS40 INS42 UPD42 UPD42 INS42 INS42 INS42 INS42 INS32 UPD40 MOV40 UPD40 MOV40 INS21 INS25 MOV25 INS27 INS27 INS42 INS42 INS42 INS32 INS83 MOV25 INS21 INS43 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 UPD45 INS42 INS42 INS42 INS40 INS40 INS42 INS7 INS27 INS8 INS8 INS42 INS33 INS42 INS33 INS42 INS42 INS42 INS40 INS32 UPD42 UPD42 INS27 UPD42 MOV42 INS42 INS42 INS42 INS45 INS42 UPD42 MOV32 INS42 INS42 UPD40 MOV40 UPD40 MOV40 INS21 INS21 UPD40 UPD42 INS42 INS42 INS42 INS42 INS42 INS42 INS45 INS32 INS45 INS40 UPD42 INS7 INS7 INS32 UPD42 MOV42 MOV32 INS42 INS42 INS42 INS42 UPD42 UPD40 UPD42 MOV42 UPD42 MOV42 DEL40 DEL26 DEL40 DEL26 DEL40 DEL26 DEL40 DEL26 DEL40 DEL26 DEL34 DEL42 DEL42 DEL42 DEL42 DEL32 DEL42 DEL32 DEL32 DEL42 DEL32 DEL33 DEL40 DEL45 DEL45 DEL40 DEL45 DEL40 DEL42 DEL39 DEL42 DEL32 DEL40 DEL32 DEL42 DEL45 DEL32 DEL27 DEL7 DEL42 DEL42 DEL40 DEL32 DEL42 DEL42 DEL45 DEL45 DEL27 DEL32 DEL42 DEL42 DEL42 DEL32 DEL66 DEL65 DEL29 DEL39 DEL42 DEL43 DEL43 DEL74 DEL44 DEL27 DEL27 DEL27 DEL8 DEL42 DEL44 DEL42 DEL70 DEL42 DEL42 DEL42 DEL32 DEL52 DEL42 DEL22 DEL42 DEL7 DEL21 DEL42 DEL83 DEL42 DEL42 DEL33 DEL27 DEL42 DEL42 DEL7 DEL21 DEL8 DEL25 DEL39 DEL34 DEL59 DEL60 DEL83 DEL39 DEL42 DEL42 DEL40 DEL32 DEL59 DEL60 DEL39 DEL59 DEL60 DEL9 DEL39 DEL42 DEL59 DEL60 DEL42 DEL8 DEL51 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL21 DEL8 DEL25 DEL42 DEL38 DEL8 DEL25 DEL74 DEL42 DEL42 DEL42 DEL42 DEL42 DEL37 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL40 DEL33 DEL27 DEL25 DEL8 DEL39 DEL42 DEL42 DEL34 DEL27 DEL42 DEL38 DEL27 DEL36 DEL38 DEL59 DEL60 DEL42 DEL7 DEL21 DEL42 DEL32 DEL59 DEL60 DEL39 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL43 DEL42 DEL45 DEL45 DEL45 DEL40 DEL27 DEL59 DEL60 DEL42 DEL34 DEL27 DEL42 DEL45 DEL42 DEL45 DEL27 DEL7 DEL21 DEL8 DEL25 DEL42 DEL33 DEL27 DEL8 DEL42 DEL45 DEL42 DEL42 DEL32 DEL27 DEL7 DEL21 DEL8 DEL25 DEL42 DEL42 DEL42 DEL42 DEL32 DEL21 DEL8 DEL25 DEL42 DEL42 DEL42 DEL32 DEL21 DEL8 DEL25 DEL42 DEL33 DEL27 DEL42 DEL42 DEL42 DEL27 DEL42 DEL37 DEL21 DEL8 DEL8 DEL25 DEL8 DEL51 DEL42 DEL37 DEL21 DEL8 DEL25 DEL8 DEL25 DEL8 DEL12 DEL54 DEL8 DEL61 DEL8 DEL31 DEL66 DEL65 DEL29 DEL83 DEL42 DEL43 DEL74 DEL42 DEL44 DEL42 DEL40 DEL40 DEL27 DEL8 DEL25 DEL8 DEL70 DEL33 DEL41 DEL8 DEL31 DEL66 DEL65 DEL29 DEL42 DEL43 DEL43 DEL74 DEL44 DEL33 DEL40 DEL40 DEL27 DEL42 DEL42 DEL7 DEL33 DEL41 DEL8 DEL42 DEL43 DEL42 DEL44 DEL42 DEL8 DEL70 DEL42 DEL41 DEL42 DEL43 DEL43 DEL74 DEL42 DEL39 DEL42 DEL39 DEL42 DEL42 DEL42 DEL43 DEL74 DEL14 DEL42 DEL42 DEL32 DEL8 DEL70 DEL43 DEL43 DEL74 DEL60 DEL42 DEL42 DEL32 DEL32 DEL21 DEL8 DEL25 DEL42 DEL41 DEL8 DEL83 DEL43 DEL42 DEL27 DEL41 DEL8 DEL45 DEL41 DEL8 DEL25 DEL40 DEL40

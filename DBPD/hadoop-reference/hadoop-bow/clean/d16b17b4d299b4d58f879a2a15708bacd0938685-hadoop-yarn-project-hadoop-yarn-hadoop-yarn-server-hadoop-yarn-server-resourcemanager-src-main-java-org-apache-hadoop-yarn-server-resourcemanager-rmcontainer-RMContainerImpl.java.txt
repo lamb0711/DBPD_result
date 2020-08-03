@@ -1,0 +1,134 @@
+YARN-4138. Roll back container resource allocation after resource increase token expires. Contributed by Meng Ding
+
++import java.util.Collections;
++import org.apache.hadoop.yarn.server.resourcemanager.rmnode
++    .RMNodeDecreaseContainerEvent;
++import org.apache.hadoop.yarn.util.resource.Resources;
+-    .addTransition(RMContainerState.RUNNING, RMContainerState.EXPIRED,
+-        RMContainerEventType.EXPIRE,
+-        new ContainerExpiredWhileRunningTransition())
+-  
++  // Only used for container resource increase and decrease. This is the
++  // resource to rollback to should container resource increase token expires.
++  private Resource lastConfirmedResource;
++
++    this.lastConfirmedResource = container.getResource();
++  public Resource getLastConfirmedResource() {
++    try {
++      readLock.lock();
++      return this.lastConfirmedResource;
++    } finally {
++      readLock.unlock();
++    }
++  }
++
++  @Override
+-      container.containerAllocationExpirer.register(container.getContainerId());
++      container.containerAllocationExpirer.register(
++          new AllocationExpirationInfo(container.getContainerId()));
+-        container.containerAllocationExpirer.register(event.getContainerId());
++        container.containerAllocationExpirer.register(
++            new AllocationExpirationInfo(event.getContainerId(), true));
+-      // Unregister the allocation expirer, it is already increased..
+-      container.containerAllocationExpirer.unregister(event.getContainerId());
+-    }
+-  }
+-  
+-  private static final class ContainerExpiredWhileRunningTransition extends
+-      BaseTransition {
++      RMContainerNMDoneChangeResourceEvent nmDoneChangeResourceEvent =
++          (RMContainerNMDoneChangeResourceEvent)event;
++      Resource rmContainerResource = container.getAllocatedResource();
++      Resource nmContainerResource =
++          nmDoneChangeResourceEvent.getNMContainerResource();
+-    @Override
+-    public void transition(RMContainerImpl container, RMContainerEvent event) {
+-      // When the container expired, and it has a pending increased request, we
+-      // will kill the container.
+-      // TODO, we can do better for this: roll back container resource to the
+-      // resource before increase, and notify scheduler about this decrease as
+-      // well. Will do that in a separated JIRA.
+-      new KillTransition().transition(container, event);
++      if (Resources.equals(rmContainerResource, nmContainerResource)) {
++        // If rmContainerResource == nmContainerResource, the resource
++        // increase is confirmed.
++        // In this case:
++        //    - Set the lastConfirmedResource as nmContainerResource
++        //    - Unregister the allocation expirer
++        container.lastConfirmedResource = nmContainerResource;
++        container.containerAllocationExpirer.unregister(
++            new AllocationExpirationInfo(event.getContainerId()));
++      } else if (Resources.fitsIn(rmContainerResource, nmContainerResource)) {
++        // If rmContainerResource < nmContainerResource, this is caused by the
++        // following sequence:
++        //   1. AM asks for increase from 1G to 5G, and RM approves it
++        //   2. AM acquires the increase token and increases on NM
++        //   3. Before NM reports 5G to RM to confirm the increase, AM sends
++        //      a decrease request to 4G, and RM approves it
++        //   4. When NM reports 5G to RM, RM now sees its own allocation as 4G
++        // In this cases:
++        //    - Set the lastConfirmedResource as rmContainerResource
++        //    - Unregister the allocation expirer
++        //    - Notify NM to reduce its resource to rmContainerResource
++        container.lastConfirmedResource = rmContainerResource;
++        container.containerAllocationExpirer.unregister(
++            new AllocationExpirationInfo(event.getContainerId()));
++        container.eventHandler.handle(new RMNodeDecreaseContainerEvent(
++            container.nodeId,
++            Collections.singletonList(container.getContainer())));
++      } else if (Resources.fitsIn(nmContainerResource, rmContainerResource)) {
++        // If nmContainerResource < rmContainerResource, this is caused by the
++        // following sequence:
++        //    1. AM asks for increase from 1G to 2G, and RM approves it
++        //    2. AM asks for increase from 2G to 4G, and RM approves it
++        //    3. AM only uses the 2G token to increase on NM, but never uses the
++        //       4G token
++        //    4. NM reports 2G to RM, but RM sees its own allocation as 4G
++        // In this case:
++        //    - Set the lastConfirmedResource as the maximum of
++        //      nmContainerResource and lastConfirmedResource
++        //    - Do NOT unregister the allocation expirer
++        // When the increase allocation expires, resource will be rolled back to
++        // the last confirmed resource.
++        container.lastConfirmedResource = Resources.componentwiseMax(
++            nmContainerResource, container.lastConfirmedResource);
++      } else {
++        // Something wrong happened, kill the container
++        LOG.warn("Something wrong happened, container size reported by NM"
++            + " is not expected, ContainerID=" + container.containerId
++            + " rm-size-resource:" + rmContainerResource + " nm-size-reosurce:"
++            + nmContainerResource);
++        container.eventHandler.handle(new RMNodeCleanContainerEvent(
++            container.nodeId, container.containerId));
++
++      }
+-      
+-      // Register with containerAllocationExpirer.
+-      // For now, we assume timeout for increase is as same as container
+-      // allocation.
++
++      Resource targetResource = changeEvent.getTargetResource();
++      Resource lastConfirmedResource = container.lastConfirmedResource;
++
+-        // if this is a decrease request, if container was increased but not
+-        // told to NM, we can consider previous increase is cancelled,
+-        // unregister from the containerAllocationExpirer
+-        container.containerAllocationExpirer.unregister(container
+-            .getContainerId());
++        // Only unregister from the containerAllocationExpirer when target
++        // resource is less than or equal to the last confirmed resource.
++        if (Resources.fitsIn(targetResource, lastConfirmedResource)) {
++          container.lastConfirmedResource = targetResource;
++          container.containerAllocationExpirer.unregister(
++              new AllocationExpirationInfo(event.getContainerId()));
++        }
+-      
+-      container.container.setResource(changeEvent.getTargetResource());
+-      
++
++      container.container.setResource(targetResource);
++
+-      container.containerAllocationExpirer.unregister(container
+-          .getContainerId());
++      container.containerAllocationExpirer.unregister(
++          new AllocationExpirationInfo(container.getContainerId()));

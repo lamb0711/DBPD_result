@@ -1,0 +1,255 @@
+YARN-2185. Use pipes when localizing archives. Contributed by Miklos Szegedi
+
++import java.io.BufferedReader;
++import java.io.InputStreamReader;
++import java.nio.charset.Charset;
++import java.util.concurrent.ExecutionException;
++import java.util.concurrent.ExecutorService;
++import java.util.concurrent.Executors;
++import java.util.concurrent.Future;
++import java.util.zip.ZipInputStream;
++   * Buffer size for copy the content of compressed file to new file.
++   */
++  private static final int BUFFER_SIZE = 8_192;
++
++  /**
++   * Convert a os-native filename to a path that works for the shell
++   * and avoids script injection attacks.
++   * @param file The filename to convert
++   * @return The unix pathname
++   * @throws IOException on windows, there can be problems with the subprocess
++   */
++  public static String makeSecureShellPath(File file) throws IOException {
++    if (Shell.WINDOWS) {
++      // Currently it is never called, but it might be helpful in the future.
++      throw new UnsupportedOperationException("Not implemented for Windows");
++    } else {
++      return makeShellPath(file, false).replace("'", "'\\''");
++    }
++  }
++
++  /**
+-   * Given a File input it will unzip the file in a the unzip directory
++   * Given a stream input it will unzip the it in the unzip directory.
++   * passed as the second parameter
++   * @param inputStream The zip file as input
++   * @param toDir The unzip directory where to unzip the zip file.
++   * @throws IOException an exception occurred
++   */
++  public static void unZip(InputStream inputStream, File toDir)
++      throws IOException {
++    try (ZipInputStream zip = new ZipInputStream(inputStream)) {
++      int numOfFailedLastModifiedSet = 0;
++      for(ZipEntry entry = zip.getNextEntry();
++          entry != null;
++          entry = zip.getNextEntry()) {
++        if (!entry.isDirectory()) {
++          File file = new File(toDir, entry.getName());
++          File parent = file.getParentFile();
++          if (!parent.mkdirs() &&
++              !parent.isDirectory()) {
++            throw new IOException("Mkdirs failed to create " +
++                parent.getAbsolutePath());
++          }
++          try (OutputStream out = new FileOutputStream(file)) {
++            IOUtils.copyBytes(zip, out, BUFFER_SIZE);
++          }
++          if (!file.setLastModified(entry.getTime())) {
++            numOfFailedLastModifiedSet++;
++          }
++        }
++      }
++      if (numOfFailedLastModifiedSet > 0) {
++        LOG.warn("Could not set last modfied time for {} file(s)",
++            numOfFailedLastModifiedSet);
++      }
++    }
++  }
++
++  /**
++   * Given a File input it will unzip it in the unzip directory.
+-   * @throws IOException
++   * @throws IOException An I/O exception has occurred
++   * Run a command and send the contents of an input stream to it.
++   * @param inputStream Input stream to forward to the shell command
++   * @param command shell command to run
++   * @throws IOException read or write failed
++   * @throws InterruptedException command interrupted
++   * @throws ExecutionException task submit failed
++   */
++  private static void runCommandOnStream(
++      InputStream inputStream, String command)
++      throws IOException, InterruptedException, ExecutionException {
++    ExecutorService executor = null;
++    ProcessBuilder builder = new ProcessBuilder();
++    builder.command(
++        Shell.WINDOWS ? "cmd" : "bash",
++        Shell.WINDOWS ? "/c" : "-c",
++        command);
++    Process process = builder.start();
++    int exitCode;
++    try {
++      // Consume stdout and stderr, to avoid blocking the command
++      executor = Executors.newFixedThreadPool(2);
++      Future output = executor.submit(() -> {
++        try {
++          // Read until the output stream receives an EOF and closed.
++          if (LOG.isDebugEnabled()) {
++            // Log directly to avoid out of memory errors
++            try (BufferedReader reader =
++                     new BufferedReader(
++                         new InputStreamReader(process.getInputStream(),
++                             Charset.forName("UTF-8")))) {
++              String line;
++              while((line = reader.readLine()) != null) {
++                LOG.debug(line);
++              }
++            }
++          } else {
++            org.apache.commons.io.IOUtils.copy(
++                process.getInputStream(),
++                new IOUtils.NullOutputStream());
++          }
++        } catch (IOException e) {
++          LOG.debug(e.getMessage());
++        }
++      });
++      Future error = executor.submit(() -> {
++        try {
++          // Read until the error stream receives an EOF and closed.
++          if (LOG.isDebugEnabled()) {
++            // Log directly to avoid out of memory errors
++            try (BufferedReader reader =
++                     new BufferedReader(
++                         new InputStreamReader(process.getErrorStream(),
++                             Charset.forName("UTF-8")))) {
++              String line;
++              while((line = reader.readLine()) != null) {
++                LOG.debug(line);
++              }
++            }
++          } else {
++            org.apache.commons.io.IOUtils.copy(
++                process.getErrorStream(),
++                new IOUtils.NullOutputStream());
++          }
++        } catch (IOException e) {
++          LOG.debug(e.getMessage());
++        }
++      });
++
++      // Pass the input stream to the command to process
++      try {
++        org.apache.commons.io.IOUtils.copy(
++            inputStream, process.getOutputStream());
++      } finally {
++        process.getOutputStream().close();
++      }
++
++      // Wait for both stdout and stderr futures to finish
++      error.get();
++      output.get();
++    } finally {
++      // Clean up the threads
++      if (executor != null) {
++        executor.shutdown();
++      }
++      // Wait to avoid leaking the child process
++      exitCode = process.waitFor();
++    }
++
++    if (exitCode != 0) {
++      throw new IOException(
++          String.format(
++              "Error executing command. %s " +
++                  "Process exited with exit code %d.",
++              command, exitCode));
++    }
++  }
++
++  /**
++   * Given a Tar File as input it will untar the file in a the untar directory
++   * passed as the second parameter
++   *
++   * This utility will untar ".tar" files and ".tar.gz","tgz" files.
++   *
++   * @param inputStream The tar file as input.
++   * @param untarDir The untar directory where to untar the tar file.
++   * @param gzipped The input stream is gzipped
++   *                TODO Use magic number and PusbackInputStream to identify
++   * @throws IOException an exception occurred
++   * @throws InterruptedException command interrupted
++   * @throws ExecutionException task submit failed
++   */
++  public static void unTar(InputStream inputStream, File untarDir,
++                           boolean gzipped)
++      throws IOException, InterruptedException, ExecutionException {
++    if (!untarDir.mkdirs()) {
++      if (!untarDir.isDirectory()) {
++        throw new IOException("Mkdirs failed to create " + untarDir);
++      }
++    }
++
++    if(Shell.WINDOWS) {
++      // Tar is not native to Windows. Use simple Java based implementation for
++      // tests and simple tar archives
++      unTarUsingJava(inputStream, untarDir, gzipped);
++    } else {
++      // spawn tar utility to untar archive for full fledged unix behavior such
++      // as resolving symlinks in tar archives
++      unTarUsingTar(inputStream, untarDir, gzipped);
++    }
++  }
++
++  /**
++  private static void unTarUsingTar(InputStream inputStream, File untarDir,
++                                    boolean gzipped)
++      throws IOException, InterruptedException, ExecutionException {
++    StringBuilder untarCommand = new StringBuilder();
++    if (gzipped) {
++      untarCommand.append("gzip -dc | (");
++    }
++    untarCommand.append("cd '");
++    untarCommand.append(FileUtil.makeSecureShellPath(untarDir));
++    untarCommand.append("' && ");
++    untarCommand.append("tar -x ");
++
++    if (gzipped) {
++      untarCommand.append(")");
++    }
++    runCommandOnStream(inputStream, untarCommand.toString());
++  }
++
+-      untarCommand.append(FileUtil.makeShellPath(inFile));
++      untarCommand.append(FileUtil.makeSecureShellPath(inFile));
+-    untarCommand.append(FileUtil.makeShellPath(untarDir));
+-    untarCommand.append("' ; ");
++    untarCommand.append(FileUtil.makeSecureShellPath(untarDir));
++    untarCommand.append("' && ");
+-      untarCommand.append(FileUtil.makeShellPath(inFile));
++      untarCommand.append(FileUtil.makeSecureShellPath(inFile));
++  private static void unTarUsingJava(InputStream inputStream, File untarDir,
++                                     boolean gzipped) throws IOException {
++    TarArchiveInputStream tis = null;
++    try {
++      if (gzipped) {
++        inputStream = new BufferedInputStream(new GZIPInputStream(
++            inputStream));
++      } else {
++        inputStream =
++            new BufferedInputStream(inputStream);
++      }
++
++      tis = new TarArchiveInputStream(inputStream);
++
++      for (TarArchiveEntry entry = tis.getNextTarEntry(); entry != null;) {
++        unpackEntries(tis, entry, untarDir);
++        entry = tis.getNextTarEntry();
++      }
++    } finally {
++      IOUtils.cleanupWithLogger(LOG, tis, inputStream);
++    }
++  }
++
+
+INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS23 INS31 INS31 INS31 INS31 INS31 INS31 INS29 INS83 INS83 INS83 INS39 INS59 INS29 INS83 INS83 INS43 INS42 INS44 INS43 INS8 INS29 INS83 INS83 INS39 INS42 INS44 INS44 INS43 INS8 INS29 INS83 INS83 INS39 INS42 INS44 INS44 INS43 INS43 INS43 INS8 INS29 INS83 INS83 INS39 INS42 INS44 INS44 INS44 INS43 INS43 INS43 INS8 INS83 INS83 INS39 INS42 INS44 INS44 INS44 INS43 INS43 INS43 INS8 INS83 INS83 INS39 INS42 INS44 INS44 INS44 INS43 INS8 INS65 INS42 INS34 INS65 INS65 INS65 INS65 INS42 INS43 INS42 INS42 INS25 INS65 INS65 INS65 INS65 INS43 INS42 INS43 INS42 INS42 INS54 INS65 INS65 INS65 INS65 INS65 INS65 INS43 INS42 INS43 INS42 INS42 INS42 INS42 INS60 INS60 INS21 INS60 INS60 INS54 INS25 INS65 INS65 INS65 INS65 INS65 INS65 INS65 INS43 INS42 INS43 INS42 INS39 INS42 INS42 INS42 INS42 INS25 INS25 INS43 INS42 INS43 INS42 INS39 INS42 INS42 INS42 INS42 INS60 INS25 INS21 INS21 INS21 INS21 INS25 INS21 INS43 INS42 INS43 INS42 INS39 INS42 INS42 INS60 INS54 INS66 INS66 INS66 INS42 INS66 INS66 INS42 INS66 INS42 INS40 INS8 INS8 INS66 INS66 INS42 INS66 INS42 INS66 INS42 INS66 INS42 INS42 INS58 INS8 UPD66 INS66 INS66 INS42 INS66 INS42 INS66 INS42 INS66 INS42 INS66 INS42 INS66 INS42 INS42 INS43 INS59 INS43 INS59 INS32 INS43 INS59 INS39 INS59 INS8 INS8 INS27 INS8 INS66 INS66 INS66 INS42 INS66 INS42 INS66 INS42 INS66 INS66 INS42 INS66 INS42 INS66 INS42 INS66 INS42 INS42 INS38 INS8 INS40 INS8 INS8 INS42 INS42 INS43 INS59 INS42 INS8 INS32 INS32 INS32 INS32 INS42 INS8 INS32 INS42 INS42 INS43 INS59 INS8 INS8 INS53 INS41 INS43 INS59 INS60 INS24 INS25 INS42 INS42 INS33 INS42 INS42 INS14 INS42 INS42 INS16 INS16 INS42 INS42 INS42 INS32 INS42 INS21 INS60 INS60 INS54 INS21 INS21 INS25 INS21 INS42 INS34 INS53 INS32 INS25 INS21 INS21 INS42 INS42 INS14 INS21 INS42 INS42 INS45 INS42 INS42 INS32 INS42 INS42 INS45 INS42 INS42 INS45 INS21 INS42 INS42 INS32 UPD45 INS42 INS42 INS33 INS25 INS21 INS24 INS21 INS14 INS32 INS42 INS42 INS14 INS39 INS59 INS58 INS27 INS7 INS8 INS27 INS8 INS43 INS40 INS45 INS45 INS40 INS45 INS45 INS42 INS42 INS7 INS43 INS59 INS43 INS59 INS8 INS8 INS32 INS32 INS27 INS8 INS7 INS14 INS42 INS42 INS38 INS8 INS32 INS32 INS43 INS32 INS42 INS42 INS42 INS32 INS42 INS42 UPD42 INS42 INS8 INS8 INS7 INS58 INS27 INS8 INS32 INS43 INS45 INS32 INS42 INS45 INS45 INS43 INS42 INS42 INS34 INS43 INS59 INS42 INS33 INS42 INS32 INS25 INS42 INS34 INS21 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS32 INS21 INS21 INS42 INS42 INS42 INS42 INS42 INS33 INS21 INS42 INS32 INS43 INS32 INS32 INS53 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS45 INS42 INS42 INS45 INS21 INS21 INS42 INS14 INS43 INS59 INS42 INS33 INS21 INS21 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS9 INS42 INS42 INS42 INS32 INS42 INS42 INS38 INS8 INS32 INS42 INS42 INS34 INS42 INS42 INS86 INS42 INS42 INS86 INS32 INS32 INS32 INS42 INS42 INS42 INS42 INS42 INS27 INS42 INS42 INS42 INS42 INS14 UPD42 UPD42 INS7 INS7 INS43 INS42 INS42 INS42 INS32 INS32 INS7 INS42 INS42 INS32 INS60 INS60 INS25 INS54 INS25 INS42 INS42 INS45 INS42 INS8 INS8 INS40 INS42 INS42 INS32 INS32 INS42 INS42 INS42 INS45 INS45 INS43 INS27 INS42 INS14 INS42 INS14 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS43 INS59 INS43 INS59 INS27 INS8 INS58 INS8 INS38 INS8 INS54 INS54 INS42 INS42 INS42 INS42 INS42 INS45 INS42 INS43 INS14 INS43 INS42 INS42 INS42 INS42 INS42 INS14 INS42 INS42 INS32 INS38 INS38 INS53 INS43 INS59 INS21 INS32 INS21 INS8 INS12 INS8 INS12 INS42 INS43 INS42 INS42 INS43 INS42 INS32 INS42 INS42 INS32 INS32 INS14 INS42 INS42 INS14 INS32 INS42 INS42 INS32 INS37 INS25 INS44 INS8 INS25 INS44 INS8 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS43 INS27 INS43 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS8 INS8 INS43 INS42 INS21 INS32 INS8 INS8 INS43 INS42 INS21 INS42 INS45 INS32 INS42 INS42 INS42 INS54 INS21 INS42 INS32 INS42 INS42 INS54 INS21 INS42 INS32 INS42 INS42 INS58 INS8 INS32 INS42 INS42 INS32 INS58 INS8 INS32 INS42 INS42 INS32 INS43 INS59 INS60 INS61 INS40 INS42 INS32 INS14 INS42 INS42 INS43 INS59 INS60 INS61 INS40 INS42 INS32 INS14 INS42 INS42 INS42 INS42 INS14 INS43 INS59 INS27 INS8 INS42 INS42 INS43 INS42 INS42 INS14 INS43 INS59 INS27 INS8 INS42 INS42 INS43 INS43 INS14 INS42 INS42 INS36 INS33 INS21 INS40 INS43 INS14 INS42 INS42 INS36 INS33 INS21 INS40 INS42 INS43 INS32 INS32 INS7 INS32 INS42 INS43 INS32 INS32 INS7 INS32 INS42 INS42 INS42 INS42 INS42 INS45 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS45 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42

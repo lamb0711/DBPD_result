@@ -1,0 +1,229 @@
+HADOOP-6656. Adds a thread in the UserGroupInformation to renew TGTs periodically. Contributed by Owen O'Malley and Devaraj Das.
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/trunk@980518 13f79535-47bb-0310-9956-ffa450edef68
+
++import javax.security.auth.kerberos.KerberosKey;
++import javax.security.auth.kerberos.KerberosTicket;
++import org.apache.hadoop.util.Shell;
++  /**
++   * Percentage of the ticket window to use before we renew ticket.
++   */
++  private static final float TICKET_RENEW_WINDOW = 0.80f;
+-  public static final long MIN_TIME_BEFORE_RELOGIN = 10 * 60 * 1000L;
++  /** Leave 10 minutes between relogin attempts. */
++  private static final long MIN_TIME_BEFORE_RELOGIN = 10 * 60 * 1000L;
+-  /** The last relogin attempt */
+-  private long lastReloginTime = 0;
+-
++  // All non-static fields must be read-only caches that come from the subject.
++  private final User user;
++  private final boolean isKeytab;
+-    for (User p: subject.getPrincipals(User.class)) {
+-      return p.getLogin();
+-    }
+-    return null;
++    return user.getLogin();
+-    for (User p: subject.getPrincipals(User.class)) {
+-      p.setLogin(login);
+-    }
++    user.setLogin(login);
++    this.user = subject.getPrincipals(User.class).iterator().next();
++    this.isKeytab = !subject.getPrivateCredentials(KerberosKey.class).isEmpty();
+-        loginUser = new UserGroupInformation(subject);
++        loginUser = new UserGroupInformation(subject);
++        loginUser.setAuthenticationMethod(isSecurityEnabled() ?
++                                          AuthenticationMethod.KERBEROS :
++                                          AuthenticationMethod.SIMPLE);
++        loginUser.spawnAutoRenewalThreadForUserCreds();
++   * Is this user logged in from a keytab file?
++   * @return true if the credentials are from a keytab file.
++   */
++  public boolean isFromKeytab() {
++    return isKeytab;
++  }
++
++  /**Spawn a thread to do periodic renewals of kerberos credentials*/
++  private void spawnAutoRenewalThreadForUserCreds() {
++    if (isSecurityEnabled()) {
++      //spawn thread only if we have kerb credentials
++      if (user.getAuthenticationMethod() == AuthenticationMethod.KERBEROS &&
++          !isKeytab) {
++        Thread t = new Thread(new Runnable() {
++          
++          /**
++           * Get the Kerberos TGT
++           * @return the user's TGT or null if none was found
++           */
++          private KerberosTicket getTGT() {
++            Set<KerberosTicket> tickets = 
++              subject.getPrivateCredentials(KerberosTicket.class);
++            for(KerberosTicket ticket: tickets) {
++              if (SecurityUtil.isOriginalTGT(ticket)) {
++                if (LOG.isDebugEnabled()) {
++                  LOG.debug("Found tgt " + ticket);
++                }
++                return ticket;
++              }
++            }
++            return null;
++          }
++
++          private long getRefreshTime(KerberosTicket tgt) {
++            long start = tgt.getStartTime().getTime();
++            long end = tgt.getEndTime().getTime();
++            return start + (long) ((end - start) * TICKET_RENEW_WINDOW);
++          }
++
++          public void run() {
++            String cmd = conf.get("hadoop.kerberos.kinit.command",
++                                  "/usr/kerberos/bin/kinit");
++            KerberosTicket tgt = getTGT();
++            if (tgt == null) {
++              return;
++            }
++            long nextRefresh = getRefreshTime(tgt);
++            while (true) {
++              try {
++                long now = System.currentTimeMillis();
++                LOG.debug("Current time is " + now);
++                LOG.debug("Next refresh is " + nextRefresh);
++                if (now < nextRefresh) {
++                  Thread.sleep(nextRefresh - now);
++                }
++                Shell.execCommand(cmd, "-R");
++                LOG.debug("renewed ticket");
++                reloginFromTicketCache();
++                tgt = getTGT();
++                if (tgt == null) {
++                  LOG.warn("No TGT after renewal. Aborting renew thread for " +
++                           getUserName());
++                  return;
++                }
++                nextRefresh = Math.max(getRefreshTime(tgt),
++                                       now + MIN_TIME_BEFORE_RELOGIN);
++              } catch (InterruptedException ie) {
++                LOG.warn("Terminating renewal thread");
++                return;
++              } catch (IOException ie) {
++                LOG.warn("Exception encountered while running the" +
++                    " renewal command. Aborting renew thread. " + ie);
++                return;
++              }
++            }
++          }
++        });
++        t.setDaemon(true);
++        t.setName("TGT Renewer for " + getUserName());
++        t.start();
++      }
++    }
++  }
++  /**
++      loginUser.setAuthenticationMethod(AuthenticationMethod.KERBEROS);
+-    if (!isSecurityEnabled())
++    if (!isSecurityEnabled() ||
++         user.getAuthenticationMethod() != AuthenticationMethod.KERBEROS ||
++         !isKeytab)
+-    if (now - lastReloginTime < MIN_TIME_BEFORE_RELOGIN ) {
+-      LOG.warn("Not attempting to re-login since the last re-login was " +
+-          "attempted less than " + (MIN_TIME_BEFORE_RELOGIN/1000) + " seconds"+
+-          " before.");
++    if (!hasSufficientTimeElapsed(now)) {
+-    // register most recent relogin
+-    lastReloginTime = System.currentTimeMillis();
++    // register most recent relogin attempt
++    user.setLastLogin(now);
++   * Re-Login a user in from the ticket cache.  This
++   * method assumes that login had happened already.
++   * The Subject field of this UserGroupInformation object is updated to have
++   * the new credentials.
++   * @throws IOException on a failure
++   */
++  public synchronized void reloginFromTicketCache()
++  throws IOException {
++    if (!isSecurityEnabled() || 
++        user.getAuthenticationMethod() != AuthenticationMethod.KERBEROS ||
++        isKeytab)
++      return;
++    LoginContext login = getLogin();
++    if (login == null) {
++      throw new IOException("login must be done first");
++    }
++    long now = System.currentTimeMillis();
++    if (!hasSufficientTimeElapsed(now)) {
++      return;
++    }
++    // register most recent relogin attempt
++    user.setLastLogin(now);
++    try {
++      LOG.info("Initiating logout for " + getUserName());
++      //clear up the kerberos state. But the tokens are not cleared! As per 
++      //the Java kerberos login module code, only the kerberos credentials
++      //are cleared
++      login.logout();
++      //login and also update the subject field of this instance to 
++      //have the new credentials (pass it to the LoginContext constructor)
++      login = 
++        new LoginContext(HadoopConfiguration.USER_KERBEROS_CONFIG_NAME, 
++            getSubject());
++      LOG.info("Initiating re-login for " + getUserName());
++      login.login();
++      setLogin(login);
++    } catch (LoginException le) {
++      throw new IOException("Login failure for " + getUserName(), le);
++    } 
++  }
++
++
++  /**
++      newLoginUser.setAuthenticationMethod(AuthenticationMethod.KERBEROS);
+-  public synchronized static boolean isLoginKeytabBased() {
+-    return keytabFile != null;
++  private boolean hasSufficientTimeElapsed(long now) {
++    if (now - user.getLastLogin() < MIN_TIME_BEFORE_RELOGIN ) {
++      LOG.warn("Not attempting to re-login since the last re-login was " +
++          "attempted less than " + (MIN_TIME_BEFORE_RELOGIN/1000) + " seconds"+
++          " before.");
++      return false;
++    }
++    return true;
++  
++  /**
++   * Did the login happen via keytab
++   * @return true or false
++   */
++  public synchronized static boolean isLoginKeytabBased() {
++    return loginUser.isKeytab;
++  }
++
+-    return new UserGroupInformation(subject);
++    UserGroupInformation result = new UserGroupInformation(subject);
++    result.setAuthenticationMethod(AuthenticationMethod.SIMPLE);
++    return result;
+-    subject.getPrincipals().add(new User(user));
+-    subject.getPrincipals().add(new RealUser(realUser));
+-    return new UserGroupInformation(subject);
++    Set<Principal> principals = subject.getPrincipals();
++    principals.add(new User(user));
++    principals.add(new RealUser(realUser));
++    UserGroupInformation result =new UserGroupInformation(subject);
++    result.setAuthenticationMethod(AuthenticationMethod.PROXY);
++    return result;
+-    for (User p: subject.getPrincipals(User.class)) {
+-      return p.getName();
+-    }
+-    return null;
++    return user.getName();
+-    for (User p : subject.getPrincipals(User.class)) {
+-      p.setAuthenticationMethod(authMethod);
+-    }
++    user.setAuthenticationMethod(authMethod);
+-    for (User p: subject.getPrincipals(User.class)) {
+-      return p.getAuthenticationMethod();
+-    }
+-    return null;
++    return user.getAuthenticationMethod();
++    System.out.println("Auth method " + ugi.user.getAuthenticationMethod());
++    System.out.println("Keytab " + ugi.isKeytab);
++      System.out.println("Auth method " + loginUser.user.getAuthenticationMethod());
++      System.out.println("Keytab " + loginUser.isKeytab);

@@ -1,0 +1,161 @@
+MAPREDUCE-2764. Fix renewal of dfs delegation tokens. Contributed by Owen.
+
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/trunk@1183187 13f79535-47bb-0310-9956-ffa450edef68
+
++import org.apache.hadoop.security.token.TokenRenewer;
++  public static final Text TOKEN_KIND = new Text("HFTP delegation");
++
+-  private URI hdfsURI;
++  private Text hdfsServiceName;
++  private URI hftpURI;
+-  private Token<DelegationTokenIdentifier> delegationToken;
++  private Token<?> delegationToken;
++  private Token<?> renewToken;
+-    return SecurityUtil.buildDTServiceName(hdfsURI, getDefaultPort());
++    return SecurityUtil.buildDTServiceName(hftpURI, getDefaultPort());
+-    nnHttpUrl = 
+-      buildUri("https://", NetUtils.normalizeHostName(name.getHost()), urlPort);
++    String normalizedNN = NetUtils.normalizeHostName(name.getHost());
++    nnHttpUrl = buildUri("https://", normalizedNN ,urlPort);
++    try {
++      hftpURI = new URI(buildUri("hftp://", normalizedNN, urlPort));
++    } catch (URISyntaxException ue) {
++      throw new IOException("bad uri for hdfs", ue);
++    }
+-    
+-    
+-    String key = HftpFileSystem.HFTP_SERVICE_NAME_KEY+
+-    SecurityUtil.buildDTServiceName(name, DFSConfigKeys.DFS_HTTPS_PORT_DEFAULT);
++    String key = HftpFileSystem.HFTP_SERVICE_NAME_KEY
++        + SecurityUtil.buildDTServiceName(name,
++            DFSConfigKeys.DFS_HTTPS_PORT_DEFAULT);
+-
+-      hdfsURI = new URI(buildUri("hdfs://", nnAddr.getHostName(), nnPort));
++      URI hdfsURI = new URI("hdfs://" + normalizedNN + ":" + nnPort);
++      hdfsServiceName = new Text(SecurityUtil.buildDTServiceName(hdfsURI, 
++                                                                 nnPort));
+-      String canonicalName = getCanonicalServiceName();
++      String hftpServiceName = getCanonicalServiceName();
+-        if (DelegationTokenIdentifier.HDFS_DELEGATION_KIND.equals(t.getKind()) &&
+-            t.getService().toString().equals(canonicalName)) {
+-          if(LOG.isDebugEnabled()) {
+-            LOG.debug("Found existing DT for " + name);
++        Text kind = t.getKind();
++        if (DelegationTokenIdentifier.HDFS_DELEGATION_KIND.equals(kind)) {
++          if (t.getService().toString().equals(hdfsServiceName)) {
++            setDelegationToken(t);
++            break;
+-          delegationToken = (Token<DelegationTokenIdentifier>) t;
+-          break;
++        } else if (TOKEN_KIND.equals(kind)) {
++          if (hftpServiceName
++              .equals(normalizeService(t.getService().toString()))) {
++            setDelegationToken(t);
++            break;
++          }
+-        delegationToken = 
+-          (Token<DelegationTokenIdentifier>) getDelegationToken(null);
++        setDelegationToken(getDelegationToken(null));
+-  
++
++  private String normalizeService(String service) {
++    int colonIndex = service.indexOf(':');
++    if (colonIndex == -1) {
++      throw new IllegalArgumentException("Invalid service for hftp token: " + 
++                                         service);
++    }
++    String hostname = 
++        NetUtils.normalizeHostName(service.substring(0, colonIndex));
++    String port = service.substring(colonIndex + 1);
++    return hostname + ":" + port;
++  }
++
++  private <T extends TokenIdentifier> void setDelegationToken(Token<T> token) {
++    renewToken = token;
++    // emulate the 203 usage of the tokens
++    // by setting the kind and service as if they were hdfs tokens
++    delegationToken = new Token<T>(token);
++    delegationToken.setKind(DelegationTokenIdentifier.HDFS_DELEGATION_KIND);
++    delegationToken.setService(hdfsServiceName);
++  }
+-  public synchronized Token<?> getDelegationToken(final String renewer) throws IOException {
++  public synchronized Token<?> getDelegationToken(final String renewer
++                                                  ) throws IOException {
+-            t.setService(new Text(getCanonicalServiceName()));
+-        throw new IllegalArgumentException("Illegal comparision to non-RenewAction");
++        throw new IllegalArgumentException
++                  ("Illegal comparision to non-RenewAction");
+-    @SuppressWarnings("unchecked")
+-          fs.ugi.reloginFromKeytab();
+-          fs.ugi.doAs(new PrivilegedExceptionAction<Void>() {
+-
+-            @Override
+-            public Void run() throws Exception {
+-              try {
+-                DelegationTokenFetcher.renewDelegationToken(fs.nnHttpUrl, 
+-                    fs.delegationToken);
+-              } catch (IOException ie) {
+-                try {
+-                  fs.delegationToken = 
+-                    (Token<DelegationTokenIdentifier>) fs.getDelegationToken(null);
+-                } catch (IOException ie2) {
+-                  throw new IOException("Can't renew or get new delegation token ", 
+-                      ie);
+-                }
+-              }
+-              return null;
+-            } 
+-          });
++          try {
++            fs.renewToken.renew(fs.getConf());
++          } catch (IOException ie) {
++            try {
++              fs.setDelegationToken(fs.getDelegationToken(null));
++            } catch (IOException ie2) {
++              throw new IOException("Can't renew or get new delegation "
++                  + "token ", ie);
++            }
++          }
+-      queue.add(new RenewAction(RENEW_CYCLE + System.currentTimeMillis(),fs));
++      queue.add(new RenewAction(RENEW_CYCLE + System.currentTimeMillis(), fs));
++  
++  @InterfaceAudience.Private
++  public static class TokenManager extends TokenRenewer {
++
++    @Override
++    public boolean handleKind(Text kind) {
++      return kind.equals(TOKEN_KIND);
++    }
++
++    @Override
++    public boolean isManaged(Token<?> token) throws IOException {
++      return true;
++    }
++
++    @SuppressWarnings("unchecked")
++    @Override
++    public long renew(Token<?> token, 
++                      Configuration conf) throws IOException {
++      // update the kerberos credentials, if they are coming from a keytab
++      UserGroupInformation.getLoginUser().checkTGTAndReloginFromKeytab();
++      // use https to renew the token
++      return 
++        DelegationTokenFetcher.renewDelegationToken
++        ("https://" + token.getService().toString(), 
++         (Token<DelegationTokenIdentifier>) token);
++    }
++
++    @SuppressWarnings("unchecked")
++    @Override
++    public void cancel(Token<?> token, 
++                       Configuration conf) throws IOException {
++      // update the kerberos credentials, if they are coming from a keytab
++      UserGroupInformation.getLoginUser().checkTGTAndReloginFromKeytab();
++      // use https to cancel the token
++      DelegationTokenFetcher.cancelDelegationToken
++        ("https://" + token.getService().toString(), 
++         (Token<DelegationTokenIdentifier>) token);
++    }
++    
++  }

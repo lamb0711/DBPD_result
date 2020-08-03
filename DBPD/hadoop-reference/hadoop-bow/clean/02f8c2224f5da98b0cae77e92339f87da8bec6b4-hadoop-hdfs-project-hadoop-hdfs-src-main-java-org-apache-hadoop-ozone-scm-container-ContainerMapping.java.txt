@@ -1,0 +1,152 @@
+HDFS-11888. Ozone: SCM: use state machine for open containers allocated for key/blocks. Contributed by Xiaoyu Yao.
+
++import org.apache.hadoop.ozone.common.statemachine.InvalidStateTransitionException;
++import org.apache.hadoop.ozone.common.statemachine.StateMachine;
++import org.apache.hadoop.scm.container.common.helpers.ContainerInfo;
++import org.apache.hadoop.util.Time;
++import java.util.HashSet;
++import java.util.Set;
++  private final StateMachine<OzoneProtos.LifeCycleState,
++        OzoneProtos.LifeCycleEvent> stateMachine;
++
++
++
++    // Initialize the container state machine.
++    Set<OzoneProtos.LifeCycleState> finalStates = new HashSet();
++    finalStates.add(OzoneProtos.LifeCycleState.OPEN);
++    finalStates.add(OzoneProtos.LifeCycleState.CLOSED);
++    finalStates.add(OzoneProtos.LifeCycleState.DELETED);
++
++    this.stateMachine = new StateMachine<>(
++        OzoneProtos.LifeCycleState.ALLOCATED, finalStates);
++    initializeStateMachine();
++  // Client-driven Create State Machine
++  // States: <ALLOCATED>------------->CREATING----------------->[OPEN]
++  // Events:            (BEGIN_CREATE)    |    (COMPLETE_CREATE)
++  //                                      |
++  //                                      |(TIMEOUT)
++  //                                      V
++  //                                  DELETING----------------->[DELETED]
++  //                                           (CLEANUP)
++  // SCM Open/Close State Machine
++  // States: OPEN------------------>[CLOSED]
++  // Events:        (CLOSE)
++
++  // Delete State Machine
++  // States: OPEN------------------>DELETING------------------>[DELETED]
++  // Events:         (DELETE)                  (CLEANUP)
++  private void initializeStateMachine() {
++    stateMachine.addTransition(OzoneProtos.LifeCycleState.ALLOCATED,
++        OzoneProtos.LifeCycleState.CREATING,
++        OzoneProtos.LifeCycleEvent.BEGIN_CREATE);
++
++    stateMachine.addTransition(OzoneProtos.LifeCycleState.CREATING,
++        OzoneProtos.LifeCycleState.OPEN,
++        OzoneProtos.LifeCycleEvent.COMPLETE_CREATE);
++
++    stateMachine.addTransition(OzoneProtos.LifeCycleState.OPEN,
++        OzoneProtos.LifeCycleState.CLOSED,
++        OzoneProtos.LifeCycleEvent.CLOSE);
++
++    stateMachine.addTransition(OzoneProtos.LifeCycleState.OPEN,
++        OzoneProtos.LifeCycleState.DELETING,
++        OzoneProtos.LifeCycleEvent.DELETE);
++
++    stateMachine.addTransition(OzoneProtos.LifeCycleState.DELETING,
++        OzoneProtos.LifeCycleState.DELETED,
++        OzoneProtos.LifeCycleEvent.CLEANUP);
++
++    // Creating timeout -> Deleting
++    stateMachine.addTransition(OzoneProtos.LifeCycleState.CREATING,
++        OzoneProtos.LifeCycleState.DELETING,
++        OzoneProtos.LifeCycleEvent.TIMEOUT);
++  }
+-   * Returns the Pipeline from the container name.
+-   *
+-   * @param containerName - Name
+-   * @return - Pipeline that makes up this container.
++   * {@inheritDoc}
+-  public Pipeline getContainer(final String containerName) throws IOException {
+-    Pipeline pipeline;
++  public ContainerInfo getContainer(final String containerName) throws IOException {
++    ContainerInfo containerInfo;
+-      byte[] pipelineBytes =
++      byte[] containerBytes =
+-      if (pipelineBytes == null) {
++      if (containerBytes == null) {
+-      pipeline = Pipeline.getFromProtoBuf(
+-          OzoneProtos.Pipeline.PARSER.parseFrom(pipelineBytes));
+-      return pipeline;
++      containerInfo = ContainerInfo.fromProtobuf(
++          OzoneProtos.SCMContainerInfo.PARSER.parseFrom(containerBytes));
++      return containerInfo;
++      // TODO: return list of ContainerInfo instead of pipelines.
++      // TODO: filter by container state
+-        Pipeline pipeline = Pipeline.getFromProtoBuf(
+-            OzoneProtos.Pipeline.PARSER.parseFrom(entry.getValue()));
+-        pipelineList.add(pipeline);
++        ContainerInfo containerInfo =  ContainerInfo.fromProtobuf(
++            OzoneProtos.SCMContainerInfo.PARSER.parseFrom(entry.getValue()));
++        Preconditions.checkNotNull(containerInfo);
++        pipelineList.add(containerInfo.getPipeline());
+-  public Pipeline allocateContainer(OzoneProtos.ReplicationType type,
++  public ContainerInfo allocateContainer(OzoneProtos.ReplicationType type,
+-    Pipeline pipeline = null;
++    ContainerInfo containerInfo = null;
+-      byte[] pipelineBytes =
++      byte[] containerBytes =
+-      if (pipelineBytes != null) {
++      if (containerBytes != null) {
+-      pipeline = pipelineSelector.getReplicationPipeline(type,
++      Pipeline pipeline = pipelineSelector.getReplicationPipeline(type,
++      containerInfo = new ContainerInfo.Builder()
++          .setState(OzoneProtos.LifeCycleState.ALLOCATED)
++          .setPipeline(pipeline)
++          .setStateEnterTime(Time.monotonicNow())
++          .build();
+-          pipeline.getProtobufMessage().toByteArray());
++          containerInfo.getProtobuf().toByteArray());
+-    return pipeline;
++    return containerInfo;
+-      byte[] pipelineBytes =
++      byte[] containerBytes =
+-      if (pipelineBytes == null) {
++      if(containerBytes == null) {
++   * {@inheritDoc}
++   * Used by client to update container state on SCM.
++   */
++  @Override
++  public OzoneProtos.LifeCycleState updateContainerState(String containerName,
++      OzoneProtos.LifeCycleEvent event) throws IOException {
++    ContainerInfo containerInfo;
++    lock.lock();
++    try {
++      byte[] dbKey = containerName.getBytes(encoding);
++      byte[] containerBytes =
++          containerStore.get(dbKey);
++      if(containerBytes == null) {
++        throw new SCMException("Failed to update container state"
++            + containerName + ", reason : container doesn't exist.",
++            SCMException.ResultCodes.FAILED_TO_FIND_CONTAINER);
++      }
++      containerInfo = ContainerInfo.fromProtobuf(
++          OzoneProtos.SCMContainerInfo.PARSER.parseFrom(containerBytes));
++
++      OzoneProtos.LifeCycleState newState;
++      try {
++         newState = stateMachine.getNextState(containerInfo.getState(), event);
++      } catch (InvalidStateTransitionException ex) {
++        throw new SCMException("Failed to update container state"
++            + containerName + ", reason : invalid state transition from state: "
++            + containerInfo.getState() + " upon event: " + event + ".",
++            SCMException.ResultCodes.FAILED_TO_CHANGE_CONTAINER_STATE);
++      }
++      containerInfo.setState(newState);
++      containerStore.put(dbKey, containerInfo.getProtobuf().toByteArray());
++      return newState;
++    } finally {
++      lock.unlock();
++    }
++  }
++
++  /**

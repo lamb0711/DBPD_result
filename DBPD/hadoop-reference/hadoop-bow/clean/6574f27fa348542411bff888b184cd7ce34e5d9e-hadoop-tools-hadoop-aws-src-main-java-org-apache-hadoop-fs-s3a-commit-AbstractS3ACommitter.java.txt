@@ -1,0 +1,491 @@
+HADOOP-16570. S3A committers encounter scale issues.
+
+Contributed by Steve Loughran.
+
+This addresses two scale issues which has surfaced in large scale benchmarks
+of the S3A Committers.
+
+* Thread pools are not cleaned up.
+  This now happens, with tests.
+
+* OOM on job commit for jobs with many thousands of tasks,
+  each generating tens of (very large) files.
+
+Instead of loading all pending commits into memory as a single list, the list
+of files to load is the sole list which is passed around; .pendingset files are
+loaded and processed in isolation -and reloaded if necessary for any
+abort/rollback operation.
+
+The parallel commit/abort/revert operations now work at the .pendingset level,
+rather than that of individual pending commit files. The existing parallelized
+Tasks API is still used to commit those files, but with a null thread pool, so
+as to serialize the operations.
+
+Change-Id: I5c8240cd31800eaa83d112358770ca0eb2bca797
+
++import java.io.FileNotFoundException;
+-import java.util.Collections;
+-import java.util.concurrent.Executors;
++import java.util.concurrent.TimeUnit;
++import java.util.stream.Collectors;
+-import com.google.common.collect.Lists;
++import org.apache.hadoop.util.concurrent.HadoopExecutors;
++import static org.apache.hadoop.fs.s3a.Constants.THREAD_POOL_SHUTDOWN_DELAY_SECONDS;
++ *
++ * The original implementation loaded all .pendingset files
++ * before attempting any commit/abort operations.
++ * While straightforward and guaranteeing that no changes were made to the
++ * destination until all files had successfully been loaded -it didn't scale;
++ * the list grew until it exceeded heap size.
++ *
++ * The second iteration builds up an {@link ActiveCommit} class with the
++ * list of .pendingset files to load and then commit; that can be done
++ * incrementally and in parallel.
++ * As a side effect of this change, unless/until changed,
++ * the commit/abort/revert of all files uploaded by a single task will be
++ * serialized. This may slow down these operations if there are many files
++ * created by a few tasks, <i>and</i> the HTTP connection pool in the S3A
++ * committer was large enough for more all the parallel POST requests.
++  public static final String THREAD_PREFIX = "s3a-committer-pool-";
++
+-      List<SinglePendingCommit> pending) throws IOException {
++      ActiveCommit pending) throws IOException {
+-    for (SinglePendingCommit commit : pending) {
+-      String key = commit.getDestinationKey();
+-      if (!key.startsWith("/")) {
+-        // fix up so that FS.makeQualified() sets up the path OK
+-        key = "/" + key;
+-      }
+-      filenames.add(key);
+-    }
++    // The list of committed objects in pending is size limited in
++    // ActiveCommit.uploadCommitted.
++    filenames.addAll(pending.committedObjects);
+-   * Base job setup deletes the success marker.
+-   * TODO: Do we need this?
++   * Base job setup (optionally) deletes the success marker and
++   * always creates the destination directory.
++   * When objects are committed that dest dir marker will inevitably
++   * be deleted; creating it now ensures there is something at the end
++   * while the job is in progress -and if nothing is created, that
++   * it is still there.
+-/*
+-    if (createJobMarker) {
+-      try (DurationInfo d = new DurationInfo("Deleting _SUCCESS marker")) {
++    try (DurationInfo d = new DurationInfo(LOG, "preparing destination")) {
++      if (createJobMarker){
++      getDestFS().mkdirs(getOutputPath());
+-*/
+-   * Commit a list of pending uploads.
++   * Commit all the pending uploads.
++   * Each file listed in the ActiveCommit instance is queued for processing
++   * in a separate thread; its contents are loaded and then (sequentially)
++   * committed.
++   * On a failure or abort of a single file's commit, all its uploads are
++   * aborted.
++   * The revert operation lists the files already committed and deletes them.
+-   * @param pending list of pending uploads
++   * @param pending  pending uploads
+-  protected void commitPendingUploads(JobContext context,
+-      List<SinglePendingCommit> pending) throws IOException {
++  protected void commitPendingUploads(
++      final JobContext context,
++      final ActiveCommit pending) throws IOException {
+-    LOG.debug("{}: committing the output of {} task(s)",
+-        getRole(), pending.size());
+-    try(CommitOperations.CommitContext commitContext
++    try (DurationInfo ignored = new DurationInfo(LOG,
++        "committing the output of %s task(s)", pending.size());
++        CommitOperations.CommitContext commitContext
+-      Tasks.foreach(pending)
++
++      Tasks.foreach(pending.getSourceFiles())
++          .suppressExceptions(false)
++          .abortWith(path ->
++              loadAndAbort(commitContext, pending, path, true, false))
++          .revertWith(path ->
++              loadAndRevert(commitContext, pending, path))
++          .run(path ->
++              loadAndCommit(commitContext, pending, path));
++    }
++  }
++
++  /**
++   * Run a precommit check that all files are loadable.
++   * This check avoids the situation where the inability to read
++   * a file only surfaces partway through the job commit, so
++   * results in the destination being tainted.
++   * @param context job context
++   * @param pending the pending operations
++   * @throws IOException any failure
++   */
++  protected void precommitCheckPendingFiles(
++      final JobContext context,
++      final ActiveCommit pending) throws IOException {
++
++    FileSystem sourceFS = pending.getSourceFS();
++    try (DurationInfo ignored =
++             new DurationInfo(LOG, "Preflight Load of pending files")) {
++
++      Tasks.foreach(pending.getSourceFiles())
++          .stopOnFailure()
++          .suppressExceptions(false)
++          .executeWith(buildThreadPool(context))
++          .run(path -> PendingSet.load(sourceFS, path));
++    }
++  }
++
++  /**
++   * Load a pendingset file and commit all of its contents.
++   * @param commitContext context to commit through
++   * @param activeCommit commit state
++   * @param path path to load
++   * @throws IOException failure
++   */
++  private void loadAndCommit(
++      final CommitOperations.CommitContext commitContext,
++      final ActiveCommit activeCommit,
++      final Path path) throws IOException {
++
++    try (DurationInfo ignored =
++             new DurationInfo(LOG, false, "Committing %s", path)) {
++      PendingSet pendingSet = PendingSet.load(activeCommit.getSourceFS(), path);
++      Tasks.foreach(pendingSet.getCommits())
++          .stopOnFailure()
++          .suppressExceptions(false)
++          .executeWith(singleCommitThreadPool())
+-          .run(commitContext::commitOrFail);
++          .run(commit -> {
++            commitContext.commitOrFail(commit);
++            activeCommit.uploadCommitted(
++                commit.getDestinationKey(), commit.getLength());
++          });
++    }
++  }
++
++  /**
++   * Load a pendingset file and revert all of its contents.
++   * @param commitContext context to commit through
++   * @param activeCommit commit state
++   * @param path path to load
++   * @throws IOException failure
++   */
++  private void loadAndRevert(
++      final CommitOperations.CommitContext commitContext,
++      final ActiveCommit activeCommit,
++      final Path path) throws IOException {
++
++    try (DurationInfo ignored =
++             new DurationInfo(LOG, false, "Committing %s", path)) {
++      PendingSet pendingSet = PendingSet.load(activeCommit.getSourceFS(), path);
++      Tasks.foreach(pendingSet.getCommits())
++          .suppressExceptions(true)
++          .run(commitContext::revertCommit);
++    }
++  }
++
++  /**
++   * Load a pendingset file and abort all of its contents.
++   * @param commitContext context to commit through
++   * @param activeCommit commit state
++   * @param path path to load
++   * @param deleteRemoteFiles should remote files be deleted?
++   * @throws IOException failure
++   */
++  private void loadAndAbort(
++      final CommitOperations.CommitContext commitContext,
++      final ActiveCommit activeCommit,
++      final Path path,
++      final boolean suppressExceptions,
++      final boolean deleteRemoteFiles) throws IOException {
++
++    try (DurationInfo ignored =
++             new DurationInfo(LOG, false, "Aborting %s", path)) {
++      PendingSet pendingSet = PendingSet.load(activeCommit.getSourceFS(),
++          path);
++      FileSystem fs = getDestFS();
++      Tasks.foreach(pendingSet.getCommits())
++          .executeWith(singleCommitThreadPool())
++          .suppressExceptions(suppressExceptions)
++          .run(commit -> {
++            try {
++              commitContext.abortSingleCommit(commit);
++            } catch (FileNotFoundException e) {
++              // Commit ID was not known; file may exist.
++              // delete it if instructed to do so.
++              if (deleteRemoteFiles) {
++                fs.delete(commit.destinationPath(), false);
++              }
++            }
++          });
+-   * Try to read every pendingset file and build a list of them/
+-   * In the case of a failure to read the file, exceptions are held until all
+-   * reads have been attempted.
+-   * @param context job context
+-   * @param suppressExceptions whether to suppress exceptions.
+-   * @param fs job attempt fs
+-   * @param pendingCommitFiles list of files found in the listing scan
+-   * @return the list of commits
+-   * @throws IOException on a failure when suppressExceptions is false.
+-   */
+-  protected List<SinglePendingCommit> loadPendingsetFiles(
+-      JobContext context,
+-      boolean suppressExceptions,
+-      FileSystem fs,
+-      Iterable<? extends FileStatus> pendingCommitFiles) throws IOException {
+-
+-    final List<SinglePendingCommit> pending = Collections.synchronizedList(
+-        Lists.newArrayList());
+-    Tasks.foreach(pendingCommitFiles)
+-        .suppressExceptions(suppressExceptions)
+-        .executeWith(buildThreadPool(context))
+-        .run(pendingCommitFile ->
+-          pending.addAll(
+-              PendingSet.load(fs, pendingCommitFile.getPath()).getCommits())
+-      );
+-    return pending;
+-  }
+-
+-  /**
+-   * @param pending pending request
++   * @param pending pending commits
+-      List<SinglePendingCommit> pending)
++      ActiveCommit pending)
++   * so cleans up the filesystems and destroys the thread pool.
++   * Subclasses must always invoke this superclass method after their
++   * own operations.
++   * Note: this instantiates the thread pool if required -so
++   * {@link #destroyThreadPool()} must be called after this.
+-    try (DurationInfo d =
++    try (DurationInfo ignored =
+-   * Subclass-specific pre commit actions.
++   * Subclass-specific pre-Job-commit actions.
++   * The staging committers all load the pending files to verify that
++   * they can be loaded.
++   * The Magic committer does not, because of the overhead of reading files
++   * from S3 makes it too expensive.
+-  protected void preCommitJob(JobContext context,
+-      List<SinglePendingCommit> pending) throws IOException {
++  @VisibleForTesting
++  public void preCommitJob(JobContext context,
++      ActiveCommit pending) throws IOException {
+-   * The final commit action is to build the {@code __SUCCESS} file entry.
++   * The final commit action is to build the {@code _SUCCESS} file entry.
+-      List<SinglePendingCommit> pending
++      ActiveCommit pending
+-  protected abstract List<SinglePendingCommit> listPendingUploadsToCommit(
++  protected abstract ActiveCommit listPendingUploadsToCommit(
+-   * Cleanup the job context, including aborting anything pending.
++   * Cleanup the job context, including aborting anything pending
++   * and destroying the thread pool.
++      destroyThreadPool();
+-   * threads in the thread-pool is set by s3.multipart.committer.num-threads.
++   * threads in the thread-pool is set by fs.s3a.committer.threads.
+-        threadPool = Executors.newFixedThreadPool(numThreads,
++        threadPool = HadoopExecutors.newFixedThreadPool(numThreads,
+-                .setNameFormat("s3-committer-pool-%d")
++                .setNameFormat(THREAD_PREFIX + context.getJobID() + "-%d")
++   * Destroy any thread pools; wait for that to finish,
++   * but don't overreact if it doesn't finish in time.
++   */
++  protected synchronized void destroyThreadPool() {
++    if (threadPool != null) {
++      LOG.debug("Destroying thread pool");
++      HadoopExecutors.shutdown(threadPool, LOG,
++          THREAD_POOL_SHUTDOWN_DELAY_SECONDS, TimeUnit.SECONDS);
++      threadPool = null;
++    }
++  }
++
++  /**
++   * Get the thread pool for executing the single file commit/revert
++   * within the commit of all uploads of a single task.
++   * This is currently null; it is here to allow the Tasks class to
++   * provide the logic for execute/revert.
++   * Why not use the existing thread pool? Too much fear of deadlocking,
++   * and tasks are being committed in parallel anyway.
++   * @return null. always.
++   */
++  protected final synchronized ExecutorService singleCommitThreadPool() {
++    return null;
++  }
++
++  /**
++   * Does this committer have a thread pool?
++   * @return true if a thread pool exists.
++   */
++  public synchronized boolean hasThreadPool() {
++    return threadPool != null;
++  }
++
++  /**
++   * This operation is used by the magic committer as part of its
++   * rollback after a failure during task commit.
++  /**
++   * Abort all pending uploads in the list.
++   * @param context job context
++   * @param pending pending uploads
++   * @param suppressExceptions should exceptions be suppressed?
++   * @param deleteRemoteFiles should remote files be deleted?
++   * @throws IOException any exception raised
++   */
++  protected void abortPendingUploads(
++      final JobContext context,
++      final ActiveCommit pending,
++      final boolean suppressExceptions,
++      final boolean deleteRemoteFiles) throws IOException {
++
++    if (pending.isEmpty()) {
++      LOG.info("{}: no pending commits to abort", getRole());
++    } else {
++      try (DurationInfo d = new DurationInfo(LOG,
++          "Aborting %s uploads", pending.size());
++           CommitOperations.CommitContext commitContext
++               = initiateCommitOperation()) {
++        Tasks.foreach(pending.getSourceFiles())
++            .executeWith(buildThreadPool(context))
++            .suppressExceptions(suppressExceptions)
++            .run(path ->
++                loadAndAbort(commitContext,
++                    pending,
++                    path,
++                    suppressExceptions,
++                    deleteRemoteFiles));
++      }
++    }
++  }
++
++  /**
++   * State of the active commit operation.
++   *
++   * It contains a list of all pendingset files to load as the source
++   * of outstanding commits to complete/abort,
++   * and tracks the files uploaded.
++   *
++   * To avoid running out of heap by loading all the source files
++   * simultaneously:
++   * <ol>
++   *   <li>
++   *     The list of files to load is passed round but
++   *     the contents are only loaded on demand.
++   *   </li>
++   *   <li>
++   *     The number of written files tracked for logging in
++   *     the _SUCCESS file are limited to a small amount -enough
++   *     for testing only.
++   *   </li>
++   * </ol>
++   */
++  public static class ActiveCommit {
++
++    private static final AbstractS3ACommitter.ActiveCommit EMPTY
++        = new ActiveCommit(null, new ArrayList<>());
++
++    /** All pendingset files to iterate through. */
++    private final List<Path> sourceFiles;
++
++    /**
++     * Filesystem for the source files.
++     */
++    private final FileSystem sourceFS;
++
++    /**
++     * List of committed objects; only built up until the commit limit is
++     * reached.
++     */
++    private final List<String> committedObjects = new ArrayList<>();
++
++    /**
++     * The total number of committed objects.
++     */
++    private int committedObjectCount;
++
++    /**
++     * Total number of bytes committed.
++     */
++    private long committedBytes;
++
++    /**
++     * Construct from a source FS and list of files.
++     * @param sourceFS filesystem containing the list of pending files
++     * @param sourceFiles .pendingset files to load and commit.
++     */
++    public ActiveCommit(
++        final FileSystem sourceFS,
++        final List<Path> sourceFiles) {
++      this.sourceFiles = sourceFiles;
++      this.sourceFS = sourceFS;
++    }
++
++    /**
++     * Create an active commit of the given pending files.
++     * @param pendingFS source filesystem.
++     * @param statuses list of file status or subclass to use.
++     * @return the commit
++     */
++    public static ActiveCommit fromStatusList(
++        final FileSystem pendingFS,
++        final List<? extends FileStatus> statuses) {
++      return new ActiveCommit(pendingFS,
++          statuses.stream()
++              .map(FileStatus::getPath)
++              .collect(Collectors.toList()));
++    }
++
++    /**
++     * Get the empty entry.
++     * @return an active commit with no pending files.
++     */
++    public static ActiveCommit empty() {
++      return EMPTY;
++    }
++
++    public List<Path> getSourceFiles() {
++      return sourceFiles;
++    }
++
++    public FileSystem getSourceFS() {
++      return sourceFS;
++    }
++
++    /**
++     * Note that a file was committed.
++     * Increase the counter of files and total size.
++     * If there is room in the committedFiles list, the file
++     * will be added to the list and so end up in the _SUCCESS file.
++     * @param key key of the committed object.
++     * @param size size in bytes.
++     */
++    public synchronized void uploadCommitted(String key, long size) {
++      if (committedObjects.size() < SUCCESS_MARKER_FILE_LIMIT) {
++        committedObjects.add(
++            key.startsWith("/") ? key : ("/" + key));
++      }
++      committedObjectCount++;
++      committedBytes += size;
++    }
++
++    public synchronized List<String> getCommittedObjects() {
++      return committedObjects;
++    }
++
++    public synchronized int getCommittedFileCount() {
++      return committedObjectCount;
++    }
++
++    public synchronized long getCommittedBytes() {
++      return committedBytes;
++    }
++
++    public int size() {
++      return sourceFiles.size();
++    }
++
++    public boolean isEmpty() {
++      return sourceFiles.isEmpty();
++    }
++
++    public void add(Path path) {
++      sourceFiles.add(path);
++    }
++  }

@@ -1,0 +1,225 @@
+YARN-90. NodeManager should identify failed disks becoming good again. Contributed by Varun Vasudev
+
++import java.util.ArrayList;
++import java.util.HashMap;
++import java.util.Map;
++import java.util.Set;
++import org.apache.commons.io.FileUtils;
++import org.apache.commons.lang.RandomStringUtils;
+-import org.apache.hadoop.util.DiskChecker.DiskErrorException;
++  public enum DiskErrorCause {
++    DISK_FULL, OTHER
++  }
++
++  static class DiskErrorInformation {
++    DiskErrorCause cause;
++    String message;
++
++    DiskErrorInformation(DiskErrorCause cause, String message) {
++      this.cause = cause;
++      this.message = message;
++    }
++  }
++
++  /**
++   * Returns a merged list which contains all the elements of l1 and l2
++   * @param l1 the first list to be included
++   * @param l2 the second list to be included
++   * @return a new list containing all the elements of the first and second list
++   */
++  static List<String> concat(List<String> l1, List<String> l2) {
++    List<String> ret = new ArrayList<String>(l1.size() + l2.size());
++    ret.addAll(l1);
++    ret.addAll(l2);
++    return ret;
++  }
++
+-  private List<String> failedDirs;
++  private List<String> errorDirs;
++  private List<String> fullDirs;
++
+-    failedDirs = new CopyOnWriteArrayList<String>();
++    errorDirs = new CopyOnWriteArrayList<String>();
++    fullDirs = new CopyOnWriteArrayList<String>();
++
+-    return Collections.unmodifiableList(failedDirs);
++    return Collections.unmodifiableList(
++        DirectoryCollection.concat(errorDirs, fullDirs));
++  }
++
++  /**
++   * @return the directories that have used all disk space
++   */
++
++  synchronized List<String> getFullDirs() {
++    return fullDirs;
+-        failedDirs.add(dir);
++        errorDirs.add(dir);
+-   * Check the health of current set of local directories, updating the list
+-   * of valid directories if necessary.
+-   * @return <em>true</em> if there is a new disk-failure identified in
+-   *         this checking. <em>false</em> otherwise.
++   * Check the health of current set of local directories(good and failed),
++   * updating the list of valid directories if necessary.
++   *
++   * @return <em>true</em> if there is a new disk-failure identified in this
++   *         checking or a failed directory passes the disk check <em>false</em>
++   *         otherwise.
+-    int oldNumFailures = numFailures;
+-    HashSet<String> checkFailedDirs = new HashSet<String>();
+-    for (final String dir : localDirs) {
++    boolean setChanged = false;
++    Set<String> preCheckGoodDirs = new HashSet<String>(localDirs);
++    Set<String> preCheckFullDirs = new HashSet<String>(fullDirs);
++    Set<String> preCheckOtherErrorDirs = new HashSet<String>(errorDirs);
++    List<String> failedDirs = DirectoryCollection.concat(errorDirs, fullDirs);
++    List<String> allLocalDirs =
++        DirectoryCollection.concat(localDirs, failedDirs);
++
++    Map<String, DiskErrorInformation> dirsFailedCheck = testDirs(allLocalDirs);
++
++    localDirs.clear();
++    errorDirs.clear();
++    fullDirs.clear();
++
++    for (Map.Entry<String, DiskErrorInformation> entry : dirsFailedCheck
++      .entrySet()) {
++      String dir = entry.getKey();
++      DiskErrorInformation errorInformation = entry.getValue();
++      switch (entry.getValue().cause) {
++      case DISK_FULL:
++        fullDirs.add(entry.getKey());
++        break;
++      case OTHER:
++        errorDirs.add(entry.getKey());
++        break;
++      }
++      if (preCheckGoodDirs.contains(dir)) {
++        LOG.warn("Directory " + dir + " error, " + errorInformation.message
++            + ", removing from list of valid directories");
++        setChanged = true;
++        numFailures++;
++      }
++    }
++    for (String dir : allLocalDirs) {
++      if (!dirsFailedCheck.containsKey(dir)) {
++        localDirs.add(dir);
++        if (preCheckFullDirs.contains(dir)
++            || preCheckOtherErrorDirs.contains(dir)) {
++          setChanged = true;
++          LOG.info("Directory " + dir
++              + " passed disk check, adding to list of valid directories.");
++        }
++      }
++    }
++    Set<String> postCheckFullDirs = new HashSet<String>(fullDirs);
++    Set<String> postCheckOtherDirs = new HashSet<String>(errorDirs);
++    for (String dir : preCheckFullDirs) {
++      if (postCheckOtherDirs.contains(dir)) {
++        LOG.warn("Directory " + dir + " error "
++            + dirsFailedCheck.get(dir).message);
++      }
++    }
++
++    for (String dir : preCheckOtherErrorDirs) {
++      if (postCheckFullDirs.contains(dir)) {
++        LOG.warn("Directory " + dir + " error "
++            + dirsFailedCheck.get(dir).message);
++      }
++    }
++    return setChanged;
++  }
++
++  Map<String, DiskErrorInformation> testDirs(List<String> dirs) {
++    HashMap<String, DiskErrorInformation> ret =
++        new HashMap<String, DiskErrorInformation>();
++    for (final String dir : dirs) {
++      String msg;
+-        if (isDiskUsageUnderPercentageLimit(testDir)) {
+-          LOG.warn("Directory " + dir
+-              + " error, used space above threshold of "
+-              + diskUtilizationPercentageCutoff
+-              + "%, removing from the list of valid directories.");
+-          checkFailedDirs.add(dir);
+-        } else if (isDiskFreeSpaceWithinLimit(testDir)) {
+-          LOG.warn("Directory " + dir + " error, free space below limit of "
+-              + diskUtilizationSpaceCutoff
+-              + "MB, removing from the list of valid directories.");
+-          checkFailedDirs.add(dir);
++        if (isDiskUsageOverPercentageLimit(testDir)) {
++          msg =
++              "used space above threshold of "
++                  + diskUtilizationPercentageCutoff
++                  + "%";
++          ret.put(dir,
++            new DiskErrorInformation(DiskErrorCause.DISK_FULL, msg));
++          continue;
++        } else if (isDiskFreeSpaceUnderLimit(testDir)) {
++          msg =
++              "free space below limit of " + diskUtilizationSpaceCutoff
++                  + "MB";
++          ret.put(dir,
++            new DiskErrorInformation(DiskErrorCause.DISK_FULL, msg));
++          continue;
+-      } catch (DiskErrorException de) {
+-        LOG.warn("Directory " + dir + " error " + de.getMessage()
+-            + ", removing from the list of valid directories.");
+-        checkFailedDirs.add(dir);
++
++        // create a random dir to make sure fs isn't in read-only mode
++        verifyDirUsingMkdir(testDir);
++      } catch (IOException ie) {
++        ret.put(dir,
++          new DiskErrorInformation(DiskErrorCause.OTHER, ie.getMessage()));
+-    for (String dir : checkFailedDirs) {
+-      localDirs.remove(dir);
+-      failedDirs.add(dir);
+-      numFailures++;
+-    }
+-    return numFailures > oldNumFailures;
++    return ret;
+-  
+-  private boolean isDiskUsageUnderPercentageLimit(File dir) {
++
++  /**
++   * Function to test whether a dir is working correctly by actually creating a
++   * random directory.
++   *
++   * @param dir
++   *          the dir to test
++   */
++  private void verifyDirUsingMkdir(File dir) throws IOException {
++
++    String randomDirName = RandomStringUtils.randomAlphanumeric(5);
++    File target = new File(dir, randomDirName);
++    int i = 0;
++    while (target.exists()) {
++
++      randomDirName = RandomStringUtils.randomAlphanumeric(5) + i;
++      target = new File(dir, randomDirName);
++      i++;
++    }
++    try {
++      DiskChecker.checkDir(target);
++    } finally {
++      FileUtils.deleteQuietly(target);
++    }
++  }
++
++  private boolean isDiskUsageOverPercentageLimit(File dir) {
+-    if (usedPercentage > diskUtilizationPercentageCutoff
+-        || usedPercentage >= 100.0F) {
+-      return true;
+-    }
+-    return false;
++    return (usedPercentage > diskUtilizationPercentageCutoff
++        || usedPercentage >= 100.0F);
+-  private boolean isDiskFreeSpaceWithinLimit(File dir) {
++  private boolean isDiskFreeSpaceUnderLimit(File dir) {
+-    if (freeSpace < this.diskUtilizationSpaceCutoff) {
+-      return true;
+-    }
+-    return false;
++    return freeSpace < this.diskUtilizationSpaceCutoff;
+
+MOV26 INS26 INS26 INS26 INS26 INS26 INS40 INS40 INS40 INS40 UPD40 INS40 INS71 INS55 INS31 INS23 INS31 INS31 INS31 INS31 INS83 INS42 INS72 INS72 INS83 INS42 INS23 INS23 INS31 INS29 INS83 INS74 INS42 INS44 INS44 INS8 INS83 INS74 INS59 INS29 INS83 INS74 INS42 INS8 MOV29 MOV83 MOV39 MOV42 INS8 INS74 INS42 INS44 INS8 INS29 INS83 INS39 INS42 INS44 INS43 INS8 UPD42 UPD42 INS42 INS42 INS43 INS59 INS43 INS59 INS42 INS44 INS44 INS8 INS65 INS65 INS65 INS65 INS43 INS43 INS74 INS42 INS74 INS42 INS60 INS21 INS21 INS41 UPD42 INS43 INS43 INS42 INS21 INS65 INS43 INS43 INS41 INS60 MOV60 INS60 INS60 INS60 INS60 INS60 INS21 INS21 INS21 INS70 INS70 INS60 INS60 INS70 INS70 INS41 INS43 INS43 INS43 INS74 INS42 INS60 MOV70 INS41 INS65 INS65 INS43 INS42 INS42 INS60 INS60 INS60 INS61 INS54 MOV41 MOV41 INS42 INS42 INS42 INS42 INS43 INS42 INS43 INS42 INS21 INS21 INS66 INS42 INS66 INS42 INS66 INS66 INS42 INS42 INS43 INS43 INS43 INS43 INS74 INS59 INS32 INS32 INS42 INS42 INS42 INS7 INS66 INS42 INS42 INS42 UPD66 UPD66 UPD66 UPD66 INS66 UPD39 MOV39 INS59 INS74 INS74 INS59 INS74 INS59 INS74 INS59 INS74 MOV59 INS74 INS59 INS32 INS32 INS32 INS44 INS32 INS8 MOV44 INS42 INS8 INS74 INS59 INS74 INS59 INS44 INS42 INS8 INS44 INS42 INS8 INS42 INS42 INS42 INS42 INS43 INS43 INS74 INS59 MOV44 UPD42 INS8 INS42 INS66 INS66 INS42 INS66 INS42 INS43 INS59 INS43 INS59 INS39 INS59 INS32 INS8 INS8 INS8 INS36 MOV27 INS42 INS42 INS7 INS7 INS42 INS42 INS42 INS42 INS43 INS43 INS42 INS14 INS42 INS42 INS42 INS42 INS42 INS42 UPD42 INS42 INS14 INS32 INS42 INS9 INS43 INS43 UPD42 INS43 INS43 INS42 INS14 INS43 INS43 INS42 INS14 INS43 INS43 INS42 INS32 INS43 INS43 INS42 INS32 INS43 INS43 INS43 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS74 INS42 INS42 INS42 INS60 INS60 INS50 INS25 INS25 INS43 INS43 INS42 INS14 INS43 INS43 INS42 INS14 INS43 INS42 INS25 UPD43 MOV43 UPD42 MOV42 INS25 INS42 INS42 INS43 INS43 INS43 INS42 INS14 INS60 INS54 INS42 INS42 INS32 INS42 INS42 INS14 INS42 INS34 INS42 INS42 INS21 INS21 INS21 INS21 INS21 MOV27 INS22 INS42 INS22 INS42 INS42 INS42 INS74 INS27 INS74 INS42 INS42 INS42 UPD42 MOV42 INS42 INS42 INS42 INS42 INS42 MOV74 INS42 INS42 INS42 INS74 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS43 INS43 INS43 INS43 INS59 INS43 INS59 INS22 INS49 INS21 INS10 INS49 INS21 INS10 MOV32 INS8 INS38 INS8 INS42 INS42 INS74 INS42 INS42 INS42 INS74 INS42 INS42 INS32 INS8 UPD42 INS32 INS8 INS42 INS42 INS42 INS74 INS43 INS59 INS8 INS12 INS42 INS42 INS34 INS43 INS42 INS42 INS7 INS7 INS37 INS32 INS32 INS52 INS42 INS52 INS42 INS43 INS43 INS32 INS32 INS43 INS43 INS43 INS43 INS40 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS32 INS32 INS42 INS42 INS32 INS42 INS32 INS42 UPD42 UPD42 MOV21 INS21 MOV21 INS32 MOV21 INS25 INS43 INS43 INS43 INS43 INS42 INS42 INS42 MOV21 INS42 INS42 INS42 MOV21 INS43 INS43 INS43 INS42 INS42 MOV60 MOV21 INS25 INS21 INS44 INS8 INS42 INS42 INS27 INS42 INS14 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS32 INS7 INS42 INS42 INS42 INS27 INS8 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS32 INS8 INS25 INS32 INS43 INS42 INS21 INS32 INS42 INS43 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS9 UPD42 INS32 INS32 INS21 MOV21 INS42 INS42 INS27 INS42 INS42 INS21 MOV21 INS18 INS32 INS8 INS42 INS42 INS42 INS32 INS42 INS42 INS34 INS42 UPD42 UPD45 INS40 UPD45 UPD42 MOV42 INS42 UPD42 MOV42 INS42 INS42 INS42 INS7 INS45 INS42 INS45 INS22 INS22 INS7 INS42 INS42 INS21 MOV21 INS18 INS42 INS42 INS42 INS14 INS42 INS9 UPD42 INS32 INS42 INS32 INS42 INS42 INS27 UPD42 UPD42 INS14 INS7 INS43 INS40 INS32 UPD45 UPD42 MOV42 UPD42 MOV42 MOV42 UPD42 MOV42 UPD42 MOV42 INS42 INS45 INS42 INS45 INS43 INS40 INS42 INS42 INS27 UPD42 UPD42 INS14 INS42 INS42 INS42 INS42 INS45 INS42 INS45 INS43 INS40 INS42 INS42 DEL42 DEL42 DEL42 DEL45 DEL42 DEL32 DEL32 DEL45 DEL8 DEL60 DEL42 DEL8 DEL32 DEL8 DEL25 DEL25 DEL8 DEL44 DEL42 DEL42 DEL42 DEL32 DEL21 DEL8 DEL12 DEL54 DEL8 DEL70 DEL42 DEL42 DEL27 DEL41 DEL8 DEL31 DEL9 DEL8 DEL25 DEL9 DEL41 DEL9 DEL8 DEL25 DEL9 DEL41

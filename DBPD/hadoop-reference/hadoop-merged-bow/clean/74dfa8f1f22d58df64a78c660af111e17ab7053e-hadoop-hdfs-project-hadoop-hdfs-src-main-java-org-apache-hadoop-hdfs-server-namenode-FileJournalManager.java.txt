@@ -1,0 +1,203 @@
+HDFS-2982. Startup performance suffers when there are many edit log segments. Contributed by Colin Patrick McCabe.
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/trunk@1342042 13f79535-47bb-0310-9956-ffa450edef68
+
++import java.util.Collection;
+-
++  
+-  synchronized public EditLogInputStream getInputStream(long fromTxId,
+-      boolean inProgressOk) throws IOException {
+-    for (EditLogFile elf : getLogFiles(fromTxId)) {
+-      if (elf.containsTxId(fromTxId)) {
+-        if (!inProgressOk && elf.isInProgress()) {
++  synchronized public void selectInputStreams(
++      Collection<EditLogInputStream> streams, long fromTxId,
++      boolean inProgressOk) {
++    List<EditLogFile> elfs;
++    try {
++      elfs = matchEditLogs(sd.getCurrentDir());
++    } catch (IOException e) {
++      LOG.error("error listing files in " + this + ". " +
++          "Skipping all edit logs in this directory.", e);
++      return;
++    }
++    LOG.debug(this + ": selecting input streams starting at " + fromTxId + 
++        (inProgressOk ? " (inProgress ok) " : " (excluding inProgress) ") +
++        "from among " + elfs.size() + " candidate file(s)");
++    for (EditLogFile elf : elfs) {
++      if (elf.lastTxId < fromTxId) {
++        LOG.debug("passing over " + elf + " because it ends at " +
++            elf.lastTxId + ", but we only care about transactions " +
++            "as new as " + fromTxId);
++        continue;
++      }
++      if (elf.isInProgress()) {
++        if (!inProgressOk) {
++          LOG.debug("passing over " + elf + " because it is in progress " +
++              "and we are ignoring in-progress logs.");
+-        if (elf.isInProgress()) {
++        try {
++        } catch (IOException e) {
++          LOG.error("got IOException while trying to validate header of " +
++              elf + ".  Skipping.", e);
++          continue;
+-        if (LOG.isTraceEnabled()) {
+-          LOG.trace("Returning edit stream reading from " + elf);
+-        }
+-        EditLogFileInputStream elfis = new EditLogFileInputStream(elf.getFile(),
++      }
++      EditLogFileInputStream elfis = new EditLogFileInputStream(elf.getFile(),
+-        long transactionsToSkip = fromTxId - elf.getFirstTxId();
+-        if (transactionsToSkip > 0) {
+-          LOG.info(String.format("Log begins at txid %d, but requested start "
+-              + "txid is %d. Skipping %d edits.", elf.getFirstTxId(), fromTxId,
+-              transactionsToSkip));
+-        }
+-        if (elfis.skipUntil(fromTxId) == false) {
+-          throw new IOException("failed to advance input stream to txid " +
+-              fromTxId);
+-        }
+-        return elfis;
+-      }
++      LOG.debug("selecting edit log stream " + elf);
++      streams.add(elfis);
+-
+-    throw new IOException("Cannot find editlog file containing " + fromTxId);
+-  }
+-
+-  @Override
+-  public long getNumberOfTransactions(long fromTxId, boolean inProgressOk)
+-      throws IOException, CorruptionException {
+-    long numTxns = 0L;
+-    
+-    for (EditLogFile elf : getLogFiles(fromTxId)) {
+-      if (LOG.isTraceEnabled()) {
+-        LOG.trace("Counting " + elf);
+-      }
+-      if (elf.getFirstTxId() > fromTxId) { // there must be a gap
+-        LOG.warn("Gap in transactions in " + sd.getRoot() + ". Gap is "
+-            + fromTxId + " - " + (elf.getFirstTxId() - 1));
+-        break;
+-      } else if (elf.containsTxId(fromTxId)) {
+-        if (!inProgressOk && elf.isInProgress()) {
+-          break;
+-        }
+-        
+-        if (elf.isInProgress()) {
+-          elf.validateLog();
+-        } 
+-
+-        if (elf.hasCorruptHeader()) {
+-          break;
+-        }
+-        numTxns += elf.getLastTxId() + 1 - fromTxId;
+-        fromTxId = elf.getLastTxId() + 1;
+-        
+-        if (elf.isInProgress()) {
+-          break;
+-        }
+-      }
+-    }
+-
+-    if (LOG.isDebugEnabled()) {
+-      LOG.debug("Journal " + this + " has " + numTxns 
+-                + " txns from " + fromTxId);
+-    }
+-
+-    long max = findMaxTransaction(inProgressOk);
+-    
+-    // fromTxId should be greater than max, as it points to the next 
+-    // transaction we should expect to find. If it is less than or equal
+-    // to max, it means that a transaction with txid == max has not been found
+-    if (numTxns == 0 && fromTxId <= max) { 
+-      String error = String.format("Gap in transactions, max txnid is %d"
+-                                   + ", 0 txns from %d", max, fromTxId);
+-      LOG.error(error);
+-      throw new CorruptionException(error);
+-    }
+-
+-    return numTxns;
+-        
++
+-        
+-        // If the file has a valid header (isn't corrupt) but contains no
+-        // transactions, we likely just crashed after opening the file and
+-        // writing the header, but before syncing any transactions. Safe to
+-        // delete the file.
+-        if (elf.getNumTransactions() == 0) {
+-          LOG.info("Deleting edit log file with zero transactions " + elf);
+-          if (!elf.getFile().delete()) {
+-            throw new IOException("Unable to delete " + elf.getFile());
+-          }
++        if (elf.getLastTxId() == HdfsConstants.INVALID_TXID) {
++          // If the file has a valid header (isn't corrupt) but contains no
++          // transactions, we likely just crashed after opening the file and
++          // writing the header, but before syncing any transactions. Safe to
++          // delete the file.
++          LOG.info("Moving aside edit log file that seems to have zero " +
++              "transactions " + elf);
++          elf.moveAsideEmptyFile();
+-        
+-  /** 
+-   * Find the maximum transaction in the journal.
+-   */
+-  private long findMaxTransaction(boolean inProgressOk)
+-      throws IOException {
+-    boolean considerSeenTxId = true;
+-    long seenTxId = NNStorage.readTransactionIdFile(sd);
+-    long maxSeenTransaction = 0;
+-    for (EditLogFile elf : getLogFiles(0)) {
+-      if (elf.isInProgress() && !inProgressOk) {
+-        if (elf.getFirstTxId() != HdfsConstants.INVALID_TXID &&
+-            elf.getFirstTxId() <= seenTxId) {
+-          // don't look at the seen_txid file if in-progress logs are not to be
+-          // examined, and the value in seen_txid falls within the in-progress
+-          // segment.
+-          considerSeenTxId = false;
+-        }
+-        continue;
+-      }
+-      
+-      if (elf.isInProgress()) {
+-        maxSeenTransaction = Math.max(elf.getFirstTxId(), maxSeenTransaction);
+-        elf.validateLog();
+-      }
+-      maxSeenTransaction = Math.max(elf.getLastTxId(), maxSeenTransaction);
+-    }
+-    if (considerSeenTxId) {
+-      return Math.max(maxSeenTransaction, seenTxId);
+-    } else {
+-      return maxSeenTransaction;
+-    }
+-  }
+-
+-    private long numTx = -1;
+-     * Count the number of valid transactions in a log.
++     * Find out where the edit log ends.
+-      this.numTx = val.getNumTransactions();
+-    
+-    long getNumTransactions() {
+-      return numTx;
+-    }
+-    
++      renameSelf(".corrupt");
++    }
++
++    void moveAsideEmptyFile() throws IOException {
++      assert lastTxId == HdfsConstants.INVALID_TXID;
++      renameSelf(".empty");
++    }
++      
++    private void renameSelf(String newSuffix) throws IOException {
+-      File dst = new File(src.getParent(), src.getName() + ".corrupt");
++      File dst = new File(src.getParent(), src.getName() + newSuffix);
+-          "Couldn't rename corrupt log " + src + " to " + dst);
++          "Couldn't rename log " + src + " to " + dst);
+-    
++
+-                           +"inProgress=%b,hasCorruptHeader=%b,numTx=%d)",
++                           +"inProgress=%b,hasCorruptHeader=%b)",
+-                           isInProgress(), hasCorruptHeader, numTx);
++                           isInProgress(), hasCorruptHeader);
+
+INS26 INS40 INS31 MOV31 MOV78 MOV83 MOV83 INS39 UPD42 MOV42 INS44 MOV44 MOV44 INS8 INS31 INS74 INS42 INS60 INS54 MOV21 INS70 INS39 INS42 MOV43 INS8 UPD39 UPD42 MOV43 INS83 UPD42 INS44 INS43 MOV43 INS74 MOV59 INS8 INS12 MOV44 INS42 INS8 MOV6 INS21 INS6 INS21 MOV43 INS42 UPD42 MOV42 INS43 INS43 INS42 MOV21 INS44 INS8 UPD42 INS25 INS25 MOV60 MOV21 MOV21 UPD66 INS32 INS27 INS32 INS42 INS42 INS7 MOV43 UPD42 MOV42 MOV21 INS41 INS52 UPD45 INS42 INS36 UPD45 MOV32 INS45 INS27 MOV8 MOV32 INS8 INS32 INS32 INS42 INS45 INS42 INS40 INS42 INS45 INS42 INS32 INS16 UPD42 UPD42 INS40 MOV42 INS18 MOV25 INS54 UPD42 MOV42 UPD42 MOV42 INS27 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 UPD45 UPD42 MOV42 MOV32 UPD42 INS42 INS42 INS45 INS45 MOV38 MOV8 INS12 INS45 INS42 UPD27 MOV27 INS42 UPD42 UPD42 INS45 INS52 UPD45 INS45 INS21 INS18 INS44 INS8 INS40 INS21 UPD45 UPD45 INS42 UPD45 INS40 INS45 UPD45 INS32 MOV43 UPD42 MOV42 INS21 MOV18 INS32 UPD42 MOV42 UPD42 MOV42 MOV27 INS32 MOV42 UPD42 MOV42 INS45 INS42 UPD45 UPD45 UPD42 MOV42 UPD42 MOV42 INS27 INS42 INS45 UPD45 INS45 INS42 INS45 DEL42 DEL42 DEL42 DEL42 DEL32 DEL27 DEL42 DEL42 DEL42 DEL45 DEL45 DEL27 DEL42 DEL42 DEL32 DEL32 DEL42 DEL42 DEL42 DEL32 DEL45 DEL42 DEL34 DEL27 DEL36 DEL52 DEL42 DEL42 DEL34 DEL27 DEL42 DEL42 DEL27 DEL27 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL42 DEL42 DEL32 DEL21 DEL42 DEL43 DEL42 DEL14 DEL53 DEL42 DEL42 DEL42 DEL32 DEL42 DEL32 DEL7 DEL42 DEL42 DEL32 DEL42 DEL32 DEL7 DEL43 DEL42 DEL42 DEL32 DEL42 DEL42 DEL42 DEL32 DEL42 DEL42 DEL32 DEL27 DEL18 DEL8 DEL25 DEL25 DEL42 DEL42 DEL32 DEL42 DEL42 DEL45 DEL42 DEL27 DEL32 DEL21 DEL8 DEL25 DEL39 DEL60 DEL42 DEL34 DEL27 DEL8 DEL25 DEL42 DEL42 DEL42 DEL32 DEL9 DEL27 DEL45 DEL42 DEL27 DEL14 DEL53 DEL8 DEL25 DEL42 DEL41 DEL8 DEL25 DEL8 DEL70 DEL45 DEL42 DEL27 DEL14 DEL53 DEL8 DEL31 DEL42 DEL78 DEL83 DEL39 DEL42 DEL39 DEL42 DEL44 DEL39 DEL42 DEL44 DEL42 DEL43 DEL39 DEL42 DEL34 DEL59 DEL60 DEL42 DEL43 DEL44 DEL42 DEL42 DEL32 DEL42 DEL42 DEL32 DEL8 DEL25 DEL42 DEL42 DEL32 DEL42 DEL27 DEL10 DEL8 DEL42 DEL42 DEL42 DEL32 DEL42 DEL38 DEL42 DEL42 DEL32 DEL27 DEL10 DEL8 DEL25 DEL42 DEL42 DEL32 DEL42 DEL42 DEL32 DEL21 DEL8 DEL25 DEL42 DEL42 DEL32 DEL10 DEL8 DEL25 DEL42 DEL42 DEL42 DEL32 DEL34 DEL27 DEL27 DEL7 DEL21 DEL42 DEL7 DEL21 DEL42 DEL42 DEL32 DEL10 DEL8 DEL25 DEL8 DEL25 DEL25 DEL8 DEL70 DEL42 DEL42 DEL32 DEL25 DEL39 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL41 DEL8 DEL31 DEL34 DEL42 DEL42 DEL32 DEL34 DEL27 DEL32 DEL42 DEL32 DEL38 DEL42 DEL43 DEL45 DEL42 DEL42 DEL32 DEL27 DEL14 DEL53 DEL8 DEL25 DEL66 DEL65 DEL29 DEL83 DEL39 DEL42 DEL39 DEL42 DEL44 DEL39 DEL42 DEL9 DEL59 DEL60 DEL39 DEL42 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL39 DEL42 DEL34 DEL59 DEL60 DEL42 DEL43 DEL44 DEL42 DEL34 DEL32 DEL42 DEL42 DEL32 DEL42 DEL38 DEL27 DEL32 DEL40 DEL27 DEL42 DEL42 DEL32 DEL42 DEL27 DEL27 DEL42 DEL9 DEL7 DEL21 DEL8 DEL25 DEL8 DEL25 DEL42 DEL42 DEL32 DEL42 DEL42 DEL32 DEL21 DEL8 DEL25 DEL8 DEL70 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL41 DEL8 DEL42 DEL41 DEL8 DEL25 DEL8 DEL31 DEL83 DEL39 DEL42 DEL34 DEL38 DEL59 DEL23 DEL52 DEL42 DEL22 DEL42 DEL42 DEL32 DEL7 DEL21 DEL42 DEL41 DEL45 DEL42

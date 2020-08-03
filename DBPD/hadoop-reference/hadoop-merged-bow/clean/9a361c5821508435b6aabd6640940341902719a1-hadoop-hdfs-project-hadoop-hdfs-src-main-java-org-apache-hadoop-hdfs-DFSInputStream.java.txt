@@ -1,0 +1,149 @@
+HDFS-5191. Revisit zero-copy API in FSDataInputStream to make it more intuitive (Contributed by Colin Patrick McCabe)
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/branches/HDFS-4949@1526020 13f79535-47bb-0310-9956-ffa450edef68
+
++import java.util.EnumSet;
++import org.apache.hadoop.fs.ByteBufferUtil;
++import org.apache.hadoop.fs.HasEnhancedByteBufferAccess;
++import org.apache.hadoop.fs.ReadOption;
+-import org.apache.hadoop.fs.ZeroCopyCursor;
++import org.apache.hadoop.hdfs.client.ClientMmap;
++import org.apache.hadoop.io.ByteBufferPool;
++import org.apache.hadoop.util.IdentityHashStore;
+-implements ByteBufferReadable, CanSetDropBehind, CanSetReadahead {
++implements ByteBufferReadable, CanSetDropBehind, CanSetReadahead,
++    HasEnhancedByteBufferAccess {
++  /**
++   * Track the ByteBuffers that we have handed out to readers.
++   * 
++   * The value type can be either ByteBufferPool or ClientMmap, depending on
++   * whether we this is a memory-mapped buffer or not.
++   */
++  private final IdentityHashStore<ByteBuffer, Object>
++      extendedReadBuffers = new IdentityHashStore<ByteBuffer, Object>(0);
++
++    if (!extendedReadBuffers.isEmpty()) {
++      final StringBuilder builder = new StringBuilder();
++      extendedReadBuffers.visitAll(new IdentityHashStore.Visitor<ByteBuffer, Object>() {
++        private String prefix = "";
++        @Override
++        public void accept(ByteBuffer k, Object v) {
++          builder.append(prefix).append(k);
++          prefix = ", ";
++        }
++      });
++      DFSClient.LOG.warn("closing file " + src + ", but there are still " +
++          "unreleased ByteBuffers allocated by read().  " +
++          "Please release " + builder.toString() + ".");
++    }
+-  synchronized void readZeroCopy(HdfsZeroCopyCursor zcursor, int toRead)
+-      throws IOException {
+-    assert(toRead > 0);
++  @Override
++  public synchronized ByteBuffer read(ByteBufferPool bufferPool,
++      int maxLength, EnumSet<ReadOption> opts) 
++          throws IOException, UnsupportedOperationException {
++    assert(maxLength > 0);
++    boolean canSkipChecksums = opts.contains(ReadOption.SKIP_CHECKSUMS);
++    if (canSkipChecksums) {
++      ByteBuffer buffer = tryReadZeroCopy(maxLength);
++      if (buffer != null) {
++        return buffer;
++      }
++    }
++    ByteBuffer buffer = ByteBufferUtil.
++        fallbackRead(this, bufferPool, maxLength);
++    if (buffer != null) {
++      extendedReadBuffers.put(buffer, bufferPool);
++    }
++    return buffer;
++  }
++
++  private synchronized ByteBuffer tryReadZeroCopy(int maxLength)
++      throws IOException {
++    // Java ByteBuffers can't be longer than 2 GB, because they use
++    // 4-byte signed integers to represent capacity, etc.
++    // So we can't mmap the parts of the block higher than the 2 GB offset.
++    // FIXME: we could work around this with multiple memory maps.
++    // See HDFS-5101.
++    long blockEnd32 = Math.min(Integer.MAX_VALUE, blockEnd);
+-    boolean canSkipChecksums = zcursor.getSkipChecksums();
+-    long blockLeft = blockEnd - curPos + 1;
+-    if (zcursor.getAllowShortReads()) {
+-      if (blockLeft < toRead) {
+-        toRead = (int)blockLeft;
++    long blockLeft = blockEnd32 - curPos + 1;
++    if (blockLeft <= 0) {
++      if (DFSClient.LOG.isDebugEnabled()) {
++        DFSClient.LOG.debug("unable to perform a zero-copy read from offset " +
++          curPos + " of " + src + "; blockLeft = " + blockLeft +
++          "; blockEnd32 = " + blockEnd32 + ", blockEnd = " + blockEnd +
++          "; maxLength = " + maxLength);
++      return null;
+-    if (canSkipChecksums && (toRead <= blockLeft)) {
+-      long blockStartInFile = currentLocatedBlock.getStartOffset();
+-      long blockPos = curPos - blockStartInFile;
+-      if (blockReader.readZeroCopy(zcursor,
+-            currentLocatedBlock, blockPos, toRead,
+-            dfsClient.getMmapManager())) {
+-        if (DFSClient.LOG.isDebugEnabled()) {
+-          DFSClient.LOG.debug("readZeroCopy read " + toRead + " bytes from " +
+-              "offset " + curPos + " via the zero-copy read path.  " +
+-              "blockEnd = " + blockEnd);
+-        }
+-        readStatistics.addZeroCopyBytes(toRead);
+-        seek(pos + toRead);
+-        return;
++    int length = Math.min((int)blockLeft, maxLength);
++    long blockStartInFile = currentLocatedBlock.getStartOffset();
++    long blockPos = curPos - blockStartInFile;
++    long limit = blockPos + length;
++    ClientMmap clientMmap =
++        blockReader.getClientMmap(currentLocatedBlock,
++            dfsClient.getMmapManager());
++    if (clientMmap == null) {
++      if (DFSClient.LOG.isDebugEnabled()) {
++        DFSClient.LOG.debug("unable to perform a zero-copy read from offset " +
++          curPos + " of " + src + "; BlockReader#getClientMmap returned " +
++          "null.");
++      return null;
+-    /*
+-     * Slow path reads.
+-     *
+-     * readStatistics will be updated when we call back into this
+-     * stream's read methods.
+-     */
+-    long prevBlockEnd = blockEnd;
+-    int slowReadAmount = zcursor.readViaSlowPath(toRead);
++    seek(pos + length);
++    ByteBuffer buffer = clientMmap.getMappedByteBuffer().asReadOnlyBuffer();
++    buffer.position((int)blockPos);
++    buffer.limit((int)limit);
++    clientMmap.ref();
++    extendedReadBuffers.put(buffer, clientMmap);
++    readStatistics.addZeroCopyBytes(length);
+-      DFSClient.LOG.debug("readZeroCopy read " + slowReadAmount + " bytes " +
+-          "from offset " + curPos + " via the fallback read path.  " +
+-          "prevBlockEnd = " + prevBlockEnd + ", blockEnd = " + blockEnd +
+-          ", canSkipChecksums = " + canSkipChecksums);
++      DFSClient.LOG.debug("readZeroCopy read " + maxLength + " bytes from " +
++          "offset " + curPos + " via the zero-copy read path.  " +
++          "blockEnd = " + blockEnd);
++    return buffer;
+-  public ZeroCopyCursor createZeroCopyCursor() 
+-      throws IOException, UnsupportedOperationException {
+-    return new HdfsZeroCopyCursor(this,
+-        dfsClient.getConf().skipShortCircuitChecksums);
++  public synchronized void releaseBuffer(ByteBuffer buffer) {
++    Object val = extendedReadBuffers.remove(buffer);
++    if (val == null) {
++      throw new IllegalArgumentException("tried to release a buffer " +
++          "that was not created by this stream, " + buffer);
++    }
++    if (val instanceof ClientMmap) {
++      ((ClientMmap)val).unref();
++    } else if (val instanceof ByteBufferPool) {
++      ((ByteBufferPool)val).putBuffer(buffer);
++    }
+
+MOV26 INS26 INS26 INS26 INS26 INS26 INS26 INS40 INS40 INS40 UPD40 INS40 INS40 INS40 INS43 INS23 INS31 INS31 INS42 INS29 INS83 INS83 INS74 INS59 INS8 MOV78 INS83 MOV83 INS43 UPD42 MOV42 MOV44 MOV44 INS44 MOV43 MOV43 INS8 INS83 INS83 INS43 INS42 INS44 MOV43 INS8 INS78 INS83 INS39 INS42 INS44 INS65 INS43 INS43 INS43 INS42 INS14 MOV25 MOV21 INS25 MOV25 MOV21 MOV21 MOV21 INS42 UPD43 UPD42 UPD42 INS74 INS42 MOV6 MOV25 MOV60 INS25 INS60 INS25 INS41 INS42 INS39 INS42 INS60 MOV60 MOV60 MOV25 INS60 MOV60 MOV60 INS60 INS60 INS25 MOV21 MOV60 INS21 INS21 INS21 INS21 INS21 MOV25 INS41 INS42 INS43 INS42 INS60 INS25 INS25 INS66 INS66 INS66 INS42 INS42 INS42 INS74 INS34 INS38 INS8 UPD42 INS43 INS43 INS42 INS8 INS43 INS59 INS27 INS8 INS42 INS39 INS59 INS27 INS39 INS59 INS39 INS59 INS43 INS59 INS27 INS8 INS43 INS32 INS32 INS32 INS32 INS32 INS32 INS42 UPD42 MOV42 INS43 INS59 INS27 INS8 INS62 INS8 INS25 INS43 INS43 INS43 INS32 INS60 INS21 INS21 INS42 INS42 INS60 INS25 INS42 INS42 INS32 INS42 INS33 INS21 INS42 INS32 INS42 INS34 INS41 INS42 INS32 INS42 INS27 INS42 INS42 INS32 INS42 INS33 MOV25 INS41 INS42 UPD42 INS32 INS42 INS42 INS11 UPD42 MOV42 UPD42 MOV42 INS11 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS40 INS42 UPD42 MOV42 INS42 INS32 INS42 INS33 INS53 INS42 INS43 INS21 INS62 INS8 INS42 INS42 INS42 INS42 INS42 INS83 INS43 INS59 INS32 INS32 UPD42 UPD42 UPD42 INS40 INS43 INS59 INS27 INS8 INS42 INS42 INS52 INS42 INS42 INS32 INS42 INS42 INS40 INS42 MOV32 INS8 INS33 INS42 INS42 MOV11 INS42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 MOV32 INS33 UPD42 INS32 INS42 INS39 INS42 INS39 INS42 INS42 INS42 INS42 INS14 INS42 INS32 INS42 INS43 INS21 INS42 INS42 INS14 INS42 INS42 INS14 INS40 INS42 INS27 INS42 INS42 INS32 INS42 INS33 INS41 INS42 INS42 INS42 INS42 UPD42 INS21 INS42 INS42 INS43 INS27 INS36 UPD42 MOV42 INS42 INS32 INS43 INS74 INS1 INS45 INS42 INS45 INS45 INS45 INS32 INS45 INS42 INS42 INS42 INS32 UPD42 UPD45 UPD45 UPD45 UPD45 INS42 INS45 INS45 INS42 INS11 INS36 INS42 INS42 INS42 INS43 INS43 INS43 INS23 INS31 INS42 INS42 INS40 INS42 INS27 INS43 INS42 INS11 INS40 INS42 INS42 INS83 INS43 INS59 INS78 INS83 INS39 INS42 INS44 INS44 MOV8 INS45 INS42 INS45 INS42 INS45 MOV42 INS45 INS42 INS45 UPD42 MOV42 INS45 INS42 UPD45 UPD42 UPD45 UPD42 UPD45 UPD45 INS42 INS43 INS42 INS42 INS42 INS45 INS42 INS43 INS42 INS43 INS42 INS21 INS21 INS42 INS42 INS42 INS32 INS7 INS32 INS42 INS42 INS42 INS45 INS42 INS42 INS42 DEL42 DEL42 DEL32 DEL27 DEL42 DEL7 DEL21 DEL8 DEL45 DEL42 DEL39 DEL42 DEL45 DEL42 DEL45 DEL42 DEL39 DEL42 DEL27 DEL36 DEL27 DEL42 DEL42 DEL42 DEL32 DEL42 DEL42 DEL42 DEL32 DEL21 DEL41 DEL8 DEL25 DEL8 DEL25 DEL39 DEL42 DEL42 DEL32 DEL59 DEL60 DEL8 DEL31 DEL43 DEL42 DEL43 DEL52 DEL42 DEL32 DEL42 DEL22 DEL14 DEL41

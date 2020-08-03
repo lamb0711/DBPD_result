@@ -1,0 +1,374 @@
+Revert "HDFS-8938. Extract BlockToMarkCorrupt and ReplicationWork as standalone classes from BlockManager. Contributed by Mingliang Liu."
+
+This reverts commit 4e9307f26dd41270f95fb50166e1a091852e4d58.
+
+-    if (b.getCorrupted().isDeleted()) {
++    if (b.corrupted.isDeleted()) {
+-      addToInvalidates(b.getCorrupted(), node);
++      addToInvalidates(b.corrupted, node);
+-    short expectedReplicas = b.getCorrupted().getReplication();
++    short expectedReplicas = b.corrupted.getReplication();
+-      storageInfo.addBlock(b.getStored());
++      storageInfo.addBlock(b.stored);
+-    corruptReplicas.addToCorruptReplicasMap(b.getCorrupted(), node,
+-        b.getReason(), b.getReasonCode());
++    corruptReplicas.addToCorruptReplicasMap(b.corrupted, node, b.reason,
++        b.reasonCode);
+-    NumberReplicas numberOfReplicas = countNodes(b.getStored());
++    NumberReplicas numberOfReplicas = countNodes(b.stored);
+-        b.isCorruptedDuringWrite();
++        (b.stored.getGenerationStamp() > b.corrupted.getGenerationStamp());
+-      updateNeededReplications(b.getStored(), -1, 0);
++      updateNeededReplications(b.stored, -1, 0);
+-    NumberReplicas nr = countNodes(b.getStored());
++    NumberReplicas nr = countNodes(b.stored);
+-      postponeBlock(b.getCorrupted());
++      postponeBlock(b.corrupted);
+-      addToInvalidates(b.getCorrupted(), dn);
+-      removeStoredBlock(b.getStored(), node);
++      addToInvalidates(b.corrupted, dn);
++      removeStoredBlock(b.stored, node);
++    int requiredReplication, numEffectiveReplicas;
++    List<DatanodeDescriptor> containingNodes;
++    DatanodeDescriptor srcNode;
++    BlockCollection bc = null;
++    int additionalReplRequired;
++
+-    final List<ReplicationWork> work = new LinkedList<>();
++    List<ReplicationWork> work = new LinkedList<ReplicationWork>();
+-            ReplicationWork rw = scheduleReplication(block, priority);
+-            if (rw != null) {
+-              work.add(rw);
++            // block should belong to a file
++            bc = getBlockCollection(block);
++            // abandoned block or block reopened for append
++            if (bc == null
++                || (bc.isUnderConstruction() && block.equals(bc.getLastBlock()))) {
++              // remove from neededReplications
++              neededReplications.remove(block, priority);
++              continue;
++
++            requiredReplication = getExpectedReplicaNum(block);
++
++            // get a source data-node
++            containingNodes = new ArrayList<DatanodeDescriptor>();
++            List<DatanodeStorageInfo> liveReplicaNodes = new ArrayList<DatanodeStorageInfo>();
++            NumberReplicas numReplicas = new NumberReplicas();
++            srcNode = chooseSourceDatanode(
++                block, containingNodes, liveReplicaNodes, numReplicas,
++                priority);
++            if(srcNode == null) { // block can not be replicated from any node
++              LOG.debug("Block " + block + " cannot be repl from any node");
++              continue;
++            }
++
++            // liveReplicaNodes can include READ_ONLY_SHARED replicas which are 
++            // not included in the numReplicas.liveReplicas() count
++            assert liveReplicaNodes.size() >= numReplicas.liveReplicas();
++
++            // do not schedule more if enough replicas is already pending
++            numEffectiveReplicas = numReplicas.liveReplicas() +
++                                    pendingReplications.getNumReplicas(block);
++      
++            if (numEffectiveReplicas >= requiredReplication) {
++              if ( (pendingReplications.getNumReplicas(block) > 0) ||
++                   (blockHasEnoughRacks(block)) ) {
++                neededReplications.remove(block, priority); // remove from neededReplications
++                blockLog.debug("BLOCK* Removing {} from neededReplications as" +
++                        " it has enough replicas", block);
++                continue;
++              }
++            }
++
++            if (numReplicas.liveReplicas() < requiredReplication) {
++              additionalReplRequired = requiredReplication
++                  - numEffectiveReplicas;
++            } else {
++              additionalReplRequired = 1; // Needed on a new rack
++            }
++            work.add(new ReplicationWork(block, bc, srcNode,
++                containingNodes, liveReplicaNodes, additionalReplRequired,
++                priority));
+-    final Set<Node> excludedNodes = new HashSet<>();
++    final Set<Node> excludedNodes = new HashSet<Node>();
+-      for (DatanodeDescriptor dn : rw.getContainingNodes()) {
++      for (DatanodeDescriptor dn : rw.containingNodes) {
+-        final DatanodeStorageInfo[] targets = rw.getTargets();
++        final DatanodeStorageInfo[] targets = rw.targets;
+-          rw.resetTargets();
++          rw.targets = null;
+-          if (validateReplicationWork(rw)) {
+-            scheduledWork++;
++          BlockInfo block = rw.block;
++          int priority = rw.priority;
++          // Recheck since global lock was released
++          // block should belong to a file
++          bc = getBlockCollection(block);
++          // abandoned block or block reopened for append
++          if(bc == null || (bc.isUnderConstruction() && block.equals(bc.getLastBlock()))) {
++            neededReplications.remove(block, priority); // remove from neededReplications
++            rw.targets = null;
++            continue;
++          }
++          requiredReplication = getExpectedReplicaNum(block);
++
++          // do not schedule more if enough replicas is already pending
++          NumberReplicas numReplicas = countNodes(block);
++          numEffectiveReplicas = numReplicas.liveReplicas() +
++            pendingReplications.getNumReplicas(block);
++
++          if (numEffectiveReplicas >= requiredReplication) {
++            if ( (pendingReplications.getNumReplicas(block) > 0) ||
++                 (blockHasEnoughRacks(block)) ) {
++              neededReplications.remove(block, priority); // remove from neededReplications
++              rw.targets = null;
++              blockLog.debug("BLOCK* Removing {} from neededReplications as" +
++                      " it has enough replicas", block);
++              continue;
++            }
++          }
++
++          if ( (numReplicas.liveReplicas() >= requiredReplication) &&
++               (!blockHasEnoughRacks(block)) ) {
++            if (rw.srcNode.getNetworkLocation().equals(
++                targets[0].getDatanodeDescriptor().getNetworkLocation())) {
++              //No use continuing, unless a new rack in this case
++              continue;
++            }
++          }
++
++          // Add block to the to be replicated list
++          rw.srcNode.addBlockToBeReplicated(block, targets);
++          scheduledWork++;
++          DatanodeStorageInfo.incrementBlocksScheduled(targets);
++
++          // Move the block-replication into a "pending" state.
++          // The reason we use 'pending' is so we can retry
++          // replications that fail after an appropriate amount of time.
++          pendingReplications.increment(block,
++              DatanodeStorageInfo.toDatanodeDescriptors(targets));
++          blockLog.debug("BLOCK* block {} is moved from neededReplications to "
++                  + "pendingReplications", block);
++
++          // remove from neededReplications
++          if(numEffectiveReplicas + targets.length >= requiredReplication) {
++            neededReplications.remove(block, priority); // remove from neededReplications
+-        DatanodeStorageInfo[] targets = rw.getTargets();
++        DatanodeStorageInfo[] targets = rw.targets;
+-          for (DatanodeStorageInfo target : targets) {
++          for (int k = 0; k < targets.length; k++) {
+-            targetList.append(target.getDatanodeDescriptor());
++            targetList.append(targets[k].getDatanodeDescriptor());
+-          blockLog.debug("BLOCK* ask {} to replicate {} to {}", rw.getSrcNode(),
+-              rw.getBlock(), targetList);
++          blockLog.debug("BLOCK* ask {} to replicate {} to {}", rw.srcNode,
++              rw.block, targetList);
+-  boolean hasEnoughEffectiveReplicas(BlockInfo block,
+-      NumberReplicas numReplicas, int pendingReplicaNum, int required) {
+-    int numEffectiveReplicas = numReplicas.liveReplicas() + pendingReplicaNum;
+-    return (numEffectiveReplicas >= required) &&
+-        (pendingReplicaNum > 0 || blockHasEnoughRacks(block));
+-  }
+-
+-  private ReplicationWork scheduleReplication(BlockInfo block, int priority) {
+-    // block should belong to a file
+-    BlockCollection bc = getBlockCollection(block);
+-    // abandoned block or block reopened for append
+-    if (bc == null
+-        || (bc.isUnderConstruction() && block.equals(bc.getLastBlock()))) {
+-      // remove from neededReplications
+-      neededReplications.remove(block, priority);
+-      return null;
+-    }
+-
+-    short requiredReplication = getExpectedReplicaNum(block);
+-
+-    // get a source data-node
+-    List<DatanodeDescriptor> containingNodes = new ArrayList<>();
+-    List<DatanodeStorageInfo> liveReplicaNodes = new ArrayList<>();
+-    NumberReplicas numReplicas = new NumberReplicas();
+-    DatanodeDescriptor srcNode = chooseSourceDatanode(block, containingNodes,
+-        liveReplicaNodes, numReplicas, priority);
+-    if (srcNode == null) { // block can not be replicated from any node
+-      LOG.debug("Block " + block + " cannot be repl from any node");
+-      return null;
+-    }
+-
+-    // liveReplicaNodes can include READ_ONLY_SHARED replicas which are
+-    // not included in the numReplicas.liveReplicas() count
+-    assert liveReplicaNodes.size() >= numReplicas.liveReplicas();
+-
+-    int pendingNum = pendingReplications.getNumReplicas(block);
+-    if (hasEnoughEffectiveReplicas(block, numReplicas, pendingNum,
+-        requiredReplication)) {
+-      neededReplications.remove(block, priority);
+-      blockLog.debug("BLOCK* Removing {} from neededReplications as" +
+-          " it has enough replicas", block);
+-      return null;
+-    }
+-
+-    final int additionalReplRequired;
+-    if (numReplicas.liveReplicas() < requiredReplication) {
+-      additionalReplRequired = requiredReplication - numReplicas.liveReplicas()
+-          - pendingNum;
+-    } else {
+-      additionalReplRequired = 1; // Needed on a new rack
+-    }
+-    return new ReplicationWork(block, bc, srcNode, containingNodes,
+-        liveReplicaNodes, additionalReplRequired, priority);
+-  }
+-
+-  private boolean validateReplicationWork(ReplicationWork rw) {
+-    BlockInfo block = rw.getBlock();
+-    int priority = rw.getPriority();
+-    // Recheck since global lock was released
+-    // block should belong to a file
+-    BlockCollection bc = getBlockCollection(block);
+-    // abandoned block or block reopened for append
+-    if(bc == null
+-        || (bc.isUnderConstruction() && block.equals(bc.getLastBlock()))) {
+-      neededReplications.remove(block, priority);
+-      rw.resetTargets();
+-      return false;
+-    }
+-
+-    // do not schedule more if enough replicas is already pending
+-    final short requiredReplication = getExpectedReplicaNum(block);
+-    NumberReplicas numReplicas = countNodes(block);
+-    final int pendingNum = pendingReplications.getNumReplicas(block);
+-    if (hasEnoughEffectiveReplicas(block, numReplicas, pendingNum,
+-        requiredReplication)) {
+-      neededReplications.remove(block, priority);
+-      rw.resetTargets();
+-      blockLog.debug("BLOCK* Removing {} from neededReplications as" +
+-          " it has enough replicas", block);
+-      return false;
+-    }
+-
+-    DatanodeStorageInfo[] targets = rw.getTargets();
+-    if ( (numReplicas.liveReplicas() >= requiredReplication) &&
+-        (!blockHasEnoughRacks(block)) ) {
+-      if (rw.getSrcNode().getNetworkLocation().equals(
+-          targets[0].getDatanodeDescriptor().getNetworkLocation())) {
+-        //No use continuing, unless a new rack in this case
+-        return false;
+-      }
+-    }
+-
+-    // Add block to the to be replicated list
+-    rw.getSrcNode().addBlockToBeReplicated(block, targets);
+-    DatanodeStorageInfo.incrementBlocksScheduled(targets);
+-
+-    // Move the block-replication into a "pending" state.
+-    // The reason we use 'pending' is so we can retry
+-    // replications that fail after an appropriate amount of time.
+-    pendingReplications.increment(block,
+-        DatanodeStorageInfo.toDatanodeDescriptors(targets));
+-    blockLog.debug("BLOCK* block {} is moved from neededReplications to "
+-        + "pendingReplications", block);
+-
+-    int numEffectiveReplicas = numReplicas.liveReplicas() + pendingNum;
+-    // remove from neededReplications
+-    if(numEffectiveReplicas + targets.length >= requiredReplication) {
+-      neededReplications.remove(block, priority);
+-    }
+-    return true;
+-  }
+-
++  
++  /**
++   * BlockToMarkCorrupt is used to build the "toCorrupt" list, which is a
++   * list of blocks that should be considered corrupt due to a block report.
++   */
++  private static class BlockToMarkCorrupt {
++    /** The corrupted block in a datanode. */
++    final BlockInfo corrupted;
++    /** The corresponding block stored in the BlockManager. */
++    final BlockInfo stored;
++    /** The reason to mark corrupt. */
++    final String reason;
++    /** The reason code to be stored */
++    final Reason reasonCode;
++
++    BlockToMarkCorrupt(BlockInfo corrupted,
++        BlockInfo stored, String reason,
++        Reason reasonCode) {
++      Preconditions.checkNotNull(corrupted, "corrupted is null");
++      Preconditions.checkNotNull(stored, "stored is null");
++
++      this.corrupted = corrupted;
++      this.stored = stored;
++      this.reason = reason;
++      this.reasonCode = reasonCode;
++    }
++
++    BlockToMarkCorrupt(BlockInfo stored, String reason,
++        Reason reasonCode) {
++      this(stored, stored, reason, reasonCode);
++    }
++
++    BlockToMarkCorrupt(BlockInfo stored, long gs, String reason,
++        Reason reasonCode) {
++      this(new BlockInfoContiguous((BlockInfoContiguous)stored), stored,
++          reason, reasonCode);
++      //the corrupted block in datanode has a different generation stamp
++      corrupted.setGenerationStamp(gs);
++    }
++
++    @Override
++    public String toString() {
++      return corrupted + "("
++          + (corrupted == stored? "same as stored": "stored=" + stored) + ")";
++    }
++  }
++  private static class ReplicationWork {
++
++    private final BlockInfo block;
++    private final BlockCollection bc;
++
++    private final DatanodeDescriptor srcNode;
++    private final List<DatanodeDescriptor> containingNodes;
++    private final List<DatanodeStorageInfo> liveReplicaStorages;
++    private final int additionalReplRequired;
++
++    private DatanodeStorageInfo targets[];
++    private final int priority;
++
++    public ReplicationWork(BlockInfo block,
++        BlockCollection bc,
++        DatanodeDescriptor srcNode,
++        List<DatanodeDescriptor> containingNodes,
++        List<DatanodeStorageInfo> liveReplicaStorages,
++        int additionalReplRequired,
++        int priority) {
++      this.block = block;
++      this.bc = bc;
++      this.srcNode = srcNode;
++      this.srcNode.incrementPendingReplicationWithoutTargets();
++      this.containingNodes = containingNodes;
++      this.liveReplicaStorages = liveReplicaStorages;
++      this.additionalReplRequired = additionalReplRequired;
++      this.priority = priority;
++      this.targets = null;
++    }
++    
++    private void chooseTargets(BlockPlacementPolicy blockplacement,
++        BlockStoragePolicySuite storagePolicySuite,
++        Set<Node> excludedNodes) {
++      try {
++        targets = blockplacement.chooseTarget(bc.getName(),
++            additionalReplRequired, srcNode, liveReplicaStorages, false,
++            excludedNodes, block.getNumBytes(),
++            storagePolicySuite.getPolicy(bc.getStoragePolicyID()));
++      } finally {
++        srcNode.decrementPendingReplicationWithoutTargets();
++      }
++    }
++  }
++
+-    /** The block is under construction, so should be ignored. */
++    /** The block is under construction, so should be ignored */
+-    /** The block is properly replicated. */
++    /** The block is properly replicated */
+
+INS55 INS55 MOV21 MOV21 INS29 INS83 INS83 INS42 INS23 INS23 INS23 INS23 MOV31 MOV31 INS31 INS31 INS83 INS83 INS42 INS23 INS23 INS23 INS23 INS23 INS23 INS23 INS23 INS31 INS31 INS60 MOV60 MOV60 INS60 INS60 INS54 INS65 INS29 INS83 INS43 INS59 INS29 INS83 INS43 INS59 INS29 INS83 INS43 INS59 INS29 INS83 INS43 INS59 UPD42 INS44 INS42 INS44 INS44 INS44 INS8 INS42 INS44 INS44 INS44 INS44 INS8 INS78 INS83 INS43 INS42 INS8 INS83 INS83 INS43 INS59 INS83 INS83 INS43 INS59 INS83 INS83 INS43 INS59 INS83 INS83 INS74 INS59 INS83 INS83 INS74 INS59 INS83 INS83 INS39 MOV59 INS83 MOV43 INS59 INS83 INS83 INS39 INS59 INS83 INS42 MOV44 INS44 INS44 INS44 INS44 INS44 MOV44 INS8 INS83 INS39 INS42 INS44 INS44 INS44 INS8 INS39 INS59 INS59 INS59 MOV43 MOV43 INS59 INS39 INS59 INS8 MOV8 INS66 INS66 INS65 INS42 INS42 INS65 INS42 INS42 INS65 INS42 INS42 INS65 INS42 INS42 UPD43 UPD42 INS43 INS42 INS43 INS42 INS43 UPD42 INS21 INS21 INS21 INS21 INS21 INS21 INS43 INS42 INS43 INS42 INS43 INS42 INS17 INS43 INS42 INS39 INS42 INS43 INS42 INS43 INS42 INS17 INS21 INS42 INS42 INS41 INS42 INS42 INS42 INS42 INS42 INS42 INS43 INS43 INS42 INS43 INS43 INS42 INS42 INS85 UPD42 MOV42 MOV43 INS42 INS43 INS42 INS74 INS42 INS74 INS42 INS39 INS42 INS21 INS21 INS21 MOV21 INS21 INS21 INS21 INS21 INS21 INS43 INS42 INS43 INS42 INS74 INS42 INS54 INS40 INS40 INS40 INS40 INS42 INS42 INS42 INS42 INS42 INS33 INS42 INS51 INS66 INS66 INS66 INS66 UPD42 INS42 INS42 INS42 INS32 INS32 INS7 INS7 INS7 INS7 INS42 INS42 UPD42 MOV42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS14 INS42 INS42 INS42 INS32 INS27 INS42 INS42 INS42 INS42 INS42 INS43 INS43 INS43 INS43 INS7 INS7 INS7 INS7 INS7 INS7 INS7 INS7 INS42 INS42 INS43 INS43 INS8 INS8 UPD66 UPD66 INS40 INS40 INS36 INS40 UPD74 INS42 INS8 UPD74 INS40 MOV44 INS8 INS42 INS42 INS42 INS45 INS42 INS42 INS42 INS45 INS22 INS42 INS22 INS42 INS22 INS42 INS22 INS42 INS43 INS11 UPD42 MOV42 INS42 UPD42 MOV42 INS42 INS45 INS36 INS45 INS42 INS42 INS42 INS42 INS22 INS42 INS22 INS42 INS22 INS42 INS22 UPD42 INS22 INS42 INS22 INS42 INS22 INS42 INS22 INS42 INS22 INS33 INS42 INS42 INS21 INS21 INS40 INS40 INS27 INS40 MOV43 INS24 INS43 MOV60 INS25 INS52 INS42 INS52 INS42 INS52 INS42 INS52 INS42 INS42 INS43 INS42 INS16 INS52 INS42 INS52 INS42 INS52 INS42 INS52 INS42 INS52 INS42 INS52 INS42 INS52 INS42 INS52 INS42 INS52 INS42 INS7 INS32 INS32 INS32 INS40 INS40 INS40 INS42 MOV58 MOV27 MOV37 INS8 INS42 INS8 MOV27 INS8 INS42 INS27 INS45 INS27 INS42 INS32 INS42 INS42 INS40 UPD42 MOV42 INS40 UPD42 MOV42 INS70 INS40 INS60 INS60 INS21 MOV25 INS21 MOV60 INS21 INS25 MOV25 INS21 MOV21 MOV21 MOV21 MOV21 MOV25 INS40 MOV60 INS24 MOV21 UPD42 MOV42 INS42 INS45 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS9 INS42 INS32 INS32 MOV44 MOV32 MOV8 INS7 MOV43 INS59 INS39 INS59 INS7 INS7 INS7 INS27 INS8 INS32 INS58 INS27 INS37 INS8 UPD42 MOV42 UPD42 MOV42 INS42 INS42 INS42 INS42 INS32 INS21 INS25 INS21 INS21 INS60 INS21 INS21 INS21 INS40 INS33 INS42 INS40 INS42 INS40 INS42 MOV32 INS21 INS18 INS42 MOV32 INS42 MOV27 INS42 INS42 MOV25 INS40 INS42 INS42 INS42 INS39 INS59 INS42 INS40 INS42 MOV21 MOV21 INS40 INS40 INS42 INS42 INS7 MOV27 INS8 INS7 INS7 MOV74 MOV59 INS7 INS7 INS27 INS8 INS32 INS7 MOV32 INS27 UPD42 MOV42 INS34 INS42 MOV32 MOV21 INS18 INS42 MOV32 INS42 MOV14 UPD42 INS42 MOV32 INS18 INS42 INS27 INS42 INS42 INS25 INS42 INS42 MOV14 INS40 INS33 INS42 INS42 INS42 INS36 MOV36 MOV21 INS21 MOV21 INS18 INS18 INS42 UPD74 UPD74 MOV32 MOV32 INS27 MOV8 INS27 MOV32 INS7 INS40 INS2 INS43 INS43 INS42 INS42 MOV42 MOV42 INS36 INS36 MOV21 INS18 INS32 INS34 INS40 INS33 INS42 INS42 INS42 INS42 INS27 INS32 INS42 UPD42 MOV42 UPD42 MOV42 INS42 INS32 INS34 UPD42 MOV42 INS42 INS42 UPD42 MOV42 UPD42 MOV42 DEL42 DEL42 DEL32 DEL42 DEL42 DEL32 DEL42 DEL42 DEL32 DEL42 DEL42 DEL32 DEL42 DEL42 DEL32 DEL42 DEL42 DEL32 DEL42 DEL42 DEL32 DEL42 DEL42 DEL32 DEL32 DEL42 DEL42 DEL32 DEL42 DEL42 DEL32 DEL42 DEL42 DEL32 DEL42 DEL42 DEL32 DEL42 DEL42 DEL32 DEL42 DEL43 DEL42 DEL42 DEL42 DEL42 DEL32 DEL83 DEL42 DEL59 DEL60 DEL39 DEL42 DEL59 DEL60 DEL42 DEL59 DEL60 DEL42 DEL59 DEL60 DEL33 DEL41 DEL39 DEL42 DEL59 DEL60 DEL33 DEL41 DEL42 DEL42 DEL32 DEL83 DEL39 DEL60 DEL42 DEL42 DEL32 DEL42 DEL41 DEL42 DEL42 DEL43 DEL42 DEL44 DEL42 DEL33 DEL27 DEL42 DEL42 DEL42 DEL32 DEL21 DEL8 DEL25 DEL8 DEL70 DEL8 DEL24 DEL8 DEL51 DEL8 DEL54 DEL42 DEL42 DEL32 DEL42 DEL43 DEL42 DEL44 DEL42 DEL42 DEL32 DEL42 DEL42 DEL32 DEL33 DEL41 DEL42 DEL42 DEL34 DEL27 DEL27 DEL32 DEL42 DEL42 DEL32 DEL9 DEL41 DEL8 DEL42 DEL42 DEL32 DEL42 DEL42 DEL42 DEL32 DEL42 DEL42 DEL32 DEL42 DEL43 DEL85 DEL5 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL44 DEL42 DEL8 DEL70 DEL8 DEL25 DEL8 DEL83 DEL39 DEL42 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL39 DEL42 DEL32 DEL59 DEL60 DEL42 DEL59 DEL60 DEL42 DEL42 DEL32 DEL21 DEL9 DEL41 DEL8 DEL25 DEL83 DEL39 DEL42 DEL59 DEL60 DEL83 DEL39 DEL59 DEL60 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL9 DEL41 DEL8 DEL25 DEL42 DEL42 DEL32 DEL42 DEL42 DEL42 DEL32 DEL21 DEL39 DEL42 DEL42 DEL27 DEL59 DEL60 DEL9 DEL41 DEL8 DEL31 DEL39 DEL39 DEL42 DEL39 DEL39 DEL42 DEL59 DEL60 DEL42 DEL42 DEL27 DEL36 DEL27 DEL41 DEL83 DEL42 DEL42

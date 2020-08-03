@@ -1,0 +1,129 @@
+MAPREDUCE-3008. Improvements to cumulative CPU emulation for short running tasks in Gridmix. (amarrk)
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/trunk@1179933 13f79535-47bb-0310-9956-ffa450edef68
+
++import org.apache.hadoop.mapreduce.TaskCounter;
+-          job.setSortComparatorClass(GridmixKey.Comparator.class);
++          job.setSortComparatorClass(LoadSortComparator.class);
++   * This is a load matching key comparator which will make sure that the
++   * resource usage load is matched even when the framework is in control.
++   */
++  public static class LoadSortComparator extends GridmixKey.Comparator {
++    private ResourceUsageMatcherRunner matcher = null;
++    private boolean isConfigured = false;
++    
++    public LoadSortComparator() {
++      super();
++    }
++    
++    @Override
++    public int compare(byte[] b1, int s1, int l1, byte[] b2, int s2, int l2) {
++      configure();
++      int ret = super.compare(b1, s1, l1, b2, s2, l2);
++      if (matcher != null) {
++        try {
++          matcher.match(); // match the resource usage now
++        } catch (Exception e) {}
++      }
++      return ret;
++    }
++    
++    //TODO Note that the sorter will be instantiated 2 times as follows
++    //       1. During the sort/spill in the map phase
++    //       2. During the merge in the sort phase
++    // We need the handle to the matcher thread only in (2).
++    // This logic can be relaxed to run only in (2).
++    private void configure() {
++      if (!isConfigured) {
++        ThreadGroup group = Thread.currentThread().getThreadGroup();
++        Thread[] threads = new Thread[group.activeCount() * 2];
++        group.enumerate(threads, true);
++        for (Thread t : threads) {
++          if (t != null && (t instanceof ResourceUsageMatcherRunner)) {
++            this.matcher = (ResourceUsageMatcherRunner) t;
++            isConfigured = true;
++            break;
++          }
++        }
++      }
++    }
++  }
++  
++  /**
+-  static class ResourceUsageMatcherRunner extends Thread {
++  static class ResourceUsageMatcherRunner extends Thread 
++  implements Progressive {
+-    private final Progressive progress;
++    private final BoostingProgress progress;
++    /**
++     * This is a progress bar that can be boosted for weaker use-cases.
++     */
++    private static class BoostingProgress implements Progressive {
++      private float boostValue = 0f;
++      TaskInputOutputContext context;
++      
++      BoostingProgress(TaskInputOutputContext context) {
++        this.context = context;
++      }
++      
++      void setBoostValue(float boostValue) {
++        this.boostValue = boostValue;
++      }
++      
++      @Override
++      public float getProgress() {
++        return Math.min(1f, context.getProgress() + boostValue);
++      }
++    }
++    
+-      progress = new Progressive() {
+-        @Override
+-        public float getProgress() {
+-          return context.getProgress();
+-        }
+-      };
++      progress = new BoostingProgress(context);
+-    protected void match() throws Exception {
++    protected void match() throws IOException, InterruptedException {
++    
++    @Override
++    public float getProgress() {
++      return matcher.getProgress();
++    }
++    
++    // boost the progress bar as fasten up the emulation cycles.
++    void boost(float value) {
++      progress.setBoostValue(value);
++    }
+-    private TaskAttemptContext context;
+-    StatusReporter(TaskAttemptContext context) {
++    private final TaskAttemptContext context;
++    private final Progressive progress;
++    
++    StatusReporter(TaskAttemptContext context, Progressive progress) {
++      this.progress = progress;
+-        while (context.getProgress() < 1) {
++        while (!isInterrupted() && progress.getProgress() < 1) {
+-      reporter = new StatusReporter(ctxt);
++      reporter = new StatusReporter(ctxt, matcher);
++      // check if the thread will get a chance to run or not
++      //  check if there will be a sort&spill->merge phase or not
++      //  check if the final sort&spill->merge phase is gonna happen or not
++      if (context.getNumReduceTasks() > 0 
++          && context.getCounter(TaskCounter.SPILLED_RECORDS).getValue() == 0) {
++        LOG.info("Boosting the map phase progress.");
++        // add the sort phase progress to the map phase and emulate
++        matcher.boost(0.33f);
++        matcher.match();
++      }
++      
+-      reporter = new StatusReporter(context);
++      reporter = new StatusReporter(context, matcher);
+-          LOG.debug(String.format("SPEC(%d) %d -> %d %d %d", id(), i,
++          LOG.debug(String.format("SPEC(%d) %d -> %d %d %d %d %d %d %d", id(), i,
+-                    info.getOutputBytes()));
++                    info.getOutputBytes(), 
++                    info.getResourceUsageMetrics().getCumulativeCpuUsage(),
++                    info.getResourceUsageMetrics().getPhysicalMemoryUsage(),
++                    info.getResourceUsageMetrics().getVirtualMemoryUsage(),
++                    info.getResourceUsageMetrics().getHeapUsage()));

@@ -1,0 +1,248 @@
+Merge trunk into HA branch
+
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/branches/HDFS-1623@1196458 13f79535-47bb-0310-9956-ffa450edef68
+
+-import org.apache.avro.ipc.Server;
++import org.apache.hadoop.fs.CommonConfigurationKeysPublic;
++import org.apache.hadoop.ipc.Server;
+-import org.apache.hadoop.security.SecurityInfo;
++import org.apache.hadoop.security.authorize.PolicyProvider;
++import org.apache.hadoop.util.StringUtils;
++import org.apache.hadoop.yarn.api.records.Resource;
+-import org.apache.hadoop.yarn.security.ContainerManagerSecurityInfo;
++import org.apache.hadoop.yarn.security.ContainerTokenIdentifier;
++import org.apache.hadoop.yarn.server.nodemanager.containermanager.application.ApplicationContainerInitEvent;
+-import org.apache.hadoop.yarn.server.nodemanager.containermanager.logaggregation.event.LogAggregatorEventType;
++import org.apache.hadoop.yarn.server.nodemanager.containermanager.loghandler.LogHandler;
++import org.apache.hadoop.yarn.server.nodemanager.containermanager.loghandler.NonAggregatingLogHandler;
++import org.apache.hadoop.yarn.server.nodemanager.containermanager.loghandler.event.LogHandlerEventType;
++import org.apache.hadoop.yarn.server.nodemanager.security.authorize.NMPolicyProvider;
++import org.apache.hadoop.yarn.server.security.ApplicationACLsManager;
++  private InetAddress resolvedAddress = null;
+-  private final AuxServices auxiluaryServices;
++  private final AuxServices auxiliaryServices;
++  private final ApplicationACLsManager aclsManager;
+-      containerTokenSecretManager) {
++      containerTokenSecretManager, ApplicationACLsManager aclsManager) {
++    this.aclsManager = aclsManager;
+-    auxiluaryServices = new AuxServices();
+-    auxiluaryServices.register(this);
+-    addService(auxiluaryServices);
++    auxiliaryServices = new AuxServices();
++    auxiliaryServices.register(this);
++    addService(auxiliaryServices);
+-    LogAggregationService logAggregationService =
+-        createLogAggregationService(this.context, this.deletionService);
+-    addService(logAggregationService);
+-    dispatcher.register(AuxServicesEventType.class, auxiluaryServices);
++    dispatcher.register(AuxServicesEventType.class, auxiliaryServices);
+-    dispatcher.register(LogAggregatorEventType.class, logAggregationService);
++    
+-  protected LogAggregationService createLogAggregationService(Context context,
++  @Override
++  public void init(Configuration conf) {
++    LogHandler logHandler =
++      createLogHandler(conf, this.context, this.deletionService);
++    addIfService(logHandler);
++    dispatcher.register(LogHandlerEventType.class, logHandler);
++    
++    super.init(conf);
++  }
++
++  private void addIfService(Object object) {
++    if (object instanceof Service) {
++      addService((Service) object);
++    }
++  }
++
++  protected LogHandler createLogHandler(Configuration conf, Context context,
+-    return new LogAggregationService(context, deletionService);
++    if (conf.getBoolean(YarnConfiguration.NM_LOG_AGGREGATION_ENABLED,
++        YarnConfiguration.DEFAULT_NM_LOG_AGGREGATION_ENABLED)) {
++      return new LogAggregationService(this.dispatcher, context,
++          deletionService);
++    } else {
++      return new NonAggregatingLogHandler(this.dispatcher, deletionService);
++    }
+-        YarnConfiguration.NM_ADDRESS, YarnConfiguration.DEFAULT_NM_ADDRESS));
++        YarnConfiguration.NM_ADDRESS, YarnConfiguration.DEFAULT_NM_ADDRESS),
++        YarnConfiguration.DEFAULT_NM_PORT,
++        YarnConfiguration.NM_ADDRESS);
++    
++    // Enable service authorization?
++    if (conf.getBoolean(
++        CommonConfigurationKeysPublic.HADOOP_SECURITY_AUTHORIZATION, 
++        false)) {
++      refreshServiceAcls(conf, new NMPolicyProvider());
++    }
++    
+-    InetAddress hostNameResolved = null;
+-      hostNameResolved = InetAddress.getLocalHost();
++      resolvedAddress = InetAddress.getLocalHost();
+-    this.context.getNodeId().setHost(hostNameResolved.getCanonicalHostName());
++    this.context.getNodeId().setHost(resolvedAddress.getCanonicalHostName());
++  void refreshServiceAcls(Configuration configuration, 
++      PolicyProvider policyProvider) {
++    this.server.refreshServiceAcl(configuration, policyProvider);
++  }
++
+-    if (auxiluaryServices.getServiceState() == STARTED) {
+-      auxiluaryServices.unregister(this);
++    if (auxiliaryServices.getServiceState() == STARTED) {
++      auxiliaryServices.unregister(this);
+-      server.close();
++      server.stop();
++   * Authorize the request.
++   * 
++   * @param containerID
++   *          of the container
++   * @param launchContext
++   *          passed if verifying the startContainer, null otherwise.
++   * @throws YarnRemoteException
++   */
++  private void authorizeRequest(ContainerId containerID,
++      ContainerLaunchContext launchContext) throws YarnRemoteException {
++
++    if (!UserGroupInformation.isSecurityEnabled()) {
++      return;
++    }
++
++    String containerIDStr = containerID.toString();
++
++    UserGroupInformation remoteUgi;
++    try {
++      remoteUgi = UserGroupInformation.getCurrentUser();
++    } catch (IOException e) {
++      String msg = "Cannot obtain the user-name for containerId: "
++          + containerIDStr + ". Got exception: "
++          + StringUtils.stringifyException(e);
++      LOG.warn(msg);
++      throw RPCUtil.getRemoteException(msg);
++    }
++
++    boolean unauthorized = false;
++    StringBuilder messageBuilder = new StringBuilder(
++        "Unauthorized request to start container. ");
++
++    if (!remoteUgi.getUserName().equals(containerIDStr)) {
++      unauthorized = true;
++      messageBuilder.append("\nExpected containerId: "
++          + remoteUgi.getUserName() + " Found: " + containerIDStr);
++    }
++
++    if (launchContext != null) {
++
++      // Verify other things for startContainer() request.
++
++      if (LOG.isDebugEnabled()) {
++      LOG.debug("Number of TokenIdentifiers in the UGI from RPC: "
++          + remoteUgi.getTokenIdentifiers().size());
++      }
++      // We must and should get only one TokenIdentifier from the RPC.
++      ContainerTokenIdentifier tokenId = (ContainerTokenIdentifier) remoteUgi
++          .getTokenIdentifiers().iterator().next();
++      if (tokenId == null) {
++        unauthorized = true;
++        messageBuilder
++            .append("\nContainerTokenIdentifier cannot be null! Null found for "
++                + containerIDStr);
++      } else {
++
++        Resource resource = tokenId.getResource();
++        if (!resource.equals(launchContext.getResource())) {
++          unauthorized = true;
++          messageBuilder.append("\nExpected resource " + resource
++              + " but found " + launchContext.getResource());
++        }
++      }
++    }
++
++    if (unauthorized) {
++      String msg = messageBuilder.toString();
++      LOG.error(msg);
++      throw RPCUtil.getRemoteException(msg);
++    }
++  }
++
++  /**
++  @SuppressWarnings("unchecked")
++    ContainerId containerID = launchContext.getContainerId();
++    authorizeRequest(containerID, launchContext);
++
+-  
++
+-    Container container =
+-        new ContainerImpl(this.dispatcher, launchContext, credentials, metrics);
+-    ContainerId containerID = launchContext.getContainerId();
++    Container container = new ContainerImpl(getConfig(), this.dispatcher,
++        launchContext, credentials, metrics);
+-    Application application = new ApplicationImpl(dispatcher,
+-        launchContext.getUser(), applicationID, credentials);
++    Application application =
++        new ApplicationImpl(dispatcher, this.aclsManager,
++            launchContext.getUser(), applicationID, credentials, context);
++      dispatcher.getEventHandler().handle(
++          new ApplicationInitEvent(applicationID, container
++              .getLaunchContext().getApplicationACLs()));
+-    dispatcher.getEventHandler().handle(new ApplicationInitEvent(container));
++    dispatcher.getEventHandler().handle(
++        new ApplicationContainerInitEvent(container));
+-    response.addAllServiceResponse(auxiluaryServices.getMeta());
++    response.addAllServiceResponse(auxiliaryServices.getMeta());
++    // TODO launchedContainer misplaced -> doesn't necessarily mean a container
++    // launch. A finished Application will not launch containers.
++  /**
++   * Stop the container running on this NodeManager.
++   */
++  @SuppressWarnings("unchecked")
++    ContainerId containerID = request.getContainerId();
++    // TODO: Only the container's owner can kill containers today.
++    authorizeRequest(containerID, null);
++
+-    ContainerId containerID = request.getContainerId();
+-      String userName;
+-      try {
+-        userName = UserGroupInformation.getCurrentUser().getUserName();
+-      } catch (IOException e) {
+-        LOG.error("Error finding userName", e);
+-        return response;
+-      }
+-      NMAuditLogger.logFailure(userName,
++      NMAuditLogger.logFailure("UnknownUser",
++
+-
+-    // user logged here not ideal since just getting user from container but
+-    // request doesn't have anything and should be coming from user of AM so 
+-    // should be the same or should be rejected by auth before here. 
++ 
+-  public GetContainerStatusResponse getContainerStatus(GetContainerStatusRequest request) throws YarnRemoteException {
++  public GetContainerStatusResponse getContainerStatus(
++      GetContainerStatusRequest request) throws YarnRemoteException {
++
++    // TODO: Only the container's owner can get containers' status today.
++    authorizeRequest(containerID, null);
++
+-      GetContainerStatusResponse response = recordFactory.newRecordInstance(GetContainerStatusResponse.class);
++      GetContainerStatusResponse response = recordFactory
++          .newRecordInstance(GetContainerStatusResponse.class);
+-    } else {
+-      throw RPCUtil.getRemoteException("Container " + containerID
+-          + " is not handled by this NodeManager");
++
++    throw RPCUtil.getRemoteException("Container " + containerID
++        + " is not handled by this NodeManager");
+-      Application app = 
+-      ContainerManagerImpl.this.context.getApplications().get(
+-          event.getApplicationID());
++      Application app =
++          ContainerManagerImpl.this.context.getApplications().get(
++              event.getApplicationID());
+-        LOG.warn("Event " + event + " sent to absent application " +
+-            event.getApplicationID());
++        LOG.warn("Event " + event + " sent to absent application "
++            + event.getApplicationID());
+-    
++  @SuppressWarnings("unchecked")
+
+MOV26 MOV26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS40 UPD40 UPD40 INS40 INS40 UPD40 INS40 INS40 INS40 UPD40 INS40 INS40 INS23 INS23 INS31 INS31 INS31 INS31 INS83 MOV43 INS59 INS83 INS83 INS43 INS59 INS44 MOV21 MOV21 INS78 INS83 INS39 INS42 INS44 INS8 INS83 INS39 INS42 INS44 INS8 UPD43 UPD42 INS44 INS8 INS39 INS42 INS44 INS44 INS8 INS29 INS83 INS39 INS42 INS44 INS44 INS43 INS8 INS79 MOV60 INS29 INS79 MOV60 INS79 INS42 INS33 UPD42 INS42 INS42 INS43 INS42 INS42 INS43 INS42 MOV60 INS21 INS21 INS21 INS43 INS42 INS25 UPD42 INS43 INS42 INS25 INS25 INS43 INS42 INS43 INS42 INS21 INS65 INS65 INS65 INS65 INS43 INS42 INS43 INS42 INS42 INS25 INS60 INS60 INS54 INS60 INS60 INS25 INS25 INS25 INS42 INS45 INS21 INS65 INS42 INS45 MOV21 INS25 INS21 MOV53 INS42 INS45 INS42 INS7 INS42 UPD43 INS32 INS32 INS48 INS42 INS62 INS8 INS42 INS32 INS8 INS8 INS32 INS8 INS42 INS42 INS32 INS66 INS42 INS66 INS42 INS66 INS42 INS42 INS42 INS38 INS8 INS43 INS59 INS43 INS59 MOV8 INS12 INS39 INS59 INS43 INS59 INS38 INS8 INS27 INS8 INS42 INS8 INS32 INS66 MOV27 INS8 INS32 INS22 INS42 UPD42 UPD42 UPD42 INS52 UPD42 UPD42 UPD42 UPD42 INS42 INS42 INS42 INS42 INS57 INS42 INS42 INS42 INS42 INS43 INS21 INS42 INS42 INS40 INS40 MOV41 INS41 INS42 INS42 INS40 INS9 INS21 INS22 INS42 INS42 INS42 INS32 INS41 INS42 INS42 INS32 INS42 INS42 MOV44 INS8 INS42 INS9 INS42 INS42 INS14 INS32 INS21 INS21 INS42 INS33 INS25 INS60 INS25 INS60 INS21 INS53 INS42 INS42 INS42 INS21 UPD42 UPD42 INS33 MOV21 MOV21 MOV41 INS42 INS42 INS33 INS52 INS42 UPD42 INS42 INS43 INS42 INS32 INS14 INS40 INS40 INS32 UPD42 INS52 INS42 UPD42 INS42 INS42 INS42 INS42 INS60 INS21 INS53 INS43 INS45 INS32 INS42 INS42 INS7 INS32 INS32 INS8 INS43 INS59 INS27 INS8 INS8 MOV43 INS59 INS32 INS32 INS32 INS22 INS42 INS32 UPD43 UPD42 INS42 INS42 INS11 INS22 INS43 INS22 INS42 INS42 INS42 INS14 UPD42 UPD42 UPD42 UPD42 MOV32 INS43 INS59 INS32 INS32 INS42 INS42 INS42 INS42 INS9 INS42 INS42 INS27 INS42 INS42 INS21 INS42 INS42 INS11 INS42 INS33 INS21 INS21 INS60 INS25 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS52 INS42 INS32 INS42 INS14 UPD42 INS45 INS43 INS42 INS52 INS42 INS42 INS52 INS42 INS43 INS42 INS42 INS27 INS42 INS42 INS42 INS42 INS42 INS42 INS45 INS32 INS45 INS42 INS32 INS43 INS32 INS7 INS32 INS43 INS59 INS38 INS8 INS42 INS42 INS42 INS42 INS43 INS42 INS32 INS42 INS42 INS45 INS42 INS45 INS32 INS42 INS42 INS42 INS42 INS27 INS42 INS32 INS42 INS42 INS9 INS42 INS42 INS27 INS42 INS42 INS32 INS32 INS21 INS21 INS42 INS32 INS42 INS42 INS42 INS42 INS45 INS32 INS32 INS42 INS45 INS42 INS42 INS42 INS42 INS42 INS32 INS7 INS32 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS9 INS42 INS42 INS27 INS42 INS42 INS45 INS42 INS45 INS32 INS42 INS42 DEL42 DEL42 DEL52 DEL32 DEL42 DEL42 DEL42 DEL43 DEL57 DEL42 DEL32 DEL21 DEL8 DEL42 DEL33 DEL59 DEL60 DEL42 DEL32 DEL45 DEL42 DEL42 DEL42 DEL59 DEL60 DEL42 DEL41 DEL8 DEL12 DEL54 DEL8 DEL25 DEL8

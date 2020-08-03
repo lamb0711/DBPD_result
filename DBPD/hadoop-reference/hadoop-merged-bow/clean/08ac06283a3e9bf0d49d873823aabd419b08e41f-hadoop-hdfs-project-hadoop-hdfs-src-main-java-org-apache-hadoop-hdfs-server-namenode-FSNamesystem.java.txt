@@ -1,0 +1,206 @@
+HDFS-7056. Snapshot support for truncate. Contributed by Konstantin Shvachko and Plamen Jeliazkov.
+-        inode.getBlocks(), fileSize, isUc, offset, length, needBlockToken,
+-        iip.isSnapshot(), feInfo);
++        inode.getBlocks(iip.getPathSnapshotId()), fileSize,
++        isUc, offset, length, needBlockToken, iip.isSnapshot(), feInfo);
+-   * @return true if and client does not need to wait for block recovery,
++   * @return true if client does not need to wait for block recovery,
+-    // Data will be lost after truncate occurs so it cannot support snapshots.
+-    if(file.isInLatestSnapshot(iip.getLatestSnapshotId()))
+-      throw new HadoopIllegalArgumentException(
+-          "Cannot truncate file with snapshot.");
+-    // Refresh INode as the file could have been closed
+-    iip = dir.getINodesInPath4Write(src, true);
+-    if(oldLength == newLength)
++    if(oldLength == newLength) {
+-    if(oldLength < newLength)
++    }
++    if(oldLength < newLength) {
++    }
+-
++    Block truncateBlock = null;
+-      prepareFileForWrite(src, iip, clientName, clientMachine, false, false);
+-      file = INodeFile.valueOf(dir.getINode4Write(src), src);
+-      initializeBlockRecovery(file);
++      long lastBlockDelta = file.computeFileSize() - newLength;
++      assert lastBlockDelta > 0 : "delta is 0 only if on block bounday";
++      truncateBlock = prepareFileForTruncate(iip, clientName, clientMachine,
++          lastBlockDelta, null);
+-    getEditLog().logTruncate(src, clientName, clientMachine, newLength, mtime);
++    getEditLog().logTruncate(src, clientName, clientMachine, newLength, mtime,
++        truncateBlock);
+-  void initializeBlockRecovery(INodeFile inodeFile) throws IOException {
+-    BlockInfo lastBlock = inodeFile.getLastBlock();
+-    long recoveryId = nextGenerationStamp(blockIdManager.isLegacyBlock(lastBlock));
+-    ((BlockInfoUnderConstruction)lastBlock).initializeBlockRecovery(
+-        BlockUCState.BEING_TRUNCATED, recoveryId);
++  /**
++   * Convert current INode to UnderConstruction.
++   * Recreate lease.
++   * Create new block for the truncated copy.
++   * Schedule truncation of the replicas.
++   *
++   * @return the returned block will be written to editLog and passed back into
++   * this method upon loading.
++   */
++  Block prepareFileForTruncate(INodesInPath iip,
++                               String leaseHolder,
++                               String clientMachine,
++                               long lastBlockDelta,
++                               Block newBlock)
++      throws IOException {
++    INodeFile file = iip.getLastINode().asFile();
++    String src = iip.getPath();
++    file.recordModification(iip.getLatestSnapshotId());
++    file.toUnderConstruction(leaseHolder, clientMachine);
++    assert file.isUnderConstruction() : "inode should be under construction.";
++    leaseManager.addLease(
++        file.getFileUnderConstructionFeature().getClientName(), src);
++    boolean shouldRecoverNow = (newBlock == null);
++    BlockInfo oldBlock = file.getLastBlock();
++    boolean shouldCopyOnTruncate = shouldCopyOnTruncate(file, oldBlock);
++    if(newBlock == null) {
++      newBlock = (shouldCopyOnTruncate) ? createNewBlock() :
++          new Block(oldBlock.getBlockId(), oldBlock.getNumBytes(),
++              nextGenerationStamp(blockIdManager.isLegacyBlock(oldBlock)));
++    }
++
++    BlockInfoUnderConstruction truncatedBlockUC;
++    if(shouldCopyOnTruncate) {
++      // Add new truncateBlock into blocksMap and
++      // use oldBlock as a source for copy-on-truncate recovery
++      truncatedBlockUC = new BlockInfoUnderConstruction(newBlock,
++          file.getBlockReplication());
++      truncatedBlockUC.setNumBytes(oldBlock.getNumBytes() - lastBlockDelta);
++      truncatedBlockUC.setTruncateBlock(oldBlock);
++      file.setLastBlock(truncatedBlockUC, blockManager.getStorages(oldBlock));
++      getBlockManager().addBlockCollection(truncatedBlockUC, file);
++
++      NameNode.stateChangeLog.info("BLOCK* prepareFileForTruncate: "
++          + "Scheduling copy-on-truncate to new size "
++          + truncatedBlockUC.getNumBytes() + " new block " + newBlock
++          + " old block " + truncatedBlockUC.getTruncateBlock());
++    } else {
++      // Use new generation stamp for in-place truncate recovery
++      blockManager.convertLastBlockToUnderConstruction(file, lastBlockDelta);
++      oldBlock = file.getLastBlock();
++      assert !oldBlock.isComplete() : "oldBlock should be under construction";
++      truncatedBlockUC = (BlockInfoUnderConstruction) oldBlock;
++      truncatedBlockUC.setTruncateBlock(new Block(oldBlock));
++      truncatedBlockUC.getTruncateBlock().setNumBytes(
++          oldBlock.getNumBytes() - lastBlockDelta);
++      truncatedBlockUC.getTruncateBlock().setGenerationStamp(
++          newBlock.getGenerationStamp());
++
++      NameNode.stateChangeLog.debug("BLOCK* prepareFileForTruncate: "
++          + "Scheduling in-place block truncate to new size "
++          + truncatedBlockUC.getTruncateBlock().getNumBytes()
++          + " block=" + truncatedBlockUC);
++    }
++    if(shouldRecoverNow)
++      truncatedBlockUC.initializeBlockRecovery(newBlock.getGenerationStamp());
++
++    // update the quota: use the preferred block size for UC block
++    final long diff =
++        file.getPreferredBlockSize() - truncatedBlockUC.getNumBytes();
++    dir.updateSpaceConsumed(iip, 0, diff * file.getBlockReplication());
++    return newBlock;
++  }
++
++  /**
++   * Defines if a replica needs to be copied on truncate or
++   * can be truncated in place.
++   */
++  boolean shouldCopyOnTruncate(INodeFile file, BlockInfo blk) {
++    if(!isUpgradeFinalized()) {
++      return true;
++    }
++    return file.isBlockInLatestSnapshot(blk);
+-    LocatedBlock ret = blockManager.convertLastBlockToUnderConstruction(file);
++    LocatedBlock ret =
++        blockManager.convertLastBlockToUnderConstruction(file, 0);
+-  private void recoverLeaseInternal(INodesInPath iip,
++  void recoverLeaseInternal(INodesInPath iip,
+-              && (lastBlock.getBlockUCState() == BlockUCState.UNDER_RECOVERY ||
+-                 lastBlock.getBlockUCState() == BlockUCState.BEING_TRUNCATED)) {
++              && lastBlock.getBlockUCState() == BlockUCState.UNDER_RECOVERY) {
+-    case BEING_TRUNCATED:
++      // determine if last block was intended to be truncated
++      Block recoveryBlock = uc.getTruncateBlock();
++      boolean truncateRecovery = recoveryBlock != null;
++      boolean copyOnTruncate = truncateRecovery &&
++          recoveryBlock.getBlockId() != uc.getBlockId();
++      assert !copyOnTruncate ||
++          recoveryBlock.getBlockId() < uc.getBlockId() &&
++          recoveryBlock.getGenerationStamp() < uc.getGenerationStamp() &&
++          recoveryBlock.getNumBytes() > uc.getNumBytes() :
++            "wrong recoveryBlock";
++
+-      if (uc.getBlockUCState() != BlockUCState.BEING_TRUNCATED) {
+-        uc.initializeBlockRecovery(blockRecoveryId);
++      if(copyOnTruncate) {
++        uc.setGenerationStamp(blockRecoveryId);
++      } else if(truncateRecovery) {
++        recoveryBlock.setGenerationStamp(blockRecoveryId);
++      uc.initializeBlockRecovery(blockRecoveryId);
+-  void commitBlockSynchronization(ExtendedBlock lastblock,
++  void commitBlockSynchronization(ExtendedBlock oldBlock,
+-    LOG.info("commitBlockSynchronization(lastblock=" + lastblock
++    LOG.info("commitBlockSynchronization(oldBlock=" + oldBlock
+-          ExtendedBlock.getLocalBlock(lastblock));
++          ExtendedBlock.getLocalBlock(oldBlock));
+-            LOG.debug("Block (=" + lastblock + ") not found");
++            LOG.debug("Block (=" + oldBlock + ") not found");
+-          throw new IOException("Block (=" + lastblock + ") not found");
++          throw new IOException("Block (=" + oldBlock + ") not found");
+-      if (!iFile.isUnderConstruction() || storedBlock.isComplete()) {
++      if ((!iFile.isUnderConstruction() || storedBlock.isComplete()) &&
++          iFile.getLastBlock().isComplete()) {
+-          LOG.debug("Unexpected block (=" + lastblock
++          LOG.debug("Unexpected block (=" + oldBlock
+-      long recoveryId =
+-        ((BlockInfoUnderConstruction)storedBlock).getBlockRecoveryId();
++      BlockInfoUnderConstruction truncatedBlock =
++          (BlockInfoUnderConstruction) iFile.getLastBlock();
++      long recoveryId = truncatedBlock.getBlockRecoveryId();
++      boolean copyTruncate =
++          truncatedBlock.getBlockId() != storedBlock.getBlockId();
+-                              + recoveryId + " for block " + lastblock); 
++                              + recoveryId + " for block " + oldBlock);
+-        Block blockToDel = ExtendedBlock.getLocalBlock(lastblock);
++        Block blockToDel = ExtendedBlock.getLocalBlock(oldBlock);
+-          blockManager.removeBlockFromMap(storedBlock);
++          blockManager.removeBlock(storedBlock);
+-        storedBlock.setGenerationStamp(newgenerationstamp);
+-        storedBlock.setNumBytes(newlength);
++        if(!copyTruncate) {
++          storedBlock.setGenerationStamp(newgenerationstamp);
++          storedBlock.setNumBytes(newlength);
++        }
+-              storageInfo.addBlock(storedBlock);
++              if(copyTruncate) {
++                storageInfo.addBlock(truncatedBlock);
++              } else {
++                storageInfo.addBlock(storedBlock);
++              }
+-        iFile.setLastBlock(storedBlock, trimmedStorageInfos);
++        if(copyTruncate) {
++          iFile.setLastBlock(truncatedBlock, trimmedStorageInfos);
++        } else {
++          iFile.setLastBlock(storedBlock, trimmedStorageInfos);
++        }
+-        src = closeFileCommitBlocks(iFile, storedBlock);
++        if(copyTruncate) {
++          src = closeFileCommitBlocks(iFile, truncatedBlock);
++          if(!iFile.isBlockInLatestSnapshot(storedBlock)) {
++            blockManager.removeBlock(storedBlock);
++          }
++        } else {
++          src = closeFileCommitBlocks(iFile, storedBlock);
++        }
+-      LOG.info("commitBlockSynchronization(newblock=" + lastblock
++      LOG.info("commitBlockSynchronization(oldBlock=" + oldBlock
+-      LOG.info("commitBlockSynchronization(" + lastblock + ") successful");
++      LOG.info("commitBlockSynchronization(" + oldBlock + ") successful");
+
+INS31 INS29 INS43 INS42 INS44 INS44 INS44 INS44 INS44 INS29 INS39 INS42 MOV44 INS44 INS8 INS60 INS65 INS65 INS42 INS43 INS42 INS43 INS42 INS43 INS42 INS39 INS42 INS43 INS42 INS60 INS60 INS21 INS21 INS6 INS21 INS60 INS60 INS25 INS60 INS25 INS25 INS60 INS21 INS41 INS65 UPD42 INS43 INS42 INS25 INS41 UPD42 UPD66 INS8 INS8 INS43 INS59 INS66 INS66 INS66 INS66 INS66 INS66 INS42 INS42 INS42 INS42 INS43 INS59 INS43 INS59 INS32 INS32 INS32 INS45 INS32 INS39 INS59 UPD39 MOV39 INS59 INS27 INS8 MOV43 INS59 INS42 INS8 INS8 INS42 INS21 INS83 INS39 INS59 INS32 INS42 INS66 INS66 INS42 INS38 INS8 INS32 INS60 INS60 INS60 INS6 INS25 MOV21 MOV41 MOV53 UPD42 MOV42 INS42 INS33 INS60 INS6 INS42 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS36 UPD42 INS42 INS32 INS42 INS33 INS21 INS42 INS21 INS21 INS21 INS21 INS21 INS21 INS21 INS21 INS6 INS21 INS21 INS21 INS21 INS21 MOV32 INS42 INS27 INS42 INS42 INS42 INS34 INS27 INS32 INS41 INS42 INS42 INS42 INS43 INS59 INS39 INS59 INS39 INS59 INS27 INS45 INS42 MOV8 INS25 INS60 INS60 INS39 INS59 INS27 INS45 INS32 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS27 UPD42 INS42 INS42 INS42 INS7 INS7 INS32 INS32 INS32 INS32 INS32 INS32 INS7 INS38 INS45 INS7 INS32 INS32 INS32 INS32 INS42 INS32 INS32 INS32 INS42 INS32 INS42 INS9 INS34 INS42 INS42 INS32 INS42 INS27 INS42 INS27 INS38 INS27 INS21 INS42 INS8 UPD45 UPD42 INS27 MOV43 INS59 INS39 INS59 INS8 INS32 INS42 INS27 INS42 INS34 UPD42 INS42 INS42 INS42 INS42 INS42 INS33 INS42 INS16 INS42 INS14 INS42 INS42 INS27 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS32 INS42 INS42 INS42 INS40 INS42 INS27 INS42 INS42 INS42 INS42 INS42 INS32 INS32 INS42 INS11 INS42 INS42 INS14 INS32 INS42 INS27 INS32 INS42 INS32 INS40 INS42 INS27 UPD42 MOV42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS33 INS42 INS27 INS42 INS27 INS27 INS32 INS21 INS36 INS32 INS42 INS11 INS42 INS27 INS25 INS25 INS25 INS42 INS42 INS32 INS42 UPD42 UPD42 UPD42 MOV42 UPD42 MOV42 UPD42 INS33 INS36 INS32 INS14 INS43 INS42 INS32 INS32 INS42 INS42 INS42 INS42 INS42 INS27 INS32 INS45 INS42 INS45 INS32 INS42 INS42 INS42 INS42 INS43 INS42 INS43 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS27 INS32 INS45 INS42 INS32 MOV32 INS27 INS27 INS32 INS32 INS42 INS42 INS42 INS32 MOV27 INS32 INS42 INS43 INS32 INS42 INS32 INS32 INS38 INS8 INS42 INS8 INS8 INS42 INS8 MOV8 UPD45 UPD42 UPD42 UPD42 MOV42 UPD42 MOV42 INS42 INS42 INS43 INS32 INS32 INS32 INS42 INS42 INS42 INS42 INS42 INS45 INS45 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS45 INS45 INS32 INS42 INS42 INS42 UPD42 INS32 INS32 INS32 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 UPD42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 MOV43 INS42 MOV21 MOV21 INS21 MOV21 INS21 INS25 INS42 INS42 INS42 INS42 INS42 MOV42 MOV32 INS42 INS42 UPD27 MOV27 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 UPD42 UPD42 INS32 INS7 INS38 INS8 UPD42 MOV27 MOV43 UPD42 INS42 INS42 INS42 INS42 INS42 INS32 INS32 INS21 UPD42 UPD42 INS8 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS25 INS42 INS42 INS42 UPD42 INS42 INS8 MOV8 INS21 INS32 INS42 INS42 INS42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL32 DEL43 DEL45 DEL14 DEL53 DEL25 DEL42 DEL42 DEL42 DEL42 DEL9 DEL32 DEL7 DEL21 DEL42 DEL42 DEL42 DEL9 DEL9 DEL32 DEL21 DEL42 DEL32 DEL42 DEL42 DEL32 DEL21 DEL39 DEL42 DEL42 DEL11 DEL36 DEL40 DEL42 DEL32 DEL59 DEL60 DEL21 DEL83 DEL42 DEL42 DEL32 DEL40 DEL27 DEL36 DEL27 DEL42 DEL49 DEL40 DEL27 DEL25 DEL42 DEL11 DEL36

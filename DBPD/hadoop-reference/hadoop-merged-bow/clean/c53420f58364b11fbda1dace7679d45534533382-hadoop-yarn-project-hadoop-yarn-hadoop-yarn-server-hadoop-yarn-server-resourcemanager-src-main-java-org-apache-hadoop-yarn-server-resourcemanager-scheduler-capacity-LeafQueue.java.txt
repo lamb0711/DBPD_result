@@ -1,0 +1,258 @@
+YARN-2637. Fixed max-am-resource-percent calculation in CapacityScheduler when activating applications. Contributed by Craig Welch
+
+-  private int maxActiveApplications; // Based on absolute max capacity
+-  private int maxActiveAppsUsingAbsCap; // Based on absolute capacity
+-  private int maxActiveApplicationsPerUser;
++  // absolute capacity as a resource (based on cluster resource)
++  private Resource absoluteCapacityResource = Resources.none();
++  
++  // sum of resources used by application masters for applications
++  // running in this queue
++  private final Resource usedAMResources = Resource.newInstance(0, 0);
++  
+-    int maxActiveApplications = 
+-        CSQueueUtils.computeMaxActiveApplications(
+-            resourceCalculator,
+-            cs.getClusterResource(), this.minimumAllocation,
+-            maxAMResourcePerQueuePercent, absoluteMaxCapacity);
+-    this.maxActiveAppsUsingAbsCap = 
+-            CSQueueUtils.computeMaxActiveApplications(
+-                resourceCalculator,
+-                cs.getClusterResource(), this.minimumAllocation,
+-                maxAMResourcePerQueuePercent, absoluteCapacity);
+-    int maxActiveApplicationsPerUser =
+-        CSQueueUtils.computeMaxActiveApplicationsPerUser(
+-            maxActiveAppsUsingAbsCap, userLimit, userLimitFactor);
+-        maxActiveApplications, maxActiveApplicationsPerUser, state, acls, cs
+-            .getConfiguration().getNodeLocalityDelay(), accessibleLabels,
++        state, acls, cs.getConfiguration().getNodeLocalityDelay(), accessibleLabels,
+-      int maxApplicationsPerUser, int maxActiveApplications,
+-      int maxActiveApplicationsPerUser, QueueState state,
++      int maxApplicationsPerUser, QueueState state,
++    
++    this.lastClusterResource = clusterResource;
++    updateAbsoluteCapacityResource(clusterResource);
++    
++    // Initialize headroom info, also used for calculating application 
++    // master resource limits.  Since this happens during queue initialization
++    // and all queues may not be realized yet, we'll use (optimistic) 
++    // absoluteMaxCapacity (it will be replaced with the more accurate 
++    // absoluteMaxAvailCapacity during headroom/userlimit/allocation events)
++    updateHeadroomInfo(clusterResource, absoluteMaxCapacity);
+-    this.maxActiveApplications = maxActiveApplications;
+-    this.maxActiveApplicationsPerUser = maxActiveApplicationsPerUser;
+-
+-        "maxActiveApplications = " + maxActiveApplications +
+-        " [= max(" + 
+-        "(int)ceil((clusterResourceMemory / minimumAllocation) * " + 
+-        "maxAMResourcePerQueuePercent * absoluteMaxCapacity)," + 
+-        "1) ]" + "\n" +
+-        "maxActiveAppsUsingAbsCap = " + maxActiveAppsUsingAbsCap +
+-        " [= max(" + 
+-        "(int)ceil((clusterResourceMemory / minimumAllocation) *" + 
+-        "maxAMResourcePercent * absoluteCapacity)," + 
+-        "1) ]" + "\n" +
+-        "maxActiveApplicationsPerUser = " + maxActiveApplicationsPerUser +
+-        " [= max(" +
+-        "(int)(maxActiveApplications * (userLimit / 100.0f) * " +
+-        "userLimitFactor)," +
+-        "1) ]" + "\n" +
+-  public synchronized int getMaximumActiveApplications() {
+-    return maxActiveApplications;
+-  }
+-
+-  public synchronized int getMaximumActiveApplicationsPerUser() {
+-    return maxActiveApplicationsPerUser;
+-  }
+-
+-        newlyParsedLeafQueue.getMaximumActiveApplications(), 
+-        newlyParsedLeafQueue.getMaximumActiveApplicationsPerUser(),
++  
++  public synchronized Resource getAMResourceLimit() {
++     /* 
++      * The limit to the amount of resources which can be consumed by
++      * application masters for applications running in the queue
++      * is calculated by taking the greater of the max resources currently
++      * available to the queue (see absoluteMaxAvailCapacity) and the absolute
++      * resources guaranteed for the queue and multiplying it by the am
++      * resource percent.
++      *
++      * This is to allow a queue to grow its (proportional) application 
++      * master resource use up to its max capacity when other queues are 
++      * idle but to scale back down to it's guaranteed capacity as they 
++      * become busy.
++      *
++      */
++     Resource queueMaxCap;
++     synchronized (queueHeadroomInfo) {
++       queueMaxCap = queueHeadroomInfo.getQueueMaxCap();
++     }
++     Resource queueCap = Resources.max(resourceCalculator, lastClusterResource,
++       absoluteCapacityResource, queueMaxCap);
++     return Resources.multiplyAndNormalizeUp( 
++          resourceCalculator,
++          queueCap, 
++          maxAMResourcePerQueuePercent, minimumAllocation);
++  }
++  
++  public synchronized Resource getUserAMResourceLimit() {
++     /*
++      * The user amresource limit is based on the same approach as the 
++      * user limit (as it should represent a subset of that).  This means that
++      * it uses the absolute queue capacity instead of the max and is modified
++      * by the userlimit and the userlimit factor as is the userlimit
++      *
++      */ 
++     float effectiveUserLimit = Math.max(userLimit / 100.0f, 1.0f /    
++       Math.max(getActiveUsersManager().getNumActiveUsers(), 1));
++     
++     return Resources.multiplyAndNormalizeUp( 
++          resourceCalculator,
++          absoluteCapacityResource, 
++          maxAMResourcePerQueuePercent * effectiveUserLimit  *
++            userLimitFactor, minimumAllocation);
++  }
++    //limit of allowed resource usage for application masters
++    Resource amLimit = getAMResourceLimit();
++    Resource userAMLimit = getUserAMResourceLimit();
++        
+-      // Check queue limit
+-      if (getNumActiveApplications() >= getMaximumActiveApplications()) {
+-        break;
++      // Check am resource limit
++      Resource amIfStarted = 
++        Resources.add(application.getAMResource(), usedAMResources);
++      
++      if (LOG.isDebugEnabled()) {
++        LOG.debug("application AMResource " + application.getAMResource() +
++          " maxAMResourcePerQueuePercent " + maxAMResourcePerQueuePercent +
++          " amLimit " + amLimit +
++          " lastClusterResource " + lastClusterResource +
++          " amIfStarted " + amIfStarted);
+-      // Check user limit
+-      User user = getUser(application.getUser());
+-      if (user.getActiveApplications() < getMaximumActiveApplicationsPerUser()) {
+-        user.activateApplication();
+-        activeApplications.add(application);
+-        i.remove();
+-        LOG.info("Application " + application.getApplicationId() +
+-            " from user: " + application.getUser() + 
+-            " activated in queue: " + getQueueName());
++      if (!Resources.lessThanOrEqual(
++        resourceCalculator, lastClusterResource, amIfStarted, amLimit)) {
++        if (getNumActiveApplications() < 1) {
++          LOG.warn("maximum-am-resource-percent is insufficient to start a" +
++            " single application in queue, it is likely set too low." +
++            " skipping enforcement to allow at least one application to start"); 
++        } else {
++          LOG.info("not starting application as amIfStarted exceeds amLimit");
++          continue;
++        }
++      
++      // Check user am resource limit
++      
++      User user = getUser(application.getUser());
++      
++      Resource userAmIfStarted = 
++        Resources.add(application.getAMResource(),
++          user.getConsumedAMResources());
++        
++      if (!Resources.lessThanOrEqual(
++          resourceCalculator, lastClusterResource, userAmIfStarted, 
++          userAMLimit)) {
++        if (getNumActiveApplications() < 1) {
++          LOG.warn("maximum-am-resource-percent is insufficient to start a" +
++            " single application in queue for user, it is likely set too low." +
++            " skipping enforcement to allow at least one application to start"); 
++        } else {
++          LOG.info("not starting application as amIfStarted exceeds " +
++            "userAmLimit");
++          continue;
++        }
++      }
++      user.activateApplication();
++      activeApplications.add(application);
++      Resources.addTo(usedAMResources, application.getAMResource());
++      Resources.addTo(user.getConsumedAMResources(), 
++        application.getAMResource());
++      i.remove();
++      LOG.info("Application " + application.getApplicationId() +
++          " from user: " + application.getUser() + 
++          " activated in queue: " + getQueueName());
++    } else {
++      Resources.subtractFrom(usedAMResources, application.getAMResource());
++      Resources.subtractFrom(user.getConsumedAMResources(),
++        application.getAMResource());
++  
++  private Resource updateHeadroomInfo(Resource clusterResource, 
++      float absoluteMaxAvailCapacity) {
++  
++    Resource queueMaxCap = 
++      Resources.multiplyAndNormalizeDown(
++          resourceCalculator, 
++          clusterResource, 
++          absoluteMaxAvailCapacity,
++          minimumAllocation);
++
++    synchronized (queueHeadroomInfo) {
++      queueHeadroomInfo.setQueueMaxCap(queueMaxCap);
++      queueHeadroomInfo.setClusterResource(clusterResource);
++    }
++    
++    return queueMaxCap;
++    
++  }
+-
+-    Resource queueMaxCap =                        // Queue Max-Capacity
+-        Resources.multiplyAndNormalizeDown(
+-            resourceCalculator, 
+-            clusterResource, 
+-            absoluteMaxAvailCapacity,
+-            minimumAllocation);
+-	
+-    synchronized (queueHeadroomInfo) {
+-      queueHeadroomInfo.setQueueMaxCap(queueMaxCap);
+-      queueHeadroomInfo.setClusterResource(clusterResource);
+-    }
++    
++    Resource queueMaxCap = 
++      updateHeadroomInfo(clusterResource, absoluteMaxAvailCapacity);
++  
++  private void updateAbsoluteCapacityResource(Resource clusterResource) {
++    
++       absoluteCapacityResource = Resources.multiplyAndNormalizeUp( 
++          resourceCalculator,
++          clusterResource, 
++          absoluteCapacity, minimumAllocation);
++       
++  }
++    updateAbsoluteCapacityResource(clusterResource);
+-    // Update queue properties
+-    maxActiveApplications = 
+-        CSQueueUtils.computeMaxActiveApplications(
+-            resourceCalculator,
+-            clusterResource, minimumAllocation, 
+-            maxAMResourcePerQueuePercent, absoluteMaxCapacity);
+-    maxActiveAppsUsingAbsCap = 
+-        CSQueueUtils.computeMaxActiveApplications(
+-            resourceCalculator,
+-            clusterResource, minimumAllocation, 
+-            maxAMResourcePerQueuePercent, absoluteCapacity);
+-    maxActiveApplicationsPerUser = 
+-        CSQueueUtils.computeMaxActiveApplicationsPerUser(
+-            maxActiveAppsUsingAbsCap, userLimit, userLimitFactor);
++    // Update headroom info based on new cluster resource value
++    // absoluteMaxCapacity now,  will be replaced with absoluteMaxAvailCapacity
++    // during allocation
++    updateHeadroomInfo(clusterResource, absoluteMaxCapacity);
++    Resource consumedAMResources = Resources.createResource(0, 0);
++    
++    public Resource getConsumedAMResources() {
++      return consumedAMResources; 
++    }
++    //? Is this actually used by anything at present?
++    //  There is a findbugs warning -re lastClusterResource (now excluded),
++    //  when this is used, verify that the access is mt correct and remove
++    //  the findbugs exclusion if possible
+
+MOV23 MOV23 MOV31 MOV31 INS31 INS31 INS43 INS83 INS43 MOV21 MOV21 INS83 INS83 INS43 INS42 INS8 INS43 INS42 INS8 UPD83 INS43 INS42 INS44 INS44 INS83 INS39 INS42 INS44 INS8 INS23 INS31 INS42 INS42 INS32 INS42 UPD42 INS32 INS21 INS42 INS60 INS51 INS60 INS41 INS42 INS60 MOV41 INS60 INS60 INS42 INS43 INS42 INS39 INS42 MOV60 MOV51 INS60 INS43 INS42 INS21 INS43 INS59 INS83 INS43 INS42 INS8 INS42 INS42 INS42 INS42 INS34 INS34 INS32 INS32 INS43 INS59 INS42 INS8 INS43 INS59 INS32 INS39 INS59 INS32 INS43 INS59 INS43 INS59 INS8 INS42 UPD42 INS43 INS59 INS42 INS7 INS32 INS32 INS42 INS42 INS32 INS42 INS41 UPD42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS21 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS27 INS42 INS42 INS42 INS32 INS42 INS42 INS32 INS60 INS25 INS60 MOV21 MOV21 INS21 INS21 MOV21 MOV21 INS21 INS21 INS42 INS42 INS32 INS42 INS32 UPD42 MOV42 MOV42 UPD42 MOV42 MOV42 UPD42 MOV42 INS42 INS42 INS34 INS34 INS42 UPD42 INS7 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS27 INS27 INS42 INS42 INS42 INS42 INS42 INS43 INS59 INS32 INS38 INS8 INS43 INS59 INS38 INS8 INS32 INS32 INS32 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS34 INS34 INS32 INS42 INS42 INS32 INS42 INS42 INS21 INS32 INS25 INS42 INS42 INS32 INS32 INS25 INS42 INS42 INS42 INS32 INS42 INS42 INS32 INS32 INS42 INS42 INS42 INS32 INS42 INS42 INS32 INS32 INS42 INS42 INS42 INS42 INS32 INS34 INS42 INS42 INS32 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS42 UPD27 MOV27 INS8 INS8 INS42 INS42 INS32 INS32 INS42 INS42 INS42 INS42 UPD42 MOV42 UPD42 MOV42 INS27 MOV8 INS8 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS27 INS34 INS21 INS21 INS18 INS42 INS42 INS42 INS42 MOV32 INS34 INS21 INS21 INS18 INS42 INS45 INS32 INS45 INS42 INS45 INS42 INS45 INS42 INS45 INS42 INS32 INS32 UPD42 INS32 INS32 INS42 INS42 INS42 INS42 INS27 INS42 INS42 INS45 INS42 INS42 INS27 INS42 INS42 INS27 INS45 INS45 INS45 INS45 INS45 INS45 INS45 INS45 DEL83 DEL39 DEL42 DEL59 DEL23 DEL39 DEL42 DEL39 DEL39 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL52 DEL42 DEL22 DEL42 DEL42 DEL32 DEL59 DEL60 DEL52 DEL42 DEL22 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL52 DEL42 DEL22 DEL42 DEL42 DEL32 DEL7 DEL21 DEL39 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL42 DEL39 DEL42 DEL44 DEL39 DEL42 DEL44 DEL52 DEL42 DEL22 DEL42 DEL7 DEL45 DEL42 DEL45 DEL45 DEL45 DEL45 DEL45 DEL45 DEL42 DEL45 DEL45 DEL45 DEL45 DEL45 DEL45 DEL42 DEL45 DEL45 DEL45 DEL45 DEL45 DEL42 DEL42 DEL32 DEL42 DEL42 DEL32 DEL42 DEL39 DEL42 DEL8 DEL10 DEL42 DEL32 DEL32 DEL27 DEL83 DEL39 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL7 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL7 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL7 DEL21

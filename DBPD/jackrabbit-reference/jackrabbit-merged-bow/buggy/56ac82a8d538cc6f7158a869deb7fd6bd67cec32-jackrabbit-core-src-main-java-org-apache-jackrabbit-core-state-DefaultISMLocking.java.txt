@@ -1,0 +1,210 @@
+JCR-2554 Deadlock inside XASession on Weblogic
+
+git-svn-id: https://svn.apache.org/repos/asf/jackrabbit/trunk@923277 13f79535-47bb-0310-9956-ffa450edef68
+
+-import org.apache.jackrabbit.core.id.ItemId;
+-import org.slf4j.Logger;
+-import org.slf4j.LoggerFactory;
++import org.apache.jackrabbit.core.id.ItemId;
++import EDU.oswego.cs.dl.util.concurrent.ReadWriteLock;
+-     * Logger instance
+-     */
+-    private static final Logger log = LoggerFactory.getLogger(DefaultISMLocking.class);
+-
+-    /**
+-    private final RWLock rwLock = new RWLock();
+-
++    private final ReadWriteLock rwLock = new RWLock();
++    
++    /**
++     * The internal Xid aware read-write lock.
++     */
++    private final ReadWriteLock xidRwLock = new XidRWLock();
++    
+-    public ReadLock acquireReadLock(ItemId id)
+-            throws InterruptedException {
+-        return new ReadLockImpl(rwLock.readLock());
++    public ReadLock acquireReadLock(ItemId id) throws InterruptedException {
++    	if (TransactionContext.getCurrentXid() == null) {
++            return new ReadLockImpl(rwLock.readLock());
++    	} else {
++            return new ReadLockImpl(xidRwLock.readLock());
++    	}
+-    public WriteLock acquireWriteLock(ChangeLog changeLog)
+-            throws InterruptedException {
+-        return new WriteLock() {
+-
+-            {
+-                rwLock.writeLock().acquire();
+-                rwLock.setActiveXid(TransactionContext.getCurrentXid());
+-            }
+-
+-            /**
+-             * {@inheritDoc}
+-             */
+-            public void release() {
+-                rwLock.writeLock().release();
+-            }
+-
+-            /**
+-             * {@inheritDoc}
+-             */
+-            public ReadLock downgrade() throws InterruptedException {
+-                ReadLock rLock = new ReadLockImpl(rwLock.readLock());
+-                release();
+-                return rLock;
+-            }
+-        };
++    public WriteLock acquireWriteLock(ChangeLog changeLog) throws InterruptedException {
++    	if (TransactionContext.getCurrentXid() == null) {
++    		return new WriteLockImpl(rwLock);
++    	} else {
++    		return new WriteLockImpl(xidRwLock);
++    	}
+-    private static final class ReadLockImpl implements ReadLock {
++    private static final class WriteLockImpl implements WriteLock {
++    	
++    	private ReadWriteLock readWriteLock;
++    	
++    	private WriteLockImpl(ReadWriteLock readWriteLock) throws InterruptedException {
++    		this.readWriteLock = readWriteLock;
++    		this.readWriteLock.writeLock().acquire();
++		}
++
++		/**
++		 * {@inheritDoc}
++		 */
++		public void release() {
++		    this.readWriteLock.writeLock().release();
++		}
++
++		/**
++		 * {@inheritDoc}
++		 */
++		public ReadLock downgrade() throws InterruptedException {
++		    ReadLock rLock = new ReadLockImpl(this.readWriteLock.readLock());
++		    release();
++		    return rLock;
++		}
++	}
++
++	private static final class ReadLockImpl implements ReadLock {
++	/**
++	 * Thread concerning ReentrantWriterPreferenceReadWriteLock
++	 */
+-        private Xid activeXid;
+-
+-        /**
++    	/**
+-            return TransactionContext.isCurrentXid(activeXid, (activeWriter_ == null || activeWriter_ == Thread.currentThread()));
++            return activeWriter_ == null || activeWriter_ == Thread.currentThread();
++    }
++
++	/**
++	 * Xid concerning ReentrantWriterPreferenceReadWriteLock
++	 */
++    private static final class XidRWLock extends ReentrantWriterPreferenceReadWriteLock {
++
++        private Xid activeXid;
+-         * Sets the active Xid
+-         * @param xid
++         * Check if the given Xid comes from the same globalTX
++         * @param otherXid
++         * @return true if same globalTX otherwise false
+-        synchronized void setActiveXid(Xid xid) {
+-            if (activeXid != null && xid != null) {
+-                boolean sameGTI = Arrays.equals(activeXid.getGlobalTransactionId(), xid.getGlobalTransactionId());
+-                if (!sameGTI) {
+-                    log.warn("Unable to set the ActiveXid while a other one is associated with a different GloalTransactionId with this RWLock.");
+-                    return;
+-                }
+-            }
+-            activeXid = xid;
++        boolean isSameGlobalTx(Xid otherXid) {
++    	    return (activeXid == otherXid) || Arrays.equals(activeXid.getGlobalTransactionId(), otherXid.getGlobalTransactionId());
++    	}
++
++        /**
++         * Allow reader when there is no active Xid, or current Xid owns
++         * the write lock (reentrant).
++         */
++        protected boolean allowReader() {
++        	Xid currentXid = TransactionContext.getCurrentXid();
++        	return activeXid == null || isSameGlobalTx(currentXid);
+-         * 
+-         * If there are no more writeHolds the activeXid will be set to null
++         */  
++        protected synchronized boolean startWrite() {
++        	Xid currentXid = TransactionContext.getCurrentXid();
++            if (activeXid != null && isSameGlobalTx(currentXid)) { // already held; re-acquire
++            	++writeHolds_;
++                return true;
++            } else if (writeHolds_ == 0) {
++            	if (activeReaders_ == 0 || (readers_.size() == 1 && readers_.get(currentXid) != null)) {
++            		activeXid = currentXid;
++            		writeHolds_ = 1;
++            		return true;
++            	} else {
++            		return false;
++            	}
++            } else {
++            	return false;
++            }
++        }
++
++        /**
++         * {@inheritDoc}
+-                return null;
++            	return null;
+-                activeXid = null;
+-                activeWriter_ = null;
++            	activeXid = null;
++
++        /**
++         * {@inheritDoc}
++         */
++		protected synchronized boolean startRead() {
++			Xid currentXid = TransactionContext.getCurrentXid();
++		    Object c = readers_.get(currentXid);
++		    if (c != null) { // already held -- just increment hold count
++		    	readers_.put(currentXid, new Integer(((Integer)(c)).intValue()+1));
++		    	++activeReaders_;
++		    	return true;
++		    } else if (allowReader()) {
++		    	readers_.put(currentXid, IONE);
++		    	++activeReaders_;
++		    	return true;
++		    } else {
++		    	return false;
++		    }
++		}
++
++        /**
++         * {@inheritDoc}
++         */
++		protected synchronized Signaller endRead() {
++			Xid currentXid = TransactionContext.getCurrentXid();
++		    Object c = readers_.get(currentXid);
++		    if (c == null) {
++		    	throw new IllegalStateException();
++		    }
++		    --activeReaders_;
++		    if (c != IONE) { // more than one hold; decrement count
++		    	int h = ((Integer)(c)).intValue()-1;
++		    	Integer ih = (h == 1)? IONE : new Integer(h);
++		    	readers_.put(currentXid, ih);
++		    	return null;
++		    } else {
++		    	readers_.remove(currentXid);
++		    
++		    	if (writeHolds_ > 0) { // a write lock is still held
++		    		return null;
++		    	} else if (activeReaders_ == 0 && waitingWriters_ > 0) {
++		    		return writerLock_;
++		    	} else  {
++		    		return null;
++		    	}
++		    }
++		}
+
+MOV26 MOV23 UPD40 INS31 INS55 INS55 UPD43 UPD43 INS8 MOV29 MOV83 MOV43 MOV42 MOV44 MOV43 INS8 INS83 INS83 INS83 INS42 MOV43 INS23 INS31 INS31 MOV31 INS29 INS83 INS83 INS83 INS42 INS43 MOV31 INS29 UPD42 INS31 INS31 INS31 INS31 INS31 UPD42 UPD42 UPD42 INS14 INS25 INS25 INS83 INS43 INS59 INS83 INS42 INS44 INS43 INS8 MOV29 MOV83 MOV39 MOV42 MOV8 INS65 INS42 INS65 MOV29 INS39 INS42 MOV44 INS8 INS29 INS83 INS39 INS42 INS8 INS29 INS83 MOV83 UPD39 MOV39 INS42 INS8 INS29 INS83 INS83 INS39 INS42 INS8 INS29 INS83 INS83 INS43 INS42 INS8 UPD66 INS43 INS27 MOV8 INS8 INS27 INS8 INS8 INS42 INS42 INS43 INS42 INS42 MOV21 MOV21 INS66 INS66 INS65 UPD42 INS41 INS65 INS60 INS41 INS65 INS60 INS25 INS65 INS60 INS60 MOV25 INS65 INS42 INS60 INS60 INS25 INS21 INS25 UPD42 MOV42 INS32 INS33 INS41 INS32 INS33 INS41 INS41 INS42 INS7 INS32 MOV27 UPD66 UPD42 INS66 INS27 INS66 INS66 INS43 INS59 INS27 INS65 INS43 INS59 MOV27 INS8 INS25 INS65 INS43 INS59 INS43 INS59 INS27 INS8 INS25 INS65 INS43 INS59 INS43 INS59 INS27 INS8 INS38 INS27 INS8 INS8 INS42 INS42 INS14 INS42 INS42 INS14 INS14 INS22 INS42 INS32 INS42 INS36 INS32 INS42 INS42 MOV32 INS27 INS32 INS42 INS42 INS32 INS32 INS21 INS41 INS27 INS8 INS8 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS33 INS21 INS21 INS41 INS32 MOV8 INS8 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS33 INS53 INS42 INS42 INS42 INS60 INS60 MOV21 INS41 INS21 INS25 INS43 INS32 INS43 INS42 INS43 INS42 INS52 INS42 INS22 UPD42 MOV42 INS22 INS27 INS42 INS42 MOV32 INS32 INS42 INS33 INS42 INS42 INS42 INS42 INS42 INS42 INS38 INS9 INS42 INS34 INS25 INS41 INS42 INS42 UPD42 MOV42 UPD42 MOV42 INS42 INS32 INS38 INS9 INS42 INS21 INS41 INS42 INS42 INS42 INS42 INS42 INS14 INS39 INS59 INS43 INS59 INS32 INS33 INS32 INS27 INS8 INS25 INS42 INS42 INS42 INS42 INS42 INS52 INS42 INS52 INS42 INS22 INS42 INS42 INS42 INS42 INS42 INS27 INS8 INS8 INS9 INS42 INS42 INS42 INS14 UPD42 MOV42 INS38 INS9 INS9 INS43 INS42 INS27 INS42 INS42 INS16 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS34 INS41 INS27 INS8 INS8 INS52 INS42 INS27 INS36 INS21 INS21 INS41 INS41 INS43 INS27 UPD42 UPD42 INS42 INS42 INS42 INS42 INS32 INS34 INS36 INS42 INS14 INS33 INS27 INS27 INS41 INS41 INS42 INS34 INS27 INS7 INS7 INS9 INS9 INS42 INS32 INS34 INS36 INS42 INS27 INS43 INS42 INS42 INS34 INS42 INS34 INS42 INS33 INS27 INS27 INS42 INS42 INS42 INS34 INS36 INS42 INS11 INS42 INS34 INS42 INS32 INS34 INS32 INS33 INS11 INS43 INS36 INS42 INS42 INS42 INS42 INS42 INS43 INS36 INS42 INS42 INS42 INS42 DEL40 DEL26 DEL83 DEL42 DEL42 DEL43 DEL57 DEL32 DEL42 DEL42 DEL32 DEL42 DEL32 DEL42 DEL32 DEL42 DEL42 DEL8 DEL28 DEL31 DEL1 DEL14 DEL41 DEL8 DEL31 DEL42 DEL42 DEL42 DEL36 DEL32 DEL42 DEL33 DEL27 DEL42 DEL39 DEL42 DEL42 DEL42 DEL32 DEL32 DEL59 DEL60 DEL8 DEL25 DEL8 DEL31 DEL66 DEL42 DEL33 DEL7 DEL21 DEL45 DEL38 DEL42 DEL42 DEL7

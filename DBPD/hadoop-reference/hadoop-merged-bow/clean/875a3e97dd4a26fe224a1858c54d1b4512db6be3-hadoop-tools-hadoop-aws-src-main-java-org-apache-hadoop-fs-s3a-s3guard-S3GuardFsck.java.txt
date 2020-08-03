@@ -1,0 +1,264 @@
+HADOOP-16424. S3Guard fsck: Check internal consistency of the MetadataStore (#1691). Contributed by Gabor Bota.
+
+
++import java.util.HashMap;
++import java.util.Map;
++import com.amazonaws.services.dynamodbv2.document.Item;
++import com.amazonaws.services.dynamodbv2.document.PrimaryKey;
++import com.amazonaws.services.dynamodbv2.document.ScanOutcome;
++import com.amazonaws.services.dynamodbv2.document.Table;
++import com.amazonaws.services.dynamodbv2.document.internal.IteratorSupport;
++import com.amazonaws.services.dynamodbv2.document.spec.GetItemSpec;
++import com.amazonaws.services.dynamodbv2.xspec.ExpressionSpecBuilder;
++import org.apache.hadoop.fs.s3a.Tristate;
++import static org.apache.hadoop.fs.s3a.s3guard.PathMetadataDynamoDBTranslation.itemToPathMetadata;
++import static org.apache.hadoop.fs.s3a.s3guard.PathMetadataDynamoDBTranslation.pathToKey;
++import static org.apache.hadoop.fs.s3a.s3guard.PathMetadataDynamoDBTranslation.pathToParentKey;
++ *   <li>Checking the internal metadata consistency</li>
+-        || s3FileStatus.getVersionId() == null ) {
++        || s3FileStatus.getVersionId() == null) {
+-      this.path = status.getPath();
++      if (status != null) {
++        this.path = status.getPath();
++      } else {
++        this.path = pm.getFileStatus().getPath();
++      }
++   * Check the DynamoDB metadatastore internally for consistency.
++   * <pre>
++   * Tasks to do here:
++   *  - find orphan entries (entries without a parent).
++   *  - find if a file's parent is not a directory (so the parent is a file).
++   *  - find entries where the parent is a tombstone.
++   *  - warn: no lastUpdated field.
++   * </pre>
++   */
++  public List<ComparePair> checkDdbInternalConsistency(Path basePath)
++      throws IOException {
++    Preconditions.checkArgument(basePath.isAbsolute(), "path must be absolute");
++
++    List<ComparePair> comparePairs = new ArrayList<>();
++    String rootStr = basePath.toString();
++    LOG.info("Root for internal consistency check: {}", rootStr);
++    StopWatch stopwatch = new StopWatch();
++    stopwatch.start();
++
++    final Table table = metadataStore.getTable();
++    final String username = metadataStore.getUsername();
++    DDBTree ddbTree = new DDBTree();
++
++    /*
++     * I. Root node construction
++     * - If the root node is the real bucket root, a node is constructed instead of
++     *   doing a query to the ddb because the bucket root is not stored.
++     * - If the root node is not a real bucket root then the entry is queried from
++     *   the ddb and constructed from the result.
++     */
++
++    DDBPathMetadata baseMeta;
++
++    if (!basePath.isRoot()) {
++      PrimaryKey rootKey = pathToKey(basePath);
++      final GetItemSpec spec = new GetItemSpec()
++          .withPrimaryKey(rootKey)
++          .withConsistentRead(true);
++      final Item baseItem = table.getItem(spec);
++      baseMeta = itemToPathMetadata(baseItem, username);
++
++      if (baseMeta == null) {
++        throw new FileNotFoundException(
++            "Base element metadata is null. " +
++                "This means the base path element is missing, or wrong path was " +
++                "passed as base path to the internal ddb consistency checker.");
++      }
++    } else {
++      baseMeta = new DDBPathMetadata(
++          new S3AFileStatus(Tristate.UNKNOWN, basePath, username)
++      );
++    }
++
++    DDBTreeNode root = new DDBTreeNode(baseMeta);
++    ddbTree.addNode(root);
++    ddbTree.setRoot(root);
++
++    /*
++     * II. Build and check the descendant tree:
++     * 1. query all nodes where the prefix is the given root, and put it in the tree
++     * 2. Check connectivity: check if each parent is in the hashmap
++     *    - This is done in O(n): we only need to find the parent based on the
++     *      path with a hashmap lookup.
++     *    - Do a test if the graph is connected - if the parent is not in the
++     *      hashmap, we found an orphan entry.
++     *
++     * 3. Do test the elements for errors:
++     *    - File is a parent of a file.
++     *    - Entries where the parent is tombstoned but the entries are not.
++     *    - Warn on no lastUpdated field.
++     *
++     */
++    ExpressionSpecBuilder builder = new ExpressionSpecBuilder();
++    builder.withCondition(
++        ExpressionSpecBuilder.S("parent")
++            .beginsWith(pathToParentKey(basePath))
++    );
++    final IteratorSupport<Item, ScanOutcome> resultIterator = table.scan(
++        builder.buildForScan()).iterator();
++    resultIterator.forEachRemaining(item -> {
++      final DDBPathMetadata pmd = itemToPathMetadata(item, username);
++      DDBTreeNode ddbTreeNode = new DDBTreeNode(pmd);
++      ddbTree.addNode(ddbTreeNode);
++    });
++
++    LOG.debug("Root: {}", ddbTree.getRoot());
++
++    for (Map.Entry<Path, DDBTreeNode> entry : ddbTree.getContentMap().entrySet()) {
++      final DDBTreeNode node = entry.getValue();
++      final ComparePair pair = new ComparePair(null, node.val);
++      // let's skip the root node when checking.
++      if (node.getVal().getFileStatus().getPath().isRoot()) {
++        continue;
++      }
++
++      if(node.getVal().getLastUpdated() == 0) {
++        pair.violations.add(Violation.NO_LASTUPDATED_FIELD);
++      }
++
++      // skip further checking the basenode which is not the actual bucket root.
++      if (node.equals(ddbTree.getRoot())) {
++        continue;
++      }
++
++      final Path parent = node.getFileStatus().getPath().getParent();
++      final DDBTreeNode parentNode = ddbTree.getContentMap().get(parent);
++      if (parentNode == null) {
++        pair.violations.add(Violation.ORPHAN_DDB_ENTRY);
++      } else {
++        if (!node.isTombstoned() && !parentNode.isDirectory()) {
++          pair.violations.add(Violation.PARENT_IS_A_FILE);
++        }
++        if(!node.isTombstoned() && parentNode.isTombstoned()) {
++          pair.violations.add(Violation.PARENT_TOMBSTONED);
++        }
++      }
++
++      if (!pair.violations.isEmpty()) {
++        comparePairs.add(pair);
++      }
++
++      node.setParent(parentNode);
++    }
++
++    // Create a handler and handle each violated pairs
++    S3GuardFsckViolationHandler handler =
++        new S3GuardFsckViolationHandler(rawFS, metadataStore);
++    comparePairs.forEach(handler::handle);
++
++    stopwatch.stop();
++    LOG.info("Total scan time: {}s", stopwatch.now(TimeUnit.SECONDS));
++    LOG.info("Scanned entries: {}", ddbTree.contentMap.size());
++
++    return comparePairs;
++  }
++
++  /**
++   * DDBTree is the tree that represents the structure of items in the DynamoDB.
++   */
++  public static class DDBTree {
++    private final Map<Path, DDBTreeNode> contentMap = new HashMap<>();
++    private DDBTreeNode root;
++
++    public DDBTree() {
++    }
++
++    public Map<Path, DDBTreeNode> getContentMap() {
++      return contentMap;
++    }
++
++    public DDBTreeNode getRoot() {
++      return root;
++    }
++
++    public void setRoot(DDBTreeNode root) {
++      this.root = root;
++    }
++
++    public void addNode(DDBTreeNode pm) {
++      contentMap.put(pm.getVal().getFileStatus().getPath(), pm);
++    }
++
++    @Override
++    public String toString() {
++      return "DDBTree{" +
++          "contentMap=" + contentMap +
++          ", root=" + root +
++          '}';
++    }
++  }
++
++  /**
++   * Tree node for DDBTree.
++   */
++  private static final class DDBTreeNode {
++    private final DDBPathMetadata val;
++    private DDBTreeNode parent;
++    private final List<DDBPathMetadata> children;
++
++    private DDBTreeNode(DDBPathMetadata pm) {
++      this.val = pm;
++      this.parent = null;
++      this.children = new ArrayList<>();
++    }
++
++    public DDBPathMetadata getVal() {
++      return val;
++    }
++
++    public DDBTreeNode getParent() {
++      return parent;
++    }
++
++    public void setParent(DDBTreeNode parent) {
++      this.parent = parent;
++    }
++
++    public List<DDBPathMetadata> getChildren() {
++      return children;
++    }
++
++    public boolean isDirectory() {
++      return val.getFileStatus().isDirectory();
++    }
++
++    public S3AFileStatus getFileStatus() {
++      return val.getFileStatus();
++    }
++
++    public boolean isTombstoned() {
++      return val.isDeleted();
++    }
++
++    @Override
++    public String toString() {
++      return "DDBTreeNode{" +
++          "val=" + val +
++          ", parent=" + parent +
++          ", children=" + children +
++          '}';
++    }
++  }
++
++  /**
+-     * An entry in the MS is tombstoned, but the object is not deleted on S3
++     * An entry in the MS is tombstoned, but the object is not deleted on S3.
+-        S3GuardFsckViolationHandler.NoEtag.class);
++        S3GuardFsckViolationHandler.NoEtag.class),
++    /**
++     * The entry does not have a parent in ddb.
++     */
++    ORPHAN_DDB_ENTRY(0, S3GuardFsckViolationHandler.OrphanDDBEntry.class),
++    /**
++     * The entry's lastUpdated field is empty.
++     */
++    NO_LASTUPDATED_FIELD(2,
++        S3GuardFsckViolationHandler.NoLastUpdatedField.class);
+
+INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS31 INS55 INS55 INS29 INS83 INS74 INS42 INS44 INS43 INS8 INS29 INS83 INS83 INS42 INS23 INS23 INS31 INS31 INS31 INS31 INS31 INS31 INS29 INS83 INS83 INS83 INS42 INS23 INS23 INS23 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS72 INS72 INS66 INS65 INS43 INS43 INS43 INS42 INS42 INS21 INS60 INS60 INS21 INS60 INS21 INS60 INS60 INS60 INS60 INS25 INS60 INS21 INS21 INS60 INS21 INS60 INS21 INS21 INS70 INS60 INS21 INS21 INS21 INS21 INS41 INS65 INS83 INS83 INS74 INS59 INS83 INS43 INS59 INS83 INS42 INS8 INS83 INS74 INS42 INS8 INS83 INS43 INS42 INS8 INS83 INS39 INS42 INS44 INS8 INS83 INS39 INS42 INS44 INS8 INS78 INS83 INS43 INS42 INS8 INS65 INS83 INS83 INS43 INS59 INS83 INS43 INS59 INS83 INS83 INS74 INS59 INS83 INS42 INS44 INS8 INS83 INS43 INS42 INS8 INS83 INS43 INS42 INS8 INS83 INS39 INS42 INS44 INS8 INS83 INS74 INS42 INS8 INS83 INS39 INS42 INS8 INS83 INS43 INS42 INS8 INS83 INS39 INS42 INS8 INS78 INS83 INS43 INS42 INS8 INS29 INS42 INS34 INS57 INS29 INS42 INS34 INS57 INS25 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS42 INS42 INS42 INS32 INS74 INS59 INS43 INS59 INS32 INS43 INS59 INS32 INS83 INS43 INS59 INS83 INS43 INS59 INS43 INS59 INS43 INS59 INS38 INS8 INS8 INS43 INS59 INS32 INS32 INS43 INS59 INS32 INS83 INS74 INS59 INS32 INS32 INS44 INS32 INS8 INS43 INS59 INS32 INS32 INS32 INS32 INS42 INS66 INS43 INS43 INS43 INS42 INS14 INS42 INS42 INS43 INS43 INS43 INS41 INS42 INS41 INS43 INS42 INS21 INS43 INS42 INS21 INS42 INS42 INS41 INS66 INS42 INS42 INS42 INS42 INS43 INS43 INS42 INS43 INS42 INS21 INS21 INS21 INS42 INS41 INS42 INS41 INS43 INS42 INS21 INS43 INS43 INS41 INS41 INS42 INS41 INS41 INS42 INS42 INS41 INS65 INS43 INS65 INS43 INS27 INS8 INS8 INS42 INS42 INS32 INS45 INS43 INS43 INS42 INS14 INS42 INS42 INS32 INS42 INS42 INS45 INS42 INS42 INS42 INS14 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS14 INS42 INS42 INS32 INS60 INS60 INS60 INS21 INS25 INS21 INS42 INS42 INS14 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS14 INS42 INS42 INS32 INS43 INS43 INS43 INS42 INS32 INS42 INS42 INS86 INS42 INS42 INS45 INS32 INS74 INS42 INS32 INS42 INS60 INS60 INS25 INS25 INS25 INS60 INS60 INS25 INS25 INS21 INS42 INS42 INS14 INS42 INS42 INS90 INS42 INS42 INS42 INS42 INS45 INS32 INS42 INS42 INS45 INS32 INS42 INS42 INS42 INS74 INS42 INS42 INS42 INS42 INS42 INS42 INS7 INS42 INS32 INS27 INS42 INS42 INS42 INS7 INS7 INS7 INS42 INS42 INS42 INS7 INS42 INS42 INS42 INS32 INS32 INS32 INS27 UPD66 INS66 INS40 INS66 INS40 INS42 INS33 MOV21 INS21 INS42 INS42 INS42 INS42 INS74 INS42 INS42 INS43 INS42 INS42 INS42 INS42 INS43 INS42 INS42 INS43 INS59 INS83 INS43 INS59 INS83 INS43 INS59 INS7 INS27 INS8 INS7 INS43 INS42 INS43 INS32 INS42 INS32 INS42 INS42 INS42 INS32 INS42 INS59 INS8 INS42 INS42 INS43 INS43 INS43 INS42 INS42 INS83 INS43 INS59 INS83 INS43 INS59 INS32 INS8 INS27 INS8 INS32 INS8 INS83 INS43 INS59 INS83 INS43 INS59 INS27 INS8 INS8 INS38 INS8 INS32 INS43 INS42 INS42 INS42 INS42 INS42 INS42 INS40 INS40 INS42 INS43 INS22 INS42 INS42 INS42 INS32 INS42 INS27 INS42 INS45 INS42 INS13 INS22 INS42 INS22 INS33 INS22 INS14 INS22 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS27 INS42 INS45 INS42 INS45 INS42 INS13 INS7 INS43 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS32 INS42 INS33 INS53 INS42 INS14 INS42 INS42 INS42 INS42 INS45 INS42 INS42 INS42 INS42 INS32 INS42 INS60 INS60 INS21 INS40 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS14 INS32 INS42 INS18 INS32 INS34 INS21 INS42 INS42 INS32 INS18 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS33 INS21 INS25 INS25 INS32 INS21 INS42 INS42 INS42 INS42 INS42 INS52 INS42 INS32 INS42 INS45 INS45 INS52 INS42 INS52 INS42 INS52 INS42 INS74 INS52 INS42 INS42 INS42 INS45 INS45 INS22 INS32 INS42 INS42 INS42 INS32 INS42 INS9 INS42 INS42 INS42 INS42 INS42 INS42 INS14 INS43 INS14 INS42 INS42 INS83 INS43 INS59 INS43 INS59 INS32 INS42 INS42 INS43 INS33 INS40 INS32 INS42 INS32 INS42 INS32 INS42 INS42 INS32 INS42 INS32 INS42 INS42 INS32 INS27 INS8 INS27 INS8 INS40 INS42 INS32 INS32 INS42 INS43 INS52 INS42 INS32 INS42 INS14 INS42 INS42 INS43 INS27 INS42 INS43 INS40 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS14 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS40 INS42 INS40 INS32 INS42 INS42 INS42 INS40 INS42 INS40 INS38 INS38 INS21 INS38 INS32 INS21 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS43 INS42 INS45 INS45 INS45 INS42 INS42 INS42 INS42 INS43 INS42 INS42 INS42 INS42 INS42 INS32 INS32 INS32 INS32 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS40 INS42 INS40 INS42 INS42 INS40 INS42 INS40

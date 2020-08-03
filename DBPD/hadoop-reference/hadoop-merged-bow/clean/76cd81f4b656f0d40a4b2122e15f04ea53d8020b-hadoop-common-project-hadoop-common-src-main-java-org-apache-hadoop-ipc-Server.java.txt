@@ -1,0 +1,340 @@
+HADOOP-13465. Design Server.Call to be extensible for unified call queue. Contributed by Daryn Sharp.
+
+-    return (call != null && call.connection != null) ? call.connection
+-        .getHostInetAddress() : null;
++    return (call != null ) ? call.getHostInetAddress() : null;
+-  
++
+-    return (call != null && call.connection != null) ? call.connection.user
+-        : null;
++    return (call != null) ? call.getRemoteUser() : null;
+- 
++
+-        String client = CurCall.get().connection.toString();
++        String client = CurCall.get().toString();
+-  /** A call queued for handling. */
+-  public static class Call implements Schedulable {
+-    private final int callId;             // the client's call id
+-    private final int retryCount;        // the retry count of the call
+-    private final Writable rpcRequest;    // Serialized Rpc request from client
+-    private final Connection connection;  // connection to client
+-    private long timestamp;               // time received when response is null
+-                                          // time served when response is not null
+-    private ByteBuffer rpcResponse;       // the response for this call
++  /** A generic call queued for handling. */
++  public static class Call implements Schedulable,
++  PrivilegedExceptionAction<Void> {
++    final int callId;            // the client's call id
++    final int retryCount;        // the retry count of the call
++    long timestamp;              // time received when response is null
++                                 // time served when response is not null
+-    private final RPC.RpcKind rpcKind;
+-    private final byte[] clientId;
++    final RPC.RpcKind rpcKind;
++    final byte[] clientId;
+-    private Call(Call call) {
+-      this(call.callId, call.retryCount, call.rpcRequest, call.connection,
+-          call.rpcKind, call.clientId, call.traceScope, call.callerContext);
++    Call(Call call) {
++      this(call.callId, call.retryCount, call.rpcKind, call.clientId,
++          call.traceScope, call.callerContext);
+-    public Call(int id, int retryCount, Writable param, 
+-        Connection connection) {
+-      this(id, retryCount, param, connection, RPC.RpcKind.RPC_BUILTIN,
+-          RpcConstants.DUMMY_CLIENT_ID);
++    Call(int id, int retryCount, RPC.RpcKind kind, byte[] clientId) {
++      this(id, retryCount, kind, clientId, null, null);
+-    public Call(int id, int retryCount, Writable param, Connection connection,
++    @VisibleForTesting // primarily TestNamenodeRetryCache
++    public Call(int id, int retryCount, Void ignore1, Void ignore2,
+-      this(id, retryCount, param, connection, kind, clientId, null, null);
++      this(id, retryCount, kind, clientId, null, null);
+-    public Call(int id, int retryCount, Writable param, Connection connection,
+-        RPC.RpcKind kind, byte[] clientId, TraceScope traceScope,
+-        CallerContext callerContext) {
++    Call(int id, int retryCount, RPC.RpcKind kind, byte[] clientId,
++        TraceScope traceScope, CallerContext callerContext) {
+-      this.rpcRequest = param;
+-      this.connection = connection;
+-      this.rpcResponse = null;
+-    
++
+-      return rpcRequest + " from " + connection + " Call#" + callId + " Retry#"
+-          + retryCount;
++      return "Call#" + callId + " Retry#" + retryCount;
+-    public void setResponse(ByteBuffer response) {
+-      this.rpcResponse = response;
++    public Void run() throws Exception {
++      return null;
++    }
++    // should eventually be abstract but need to avoid breaking tests
++    public UserGroupInformation getRemoteUser() {
++      return null;
++    }
++    public InetAddress getHostInetAddress() {
++      return null;
++    }
++    public String getHostAddress() {
++      InetAddress addr = getHostInetAddress();
++      return (addr != null) ? addr.getHostAddress() : null;
+-    public void postponeResponse() {
++    public final void postponeResponse() {
+-    public void sendResponse() throws IOException {
++    public final void sendResponse() throws IOException {
+-        connection.sendResponse(this);
++        doResponse(null);
+-    public void abortResponse(Throwable t) throws IOException {
++    public final void abortResponse(Throwable t) throws IOException {
+-        connection.abortResponse(this, t);
++        doResponse(t);
++    void doResponse(Throwable t) throws IOException {}
++
+-      return connection.user;
++      return getRemoteUser();
++  /** A RPC extended call queued for handling. */
++  private class RpcCall extends Call {
++    final Connection connection;  // connection to client
++    final Writable rpcRequest;    // Serialized Rpc request from client
++    ByteBuffer rpcResponse;       // the response for this call
++
++    RpcCall(RpcCall call) {
++      super(call);
++      this.connection = call.connection;
++      this.rpcRequest = call.rpcRequest;
++    }
++
++    RpcCall(Connection connection, int id) {
++      this(connection, id, RpcConstants.INVALID_RETRY_COUNT);
++    }
++
++    RpcCall(Connection connection, int id, int retryCount) {
++      this(connection, id, retryCount, null,
++          RPC.RpcKind.RPC_BUILTIN, RpcConstants.DUMMY_CLIENT_ID,
++          null, null);
++    }
++
++    RpcCall(Connection connection, int id, int retryCount,
++        Writable param, RPC.RpcKind kind, byte[] clientId,
++        TraceScope traceScope, CallerContext context) {
++      super(id, retryCount, kind, clientId, traceScope, context);
++      this.connection = connection;
++      this.rpcRequest = param;
++    }
++
++    @Override
++    public UserGroupInformation getRemoteUser() {
++      return connection.user;
++    }
++
++    @Override
++    public InetAddress getHostInetAddress() {
++      return connection.getHostInetAddress();
++    }
++
++    @Override
++    public Void run() throws Exception {
++      if (!connection.channel.isOpen()) {
++        Server.LOG.info(Thread.currentThread().getName() + ": skipped " + this);
++        return null;
++      }
++      String errorClass = null;
++      String error = null;
++      RpcStatusProto returnStatus = RpcStatusProto.SUCCESS;
++      RpcErrorCodeProto detailedErr = null;
++      Writable value = null;
++
++      try {
++        value = call(
++            rpcKind, connection.protocolName, rpcRequest, timestamp);
++      } catch (Throwable e) {
++        if (e instanceof UndeclaredThrowableException) {
++          e = e.getCause();
++        }
++        logException(Server.LOG, e, this);
++        if (e instanceof RpcServerException) {
++          RpcServerException rse = ((RpcServerException)e);
++          returnStatus = rse.getRpcStatusProto();
++          detailedErr = rse.getRpcErrorCodeProto();
++        } else {
++          returnStatus = RpcStatusProto.ERROR;
++          detailedErr = RpcErrorCodeProto.ERROR_APPLICATION;
++        }
++        errorClass = e.getClass().getName();
++        error = StringUtils.stringifyException(e);
++        // Remove redundant error class name from the beginning of the
++        // stack trace
++        String exceptionHdr = errorClass + ": ";
++        if (error.startsWith(exceptionHdr)) {
++          error = error.substring(exceptionHdr.length());
++        }
++      }
++      setupResponse(this, returnStatus, detailedErr,
++          value, errorClass, error);
++      sendResponse();
++      return null;
++    }
++
++    void setResponse(ByteBuffer response) throws IOException {
++      this.rpcResponse = response;
++    }
++
++    @Override
++    void doResponse(Throwable t) throws IOException {
++      RpcCall call = this;
++      if (t != null) {
++        // clone the call to prevent a race with another thread stomping
++        // on the response while being sent.  the original call is
++        // effectively discarded since the wait count won't hit zero
++        call = new RpcCall(this);
++        setupResponse(call,
++            RpcStatusProto.FATAL, RpcErrorCodeProto.ERROR_RPC_SERVER,
++            null, t.getClass().getName(), StringUtils.stringifyException(t));
++      }
++      connection.sendResponse(call);
++    }
++
++    @Override
++    public String toString() {
++      return super.toString() + " " + rpcRequest + " from " + connection;
++    }
++  }
++
+-          ArrayList<Call> calls;
++          ArrayList<RpcCall> calls;
+-            calls = new ArrayList<Call>(writeSelector.keys().size());
++            calls = new ArrayList<RpcCall>(writeSelector.keys().size());
+-              Call call = (Call)key.attachment();
++              RpcCall call = (RpcCall)key.attachment();
+-          
+-          for(Call call : calls) {
++
++          for (RpcCall call : calls) {
+-      Call call = (Call)key.attachment();
++      RpcCall call = (RpcCall)key.attachment();
+-    private void doPurge(Call call, long now) {
+-      LinkedList<Call> responseQueue = call.connection.responseQueue;
++    private void doPurge(RpcCall call, long now) {
++      LinkedList<RpcCall> responseQueue = call.connection.responseQueue;
+-        Iterator<Call> iter = responseQueue.listIterator(0);
++        Iterator<RpcCall> iter = responseQueue.listIterator(0);
+-    private boolean processResponse(LinkedList<Call> responseQueue,
++    private boolean processResponse(LinkedList<RpcCall> responseQueue,
+-      Call call = null;
++      RpcCall call = null;
+-    void doRespond(Call call) throws IOException {
++    void doRespond(RpcCall call) throws IOException {
+-    private LinkedList<Call> responseQueue;
++    private LinkedList<RpcCall> responseQueue;
+-    private final Call authFailedCall = new Call(AUTHORIZATION_FAILED_CALL_ID,
+-        RpcConstants.INVALID_RETRY_COUNT, null, this);
++    private final RpcCall authFailedCall =
++        new RpcCall(this, AUTHORIZATION_FAILED_CALL_ID);
+-      this.responseQueue = new LinkedList<Call>();
++      this.responseQueue = new LinkedList<RpcCall>();
+-      final Call saslCall = new Call(AuthProtocol.SASL.callId,
+-          RpcConstants.INVALID_RETRY_COUNT, null, this);
++      final RpcCall saslCall = new RpcCall(this, AuthProtocol.SASL.callId);
+-        Call fakeCall = new Call(-1, RpcConstants.INVALID_RETRY_COUNT, null,
+-            this);
++        RpcCall fakeCall = new RpcCall(this, -1);
+-        Call fakeCall = new Call(-1, RpcConstants.INVALID_RETRY_COUNT, null,
+-            this);
++        RpcCall fakeCall = new RpcCall(this, -1);
+-        Call fakeCall = new Call(0, RpcConstants.INVALID_RETRY_COUNT, null,
+-            this);
++        RpcCall fakeCall = new RpcCall(this, 0);
+-      Call fakeCall = new Call(0, RpcConstants.INVALID_RETRY_COUNT, null, this);
++      RpcCall fakeCall = new RpcCall(this, 0);
+-        final Call call = new Call(callId, retry, null, this);
++        final RpcCall call = new RpcCall(this, callId, retry);
+-      Call call = new Call(header.getCallId(), header.getRetryCount(),
+-          rpcRequest, this, ProtoUtil.convert(header.getRpcKind()),
++      RpcCall call = new RpcCall(this, header.getCallId(),
++          header.getRetryCount(), rpcRequest,
++          ProtoUtil.convert(header.getRpcKind()),
+-    private void sendResponse(Call call) throws IOException {
++    private void sendResponse(RpcCall call) throws IOException {
+-    private void abortResponse(Call call, Throwable t) throws IOException {
+-      // clone the call to prevent a race with the other thread stomping
+-      // on the response while being sent.  the original call is
+-      // effectively discarded since the wait count won't hit zero
+-      call = new Call(call);
+-      setupResponse(call,
+-          RpcStatusProto.FATAL, RpcErrorCodeProto.ERROR_RPC_SERVER,
+-          null, t.getClass().getName(), StringUtils.stringifyException(t));
+-      call.sendResponse();
+-    }
+-
+-          if (!call.connection.channel.isOpen()) {
+-            LOG.info(Thread.currentThread().getName() + ": skipped " + call);
+-            continue;
+-          }
+-          String errorClass = null;
+-          String error = null;
+-          RpcStatusProto returnStatus = RpcStatusProto.SUCCESS;
+-          RpcErrorCodeProto detailedErr = null;
+-          Writable value = null;
+-
+-
+-          try {
+-            // Make the call as the user via Subject.doAs, thus associating
+-            // the call with the Subject
+-            if (call.connection.user == null) {
+-              value = call(call.rpcKind, call.connection.protocolName, call.rpcRequest, 
+-                           call.timestamp);
+-            } else {
+-              value = 
+-                call.connection.user.doAs
+-                  (new PrivilegedExceptionAction<Writable>() {
+-                     @Override
+-                     public Writable run() throws Exception {
+-                       // make the call
+-                       return call(call.rpcKind, call.connection.protocolName, 
+-                                   call.rpcRequest, call.timestamp);
+-
+-                     }
+-                   }
+-                  );
+-            }
+-          } catch (Throwable e) {
+-            if (e instanceof UndeclaredThrowableException) {
+-              e = e.getCause();
+-            }
+-            logException(LOG, e, call);
+-            if (e instanceof RpcServerException) {
+-              RpcServerException rse = ((RpcServerException)e); 
+-              returnStatus = rse.getRpcStatusProto();
+-              detailedErr = rse.getRpcErrorCodeProto();
+-            } else {
+-              returnStatus = RpcStatusProto.ERROR;
+-              detailedErr = RpcErrorCodeProto.ERROR_APPLICATION;
+-            }
+-            errorClass = e.getClass().getName();
+-            error = StringUtils.stringifyException(e);
+-            // Remove redundant error class name from the beginning of the stack trace
+-            String exceptionHdr = errorClass + ": ";
+-            if (error.startsWith(exceptionHdr)) {
+-              error = error.substring(exceptionHdr.length());
+-            }
+-          }
+-          CurCall.set(null);
+-          synchronized (call.connection.responseQueue) {
+-            setupResponse(call, returnStatus, detailedErr,
+-                value, errorClass, error);
+-            call.sendResponse();
++          UserGroupInformation remoteUser = call.getRemoteUser();
++          if (remoteUser != null) {
++            remoteUser.doAs(call);
++          } else {
++            call.run();
++          CurCall.set(null);
+-      Call call, RpcStatusProto status, RpcErrorCodeProto erCode,
++      RpcCall call, RpcStatusProto status, RpcErrorCodeProto erCode,
+-  private void setupResponse(Call call,
++  private void setupResponse(RpcCall call,
+-                             Call call,
++                             RpcCall call,
+-  private void wrapWithSasl(Call call) throws IOException {
++  private void wrapWithSasl(RpcCall call) throws IOException {
+
+INS55 INS74 INS31 INS31 INS31 INS31 INS31 INS31 INS29 INS83 INS42 MOV43 MOV23 MOV23 MOV23 INS31 INS31 INS31 INS31 MOV31 INS31 INS31 MOV31 MOV31 INS31 MOV43 INS43 INS44 INS44 INS44 INS78 INS44 INS44 INS44 INS83 INS43 INS42 INS43 INS8 INS83 INS43 INS42 INS8 INS83 INS43 INS42 INS8 INS83 INS43 INS42 INS8 INS83 INS83 INS83 INS39 INS42 INS44 INS43 INS8 INS78 INS83 INS43 INS42 INS8 INS65 INS42 INS44 INS8 INS42 MOV44 MOV44 INS8 INS42 MOV44 MOV44 MOV44 INS8 INS42 MOV44 INS44 MOV44 MOV44 INS44 INS44 INS44 INS44 INS8 UPD42 INS78 INS83 INS43 INS42 INS8 INS78 INS83 INS43 INS42 MOV43 MOV8 INS43 INS78 UPD42 INS8 MOV78 INS83 INS43 INS42 INS8 UPD74 MOV74 INS43 UPD43 UPD43 UPD43 UPD43 UPD66 INS42 INS39 INS42 INS39 INS42 UPD43 UPD42 INS5 INS42 INS42 INS39 INS42 INS39 INS42 UPD43 UPD42 INS43 INS42 INS42 INS42 INS41 INS42 INS41 INS42 INS41 INS42 INS60 INS41 INS43 INS42 INS42 INS42 INS42 INS41 INS66 INS43 INS42 INS46 INS21 INS21 INS17 INS17 INS39 INS42 INS43 INS42 INS5 INS42 INS43 INS42 INS43 INS42 INS46 MOV21 MOV21 INS42 INS42 INS41 INS42 INS42 MOV21 MOV21 INS41 INS42 INS42 INS60 INS25 INS21 INS42 INS41 MOV60 UPD43 UPD74 UPD43 UPD43 INS42 UPD43 UPD42 UPD42 UPD42 UPD42 INS32 INS40 INS39 INS85 UPD42 UPD42 INS33 INS33 UPD42 INS42 INS33 INS33 INS33 INS43 INS59 INS16 INS42 INS32 INS42 INS42 INS7 INS7 INS42 INS42 INS40 INS42 INS42 INS42 INS33 INS40 INS40 INS33 INS33 INS40 INS39 INS85 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS8 INS33 INS43 INS59 INS27 MOV8 INS32 INS27 UPD43 UPD42 INS74 MOV43 UPD43 UPD43 UPD42 UPD42 UPD43 INS52 UPD43 UPD43 UPD43 UPD42 MOV27 INS42 MOV27 INS42 INS42 UPD45 INS42 INS42 INS32 INS36 INS32 INS33 INS42 INS22 INS40 INS22 INS40 INS42 INS42 INS41 MOV21 INS52 UPD42 MOV42 INS42 INS52 INS42 INS33 INS42 INS42 INS42 INS48 INS45 INS42 INS45 INS42 UPD42 INS43 INS43 MOV42 UPD42 UPD42 UPD42 UPD42 UPD42 UPD42 INS42 INS27 INS42 INS42 INS52 INS42 INS52 INS42 UPD40 INS33 INS42 UPD43 INS42 INS42 UPD74 UPD74 MOV74 UPD43 INS52 UPD43 UPD43 INS52 UPD43 INS52 INS8 INS42 INS33 UPD42 INS33 UPD42 INS40 UPD42 UPD43 UPD43 UPD42 UPD42 UPD43 UPD42 UPD43 UPD42 MOV60 MOV25 MOV21 MOV25 MOV21 INS60 INS25 MOV21 INS52 UPD42 INS42 INS40 INS42 UPD42 MOV42 INS40 INS52 UPD43 INS52 UPD74 MOV74 UPD42 UPD42 UPD43 MOV38 UPD42 UPD43 UPD42 INS43 INS59 INS27 INS8 INS8 MOV32 UPD42 UPD43 UPD43 UPD42 UPD43 MOV38 UPD42 UPD43 INS52 INS42 INS42 INS32 INS42 INS33 INS21 INS21 UPD42 UPD42 UPD42 UPD43 INS52 UPD42 INS42 INS42 INS32 INS32 INS60 UPD42 INS42 INS42 INS42 INS42 INS42 UPD74 MOV74 INS43 INS59 UPD43 INS42 INS42 INS11 UPD42 INS43 MOV32 INS42 DEL40 DEL33 DEL27 DEL27 DEL40 DEL40 DEL33 DEL27 DEL27 DEL40 DEL42 DEL22 DEL83 DEL83 DEL83 DEL83 DEL83 DEL83 DEL40 DEL40 DEL83 DEL42 DEL40 DEL40 DEL42 DEL42 DEL83 DEL52 DEL42 DEL22 DEL33 DEL7 DEL21 DEL42 DEL45 DEL42 DEL42 DEL52 DEL42 DEL52 DEL83 DEL83 DEL83 DEL42 DEL42 DEL18 DEL40 DEL42 DEL43 DEL74 DEL83 DEL42 DEL43 DEL42 DEL40 DEL40 DEL40 DEL40 DEL32 DEL41 DEL8 DEL31 DEL1 DEL14 DEL40 DEL33 DEL27 DEL42 DEL42 DEL40 DEL40 DEL40 DEL40 DEL32 DEL7 DEL21 DEL8 DEL8 DEL25 DEL8 DEL42 DEL42 DEL42 DEL42 DEL40 DEL8 DEL51 DEL83 DEL83 DEL43 DEL42 DEL44 DEL42 DEL42 DEL42 DEL32 DEL21 DEL42 DEL43 DEL42 DEL42 DEL43 DEL11 DEL59 DEL60 DEL42 DEL43 DEL74 DEL40 DEL33 DEL52 DEL40 DEL33 DEL52 DEL40 DEL33 DEL40 DEL33 DEL40 DEL33 DEL52 DEL40 DEL33 DEL52 DEL33 DEL52 DEL52

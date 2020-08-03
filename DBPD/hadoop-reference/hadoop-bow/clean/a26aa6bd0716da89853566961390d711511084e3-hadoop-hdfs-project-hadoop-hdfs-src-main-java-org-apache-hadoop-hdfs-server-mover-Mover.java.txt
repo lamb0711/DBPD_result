@@ -1,0 +1,154 @@
+HDFS-6944. Archival Storage: add retry and termination logic for Mover. Contributed by Jing Zhao.
+
++import com.google.common.annotations.VisibleForTesting;
+-      new Processor().processNamespace();
+-
+-      return ExitStatus.IN_PROGRESS;
++      boolean hasRemaining = new Processor().processNamespace();
++      return hasRemaining ? ExitStatus.IN_PROGRESS : ExitStatus.SUCCESS;
+-    private void processNamespace() {
++    /**
++     * @return whether there is still remaining migration work for the next
++     *         round
++     */
++    private boolean processNamespace() {
++      boolean hasRemaining = true;
+-        processDirRecursively("", dfs.getFileInfo("/"));
++        hasRemaining = processDirRecursively("", dfs.getFileInfo("/"));
++      // wait for pending move to finish and retry the failed migration
++      hasRemaining |= Dispatcher.waitForMoveCompletion(storages.targets.values());
++      return hasRemaining;
+-    private void processChildrenList(String fullPath) {
++    /**
++     * @return whether there is still remaing migration work for the next
++     *         round
++     */
++    private boolean processChildrenList(String fullPath) {
++      boolean hasRemaining = false;
+-          return;
++          return hasRemaining;
+-          return;
++          return hasRemaining;
+-          processDirRecursively(fullPath, child);
++          hasRemaining |= processDirRecursively(fullPath, child);
+-        if (!children.hasMore()) {
++        if (children.hasMore()) {
+-          return;
++          return hasRemaining;
+-    private void processDirRecursively(String parent, HdfsFileStatus status) {
++    /** @return whether the migration requires next round */
++    private boolean processDirRecursively(String parent,
++                                          HdfsFileStatus status) {
+-      if (status.isSymlink()) {
+-        return; //ignore symlinks
+-      } else if (status.isDir()) {
++      boolean hasRemaining = false;
++      if (status.isDir()) {
+-          fullPath = fullPath + Path.SEPARATOR; 
++          fullPath = fullPath + Path.SEPARATOR;
+-        processChildrenList(fullPath);
++        hasRemaining = processChildrenList(fullPath);
+-          processChildrenList(dirSnapshot);
++          hasRemaining |= processChildrenList(dirSnapshot);
+-      } else { // file
++      } else if (!status.isSymlink()) { // file
+-          if (isSnapshotPathInCurrent(fullPath)) {
++          if (!isSnapshotPathInCurrent(fullPath)) {
+-            return;
++            hasRemaining = processFile((HdfsLocatedFileStatus)status);
+-          return;
++          return false;
+-        processFile(parent, (HdfsLocatedFileStatus)status);
++      return hasRemaining;
+-    private void processFile(String parent, HdfsLocatedFileStatus status) { 
++    /** @return true if it is necessary to run another round of migration */
++    private boolean processFile(HdfsLocatedFileStatus status) {
+-      final LocatedBlocks locations = status.getBlockLocations();
+-      for(LocatedBlock lb : locations.getLocatedBlocks()) {
+-        final StorageTypeDiff diff = new StorageTypeDiff(types, lb.getStorageTypes());
++      final LocatedBlocks locatedBlocks = status.getBlockLocations();
++      boolean hasRemaining = false;
++      for(LocatedBlock lb : locatedBlocks.getLocatedBlocks()) {
++        final StorageTypeDiff diff = new StorageTypeDiff(types,
++            lb.getStorageTypes());
+-          scheduleMoves4Block(diff, lb);
++          if (scheduleMoves4Block(diff, lb)) {
++            hasRemaining |= (diff.existing.size() > 1 &&
++                diff.expected.size() > 1);
++          } else {
++            hasRemaining = true;
++          }
++      return hasRemaining;
+-    void scheduleMoves4Block(StorageTypeDiff diff, LocatedBlock lb) {
++    boolean scheduleMoves4Block(StorageTypeDiff diff, LocatedBlock lb) {
+-      for(final Iterator<StorageType> i = diff.existing.iterator(); i.hasNext(); ) {
+-        final StorageType t = i.next();
+-        for(final Iterator<MLocation> j = locations.iterator(); j.hasNext(); ) {
+-          final MLocation ml = j.next();
+-          final Source source = storages.getSource(ml); 
++      for (final StorageType t : diff.existing) {
++        for (final MLocation ml : locations) {
++          final Source source = storages.getSource(ml);
+-            // try to schedule replica move.
+-            if (scheduleMoveReplica(db, ml, source, diff.expected)) {
+-              i.remove();
+-              j.remove();
+-              return;
++            // try to schedule one replica move.
++            if (scheduleMoveReplica(db, source, diff.expected)) {
++              return true;
++      return false;
++    @VisibleForTesting
+-        List<StorageType> targetTypes) {
+-      return scheduleMoveReplica(db, ml, storages.getSource(ml), targetTypes);
++                                List<StorageType> targetTypes) {
++      return scheduleMoveReplica(db, storages.getSource(ml), targetTypes);
+-    boolean scheduleMoveReplica(DBlock db, MLocation ml, Source source,
++    boolean scheduleMoveReplica(DBlock db, Source source,
+-        if (chooseTarget(db, ml, source, targetTypes, Matcher.SAME_NODE_GROUP)) {
++        if (chooseTarget(db, source, targetTypes, Matcher.SAME_NODE_GROUP)) {
+-      if (chooseTarget(db, ml, source, targetTypes, Matcher.SAME_RACK)) {
++      if (chooseTarget(db, source, targetTypes, Matcher.SAME_RACK)) {
+-      if (chooseTarget(db, ml, source, targetTypes, Matcher.ANY_OTHER)) {
+-        return true;
+-      }
+-      return false;
++      return chooseTarget(db, source, targetTypes, Matcher.ANY_OTHER);
+-    boolean chooseTarget(DBlock db, MLocation ml, Source source,
++    boolean chooseTarget(DBlock db, Source source,
+-      for(final Iterator<StorageType> i = targetTypes.iterator(); i.hasNext(); ) {
+-        final StorageType t = i.next();
++      for (StorageType t : targetTypes) {
+-          if (matcher.match(cluster, ml.datanode, target.getDatanodeInfo())) {
++          if (matcher.match(cluster, source.getDatanodeInfo(),
++              target.getDatanodeInfo())) {
+-              i.remove();
+-  
+-  private static class StorageTypeDiff {
++  @VisibleForTesting
++  static class StorageTypeDiff {
+-     * @return if the existing types is empty after removed the overlap.
++     * @return if the existing types or the expected types is empty after
++     *         removing the overlap.
+-      return existing.isEmpty();
++      return expected.isEmpty() || existing.isEmpty();
+-    final long sleeptime = 2000*conf.getLong(
++    final long sleeptime = 2000 * conf.getLong(
+-      connectors = NameNodeConnector.newNameNodeConnectors(namenodes, 
++      connectors = NameNodeConnector.newNameNodeConnectors(namenodes,
+-      while (true) {
++      while (connectors.size() > 0) {
+-        for(NameNodeConnector nnc : connectors) {
++        Iterator<NameNodeConnector> iter = connectors.iterator();
++        while (iter.hasNext()) {
++          NameNodeConnector nnc = iter.next();
+-          if (r != ExitStatus.IN_PROGRESS) {
+-            //must be an error statue, return.
++          if (r == ExitStatus.SUCCESS) {
++            iter.remove();
++          } else if (r != ExitStatus.IN_PROGRESS) {
++            // must be an error statue, return
+-
++      return ExitStatus.SUCCESS.getExitCode();
+-      for(NameNodeConnector nnc : connectors) {
++      for (NameNodeConnector nnc : connectors) {

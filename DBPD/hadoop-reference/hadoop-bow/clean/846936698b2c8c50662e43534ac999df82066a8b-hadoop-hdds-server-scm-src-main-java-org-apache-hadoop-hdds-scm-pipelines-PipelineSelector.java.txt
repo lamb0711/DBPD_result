@@ -1,0 +1,245 @@
+HDDS-399. Persist open pipeline information across SCM restart. Contributed by Mukul Kumar Singh.
+
+-import org.apache.hadoop.hdds.scm.container.ContainerStateManager;
+-import org.apache.hadoop.ozone.common.statemachine
+-    .InvalidStateTransitionException;
+-import org.apache.hadoop.ozone.common.statemachine.StateMachine;
++import org.apache.hadoop.ozone.OzoneConsts;
++import org.apache.hadoop.utils.MetadataStore;
++import org.apache.hadoop.utils.MetadataStoreBuilder;
++import java.io.File;
+-import java.util.NavigableSet;
++import java.util.HashMap;
+-import java.util.stream.Collectors;
++import static org.apache.hadoop.hdds.server
++        .ServerUtils.getOzoneMetaDirPath;
++import static org.apache.hadoop.ozone
++        .OzoneConsts.SCM_PIPELINE_DB;
+-  private final ContainerStateManager containerStateManager;
++  private final MetadataStore pipelineStore;
++  private final PipelineStateManager stateManager;
++  private final Map<PipelineID, HashSet<ContainerID>> pipeline2ContainerMap;
+-  private final StateMachine<LifeCycleState,
+-      HddsProtos.LifeCycleEvent> stateMachine;
+-  public PipelineSelector(NodeManager nodeManager,
+-      ContainerStateManager containerStateManager, Configuration conf,
+-      EventPublisher eventPublisher) {
++  public PipelineSelector(NodeManager nodeManager, Configuration conf,
++      EventPublisher eventPublisher, int cacheSizeMB) throws IOException {
+-            containerSize, node2PipelineMap, pipelineMap);
++            containerSize);
+-            conf, node2PipelineMap, pipelineMap);
+-    // Initialize the container state machine.
+-    Set<HddsProtos.LifeCycleState> finalStates = new HashSet();
++            conf);
+-    this.containerStateManager = containerStateManager;
+-    // These are the steady states of a container.
+-    finalStates.add(HddsProtos.LifeCycleState.OPEN);
+-    finalStates.add(HddsProtos.LifeCycleState.CLOSED);
++    stateManager = new PipelineStateManager();
++    pipeline2ContainerMap = new HashMap<>();
+-    this.stateMachine = new StateMachine<>(HddsProtos.LifeCycleState.ALLOCATED,
+-        finalStates);
+-    initializeStateMachine();
++    // Write the container name to pipeline mapping.
++    File metaDir = getOzoneMetaDirPath(conf);
++    File containerDBPath = new File(metaDir, SCM_PIPELINE_DB);
++    pipelineStore = MetadataStoreBuilder.newBuilder()
++            .setConf(conf)
++            .setDbFile(containerDBPath)
++            .setCacheSize(cacheSizeMB * OzoneConsts.MB)
++            .build();
++
++    reloadExistingPipelines();
+-  /**
+-   * Event and State Transition Mapping.
+-   *
+-   * State: ALLOCATED ---------------> CREATING
+-   * Event:                CREATE
+-   *
+-   * State: CREATING  ---------------> OPEN
+-   * Event:               CREATED
+-   *
+-   * State: OPEN      ---------------> CLOSING
+-   * Event:               FINALIZE
+-   *
+-   * State: CLOSING   ---------------> CLOSED
+-   * Event:                CLOSE
+-   *
+-   * State: CREATING  ---------------> CLOSED
+-   * Event:               TIMEOUT
+-   *
+-   *
+-   * Container State Flow:
+-   *
+-   * [ALLOCATED]---->[CREATING]------>[OPEN]-------->[CLOSING]
+-   *            (CREATE)     | (CREATED)     (FINALIZE)   |
+-   *                         |                            |
+-   *                         |                            |
+-   *                         |(TIMEOUT)                   |(CLOSE)
+-   *                         |                            |
+-   *                         +--------> [CLOSED] <--------+
+-   */
+-  private void initializeStateMachine() {
+-    stateMachine.addTransition(HddsProtos.LifeCycleState.ALLOCATED,
+-        HddsProtos.LifeCycleState.CREATING,
+-        HddsProtos.LifeCycleEvent.CREATE);
++  private void reloadExistingPipelines() throws IOException {
++    if (pipelineStore.isEmpty()) {
++      // Nothing to do just return
++      return;
++    }
+-    stateMachine.addTransition(HddsProtos.LifeCycleState.CREATING,
+-        HddsProtos.LifeCycleState.OPEN,
+-        HddsProtos.LifeCycleEvent.CREATED);
++    List<Map.Entry<byte[], byte[]>> range =
++            pipelineStore.getSequentialRangeKVs(null, Integer.MAX_VALUE, null);
+-    stateMachine.addTransition(HddsProtos.LifeCycleState.OPEN,
+-        HddsProtos.LifeCycleState.CLOSING,
+-        HddsProtos.LifeCycleEvent.FINALIZE);
++    // Transform the values into the pipelines.
++    // TODO: filter by pipeline state
++    for (Map.Entry<byte[], byte[]> entry : range) {
++      Pipeline pipeline = Pipeline.getFromProtoBuf(
++                HddsProtos.Pipeline.PARSER.parseFrom(entry.getValue()));
++      Preconditions.checkNotNull(pipeline);
++      addExistingPipeline(pipeline);
++    }
++  }
+-    stateMachine.addTransition(HddsProtos.LifeCycleState.CLOSING,
+-        HddsProtos.LifeCycleState.CLOSED,
+-        HddsProtos.LifeCycleEvent.CLOSE);
++  public Set<ContainerID> getOpenContainerIDsByPipeline(PipelineID pipelineID) {
++    return pipeline2ContainerMap.get(pipelineID);
++  }
+-    stateMachine.addTransition(HddsProtos.LifeCycleState.CREATING,
+-        HddsProtos.LifeCycleState.CLOSED,
+-        HddsProtos.LifeCycleEvent.TIMEOUT);
++  public void addContainerToPipeline(PipelineID pipelineID, long containerID) {
++    pipeline2ContainerMap.get(pipelineID)
++            .add(ContainerID.valueof(containerID));
++  }
++
++  public void removeContainerFromPipeline(PipelineID pipelineID,
++                                          long containerID) throws IOException {
++    pipeline2ContainerMap.get(pipelineID)
++            .remove(ContainerID.valueof(containerID));
++    closePipelineIfNoOpenContainers(pipelineMap.get(pipelineID));
+-      pipeline = manager.getPipeline(replicationFactor, replicationType);
++      PipelineID pipelineId =
++              manager.getPipeline(replicationFactor, replicationType);
++      pipeline = pipelineMap.get(pipelineId);
++      Preconditions.checkArgument(pipeline.getLifeCycleState() ==
++              LifeCycleState.OPEN);
++      pipelineStore.put(pipeline.getId().getProtobuf().toByteArray(),
++              pipeline.getProtobufMessage().toByteArray());
+-    NavigableSet<ContainerID> containerIDS = containerStateManager
+-        .getMatchingContainerIDsByPipeline(pipeline.getId());
++    HashSet<ContainerID> containerIDS =
++            pipeline2ContainerMap.get(pipeline.getId());
+-    NavigableSet<ContainerID> containers =
+-        containerStateManager
+-            .getMatchingContainerIDsByPipeline(pipeline.getId());
++    HashSet<ContainerID> containers =
++            pipeline2ContainerMap.get(pipeline.getId());
++  /**
++   * Add to a given pipeline.
++   */
++  private void addOpenPipeline(Pipeline pipeline) {
++    PipelineManager manager = getPipelineManager(pipeline.getType());
++    Preconditions.checkNotNull(manager, "Found invalid pipeline manager");
++    LOG.debug("Adding Open pipeline. pipelineID: {}", pipeline.getId());
++    manager.addOpenPipeline(pipeline);
++  }
++
+-    NavigableSet<ContainerID> containers =
+-        containerStateManager
+-            .getMatchingContainerIDsByPipeline(pipeline.getId());
++    HashSet<ContainerID> containers =
++            pipeline2ContainerMap.get(pipeline.getId());
+-  /**
+-   * list members in the pipeline .
+-   */
+-
+-  public List<DatanodeDetails> getDatanodes(ReplicationType replicationType,
+-      PipelineID pipelineID) throws IOException {
+-    PipelineManager manager = getPipelineManager(replicationType);
+-    Preconditions.checkNotNull(manager, "Found invalid pipeline manager");
+-    LOG.debug("Getting data nodes from pipeline : {}", pipelineID);
+-    return manager.getMembers(pipelineID);
+-  }
+-
+-  /**
+-   * Update the datanodes in the list of the pipeline.
+-   */
+-
+-  public void updateDatanodes(ReplicationType replicationType, PipelineID
+-      pipelineID, List<DatanodeDetails> newDatanodes) throws IOException {
+-    PipelineManager manager = getPipelineManager(replicationType);
+-    Preconditions.checkNotNull(manager, "Found invalid pipeline manager");
+-    LOG.debug("Updating pipeline: {} with new nodes:{}", pipelineID,
+-        newDatanodes.stream().map(DatanodeDetails::toString)
+-            .collect(Collectors.joining(",")));
+-    manager.updatePipeline(pipelineID, newDatanodes);
+-  }
+-
+-  public Node2PipelineMap getNode2PipelineMap() {
+-    return node2PipelineMap;
+-  }
+-
++  private void addExistingPipeline(Pipeline pipeline) throws IOException {
++    LifeCycleState state = pipeline.getLifeCycleState();
++    switch (state) {
++    case ALLOCATED:
++      // a pipeline in allocated state is only present in SCM and does not exist
++      // on datanode, on SCM restart, this pipeline can be ignored.
++      break;
++    case CREATING:
++    case OPEN:
++    case CLOSING:
++      //TODO: process pipeline report and move pipeline to active queue
++      // when all the nodes have reported.
++      pipelineMap.put(pipeline.getId(), pipeline);
++      pipeline2ContainerMap.put(pipeline.getId(), new HashSet<>());
++      node2PipelineMap.addPipeline(pipeline);
++      break;
++    case CLOSED:
++      // if the pipeline is in closed state, nothing to do.
++      break;
++    default:
++      throw new IOException("invalid pipeline state:" + state);
++    }
++  }
++
+-    HddsProtos.LifeCycleState newState;
+-    try {
+-      newState = stateMachine.getNextState(pipeline.getLifeCycleState(), event);
+-    } catch (InvalidStateTransitionException ex) {
+-      String error = String.format("Failed to update pipeline state %s, " +
+-              "reason: invalid state transition from state: %s upon " +
+-              "event: %s.",
+-          pipeline.getId(), pipeline.getLifeCycleState(), event);
+-      LOG.error(error);
+-      throw new SCMException(error, FAILED_TO_CHANGE_PIPELINE_STATE);
+-    }
+-
+-    // This is a post condition after executing getNextState.
+-    Preconditions.checkNotNull(newState);
+-    Preconditions.checkNotNull(pipeline);
++        pipelineMap.put(pipeline.getId(), pipeline);
++        pipeline2ContainerMap.put(pipeline.getId(), new HashSet<>());
++        node2PipelineMap.addPipeline(pipeline);
++        addOpenPipeline(pipeline);
++        pipeline2ContainerMap.remove(pipeline.getId());
++        node2PipelineMap.removePipeline(pipeline);
++        pipelineMap.remove(pipeline.getId());
+-      pipeline.setLifeCycleState(newState);
++      stateManager.updatePipelineState(pipeline, event);
++      pipelineStore.put(pipeline.getId().getProtobuf().toByteArray(),
++              pipeline.getProtobufMessage().toByteArray());
+-  public void shutdown() {
++  public void shutdown() throws IOException {
++
++    if (pipelineStore != null) {
++      pipelineStore.close();
++    }

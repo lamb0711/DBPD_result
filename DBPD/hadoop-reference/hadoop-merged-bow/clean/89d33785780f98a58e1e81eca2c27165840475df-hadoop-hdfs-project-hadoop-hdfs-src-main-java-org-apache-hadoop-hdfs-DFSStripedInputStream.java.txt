@@ -1,0 +1,315 @@
+HDFS-8033. Erasure coding: stateful (non-positional) read from files in striped layout. Contributed by Zhe Zhang.
+
++import org.apache.hadoop.fs.ChecksumException;
+-import org.apache.hadoop.hdfs.protocol.DatanodeInfo;
+-import org.apache.hadoop.hdfs.protocol.ExtendedBlock;
+-import org.apache.hadoop.hdfs.protocol.LocatedBlock;
+-import org.apache.hadoop.hdfs.protocol.LocatedStripedBlock;
+-import org.apache.hadoop.hdfs.protocol.ECInfo;
+-import org.apache.hadoop.hdfs.server.namenode.UnsupportedActionException;
++import org.apache.hadoop.hdfs.protocol.*;
++import org.apache.hadoop.hdfs.protocol.datatransfer.InvalidEncryptionKeyException;
++import org.apache.hadoop.hdfs.security.token.block.BlockTokenIdentifier;
++import org.apache.hadoop.hdfs.server.datanode.CachingStrategy;
++import org.apache.hadoop.security.token.Token;
++import java.net.InetSocketAddress;
++  private final short groupSize = HdfsConstants.NUM_DATA_BLOCKS;
++  private BlockReader[] blockReaders = null;
++  private DatanodeInfo[] currentNodes = null;
+-    throw new UnsupportedActionException("Stateful read is not supported");
++    ReaderStrategy byteBufferReader = new ByteBufferStrategy(buf);
++    TraceScope scope =
++        dfsClient.getPathTraceScope("DFSInputStream#byteBufferRead", src);
++    try {
++      return readWithStrategy(byteBufferReader, 0, buf.remaining());
++    } finally {
++      scope.close();
++    }
++  }
++
++  /**
++   * When seeking into a new block group, create blockReader for each internal
++   * block in the group.
++   */
++  @VisibleForTesting
++  private synchronized DatanodeInfo[] blockSeekTo(long target)
++      throws IOException {
++    if (target >= getFileLength()) {
++      throw new IOException("Attempted to read past end of file");
++    }
++
++    // Will be getting a new BlockReader.
++    closeCurrentBlockReaders();
++
++    // Connect to best DataNode for desired Block, with potential offset
++    DatanodeInfo[] chosenNodes = new DatanodeInfo[groupSize];
++    int refetchToken = 1; // only need to get a new access token once
++    int refetchEncryptionKey = 1; // only need to get a new encryption key once
++
++    // Compute desired striped block group
++    LocatedStripedBlock targetBlockGroup = getBlockGroupAt(target);
++
++    // Update current position
++    this.pos = target;
++    this.blockEnd = targetBlockGroup.getStartOffset() +
++        targetBlockGroup.getBlockSize() - 1;
++
++    long offsetIntoBlockGroup = target - targetBlockGroup.getStartOffset();
++    LocatedBlock[] targetBlocks = StripedBlockUtil.parseStripedBlockGroup(
++        targetBlockGroup, cellSize, dataBlkNum, parityBlkNum);
++    // The purpose is to get start offset into each block
++    ReadPortion[] readPortions = planReadPortions(groupSize, cellSize,
++        offsetIntoBlockGroup, 0, 0);
++    while (true) {
++      int i = 0;
++      InetSocketAddress targetAddr = null;
++      try {
++        blockReaders = new BlockReader[groupSize];
++        for (i = 0; i < groupSize; i++) {
++          LocatedBlock targetBlock = targetBlocks[i];
++          if (targetBlock == null) {
++            continue;
++          }
++          long offsetIntoBlock = readPortions[i].startOffsetInBlock;
++          DNAddrPair retval = getBestNodeDNAddrPair(targetBlock, null);
++          chosenNodes[i] = retval.info;
++          targetAddr = retval.addr;
++          StorageType storageType = retval.storageType;
++
++          ExtendedBlock blk = targetBlock.getBlock();
++          Token<BlockTokenIdentifier> accessToken = targetBlock.getBlockToken();
++          CachingStrategy curCachingStrategy;
++          boolean shortCircuitForbidden;
++          synchronized(infoLock) {
++            curCachingStrategy = cachingStrategy;
++            shortCircuitForbidden = shortCircuitForbidden();
++          }
++          blockReaders[i] = new BlockReaderFactory(dfsClient.getConf()).
++              setInetSocketAddress(targetAddr).
++              setRemotePeerFactory(dfsClient).
++              setDatanodeInfo(chosenNodes[i]).
++              setStorageType(storageType).
++              setFileName(src).
++              setBlock(blk).
++              setBlockToken(accessToken).
++              setStartOffset(offsetIntoBlock).
++              setVerifyChecksum(verifyChecksum).
++              setClientName(dfsClient.clientName).
++              setLength(blk.getNumBytes() - offsetIntoBlock).
++              setCachingStrategy(curCachingStrategy).
++              setAllowShortCircuitLocalReads(!shortCircuitForbidden).
++              setClientCacheContext(dfsClient.getClientContext()).
++              setUserGroupInformation(dfsClient.ugi).
++              setConfiguration(dfsClient.getConfiguration()).
++              build();
++        }
++        currentLocatedBlock = targetBlockGroup;
++        return chosenNodes;
++      } catch (IOException ex) {
++        // Retry in case of encryption key or token exceptions. Otherwise throw
++        // IOException: since each internal block is singly replicated, it's
++        // not meaningful trying to locate another replica.
++        if (ex instanceof InvalidEncryptionKeyException && refetchEncryptionKey > 0) {
++          DFSClient.LOG.info("Will fetch a new encryption key and retry, "
++              + "encryption key was invalid when connecting to " + targetAddr
++              + " : " + ex);
++          // The encryption key used is invalid.
++          refetchEncryptionKey--;
++          dfsClient.clearDataEncryptionKey();
++        } else if (refetchToken > 0 && tokenRefetchNeeded(ex, targetAddr)) {
++          refetchToken--;
++          fetchBlockAt(target);
++        } else {
++          DFSClient.LOG.warn("Failed to connect to " + targetAddr + " for block"
++              + ", add to deadNodes and continue. " + ex, ex);
++          // Put chosen node into dead list and throw exception
++          addToDeadNodes(chosenNodes[i]);
++          throw ex;
++        }
++      }
++    }
++  }
++
++  /**
++   * Extend the super method with the logic of switching between cells.
++   * When reaching the end of a cell, proceed to the next cell and read it
++   * with the next blockReader.
++   */
++  @Override
++  protected void closeCurrentBlockReaders() {
++    if (blockReaders ==  null || blockReaders.length == 0) {
++      return;
++    }
++    for (int i = 0; i < groupSize; i++) {
++      if (blockReaders[i] == null) {
++        continue;
++      }
++      try {
++        blockReaders[i].close();
++      } catch (IOException e) {
++        DFSClient.LOG.error("error closing blockReader", e);
++      }
++      blockReaders[i] = null;
++    }
++    blockEnd = -1;
+-  public synchronized int read(final byte buf[], int off, int len)
++  protected synchronized int readWithStrategy(ReaderStrategy strategy,
++      int off, int len) throws IOException {
++    dfsClient.checkOpen();
++    if (closed.get()) {
++      throw new IOException("Stream closed");
++    }
++    Map<ExtendedBlock,Set<DatanodeInfo>> corruptedBlockMap
++        = new HashMap<>();
++    failures = 0;
++    if (pos < getFileLength()) {
++      int retries = 2;
++      /** Index of the target block in a stripe to read from */
++      int idxInGroup = (int) ((pos / cellSize) % dataBlkNum);
++      while (retries > 0) {
++        try {
++          // currentNode can be left as null if previous read had a checksum
++          // error on the same block. See HDFS-3067
++          if (pos > blockEnd || currentNodes == null) {
++            currentNodes = blockSeekTo(pos);
++          }
++          int realLen = (int) Math.min(len, (blockEnd - pos + 1L));
++          synchronized(infoLock) {
++            if (locatedBlocks.isLastBlockComplete()) {
++              realLen = (int) Math.min(realLen,
++                  locatedBlocks.getFileLength() - pos);
++            }
++          }
++
++          /** Number of bytes already read into buffer */
++          int result = 0;
++          while (result < realLen) {
++            /**
++             * Temporary position into the file; {@link pos} might not proceed
++             * to this temporary position in case of exceptions.
++             */
++            long tmpPos = pos + result;
++            /** Start and end offsets of a cell in the file */
++            long cellStart = (tmpPos / cellSize) * cellSize;
++            long cellEnd = cellStart + cellSize - 1;
++
++            /** Number of bytes to read from the current cell */
++            int realLenInCell = (int) Math.min(realLen - result,
++                cellEnd - tmpPos + 1L);
++            assert realLenInCell > 0 : "Temporary position shouldn't be " +
++                "after cellEnd";
++            // Read from one blockReader up to cell boundary
++            int cellRet = readBuffer(blockReaders[idxInGroup],
++                currentNodes[idxInGroup], strategy, off + result,
++                realLenInCell);
++            if (cellRet >= 0) {
++              result += cellRet;
++              if (cellRet < realLenInCell) {
++                // A short read indicates the current blockReader buffer is
++                // already drained. Should return the read call. Otherwise
++                // should proceed to the next cell.
++                break;
++              }
++            } else {
++              // got a EOS from reader though we expect more data on it.
++              throw new IOException("Unexpected EOS from the reader");
++            }
++            idxInGroup = (idxInGroup + 1) % dataBlkNum;
++          }
++
++          pos += result;
++
++          if (dfsClient.stats != null) {
++            dfsClient.stats.incrementBytesRead(result);
++          }
++          return result;
++        } catch (ChecksumException ce) {
++          throw ce;
++        } catch (IOException e) {
++          if (retries == 1) {
++            DFSClient.LOG.warn("DFS Read", e);
++          }
++          blockEnd = -1;
++          if (currentNodes[idxInGroup] != null) {
++            addToDeadNodes(currentNodes[idxInGroup]);
++          }
++          if (--retries == 0) {
++            throw e;
++          }
++        } finally {
++          // Check if need to report block replicas corruption either read
++          // was successful or ChecksumException occured.
++          reportCheckSumFailure(corruptedBlockMap,
++              currentLocatedBlock.getLocations().length);
++        }
++      }
++    }
++    return -1;
++  }
++
++  private synchronized int readBuffer(BlockReader blockReader,
++      DatanodeInfo currentNode, ReaderStrategy readerStrategy, int off, int len)
+-    throw new UnsupportedActionException("Stateful read is not supported");
++    IOException ioe;
++    while (true) {
++      try {
++        return readerStrategy.doRead(blockReader, off, len);
++      } catch ( ChecksumException ce ) {
++        DFSClient.LOG.warn("Found Checksum error for "
++            + getCurrentBlock() + " from " + currentNode
++            + " at " + ce.getPos());
++        // If current block group is corrupt, it's meaningless to retry.
++        // TODO: this should trigger decoding logic (HDFS-7678)
++        throw ce;
++      } catch ( IOException e ) {
++        ioe = e;
++      }
++
++      boolean sourceFound = seekToBlockSource(pos);
++      if (!sourceFound) {
++        throw ioe;
++      }
++    }
++  }
++
++  private boolean seekToBlockSource(long targetPos)
++      throws IOException {
++    currentNodes = blockSeekTo(targetPos);
++    return true;
++  }
++
++  protected class ByteBufferStrategy extends DFSInputStream.ByteBufferStrategy {
++    ByteBufferStrategy(ByteBuffer buf) {
++      super(buf);
++    }
++
++    @Override
++    public int doRead(BlockReader blockReader, int off, int len)
++        throws ChecksumException, IOException {
++      int oldlimit = buf.limit();
++      if (buf.remaining() > len) {
++        buf.limit(buf.position() + len);
++      }
++      int ret = super.doRead(blockReader, off, len);
++      buf.limit(oldlimit);
++      return ret;
++    }
+-  private LocatedBlock getBlockGroupAt(long offset) throws IOException {
+-    return super.getBlockAt(offset);
++  private LocatedStripedBlock getBlockGroupAt(long offset) throws IOException {
++    LocatedBlock lb = super.getBlockAt(offset);
++    assert lb instanceof LocatedStripedBlock : "NameNode" +
++        " should return a LocatedStripedBlock for a striped file";
++    return (LocatedStripedBlock)lb;
+-    LocatedBlock block = getBlockGroupAt(blockStartOffset);
+-    assert block instanceof LocatedStripedBlock : "NameNode" +
+-        " should return a LocatedStripedBlock for a striped file";
+-    LocatedStripedBlock blockGroup = (LocatedStripedBlock) block;
++    LocatedStripedBlock blockGroup = getBlockGroupAt(blockStartOffset);
++
+-    private long readLength = 0;
++    private int readLength = 0;
+-    long getReadLength() {
++    int getReadLength() {
+
+MOV26 MOV26 INS26 UPD40 UPD40 UPD40 UPD40 UPD40 UPD40 INS40 INS23 INS23 INS23 INS31 INS31 INS31 INS31 INS31 INS55 INS83 INS83 INS39 INS59 INS83 INS5 INS59 INS83 INS5 INS59 MOV78 MOV83 MOV83 MOV39 MOV42 MOV44 MOV43 INS8 INS29 INS78 INS83 INS83 INS5 INS42 INS44 INS43 INS8 INS29 INS78 INS83 INS39 INS42 INS8 UPD83 INS42 INS44 INS8 INS83 INS83 INS39 INS42 INS44 INS44 INS44 INS44 INS44 INS43 INS8 INS83 INS39 INS42 INS44 INS43 INS8 INS83 INS42 INS43 INS31 INS31 MOV43 INS42 INS40 INS43 INS85 INS42 INS33 INS43 INS85 INS42 INS33 INS60 INS60 INS54 INS65 INS42 INS43 INS85 INS39 INS42 INS42 INS25 INS21 INS60 INS60 INS60 INS60 INS21 INS21 INS60 INS60 INS60 INS61 INS65 INS42 INS25 INS24 INS21 INS43 INS42 INS21 INS25 INS60 INS21 INS25 INS41 INS43 INS42 INS43 INS42 INS43 INS42 INS39 INS42 INS39 INS42 INS42 INS60 INS61 INS39 INS42 INS42 INS21 INS41 INS40 INS42 INS44 INS8 INS78 INS83 INS39 INS42 INS44 INS44 INS44 INS43 INS43 INS8 INS60 INS6 UPD39 UPD39 INS42 INS42 INS43 INS59 INS43 INS59 INS8 INS8 INS66 INS66 INS42 INS27 INS8 INS32 INS5 INS59 INS39 INS59 INS39 INS59 MOV43 INS59 INS7 INS7 INS39 INS59 INS5 INS59 INS5 INS59 INS9 INS8 INS66 INS66 INS66 INS27 INS8 INS58 INS27 INS37 INS8 INS7 INS42 INS32 INS32 INS8 INS74 INS59 INS7 INS27 INS8 INS38 INS42 INS42 INS42 INS43 INS59 INS9 INS8 INS7 INS9 INS43 INS42 INS46 INS42 INS43 INS42 INS39 INS42 INS39 INS42 INS42 INS42 INS60 INS25 INS60 INS21 INS41 MOV43 INS59 INS62 MOV27 MOV11 INS43 INS42 INS42 INS14 INS42 INS42 INS32 INS41 INS21 INS42 INS32 MOV53 INS42 INS43 INS85 INS42 INS3 INS42 INS34 INS42 INS34 INS42 INS32 INS22 INS42 INS22 INS27 INS42 INS27 INS43 INS85 INS42 INS32 INS43 INS85 INS42 INS32 INS60 INS60 INS54 INS27 INS27 INS41 INS39 INS59 INS42 INS42 INS42 INS25 INS54 INS21 INS42 INS38 INS42 INS42 INS42 INS42 INS53 INS43 INS43 INS74 INS42 INS14 INS42 INS34 INS42 INS32 INS60 INS60 INS61 INS34 INS42 INS42 INS54 INS60 INS25 INS42 INS32 INS42 INS42 INS42 INS39 INS59 INS27 INS8 INS39 INS59 INS32 INS42 INS42 MOV48 INS42 INS43 UPD42 INS42 UPD42 INS43 INS42 INS42 INS42 INS45 INS42 INS32 INS32 INS42 INS42 INS5 INS42 INS42 INS42 INS52 INS42 INS52 INS42 INS27 INS34 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS34 INS34 INS39 INS59 INS43 INS59 INS8 INS12 INS42 INS33 INS40 INS34 INS42 INS34 INS27 INS8 INS8 INS12 INS7 INS34 INS14 INS42 INS42 INS43 INS43 INS74 INS42 INS39 INS59 INS39 INS59 INS27 INS8 INS8 INS12 INS12 INS39 INS59 INS38 INS8 INS42 INS42 INS42 INS32 INS32 INS42 INS21 INS42 INS48 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS34 INS32 INS42 INS42 UPD43 UPD45 INS43 INS85 INS32 INS32 INS42 INS42 INS42 INS34 INS42 INS42 INS33 INS21 INS24 INS21 INS41 INS44 INS8 INS2 INS33 INS18 INS21 INS44 INS8 INS2 INS33 INS43 INS45 INS42 INS42 INS43 INS42 INS34 INS42 INS11 INS42 INS34 INS54 INS41 INS44 INS8 INS44 INS8 INS42 INS32 INS42 INS53 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS42 UPD42 INS42 INS42 INS42 INS42 INS42 INS7 INS7 INS27 INS37 INS8 INS7 INS42 INS43 INS42 INS25 INS42 INS42 INS32 INS43 INS42 INS21 INS42 INS42 INS42 INS42 INS39 INS36 INS8 INS12 INS12 INS8 INS32 INS43 INS42 INS21 INS53 INS43 INS42 INS21 INS42 INS42 INS42 INS42 INS42 INS27 INS42 INS3 INS42 INS34 INS42 INS42 INS42 INS60 INS25 INS60 INS60 INS21 INS21 INS60 INS60 INS60 INS60 INS60 INS51 INS21 INS42 INS42 INS42 INS27 INS8 INS25 INS2 INS42 INS42 INS32 INS27 INS25 INS60 INS51 INS60 INS61 INS21 INS25 INS41 INS44 INS8 INS44 INS8 INS21 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS7 INS32 INS42 INS5 INS42 MOV43 INS59 INS27 INS8 INS39 INS59 INS43 INS59 INS7 INS7 INS43 INS59 INS43 INS59 INS74 INS59 INS43 INS59 INS39 INS59 INS42 INS8 INS7 INS62 INS27 INS21 INS21 INS21 INS27 INS8 INS8 INS42 INS42 INS40 INS42 INS45 INS42 INS36 INS42 INS27 INS8 INS39 INS59 INS42 INS8 INS39 INS59 INS27 INS8 INS7 INS27 INS8 INS42 INS43 INS42 INS53 INS43 INS42 INS25 INS21 INS25 INS25 INS32 INS40 INS42 INS27 INS42 INS42 INS42 INS42 INS43 INS85 INS42 INS2 INS42 INS33 INS18 INS42 INS22 INS42 INS42 INS32 INS2 INS40 INS42 INS40 INS42 INS42 INS40 INS42 INS42 INS32 INS43 INS43 INS42 INS32 INS42 INS42 INS42 INS21 INS21 INS2 INS32 INS42 INS43 INS42 INS34 INS32 INS37 INS32 INS27 INS32 INS21 INS21 INS21 INS21 INS53 INS27 INS27 INS27 INS21 INS42 INS11 INS25 INS42 INS34 INS42 INS42 INS60 INS60 INS60 INS60 INS6 INS60 INS25 INS21 INS42 INS42 INS40 INS33 INS21 INS42 INS42 INS42 INS27 INS8 INS7 INS27 INS8 INS27 INS8 INS42 INS42 INS22 INS45 INS32 INS45 INS42 INS45 INS32 INS42 INS42 INS42 INS2 INS42 INS42 INS42 INS33 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS7 INS7 INS42 INS42 INS32 INS42 INS42 INS40 INS42 INS27 INS42 INS42 INS42 INS42 INS34 INS42 INS42 INS42 INS37 INS32 INS32 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS33 INS7 INS39 INS32 INS32 INS8 INS39 INS59 INS39 INS59 INS39 INS59 INS39 INS59 INS27 INS27 INS39 INS59 INS27 INS8 INS8 INS7 INS32 INS42 INS34 INS21 INS42 INS38 INS2 INS33 INS21 INS38 INS34 INS53 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS32 INS42 INS32 INS27 INS42 INS45 INS42 INS42 INS42 INS42 INS40 INS42 INS27 INS42 INS42 INS2 INS42 INS32 INS42 INS42 INS42 INS36 INS42 INS42 INS21 INS42 INS27 INS42 INS27 INS42 INS27 INS42 INS11 INS42 INS34 INS45 INS45 INS42 INS32 INS42 INS34 INS21 INS25 MOV53 INS42 INS27 INS40 INS42 INS42 INS32 INS34 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS40 INS42 INS42 INS45 INS45 INS45 INS42 INS45 INS45 INS42 INS42 INS42 INS42 INS42 INS27 INS7 INS42 INS42 INS36 INS42 INS27 INS34 INS39 INS32 INS42 INS2 INS2 INS42 INS27 INS42 INS7 INS27 INS8 INS36 INS42 INS40 INS42 INS45 INS42 INS42 INS2 INS32 INS42 INS32 INS27 INS34 INS42 INS11 INS27 INS42 INS42 INS42 INS42 INS27 INS27 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS10 UPD43 UPD45 INS27 INS42 INS42 INS32 INS42 INS38 INS42 INS42 INS42 INS42 INS39 INS32 INS42 INS42 INS42 INS42 INS27 INS34 UPD42 INS42 INS34 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS27 INS42 INS42 INS32 INS42 INS27 INS32 INS42 INS32 INS42 INS40 INS32 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS2 INS32 INS42 INS42 INS42 INS42 INS14 INS42 INS42 INS43 INS32 INS42 INS42 INS42 DEL8 DEL31 DEL42 DEL83 DEL39 DEL42 DEL85 DEL44 DEL8 DEL42 DEL62 DEL6 DEL42 DEL59 DEL60

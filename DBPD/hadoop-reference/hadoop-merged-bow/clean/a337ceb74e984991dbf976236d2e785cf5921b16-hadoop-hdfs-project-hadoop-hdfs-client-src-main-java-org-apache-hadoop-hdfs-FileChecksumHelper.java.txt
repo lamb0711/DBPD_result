@@ -1,0 +1,193 @@
+Revert "HDFS-9694. Make existing DFSClient#getFileChecksum() work for striped blocks. Contributed by Kai Zheng"
+
+This reverts commit e5ff0ea7ba087984262f1f27200ae5bb40d9b838.
+
+-import org.apache.hadoop.hdfs.protocol.ErasureCodingPolicy;
+-import org.apache.hadoop.hdfs.protocol.LocatedStripedBlock;
+-import org.apache.hadoop.hdfs.protocol.StripedBlockInfo;
+-    private boolean isRefetchBlocks = false;
++    private boolean refetchBlocks = false;
+-    void refetchBlocks() throws IOException {
+-      this.blockLocations = getClient().getBlockLocations(getSrc(),
+-          getLength());
+-      this.locatedBlocks = getBlockLocations().getLocatedBlocks();
+-      this.isRefetchBlocks = false;
++    void setBlockLocations(LocatedBlocks blockLocations) {
++      this.blockLocations = blockLocations;
++    void setLocatedBlocks(List<LocatedBlock> locatedBlocks) {
++      this.locatedBlocks = locatedBlocks;
++    }
++
+-      return isRefetchBlocks;
++      return refetchBlocks;
+-      this.isRefetchBlocks = refetchBlocks;
++      this.refetchBlocks = refetchBlocks;
+-          refetchBlocks();
++          setBlockLocations(getClient().getBlockLocations(getSrc(),
++              getLength()));
++          setLocatedBlocks(getBlockLocations().getLocatedBlocks());
++          setRefetchBlocks(false);
+-        final MD5Hash md5 = new MD5Hash(checksumData.getMd5().toByteArray());
++        final MD5Hash md5 = new MD5Hash(
++            checksumData.getMd5().toByteArray());
+-          ct = PBHelperClient.convert(checksumData.getCrcType());
++          ct = PBHelperClient.convert(checksumData
++              .getCrcType());
+-
+-  /**
+-   * Striped file checksum computing.
+-   */
+-  static class StripedFileNonStripedChecksumComputer
+-      extends FileChecksumComputer {
+-    private final ErasureCodingPolicy ecPolicy;
+-    private int bgIdx;
+-
+-    StripedFileNonStripedChecksumComputer(String src, long length,
+-                                          LocatedBlocks blockLocations,
+-                                          ClientProtocol namenode,
+-                                          DFSClient client,
+-                                          ErasureCodingPolicy ecPolicy)
+-        throws IOException {
+-      super(src, length, blockLocations, namenode, client);
+-
+-      this.ecPolicy = ecPolicy;
+-    }
+-
+-    @Override
+-    void checksumBlocks() throws IOException {
+-      int tmpTimeout = 3000 * 1 + getClient().getConf().getSocketTimeout();
+-      setTimeout(tmpTimeout);
+-
+-      for (bgIdx = 0;
+-           bgIdx < getLocatedBlocks().size() && getRemaining() >= 0; bgIdx++) {
+-        if (isRefetchBlocks()) {  // refetch to get fresh tokens
+-          refetchBlocks();
+-        }
+-
+-        LocatedBlock locatedBlock = getLocatedBlocks().get(bgIdx);
+-        LocatedStripedBlock blockGroup = (LocatedStripedBlock) locatedBlock;
+-
+-        if (!checksumBlockGroup(blockGroup)) {
+-          throw new IOException("Fail to get block MD5 for " + locatedBlock);
+-        }
+-      }
+-    }
+-
+-
+-    private boolean checksumBlockGroup(
+-        LocatedStripedBlock blockGroup) throws IOException {
+-      ExtendedBlock block = blockGroup.getBlock();
+-      if (getRemaining() < block.getNumBytes()) {
+-        block.setNumBytes(getRemaining());
+-      }
+-      setRemaining(getRemaining() - block.getNumBytes());
+-
+-      StripedBlockInfo stripedBlockInfo = new StripedBlockInfo(block,
+-          blockGroup.getLocations(), blockGroup.getBlockTokens(), ecPolicy);
+-      DatanodeInfo[] datanodes = blockGroup.getLocations();
+-
+-      //try each datanode in the block group.
+-      boolean done = false;
+-      for (int j = 0; !done && j < datanodes.length; j++) {
+-        try {
+-          tryDatanode(blockGroup, stripedBlockInfo, datanodes[j]);
+-          done = true;
+-        } catch (InvalidBlockTokenException ibte) {
+-          if (bgIdx > getLastRetriedIndex()) {
+-            LOG.debug("Got access token error in response to OP_BLOCK_CHECKSUM "
+-                    + "for file {} for block {} from datanode {}. Will retry "
+-                    + "the block once.",
+-                getSrc(), block, datanodes[j]);
+-            setLastRetriedIndex(bgIdx);
+-            done = true; // actually it's not done; but we'll retry
+-            bgIdx--; // repeat at bgIdx-th block
+-            setRefetchBlocks(true);
+-          }
+-        } catch (IOException ie) {
+-          LOG.warn("src={}" + ", datanodes[{}]={}",
+-              getSrc(), j, datanodes[j], ie);
+-        }
+-      }
+-
+-      return done;
+-    }
+-
+-    /**
+-     * Return true when sounds good to continue or retry, false when severe
+-     * condition or totally failed.
+-     */
+-    private void tryDatanode(LocatedStripedBlock blockGroup,
+-                             StripedBlockInfo stripedBlockInfo,
+-                             DatanodeInfo datanode) throws IOException {
+-
+-      try (IOStreamPair pair = getClient().connectToDN(datanode,
+-          getTimeout(), blockGroup.getBlockToken())) {
+-
+-        LOG.debug("write to {}: {}, blockGroup={}",
+-            datanode, Op.BLOCK_GROUP_CHECKSUM, blockGroup);
+-
+-        // get block MD5
+-        createSender(pair).blockGroupChecksum(stripedBlockInfo,
+-            blockGroup.getBlockToken());
+-
+-        BlockOpResponseProto reply = BlockOpResponseProto.parseFrom(
+-            PBHelperClient.vintPrefixed(pair.in));
+-
+-        String logInfo = "for blockGroup " + blockGroup +
+-            " from datanode " + datanode;
+-        DataTransferProtoUtil.checkBlockOpStatus(reply, logInfo);
+-
+-        OpBlockChecksumResponseProto checksumData = reply.getChecksumResponse();
+-
+-        //read byte-per-checksum
+-        final int bpc = checksumData.getBytesPerCrc();
+-        if (bgIdx == 0) { //first block
+-          setBytesPerCRC(bpc);
+-        } else {
+-          if (bpc != getBytesPerCRC()) {
+-            throw new IOException("Byte-per-checksum not matched: bpc=" + bpc
+-                + " but bytesPerCRC=" + getBytesPerCRC());
+-          }
+-        }
+-
+-        //read crc-per-block
+-        final long cpb = checksumData.getCrcPerBlock();
+-        if (getLocatedBlocks().size() > 1 && bgIdx == 0) { // first block
+-          setCrcPerBlock(cpb);
+-        }
+-
+-        //read md5
+-        final MD5Hash md5 = new MD5Hash(
+-            checksumData.getMd5().toByteArray());
+-        md5.write(getMd5out());
+-
+-        // read crc-type
+-        final DataChecksum.Type ct;
+-        if (checksumData.hasCrcType()) {
+-          ct = PBHelperClient.convert(checksumData.getCrcType());
+-        } else {
+-          LOG.debug("Retrieving checksum from an earlier-version DataNode: " +
+-              "inferring checksum by reading first byte");
+-          ct = getClient().inferChecksumTypeByReading(blockGroup, datanode);
+-        }
+-
+-        if (bgIdx == 0) {
+-          setCrcType(ct);
+-        } else if (getCrcType() != DataChecksum.Type.MIXED &&
+-            getCrcType() != ct) {
+-          // if crc types are mixed in a file
+-          setCrcType(DataChecksum.Type.MIXED);
+-        }
+-
+-        if (LOG.isDebugEnabled()) {
+-          if (bgIdx == 0) {
+-            LOG.debug("set bytesPerCRC=" + getBytesPerCRC()
+-                + ", crcPerBlock=" + getCrcPerBlock());
+-          }
+-          LOG.debug("got reply from " + datanode + ": md5=" + md5);
+-        }
+-      }
+-    }
+-  }
+
+MOV31 INS31 INS39 INS42 MOV44 INS8 UPD42 INS44 INS8 UPD42 INS21 INS74 INS42 MOV21 INS7 INS43 MOV43 UPD42 MOV22 INS42 UPD42 MOV42 INS42 UPD42 MOV8 INS21 INS32 INS32 INS32 INS42 MOV32 INS42 MOV32 INS42 INS9 DEL40 DEL26 DEL40 DEL26 DEL40 DEL26 DEL43 DEL7 DEL52 DEL42 DEL22 DEL9 DEL7 DEL42 DEL32 DEL21 DEL8 DEL66 DEL65 DEL29 DEL83 DEL42 DEL42 DEL43 DEL83 DEL83 DEL42 DEL43 DEL42 DEL59 DEL23 DEL83 DEL39 DEL42 DEL59 DEL23 DEL42 DEL42 DEL43 DEL42 DEL44 DEL39 DEL42 DEL44 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL42 DEL42 DEL42 DEL42 DEL46 DEL52 DEL42 DEL22 DEL42 DEL7 DEL21 DEL8 DEL31 DEL42 DEL78 DEL39 DEL42 DEL42 DEL43 DEL39 DEL42 DEL34 DEL34 DEL27 DEL42 DEL32 DEL42 DEL32 DEL42 DEL32 DEL27 DEL59 DEL60 DEL42 DEL42 DEL32 DEL21 DEL42 DEL34 DEL7 DEL42 DEL42 DEL32 DEL42 DEL32 DEL27 DEL42 DEL32 DEL34 DEL27 DEL27 DEL42 DEL37 DEL42 DEL32 DEL42 DEL32 DEL21 DEL8 DEL25 DEL42 DEL42 DEL32 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL43 DEL42 DEL42 DEL43 DEL42 DEL11 DEL59 DEL60 DEL42 DEL42 DEL32 DEL38 DEL42 DEL43 DEL45 DEL42 DEL27 DEL14 DEL53 DEL8 DEL25 DEL8 DEL24 DEL8 DEL31 DEL83 DEL39 DEL42 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL43 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL32 DEL42 DEL42 DEL32 DEL27 DEL42 DEL42 DEL42 DEL32 DEL32 DEL21 DEL8 DEL25 DEL42 DEL42 DEL32 DEL42 DEL42 DEL32 DEL27 DEL32 DEL21 DEL42 DEL43 DEL42 DEL42 DEL43 DEL42 DEL42 DEL42 DEL32 DEL42 DEL42 DEL32 DEL42 DEL14 DEL59 DEL60 DEL42 DEL43 DEL85 DEL5 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL39 DEL42 DEL9 DEL59 DEL60 DEL39 DEL42 DEL34 DEL59 DEL58 DEL42 DEL38 DEL42 DEL40 DEL27 DEL27 DEL42 DEL37 DEL42 DEL42 DEL42 DEL42 DEL42 DEL2 DEL32 DEL21 DEL42 DEL9 DEL7 DEL21 DEL8 DEL42 DEL43 DEL42 DEL44 DEL42 DEL42 DEL32 DEL27 DEL42 DEL42 DEL45 DEL45 DEL45 DEL27 DEL42 DEL32 DEL42 DEL42 DEL42 DEL2 DEL32 DEL21 DEL42 DEL42 DEL32 DEL21 DEL42 DEL9 DEL7 DEL21 DEL42 DEL37 DEL21 DEL42 DEL9 DEL32 DEL21 DEL8 DEL25 DEL8 DEL12 DEL42 DEL43 DEL42 DEL44 DEL42 DEL42 DEL45 DEL45 DEL27 DEL42 DEL32 DEL42 DEL42 DEL42 DEL2 DEL42 DEL32 DEL21 DEL8 DEL12 DEL54 DEL8 DEL24 DEL42 DEL41 DEL8 DEL31 DEL66 DEL66 DEL65 DEL29 DEL83 DEL39 DEL42 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL43 DEL42 DEL42 DEL32 DEL42 DEL42 DEL42 DEL32 DEL42 DEL42 DEL32 DEL32 DEL59 DEL58 DEL42 DEL42 DEL45 DEL42 DEL40 DEL42 DEL32 DEL21 DEL42 DEL42 DEL32 DEL42 DEL42 DEL42 DEL42 DEL32 DEL32 DEL21 DEL42 DEL43 DEL42 DEL42 DEL42 DEL42 DEL42 DEL40 DEL32 DEL32 DEL59 DEL60 DEL42 DEL43 DEL42 DEL45 DEL42 DEL45 DEL42 DEL27 DEL59 DEL60 DEL42 DEL42 DEL42 DEL42 DEL32 DEL21 DEL42 DEL43 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL83 DEL39 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL34 DEL27 DEL42 DEL42 DEL32 DEL21 DEL8 DEL42 DEL42 DEL32 DEL27 DEL42 DEL43 DEL45 DEL42 DEL45 DEL42 DEL32 DEL27 DEL14 DEL53 DEL8 DEL25 DEL8 DEL25 DEL83 DEL39 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL32 DEL42 DEL32 DEL34 DEL27 DEL42 DEL34 DEL27 DEL27 DEL42 DEL42 DEL32 DEL21 DEL8 DEL25 DEL83 DEL42 DEL43 DEL42 DEL42 DEL43 DEL42 DEL42 DEL32 DEL42 DEL32 DEL14 DEL59 DEL60 DEL42 DEL42 DEL42 DEL32 DEL32 DEL21 DEL83 DEL40 DEL43 DEL42 DEL59 DEL60 DEL42 DEL42 DEL32 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL32 DEL7 DEL21 DEL8 DEL42 DEL42 DEL45 DEL45 DEL27 DEL32 DEL21 DEL42 DEL42 DEL32 DEL42 DEL42 DEL42 DEL32 DEL7 DEL21 DEL8 DEL25 DEL42 DEL34 DEL27 DEL42 DEL42 DEL32 DEL21 DEL8 DEL42 DEL32 DEL40 DEL27 DEL42 DEL32 DEL42 DEL27 DEL27 DEL42 DEL40 DEL32 DEL21 DEL8 DEL25 DEL25 DEL42 DEL42 DEL32 DEL42 DEL34 DEL27 DEL42 DEL42 DEL45 DEL42 DEL32 DEL45 DEL42 DEL32 DEL27 DEL32 DEL21 DEL8 DEL25 DEL42 DEL42 DEL45 DEL42 DEL45 DEL42 DEL27 DEL32 DEL21 DEL8 DEL25 DEL8 DEL54 DEL8 DEL31 DEL55

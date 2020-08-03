@@ -1,0 +1,150 @@
+HDFS-9646. ErasureCodingWorker may fail when recovering data blocks with length less than the first internal block. Contributed by Jing Zhao.
+
++import java.util.HashSet;
++import java.util.Set;
++import org.apache.hadoop.fs.ChecksumException;
+-    if (LOG.isDebugEnabled()) {
+-      LOG.debug("Using striped reads; pool threads=" + num);
+-    }
++    LOG.debug("Using striped reads; pool threads=" + num);
++
+-    if (LOG.isDebugEnabled()) {
+-      LOG.debug("Using striped block recovery; pool threads=" + num);
+-    }
++    LOG.debug("Using striped block recovery; pool threads=" + num);
+-      StripedReader reader = new StripedReader(liveIndices[i]);
++      final ExtendedBlock block = getBlock(blockGroup, liveIndices[i]);
++      StripedReader reader = new StripedReader(liveIndices[i], block, sources[i]);
+-      BlockReader blockReader = newBlockReader(
+-          getBlock(blockGroup, liveIndices[i]), offsetInBlock, sources[i]);
++      BlockReader blockReader = newBlockReader(block, offsetInBlock, sources[i]);
+-        long firstStripedBlockLength = getBlockLen(blockGroup, 0);
+-        while (positionInBlock < firstStripedBlockLength) {
+-          int toRead = Math.min(
+-              bufferSize, (int)(firstStripedBlockLength - positionInBlock));
++        long maxTargetLength = 0;
++        for (short targetIndex : targetIndices) {
++          maxTargetLength = Math.max(maxTargetLength,
++              getBlockLen(blockGroup, targetIndex));
++        }
++        while (positionInBlock < maxTargetLength) {
++          final int toRecover = (int) Math.min(
++              bufferSize, maxTargetLength - positionInBlock);
+-          //   The returned success list is the source DNs we do real read from
+-          success = readMinimumStripedData4Recovery(success);
++          // The returned success list is the source DNs we do real read from
++          Map<ExtendedBlock, Set<DatanodeInfo>> corruptionMap = new HashMap<>();
++          try {
++            success = readMinimumStripedData4Recovery(success, toRecover,
++                corruptionMap);
++          } finally {
++            // report corrupted blocks to NN
++            reportCorruptedBlocks(corruptionMap);
++          }
+-          long remaining = firstStripedBlockLength - positionInBlock;
+-          int toRecoverLen = remaining < bufferSize ? 
+-              (int)remaining : bufferSize;
+-          recoverTargets(success, targetsStatus, toRecoverLen);
++          recoverTargets(success, targetsStatus, toRecover);
+-          positionInBlock += toRead;
++          positionInBlock += toRecover;
+-    private long getReadLength(int index) {
++    /** the reading length should not exceed the length for recovery */
++    private int getReadLength(int index, int recoverLength) {
+-      return remaining > bufferSize ? bufferSize : remaining;
++      return (int) Math.min(remaining, recoverLength);
++     * @param recoverLength the length to recover.
+-    private int[] readMinimumStripedData4Recovery(final int[] success)
++    private int[] readMinimumStripedData4Recovery(final int[] success,
++        int recoverLength, Map<ExtendedBlock, Set<DatanodeInfo>> corruptionMap)
++      Preconditions.checkArgument(recoverLength >= 0 &&
++          recoverLength <= bufferSize);
+-        if (getReadLength(liveIndices[success[i]]) > 0) {
+-          Callable<Void> readCallable = readFromBlock(
+-              reader.blockReader, reader.buffer);
++        final int toRead = getReadLength(liveIndices[success[i]],
++            recoverLength);
++        if (toRead > 0) {
++          Callable<Void> readCallable = readFromBlock(reader, reader.buffer,
++              toRead, corruptionMap);
+-            resultIndex = scheduleNewRead(used);
++            resultIndex = scheduleNewRead(used, recoverLength, corruptionMap);
+-            resultIndex = scheduleNewRead(used);
++            resultIndex = scheduleNewRead(used, recoverLength, corruptionMap);
++      if (len > buffer.limit()) {
++        buffer.limit(len);
++      }
++          targetBuffers[i].limit(toRecoverLen);
+-          outputs[i].limit(toRecoverLen);
+-          if (remaining < 0) {
++          if (remaining <= 0) {
+-    private int scheduleNewRead(BitSet used) {
++    private int scheduleNewRead(BitSet used, int recoverLength,
++        Map<ExtendedBlock, Set<DatanodeInfo>> corruptionMap) {
++      int toRead = 0;
+-        if (getReadLength(liveIndices[m]) > 0) {
++        toRead = getReadLength(liveIndices[m], recoverLength);
++        if (toRead > 0) {
+-          if (getReadLength(liveIndices[i]) > 0) {
++          toRead = getReadLength(liveIndices[i], recoverLength);
++          if (toRead > 0) {
++              r.buffer.position(0);
+-        Callable<Void> readCallable = readFromBlock(
+-            reader.blockReader, reader.buffer);
++        Callable<Void> readCallable = readFromBlock(reader, reader.buffer,
++            toRead, corruptionMap);
+-    private Callable<Void> readFromBlock(final BlockReader reader,
+-        final ByteBuffer buf) {
++    private Callable<Void> readFromBlock(final StripedReader reader,
++        final ByteBuffer buf, final int length,
++        final Map<ExtendedBlock, Set<DatanodeInfo>> corruptionMap) {
+-            actualReadFromBlock(reader, buf);
++            buf.limit(length);
++            actualReadFromBlock(reader.blockReader, buf);
++          } catch (ChecksumException e) {
++            LOG.warn("Found Checksum error for " + reader.block + " from "
++                + reader.source + " at " + e.getPos());
++            addCorruptedBlock(reader.block, reader.source, corruptionMap);
++            throw e;
++    private void reportCorruptedBlocks(
++        Map<ExtendedBlock, Set<DatanodeInfo>> corruptionMap) throws IOException {
++      if (!corruptionMap.isEmpty()) {
++        for (Map.Entry<ExtendedBlock, Set<DatanodeInfo>> entry :
++            corruptionMap.entrySet()) {
++          for (DatanodeInfo dnInfo : entry.getValue()) {
++            datanode.reportRemoteBadBlock(dnInfo, entry.getKey());
++          }
++        }
++      }
++    }
++
++    private void addCorruptedBlock(ExtendedBlock blk, DatanodeInfo node,
++        Map<ExtendedBlock, Set<DatanodeInfo>> corruptionMap) {
++      Set<DatanodeInfo> dnSet = corruptionMap.get(blk);
++      if (dnSet == null) {
++        dnSet = new HashSet<>();
++        corruptionMap.put(blk, dnSet);
++      }
++      if (!dnSet.contains(node)) {
++        dnSet.add(node);
++      }
++    }
++
+-        for (int i = 0; i < zeroStripeBuffers.length; i++) {
+-          zeroStripeBuffers[i].clear();
++        for (ByteBuffer zeroStripeBuffer : zeroStripeBuffers) {
++          zeroStripeBuffer.clear();
+-      for (int i = 0; i < targetBuffers.length; i++) {
+-        if (targetBuffers[i] != null) {
+-          targetBuffers[i].clear();
++      for (ByteBuffer targetBuffer : targetBuffers) {
++        if (targetBuffer != null) {
++          targetBuffer.clear();
++    private final ExtendedBlock block;
++    private final DatanodeInfo source;
+-    private StripedReader(short index) {
++    StripedReader(short index, ExtendedBlock block, DatanodeInfo source) {
++      this.block = block;
++      this.source = source;
+
+INS26 INS26 INS26 INS40 INS40 INS40 INS31 INS31 INS23 INS23 MOV21 MOV21 MOV60 INS29 UPD39 INS44 INS44 INS44 INS44 INS44 INS44 INS44 INS83 INS39 INS42 INS44 INS43 INS8 INS83 INS39 INS42 INS44 INS44 INS44 INS8 INS83 INS83 INS43 INS59 INS83 INS83 INS43 INS59 INS44 INS44 INS60 INS65 INS39 INS42 INS65 INS39 INS42 INS74 INS42 INS21 INS25 INS39 INS42 INS74 INS42 INS60 UPD43 INS83 INS39 INS42 INS83 INS74 INS42 INS74 INS42 INS42 INS25 INS43 INS42 INS43 INS42 INS74 INS42 INS60 INS25 INS25 INS70 INS42 INS42 INS42 INS42 INS43 INS42 INS43 INS42 INS21 INS21 INS83 INS43 MOV43 MOV43 INS59 INS66 INS11 INS42 INS66 INS43 INS43 INS74 INS32 INS27 INS8 INS43 INS43 INS74 INS39 INS59 UPD42 INS43 INS43 INS74 INS43 INS43 INS74 INS38 INS8 INS42 INS42 INS43 INS43 INS74 INS74 INS59 INS27 INS8 INS38 INS8 INS44 INS42 INS8 INS42 INS42 INS7 INS7 INS42 UPD42 MOV32 INS42 INS32 INS60 INS70 INS39 INS32 INS42 INS42 INS43 INS43 INS42 INS42 INS27 INS60 INS42 INS32 INS21 INS42 INS42 INS43 INS43 INS42 INS34 INS21 INS42 INS42 INS43 INS43 INS42 INS42 INS43 INS43 INS32 INS70 INS42 INS42 INS43 INS43 INS43 INS43 INS42 INS32 INS42 INS33 INS21 INS21 INS32 INS21 INS70 INS43 INS42 MOV25 INS22 INS42 INS22 INS42 MOV43 INS42 INS2 INS42 INS42 INS42 MOV2 MOV39 INS59 INS44 INS42 INS8 INS42 INS42 INS42 INS42 INS42 INS42 INS27 INS27 INS83 INS39 INS59 INS42 INS42 INS32 MOV21 INS42 INS42 INS7 INS42 INS42 INS42 INS42 INS42 INS42 INS44 INS32 INS8 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS7 INS32 INS42 INS42 INS42 INS32 INS44 INS42 INS8 INS42 INS52 INS42 INS52 INS42 INS42 INS42 UPD42 MOV42 INS34 INS39 INS42 INS21 UPD42 INS60 INS54 INS42 INS34 INS42 INS42 INS42 MOV32 INS42 INS42 INS42 INS42 INS42 MOV32 INS42 INS21 INS74 INS42 INS42 INS42 INS70 INS42 INS14 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS43 INS42 MOV21 INS42 INS7 INS83 INS74 INS59 INS8 INS8 INS42 UPD27 INS42 INS7 INS42 INS42 INS42 INS43 INS43 INS74 INS44 INS32 INS8 INS74 INS42 INS42 INS32 UPD42 INS11 INS43 INS43 INS74 INS42 INS14 MOV21 INS21 UPD42 UPD42 INS42 MOV32 INS42 INS12 INS40 INS42 INS43 INS43 INS43 INS42 INS42 INS42 INS21 INS43 INS42 INS42 INS42 INS42 INS42 INS32 INS39 INS32 INS42 INS42 INS43 INS43 INS74 INS32 INS42 INS42 INS42 UPD42 INS42 INS21 INS44 INS8 INS42 INS42 INS42 INS32 INS42 MOV42 MOV42 INS42 MOV42 MOV42 MOV42 INS27 INS42 INS42 INS43 INS42 INS42 INS21 INS32 INS43 INS42 INS21 INS21 INS53 INS42 INS42 INS42 INS32 UPD42 MOV42 MOV42 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS40 INS42 INS32 INS32 INS42 INS42 INS42 INS42 INS42 INS40 INS42 INS34 INS42 INS42 INS27 INS42 INS40 INS40 INS42 INS42 INS42 INS45 INS40 INS45 INS40 INS45 INS32 INS42 INS42 DEL42 DEL42 DEL32 DEL8 DEL25 DEL42 DEL42 DEL32 DEL8 DEL25 DEL42 DEL42 DEL32 DEL34 DEL32 DEL59 DEL60 DEL39 DEL27 DEL36 DEL11 DEL32 DEL39 DEL42 DEL42 DEL42 DEL27 DEL59 DEL60 DEL39 DEL42 DEL42 DEL42 DEL27 DEL39 DEL42 DEL11 DEL42 DEL16 DEL59 DEL60 DEL42 DEL42 DEL27 DEL42 DEL42 DEL16 DEL40 DEL40 DEL42 DEL42 DEL42 DEL2 DEL39 DEL42 DEL34 DEL59 DEL58 DEL42 DEL40 DEL27 DEL42 DEL37 DEL8 DEL24 DEL42 DEL42 DEL2 DEL39 DEL42 DEL34 DEL59 DEL58 DEL42 DEL40 DEL27 DEL42 DEL37 DEL8 DEL24 DEL83

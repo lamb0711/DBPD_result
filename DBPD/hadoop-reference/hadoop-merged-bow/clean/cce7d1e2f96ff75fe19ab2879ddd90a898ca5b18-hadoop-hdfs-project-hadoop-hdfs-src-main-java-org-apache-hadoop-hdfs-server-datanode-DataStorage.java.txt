@@ -1,0 +1,359 @@
+Merge remote-tracking branch 'origin/trunk' into MR-2841
+
+Conflicts:
+	hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/main/java/org/apache/hadoop/mapred/MapTask.java
+
++import com.google.common.collect.Lists;
++import com.google.common.util.concurrent.Futures;
+-import org.apache.hadoop.fs.*;
++import org.apache.hadoop.fs.FileUtil;
++import org.apache.hadoop.fs.HardLink;
++import org.apache.hadoop.fs.LocalFileSystem;
++import org.apache.hadoop.fs.Path;
++import org.apache.hadoop.hdfs.protocol.Block;
++import org.apache.hadoop.io.nativeio.NativeIO;
+-import java.io.*;
++import java.io.File;
++import java.io.FileInputStream;
++import java.io.FileOutputStream;
++import java.io.IOException;
++import java.io.RandomAccessFile;
+-import java.util.*;
++import java.util.ArrayList;
++import java.util.Collection;
++import java.util.Collections;
++import java.util.HashMap;
++import java.util.HashSet;
++import java.util.Iterator;
++import java.util.List;
++import java.util.Map;
++import java.util.Properties;
++import java.util.Set;
++import java.util.concurrent.Callable;
++import java.util.concurrent.ExecutorService;
++import java.util.concurrent.Executors;
++import java.util.concurrent.Future;
+-   * Analyze storage directories.
+-   * Recover from previous transitions if required. 
+-   * Perform fs state transition if necessary depending on the namespace info.
+-   * Read storage info.
+-   * <br>
+-   * This method should be synchronized between multiple DN threads.  Only the 
+-   * first DN thread does DN level storage dir recoverTransitionRead.
+-   * 
++   * {{@inheritDoc org.apache.hadoop.hdfs.server.common.Storage#writeAll()}}
++   */
++  private void writeAll(Collection<StorageDirectory> dirs) throws IOException {
++    this.layoutVersion = getServiceLayoutVersion();
++    for (StorageDirectory dir : dirs) {
++      writeProperties(dir);
++    }
++  }
++
++  /**
++   * Add a list of volumes to be managed by DataStorage. If the volume is empty,
++   * format it, otherwise recover it from previous transitions if required.
++   *
++   * @param datanode the reference to DataNode.
+-  synchronized void recoverTransitionRead(DataNode datanode,
++  synchronized void addStorageLocations(DataNode datanode,
+-    if (initialized) {
+-      // DN storage has been initialized, no need to do anything
+-      return;
++    // Similar to recoverTransitionRead, it first ensures the datanode level
++    // format is completed.
++    List<StorageLocation> tmpDataDirs =
++        new ArrayList<StorageLocation>(dataDirs);
++    addStorageLocations(datanode, nsInfo, tmpDataDirs, startOpt, false, true);
++
++    Collection<File> bpDataDirs = new ArrayList<File>();
++    String bpid = nsInfo.getBlockPoolID();
++    for (StorageLocation dir : dataDirs) {
++      File dnRoot = dir.getFile();
++      File bpRoot = BlockPoolSliceStorage.getBpRoot(bpid, new File(dnRoot,
++          STORAGE_DIR_CURRENT));
++      bpDataDirs.add(bpRoot);
+-    LOG.info("Data-node version: " + HdfsConstants.DATANODE_LAYOUT_VERSION
+-        + " and name-node layout version: " + nsInfo.getLayoutVersion());
+-    
+-    // 1. For each data directory calculate its state and 
+-    // check whether all is consistent before transitioning.
+-    // Format and recover.
+-    this.storageDirs = new ArrayList<StorageDirectory>(dataDirs.size());
+-    ArrayList<StorageState> dataDirStates = new ArrayList<StorageState>(dataDirs.size());
++    // mkdir for the list of BlockPoolStorage
++    makeBlockPoolDataDir(bpDataDirs, null);
++    BlockPoolSliceStorage bpStorage = this.bpStorageMap.get(bpid);
++    if (bpStorage == null) {
++      bpStorage = new BlockPoolSliceStorage(
++          nsInfo.getNamespaceID(), bpid, nsInfo.getCTime(),
++          nsInfo.getClusterID());
++    }
++
++    bpStorage.recoverTransitionRead(datanode, nsInfo, bpDataDirs, startOpt);
++    addBlockPoolStorage(bpid, bpStorage);
++  }
++
++  /**
++   * Add a list of volumes to be managed by this DataStorage. If the volume is
++   * empty, it formats the volume, otherwise it recovers it from previous
++   * transitions if required.
++   *
++   * If isInitialize is false, only the directories that have finished the
++   * doTransition() process will be added into DataStorage.
++   *
++   * @param datanode the reference to DataNode.
++   * @param nsInfo namespace information
++   * @param dataDirs array of data storage directories
++   * @param startOpt startup option
++   * @param isInitialize whether it is called when DataNode starts up.
++   * @throws IOException
++   */
++  private synchronized void addStorageLocations(DataNode datanode,
++      NamespaceInfo nsInfo, Collection<StorageLocation> dataDirs,
++      StartupOption startOpt, boolean isInitialize, boolean ignoreExistingDirs)
++      throws IOException {
++    Set<String> existingStorageDirs = new HashSet<String>();
++    for (int i = 0; i < getNumStorageDirs(); i++) {
++      existingStorageDirs.add(getStorageDir(i).getRoot().getAbsolutePath());
++    }
++
++    // 1. For each data directory calculate its state and check whether all is
++    // consistent before transitioning. Format and recover.
++    ArrayList<StorageState> dataDirStates =
++        new ArrayList<StorageState>(dataDirs.size());
++    List<StorageDirectory> addedStorageDirectories =
++        new ArrayList<StorageDirectory>();
++      if (existingStorageDirs.contains(dataDir.getAbsolutePath())) {
++        LOG.info("Storage directory " + dataDir + " has already been used.");
++        it.remove();
++        continue;
++      }
+-        switch(curState) {
++        switch (curState) {
+-          LOG.info("Storage directory " + dataDir + " is not formatted");
++          LOG.info("Storage directory " + dataDir + " is not formatted for "
++            + nsInfo.getBlockPoolID());
+-      // add to the storage list
+-      addStorageDir(sd);
++      if (isInitialize) {
++        addStorageDir(sd);
++      }
++      addedStorageDirectories.add(sd);
+-    if (dataDirs.size() == 0 || dataDirStates.size() == 0)  // none of the data dirs exist
++    if (dataDirs.size() == 0 || dataDirStates.size() == 0) {
++      // none of the data dirs exist
++      if (ignoreExistingDirs) {
++        return;
++      }
++    }
+-    // During startup some of them can upgrade or rollback 
+-    // while others could be uptodate for the regular startup.
+-    try {
+-      for (int idx = 0; idx < getNumStorageDirs(); idx++) {
+-        doTransition(datanode, getStorageDir(idx), nsInfo, startOpt);
+-        createStorageID(getStorageDir(idx));
++    // During startup some of them can upgrade or rollback
++    // while others could be up-to-date for the regular startup.
++    for (Iterator<StorageDirectory> it = addedStorageDirectories.iterator();
++        it.hasNext(); ) {
++      StorageDirectory sd = it.next();
++      try {
++        doTransition(datanode, sd, nsInfo, startOpt);
++        createStorageID(sd);
++      } catch (IOException e) {
++        if (!isInitialize) {
++          sd.unlock();
++          it.remove();
++          continue;
++        }
++        unlockAll();
++        throw e;
+-    } catch (IOException e) {
+-      unlockAll();
+-      throw e;
+-    // 3. Update all storages. Some of them might have just been formatted.
+-    this.writeAll();
++    // 3. Update all successfully loaded storages. Some of them might have just
++    // been formatted.
++    this.writeAll(addedStorageDirectories);
++
++    // 4. Make newly loaded storage directories visible for service.
++    if (!isInitialize) {
++      this.storageDirs.addAll(addedStorageDirectories);
++    }
++  }
++
++  /**
++   * Remove volumes from DataStorage.
++   * @param locations a collection of volumes.
++   */
++  synchronized void removeVolumes(Collection<StorageLocation> locations) {
++    if (locations.isEmpty()) {
++      return;
++    }
++
++    Set<File> dataDirs = new HashSet<File>();
++    for (StorageLocation sl : locations) {
++      dataDirs.add(sl.getFile());
++    }
++
++    for (BlockPoolSliceStorage bpsStorage : this.bpStorageMap.values()) {
++      bpsStorage.removeVolumes(dataDirs);
++    }
++
++    for (Iterator<StorageDirectory> it = this.storageDirs.iterator();
++         it.hasNext(); ) {
++      StorageDirectory sd = it.next();
++      if (dataDirs.contains(sd.getRoot())) {
++        it.remove();
++      }
++    }
++  }
++
++  /**
++   * Analyze storage directories.
++   * Recover from previous transitions if required.
++   * Perform fs state transition if necessary depending on the namespace info.
++   * Read storage info.
++   * <br>
++   * This method should be synchronized between multiple DN threads.  Only the
++   * first DN thread does DN level storage dir recoverTransitionRead.
++   *
++   * @param nsInfo namespace information
++   * @param dataDirs array of data storage directories
++   * @param startOpt startup option
++   * @throws IOException
++   */
++  synchronized void recoverTransitionRead(DataNode datanode,
++      NamespaceInfo nsInfo, Collection<StorageLocation> dataDirs,
++      StartupOption startOpt)
++      throws IOException {
++    if (initialized) {
++      // DN storage has been initialized, no need to do anything
++      return;
++    }
++    LOG.info("DataNode version: " + HdfsConstants.DATANODE_LAYOUT_VERSION
++        + " and NameNode layout version: " + nsInfo.getLayoutVersion());
++
++    this.storageDirs = new ArrayList<StorageDirectory>(dataDirs.size());
++    addStorageLocations(datanode, nsInfo, dataDirs, startOpt, true, false);
+-    // 4. mark DN storage is initialized
++    // mark DN storage is initialized
++
+-      doUpgrade(sd, nsInfo);  // upgrade
++      doUpgrade(datanode, sd, nsInfo);  // upgrade
+-  void doUpgrade(StorageDirectory sd, NamespaceInfo nsInfo) throws IOException {
++  void doUpgrade(DataNode datanode, StorageDirectory sd, NamespaceInfo nsInfo)
++      throws IOException {
+-    linkAllBlocks(tmpDir, bbwDir, new File(curBpDir, STORAGE_DIR_CURRENT));
++    linkAllBlocks(datanode, tmpDir, bbwDir, new File(curBpDir,
++        STORAGE_DIR_CURRENT));
+-  private void linkAllBlocks(File fromDir, File fromBbwDir, File toDir)
+-      throws IOException {
++  private void linkAllBlocks(DataNode datanode, File fromDir, File fromBbwDir,
++      File toDir) throws IOException {
+-      linkBlocks(new File(fromDir, STORAGE_DIR_FINALIZED), 
++      linkBlocks(datanode, new File(fromDir, STORAGE_DIR_FINALIZED),
+-      linkBlocks(new File(fromDir, STORAGE_DIR_RBW), 
++      linkBlocks(datanode, new File(fromDir, STORAGE_DIR_RBW),
+-      linkBlocks(fromDir, new File(toDir, STORAGE_DIR_FINALIZED), 
++      linkBlocks(datanode, fromDir, new File(toDir, STORAGE_DIR_FINALIZED),
+-        linkBlocks(fromBbwDir,
++        linkBlocks(datanode, fromBbwDir,
++
++  private static class LinkArgs {
++    public File src;
++    public File dst;
++
++    public LinkArgs(File src, File dst) {
++      this.src = src;
++      this.dst = dst;
++    }
++  }
++
++  static void linkBlocks(DataNode datanode, File from, File to, int oldLV,
++      HardLink hl) throws IOException {
++    boolean upgradeToIdBasedLayout = false;
++    // If we are upgrading from a version older than the one where we introduced
++    // block ID-based layout AND we're working with the finalized directory,
++    // we'll need to upgrade from the old flat layout to the block ID-based one
++    if (oldLV > DataNodeLayoutVersion.Feature.BLOCKID_BASED_LAYOUT.getInfo().
++        getLayoutVersion() && to.getName().equals(STORAGE_DIR_FINALIZED)) {
++      upgradeToIdBasedLayout = true;
++    }
++
++    final List<LinkArgs> idBasedLayoutSingleLinks = Lists.newArrayList();
++    linkBlocksHelper(from, to, oldLV, hl, upgradeToIdBasedLayout, to,
++        idBasedLayoutSingleLinks);
++    int numLinkWorkers = datanode.getConf().getInt(
++        DFSConfigKeys.DFS_DATANODE_BLOCK_ID_LAYOUT_UPGRADE_THREADS_KEY,
++        DFSConfigKeys.DFS_DATANODE_BLOCK_ID_LAYOUT_UPGRADE_THREADS);
++    ExecutorService linkWorkers = Executors.newFixedThreadPool(numLinkWorkers);
++    final int step = idBasedLayoutSingleLinks.size() / numLinkWorkers + 1;
++    List<Future<Void>> futures = Lists.newArrayList();
++    for (int i = 0; i < idBasedLayoutSingleLinks.size(); i += step) {
++      final int iCopy = i;
++      futures.add(linkWorkers.submit(new Callable<Void>() {
++        @Override
++        public Void call() throws IOException {
++          int upperBound = Math.min(iCopy + step,
++              idBasedLayoutSingleLinks.size());
++          for (int j = iCopy; j < upperBound; j++) {
++            LinkArgs cur = idBasedLayoutSingleLinks.get(j);
++            NativeIO.link(cur.src, cur.dst);
++          }
++          return null;
++        }
++      }));
++    }
++    linkWorkers.shutdown();
++    for (Future<Void> f : futures) {
++      Futures.get(f, IOException.class);
++    }
++  }
+-  static void linkBlocks(File from, File to, int oldLV, HardLink hl) 
+-  throws IOException {
++  static void linkBlocksHelper(File from, File to, int oldLV, HardLink hl,
++  boolean upgradeToIdBasedLayout, File blockRoot,
++      List<LinkArgs> idBasedLayoutSingleLinks) throws IOException {
+-    if (!to.mkdirs())
+-      throw new IOException("Cannot create directory " + to);
+-    
++    // If we are upgrading to block ID-based layout, we don't want to recreate
++    // any subdirs from the source that contain blocks, since we have a new
++    // directory structure
++    if (!upgradeToIdBasedLayout || !to.getName().startsWith(
++        BLOCK_SUBDIR_PREFIX)) {
++      if (!to.mkdirs())
++        throw new IOException("Cannot create directory " + to);
++    }
++
+-      HardLink.createHardLinkMult(from, blockNames, to);
+-      hl.linkStats.countMultLinks++;
+-      hl.linkStats.countFilesMultLinks += blockNames.length;
++      if (upgradeToIdBasedLayout) {
++        for (String blockName : blockNames) {
++          long blockId = Block.getBlockId(blockName);
++          File blockLocation = DatanodeUtil.idToBlockDir(blockRoot, blockId);
++          if (!blockLocation.exists()) {
++            if (!blockLocation.mkdirs()) {
++              throw new IOException("Failed to mkdirs " + blockLocation);
++            }
++          }
++          idBasedLayoutSingleLinks.add(new LinkArgs(new File(from, blockName),
++              new File(blockLocation, blockName)));
++          hl.linkStats.countSingleLinks++;
++        }
++      } else {
++        HardLink.createHardLinkMult(from, blockNames, to);
++        hl.linkStats.countMultLinks++;
++        hl.linkStats.countFilesMultLinks += blockNames.length;
++      }
+-      linkBlocks(new File(from, otherNames[i]), 
+-          new File(to, otherNames[i]), oldLV, hl);
++      linkBlocksHelper(new File(from, otherNames[i]),
++          new File(to, otherNames[i]), oldLV, hl, upgradeToIdBasedLayout,
++          blockRoot, idBasedLayoutSingleLinks);
+
+INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS40 INS40 INS40 INS40 INS40 UPD40 INS40 INS40 UPD40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 UPD40 INS40 INS40 INS40 INS40 INS40 INS40 INS31 INS31 INS31 INS31 INS55 INS31 INS29 INS83 INS39 INS42 INS44 INS43 INS8 INS29 INS83 INS39 INS42 INS44 INS44 INS44 INS44 INS43 INS8 INS29 INS83 UPD42 INS44 INS44 INS29 INS83 INS39 INS42 INS44 INS8 MOV29 INS83 INS39 INS42 INS44 INS44 INS44 INS44 INS43 INS8 INS44 INS44 INS83 INS83 INS42 INS23 INS23 INS31 INS83 INS39 INS42 INS44 INS44 INS44 INS44 INS44 INS43 INS8 UPD42 INS44 INS44 INS44 INS65 INS74 INS42 INS42 INS21 INS70 INS65 INS65 INS65 INS65 INS65 INS65 INS43 INS42 INS43 INS42 INS74 INS42 INS43 INS42 INS42 INS60 INS21 INS60 INS60 INS70 INS21 INS60 INS25 INS21 INS21 INS65 INS65 INS65 INS65 INS65 INS65 INS65 INS39 INS42 INS39 INS42 INS60 INS24 INS60 INS24 INS25 INS65 INS65 INS74 INS42 INS25 INS60 INS70 INS70 INS24 INS43 INS42 INS43 INS42 INS74 INS42 INS43 INS42 INS42 MOV25 MOV21 MOV21 INS21 MOV21 INS43 INS42 INS43 INS42 INS83 INS43 INS59 INS83 INS43 INS59 INS83 INS42 INS44 INS44 INS8 INS43 INS42 INS43 INS42 INS43 INS42 INS39 INS42 INS43 INS42 INS42 INS60 INS25 INS60 INS21 INS60 INS60 INS60 INS60 INS24 INS21 INS70 INS39 INS42 INS43 INS42 INS74 INS42 INS25 INS25 INS66 INS65 INS66 INS43 INS43 INS7 INS44 INS42 INS8 INS66 INS66 INS42 INS66 INS42 INS66 INS42 INS66 INS42 INS66 INS42 INS42 INS42 INS43 INS43 INS42 INS74 INS59 INS32 INS74 INS59 INS43 INS59 INS44 INS42 INS8 INS32 INS43 INS59 INS27 INS8 INS32 INS32 INS66 INS66 INS66 INS66 INS66 INS42 INS66 INS42 INS66 INS42 INS66 INS42 INS66 INS42 INS66 INS42 INS74 INS59 MOV58 MOV27 MOV37 INS8 INS74 INS59 INS8 INS58 INS32 INS8 INS38 INS8 INS66 INS42 INS66 INS43 INS43 INS32 INS8 INS74 INS59 INS44 INS42 INS8 INS44 INS32 INS8 INS58 INS32 INS8 UPD66 UPD66 INS42 INS42 INS43 INS43 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS43 INS42 INS43 INS42 INS21 INS21 INS42 INS42 INS42 INS42 INS39 INS59 INS27 INS8 INS83 INS74 INS59 INS32 INS39 INS59 INS43 INS59 INS83 INS39 INS59 INS74 INS59 INS58 INS27 INS7 INS8 INS32 INS44 INS42 INS8 INS42 INS43 INS43 INS27 INS8 MOV27 INS8 MOV8 INS66 INS42 INS42 INS22 INS32 INS43 INS42 INS21 INS42 INS42 INS43 INS43 INS42 INS14 INS42 INS42 INS42 INS42 INS42 INS9 INS9 INS43 INS43 INS42 INS14 INS42 INS42 INS32 INS43 INS42 INS60 INS60 INS21 INS42 INS42 INS33 INS42 INS42 INS32 INS42 INS33 INS21 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS43 INS43 INS42 INS14 UPD42 UPD42 INS21 INS43 INS43 INS42 INS14 INS25 INS25 INS21 INS25 MOV53 INS74 INS59 INS42 INS42 INS60 INS54 INS42 INS42 INS21 INS42 INS42 INS42 INS42 INS41 INS43 INS43 INS42 INS14 INS43 INS42 INS21 INS43 INS42 INS22 INS42 INS21 INS74 INS59 INS42 INS42 INS60 INS25 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS9 INS9 INS42 INS42 INS42 INS7 INS7 INS42 INS9 INS27 INS32 INS21 INS43 INS43 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS27 INS43 INS74 INS42 INS32 INS39 INS59 INS42 INS32 INS42 INS42 INS60 INS21 INS42 INS42 INS74 INS42 INS21 INS42 INS42 INS38 INS38 MOV25 INS25 INS52 INS42 INS42 INS42 INS32 INS42 INS42 INS74 INS42 INS42 INS42 INS74 INS42 INS42 INS42 INS43 INS59 INS43 INS59 INS32 INS22 INS42 INS42 INS7 INS42 INS42 INS74 UPD42 INS32 INS42 INS42 INS74 INS32 INS8 INS42 INS8 INS32 INS42 INS8 INS43 INS43 INS42 INS32 INS43 INS59 INS8 MOV12 INS32 INS42 INS42 INS74 INS42 INS32 INS42 INS52 INS42 INS32 INS43 INS43 INS42 INS32 INS43 INS59 INS32 INS8 UPD45 UPD45 INS22 INS42 INS22 INS42 INS42 INS32 INS32 INS42 INS42 INS7 INS42 INS42 INS42 INS42 INS32 INS42 INS40 INS40 INS42 INS42 INS42 INS27 INS34 INS42 INS43 INS43 INS42 INS42 INS42 INS34 INS42 INS42 INS83 INS39 INS59 INS32 INS43 INS43 INS32 INS42 INS32 INS42 INS8 MOV8 UPD42 INS42 INS42 INS42 INS42 INS42 INS43 INS43 INS43 INS43 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS42 INS52 INS42 INS42 INS14 INS43 INS43 INS42 INS42 INS32 INS43 INS43 INS42 INS42 INS32 INS21 INS21 INS18 MOV21 INS42 INS42 INS42 INS41 INS42 INS42 INS42 INS42 INS42 INS42 INS32 MOV21 MOV21 INS8 INS22 INS42 INS42 INS43 INS43 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS22 INS42 INS42 INS42 INS32 INS42 INS42 INS32 INS21 INS42 INS42 INS42 INS42 INS52 INS42 INS52 INS42 INS32 INS42 INS42 INS42 INS42 INS9 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS57 INS32 INS42 INS42 INS70 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS14 INS43 INS32 INS42 INS32 INS32 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS32 INS32 INS42 INS42 INS25 MOV21 MOV53 INS52 INS42 INS42 INS42 INS42 INS42 INS52 INS42 INS42 INS42 INS42 INS42 INS32 INS40 INS42 INS42 INS42 INS42 INS42 INS14 INS43 INS42 INS42 INS44 INS42 INS8 INS43 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS27 INS42 INS42 UPD42 MOV42 UPD42 MOV42 INS38 INS8 INS42 INS42 INS42 INS74 INS1 INS42 INS43 INS42 INS60 INS60 INS25 INS21 INS21 INS42 INS42 INS42 INS45 INS42 INS45 INS42 INS21 INS21 INS18 INS43 INS43 INS31 INS42 INS39 INS59 INS43 INS59 INS38 INS8 INS32 INS37 UPD45 INS32 INS32 INS32 INS42 INS42 INS78 INS83 INS43 INS42 INS43 INS8 INS42 INS32 INS42 INS42 INS32 INS32 MOV25 INS42 INS42 INS14 INS40 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS60 INS24 INS41 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS38 INS8 INS43 INS14 INS14 INS39 INS59 INS58 INS27 INS37 INS8 INS33 INS32 INS53 INS42 INS43 INS42 INS42 INS43 INS42 INS42 INS42 INS32 INS39 INS59 INS42 INS42 INS42 INS60 INS21 INS42 INS42 INS14 INS42 INS42 INS42 INS42 INS27 INS32 INS42 INS42 INS43 INS59 INS32 INS43 INS27 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS40 INS40 INS42 INS45 INS42 INS42 INS42 INS42 DEL42 DEL32 DEL42 DEL32 DEL8 DEL8 DEL24 DEL8 DEL54

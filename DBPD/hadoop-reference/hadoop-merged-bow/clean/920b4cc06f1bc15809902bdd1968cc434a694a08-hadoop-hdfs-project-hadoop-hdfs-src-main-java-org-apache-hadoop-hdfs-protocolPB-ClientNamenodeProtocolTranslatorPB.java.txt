@@ -1,0 +1,197 @@
+HDFS-5052. Add cacheRequest/uncacheRequest support to NameNode.  (Contributed by Colin Patrick McCabe.)
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/branches/HDFS-4949@1516669 13f79535-47bb-0310-9956-ffa450edef68
+
++import java.util.ArrayList;
++import java.util.List;
++import java.util.NoSuchElementException;
++import org.apache.hadoop.fs.RemoteIterator;
++import org.apache.hadoop.hdfs.protocol.PathCacheDirective;
++import org.apache.hadoop.hdfs.protocol.PathCacheEntry;
++import org.apache.hadoop.hdfs.protocol.AddPathCacheDirectiveException.EmptyPathError;
++import org.apache.hadoop.hdfs.protocol.AddPathCacheDirectiveException.InvalidPathNameError;
++import org.apache.hadoop.hdfs.protocol.AddPathCacheDirectiveException.InvalidPoolNameError;
++import org.apache.hadoop.hdfs.protocol.AddPathCacheDirectiveException.UnexpectedAddPathCacheDirectiveException;
++import org.apache.hadoop.hdfs.protocol.RemovePathCacheEntryException.InvalidIdException;
++import org.apache.hadoop.hdfs.protocol.RemovePathCacheEntryException.NoSuchIdException;
++import org.apache.hadoop.hdfs.protocol.RemovePathCacheEntryException.UnexpectedRemovePathCacheEntryException;
++import org.apache.hadoop.hdfs.protocol.proto.ClientNamenodeProtocolProtos.PathCacheDirectiveProto;
++import org.apache.hadoop.hdfs.protocol.proto.ClientNamenodeProtocolProtos.AddPathCacheDirectiveErrorProto;
++import org.apache.hadoop.hdfs.protocol.proto.ClientNamenodeProtocolProtos.AddPathCacheDirectivesRequestProto;
++import org.apache.hadoop.hdfs.protocol.proto.ClientNamenodeProtocolProtos.AddPathCacheDirectivesResponseProto;
++import org.apache.hadoop.hdfs.protocol.proto.ClientNamenodeProtocolProtos.ListPathCacheEntriesElementProto;
++import org.apache.hadoop.hdfs.protocol.proto.ClientNamenodeProtocolProtos.ListPathCacheEntriesRequestProto;
++import org.apache.hadoop.hdfs.protocol.proto.ClientNamenodeProtocolProtos.ListPathCacheEntriesRequestProto;
++import org.apache.hadoop.hdfs.protocol.proto.ClientNamenodeProtocolProtos.ListPathCacheEntriesResponseProto;
++import org.apache.hadoop.hdfs.protocol.proto.ClientNamenodeProtocolProtos.RemovePathCacheEntriesRequestProto;
++import org.apache.hadoop.hdfs.protocol.proto.ClientNamenodeProtocolProtos.RemovePathCacheEntriesResponseProto;
++import org.apache.hadoop.hdfs.protocol.proto.ClientNamenodeProtocolProtos.RemovePathCacheEntryErrorProto;
++import org.apache.hadoop.util.Fallible;
++
++  private static IOException addPathCacheDirectivesError(long code,
++      PathCacheDirective directive) {
++    if (code == AddPathCacheDirectiveErrorProto.EMPTY_PATH_ERROR_VALUE) {
++      return new EmptyPathError(directive);
++    } else if (code == AddPathCacheDirectiveErrorProto.
++        INVALID_PATH_NAME_ERROR_VALUE) {
++      return new InvalidPathNameError(directive);
++    } else if (code == AddPathCacheDirectiveErrorProto.
++        INVALID_POOL_NAME_ERROR_VALUE) {
++      return new InvalidPoolNameError(directive);
++    } else {
++      return new UnexpectedAddPathCacheDirectiveException(directive);
++    }
++  }
++  
++  @Override
++  public List<Fallible<PathCacheEntry>> addPathCacheDirectives(
++        List<PathCacheDirective> directives) throws IOException {
++    try {
++      AddPathCacheDirectivesRequestProto.Builder builder =
++          AddPathCacheDirectivesRequestProto.newBuilder();
++      for (PathCacheDirective directive : directives) {
++        builder.addElements(PathCacheDirectiveProto.newBuilder().
++            setPath(directive.getPath()).
++            setPool(directive.getPool()).
++            build());
++      }
++      AddPathCacheDirectivesResponseProto result = 
++          rpcProxy.addPathCacheDirectives(null, builder.build());
++      int resultsCount = result.getResultsCount();
++      ArrayList<Fallible<PathCacheEntry>> results = 
++          new ArrayList<Fallible<PathCacheEntry>>(resultsCount);
++      for (int i = 0; i < resultsCount; i++) {
++        PathCacheDirective directive = directives.get(i);
++        long code = result.getResults(i);
++        if (code > 0) {
++          results.add(new Fallible<PathCacheEntry>(
++                new PathCacheEntry(code, directive)));
++        } else {
++          results.add(new Fallible<PathCacheEntry>(
++                addPathCacheDirectivesError(code, directive))); 
++        }
++      }
++      return results;
++    } catch (ServiceException e) {
++      throw ProtobufHelper.getRemoteException(e);
++    }
++  }
++  
++  private static IOException removePathCacheEntriesError(long code, long id) {
++    if (code == RemovePathCacheEntryErrorProto.
++        INVALID_CACHED_PATH_ID_ERROR_VALUE) {
++      return new InvalidIdException(id);
++    } else if (code == RemovePathCacheEntryErrorProto.
++        NO_SUCH_CACHED_PATH_ID_ERROR_VALUE) {
++      return new NoSuchIdException(id);
++    } else {
++      return new UnexpectedRemovePathCacheEntryException(id);
++    }
++  }
++
++  @Override
++  public List<Fallible<Long>> removePathCacheEntries(List<Long> ids)
++      throws IOException {
++    try {
++      RemovePathCacheEntriesRequestProto.Builder builder =
++          RemovePathCacheEntriesRequestProto.newBuilder();
++      for (Long id : ids) {
++        builder.addElements(id);
++      }
++      RemovePathCacheEntriesResponseProto result = 
++          rpcProxy.removePathCacheEntries(null, builder.build());
++      int resultsCount = result.getResultsCount();
++      ArrayList<Fallible<Long>> results = 
++          new ArrayList<Fallible<Long>>(resultsCount);
++      for (int i = 0; i < resultsCount; i++) {
++        long code = result.getResults(i);
++        if (code > 0) {
++          results.add(new Fallible<Long>(code));
++        } else {
++          results.add(new Fallible<Long>(
++              removePathCacheEntriesError(code, ids.get(i))));
++        }
++      }
++      return results;
++    } catch (ServiceException e) {
++      throw ProtobufHelper.getRemoteException(e);
++    }
++  }
++
++  private class PathCacheEntriesIterator
++      implements RemoteIterator<PathCacheEntry> {
++    private long prevId;
++    private final String pool;
++    private final int repliesPerRequest;
++    private ListPathCacheEntriesResponseProto response;
++    private int idx;
++
++    public PathCacheEntriesIterator(long prevId, String pool,
++        int repliesPerRequest) {
++      this.prevId = prevId;
++      this.pool = pool;
++      this.repliesPerRequest = repliesPerRequest;
++      this.response = null;
++      this.idx = -1;
++    }
++
++    private void makeRequest() throws IOException {
++      idx = 0;
++      response = null;
++      try {
++        ListPathCacheEntriesRequestProto req =
++            ListPathCacheEntriesRequestProto.newBuilder().
++              setPrevId(prevId).
++              setPool(pool).
++              setMaxReplies(repliesPerRequest).
++              build();
++        response = rpcProxy.listPathCacheEntries(null, req);
++        if (response.getElementsCount() == 0) {
++          response = null;
++        }
++      } catch (ServiceException e) {
++        throw ProtobufHelper.getRemoteException(e);
++      }
++    }
++
++    private void makeRequestIfNeeded() throws IOException {
++      if (idx == -1) {
++        makeRequest();
++      } else if ((response != null) && (idx >= response.getElementsCount())) {
++        if (response.getHasMore()) {
++          makeRequest();
++        } else {
++          response = null;
++        }
++      }
++    }
++
++    @Override
++    public boolean hasNext() throws IOException {
++      makeRequestIfNeeded();
++      return (response != null);
++    }
++
++    @Override
++    public PathCacheEntry next() throws IOException {
++      makeRequestIfNeeded();
++      if (response == null) {
++        throw new NoSuchElementException();
++      }
++      ListPathCacheEntriesElementProto elementProto =
++        response.getElements(idx);
++      prevId = elementProto.getId();
++      idx++;
++      return new PathCacheEntry(elementProto.getId(), 
++          new PathCacheDirective(elementProto.getPath(),
++              elementProto.getPool()));
++    }
++  }
++
++  @Override
++  public RemoteIterator<PathCacheEntry> listPathCacheEntries(long prevId,
++      String pool, int repliesPerRequest) throws IOException {
++    return new PathCacheEntriesIterator(prevId, pool, repliesPerRequest);
++  }
+
+INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS31 INS31 INS31 INS31 INS55 INS31 INS83 INS83 INS43 INS42 INS44 INS44 INS8 INS78 INS83 INS74 INS42 INS44 INS43 INS8 INS83 INS83 INS43 INS42 INS44 INS44 INS8 INS78 INS83 INS74 INS42 INS44 INS43 INS8 INS83 INS42 INS74 INS23 INS23 INS23 INS23 INS23 INS31 INS31 INS31 INS31 INS31 INS78 INS83 INS74 INS42 INS44 INS44 INS44 INS43 INS8 INS42 INS39 INS42 INS43 INS42 INS25 INS42 INS43 INS74 INS74 INS42 INS42 INS54 INS42 INS39 INS42 INS39 INS42 INS25 INS42 INS43 INS74 INS74 INS42 INS42 INS54 INS43 INS43 INS83 INS39 INS59 INS83 INS83 INS43 INS59 INS83 INS83 INS39 INS59 INS83 INS43 INS59 INS83 INS39 INS59 INS83 INS42 INS44 INS44 INS44 INS8 INS83 INS39 INS42 INS43 INS8 INS83 INS39 INS42 INS43 INS8 INS78 INS83 INS39 INS42 INS43 INS8 INS78 INS83 INS43 INS42 INS43 INS8 INS42 INS43 INS43 INS39 INS42 INS43 INS42 INS39 INS42 INS42 INS41 INS42 INS27 INS8 INS25 INS42 INS43 INS43 INS43 INS43 INS8 INS12 INS27 INS8 INS25 INS42 INS43 INS43 INS43 INS43 INS8 INS12 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS39 INS42 INS43 INS42 INS39 INS42 INS21 INS21 INS21 INS21 INS21 INS42 INS21 INS21 INS54 INS42 INS25 INS42 INS42 INS21 INS41 INS42 INS42 INS42 INS21 INS25 INS60 INS21 INS21 INS41 INS42 INS42 INS42 INS14 INS42 INS40 INS41 INS27 INS8 INS25 INS42 INS42 INS42 INS42 INS60 INS70 INS60 INS60 INS60 INS24 INS41 INS44 INS8 INS42 INS40 INS41 INS27 INS8 INS8 INS42 INS42 INS42 INS42 INS60 INS70 INS60 INS60 INS60 INS24 INS41 INS44 INS8 INS42 INS7 INS7 INS7 INS7 INS7 INS7 INS7 INS8 INS12 INS27 INS8 INS25 INS32 INS36 INS32 INS27 INS8 INS43 INS59 INS7 INS37 INS14 INS43 INS42 INS42 INS42 INS14 INS42 INS40 INS41 INS27 INS8 INS8 INS43 INS59 INS44 INS42 INS8 INS43 INS59 INS39 INS59 INS74 INS59 INS58 INS27 INS37 INS8 INS42 INS43 INS42 INS53 INS14 INS42 INS40 INS41 INS41 INS43 INS59 INS44 INS42 INS8 INS43 INS59 INS39 INS59 INS74 INS59 INS58 INS27 INS37 INS8 INS42 INS43 INS42 INS53 INS22 INS42 INS22 INS42 INS22 INS42 INS22 INS33 INS22 INS38 INS42 INS34 INS42 INS33 INS60 INS21 INS25 INS44 INS8 INS42 INS38 INS21 INS27 INS8 INS42 INS27 INS42 INS42 INS33 INS53 INS42 INS42 INS32 INS42 INS32 INS42 INS43 INS32 INS14 INS42 INS43 INS42 INS14 INS42 INS40 INS41 INS41 INS40 INS42 INS32 INS43 INS42 INS21 INS42 INS42 INS32 INS42 INS32 INS43 INS74 INS42 INS14 INS39 INS59 INS42 INS42 INS42 INS60 INS60 INS25 INS42 INS32 INS43 INS42 INS14 INS14 INS40 INS42 INS32 INS43 INS42 INS21 INS42 INS42 INS32 INS42 INS32 INS43 INS74 INS42 INS14 INS39 INS59 INS42 INS42 INS42 INS60 INS25 INS42 INS32 INS52 INS42 INS52 INS42 INS52 INS42 INS52 INS42 INS52 INS42 INS34 INS43 INS59 INS7 INS27 INS8 INS43 INS42 INS53 INS34 INS32 INS36 INS36 INS25 INS42 INS33 INS14 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS43 INS32 INS32 INS42 INS43 INS42 INS14 INS14 INS42 INS42 INS42 INS32 INS42 INS42 INS33 INS32 INS42 INS42 INS42 INS43 INS43 INS74 INS42 INS42 INS34 INS43 INS59 INS39 INS59 INS27 INS8 INS8 INS42 INS42 INS42 INS42 INS43 INS42 INS43 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS33 INS32 INS42 INS42 INS42 INS43 INS43 INS74 INS42 INS42 INS34 INS39 INS59 INS27 INS8 INS8 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS32 INS32 INS34 INS21 INS42 INS32 INS42 INS27 INS27 INS32 INS8 INS8 INS43 INS42 INS42 INS42 INS42 INS42 INS42 INS43 INS42 INS43 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS43 INS74 INS42 INS42 INS32 INS42 INS32 INS42 INS34 INS21 INS21 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS43 INS74 INS42 INS32 INS42 INS34 INS21 INS21 INS32 INS42 INS42 INS42 INS33 INS42 INS42 INS42 INS7 INS42 INS42 INS42 INS42 INS33 INS42 INS32 INS42 INS42 INS21 INS21 INS42 INS42 INS42 INS32 INS42 INS42 INS43 INS43 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS32 INS42 INS43 INS43 INS42 INS42 INS42 INS32 INS32 INS32 INS42 INS42 INS42 INS33 INS42 INS42 INS32 INS7 INS32 INS42 INS32 INS42 INS42 INS42 INS42 INS14 INS42 INS42 INS14 INS42 INS42 INS42 INS42 INS14 INS42 INS42 INS14 INS32 INS42 INS42 INS42 INS42 INS33 INS32 INS42 INS32 INS42 INS42 INS74 INS14 INS74 INS32 INS74 INS42 INS74 INS32 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS43 INS43 INS43 INS42 INS42 INS43 INS43 INS42 INS42 INS42 INS43 INS43 INS43 INS43 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42

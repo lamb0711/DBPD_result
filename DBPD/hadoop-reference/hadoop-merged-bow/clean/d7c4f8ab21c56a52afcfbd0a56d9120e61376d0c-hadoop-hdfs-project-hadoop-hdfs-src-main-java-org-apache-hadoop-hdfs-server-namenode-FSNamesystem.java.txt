@@ -1,0 +1,182 @@
+HDFS-13616. Batch listing of multiple directories (#1725)
+
+
++
++import com.google.common.collect.Maps;
++import com.google.protobuf.ByteString;
++import org.apache.hadoop.hdfs.protocol.BatchedDirectoryListing;
++import org.apache.hadoop.hdfs.protocol.HdfsPartialListing;
++import org.apache.hadoop.ipc.ObserverRetryOnActiveException;
++import java.security.GeneralSecurityException;
++import java.security.MessageDigest;
++import java.security.NoSuchAlgorithmException;
++import java.util.LinkedHashMap;
++import org.apache.hadoop.hdfs.protocol.proto.HdfsProtos.BatchedListingKeyProto;
+-import org.apache.hadoop.ipc.ObserverRetryOnActiveException;
++import org.apache.hadoop.ipc.RemoteException;
++
++  // Maximum number of paths that can be listed per batched call.
++  private final int batchedListingLimit;
++
++  private final MessageDigest digest;
++
++      try {
++        digest = MessageDigest.getInstance("MD5");
++      } catch (NoSuchAlgorithmException e) {
++        throw new IOException("Algorithm 'MD5' not found");
++      }
++
++      this.batchedListingLimit = conf.getInt(
++          DFSConfigKeys.DFS_NAMENODE_BATCHED_LISTING_LIMIT,
++          DFSConfigKeys.DFS_NAMENODE_BATCHED_LISTING_LIMIT_DEFAULT);
++      Preconditions.checkArgument(
++          batchedListingLimit > 0,
++          DFSConfigKeys.DFS_NAMENODE_BATCHED_LISTING_LIMIT +
++              " must be greater than zero");
+-      
++
++  public byte[] getSrcPathsHash(String[] srcs) {
++    synchronized (digest) {
++      for (String src : srcs) {
++        digest.update(src.getBytes(Charsets.UTF_8));
++      }
++      byte[] result = digest.digest();
++      digest.reset();
++      return result;
++    }
++  }
++
++  BatchedDirectoryListing getBatchedListing(String[] srcs, byte[] startAfter,
++      boolean needLocation) throws IOException {
++
++    if (srcs.length > this.batchedListingLimit) {
++      String msg = String.format("Too many source paths (%d > %d)",
++          srcs.length, batchedListingLimit);
++      throw new IllegalArgumentException(msg);
++    }
++
++    // Parse the startAfter key if present
++    int srcsIndex = 0;
++    byte[] indexStartAfter = new byte[0];
++
++    if (startAfter.length > 0) {
++      BatchedListingKeyProto startAfterProto =
++          BatchedListingKeyProto.parseFrom(startAfter);
++      // Validate that the passed paths match the checksum from key
++      Preconditions.checkArgument(
++          Arrays.equals(
++              startAfterProto.getChecksum().toByteArray(),
++              getSrcPathsHash(srcs)));
++      srcsIndex = startAfterProto.getPathIndex();
++      indexStartAfter = startAfterProto.getStartAfter().toByteArray();
++      // Special case: if the indexStartAfter key is an empty array, it
++      // means the last element we listed was a file, not a directory.
++      // Skip it so we don't list it twice.
++      if (indexStartAfter.length == 0) {
++        srcsIndex++;
++      }
++    }
++    final int startSrcsIndex = srcsIndex;
++    final String operationName = "listStatus";
++    final FSPermissionChecker pc = getPermissionChecker();
++
++    BatchedDirectoryListing bdl;
++
++    checkOperation(OperationCategory.READ);
++    readLock();
++    try {
++      checkOperation(NameNode.OperationCategory.READ);
++
++      // List all directories from the starting index until we've reached
++      // ls limit OR finished listing all srcs.
++      LinkedHashMap<Integer, HdfsPartialListing> listings =
++          Maps.newLinkedHashMap();
++      DirectoryListing lastListing = null;
++      int numEntries = 0;
++      for (; srcsIndex < srcs.length; srcsIndex++) {
++        String src = srcs[srcsIndex];
++        HdfsPartialListing listing;
++        try {
++          DirectoryListing dirListing =
++              getListingInt(dir, pc, src, indexStartAfter, needLocation);
++          if (dirListing == null) {
++            throw new FileNotFoundException("Path " + src + " does not exist");
++          }
++          listing = new HdfsPartialListing(
++              srcsIndex, Lists.newArrayList(dirListing.getPartialListing()));
++          numEntries += listing.getPartialListing().size();
++          lastListing = dirListing;
++        } catch (Exception e) {
++          if (e instanceof AccessControlException) {
++            logAuditEvent(false, operationName, src);
++          }
++          listing = new HdfsPartialListing(
++              srcsIndex,
++              new RemoteException(
++                  e.getClass().getCanonicalName(),
++                  e.getMessage()));
++          lastListing = null;
++          LOG.info("Exception listing src {}", src, e);
++        }
++
++        listings.put(srcsIndex, listing);
++        // Null out the indexStartAfter after the first time.
++        // If we get a partial result, we're done iterating because we're also
++        // over the list limit.
++        if (indexStartAfter.length != 0) {
++          indexStartAfter = new byte[0];
++        }
++        // Terminate if we've reached the maximum listing size
++        if (numEntries >= dir.getListLimit()) {
++          break;
++        }
++      }
++
++      HdfsPartialListing[] partialListingArray =
++          listings.values().toArray(new HdfsPartialListing[] {});
++
++      // Check whether there are more dirs/files to be listed, and if so setting
++      // up the index to start within the first dir to be listed next time.
++      if (srcsIndex >= srcs.length) {
++        // If the loop finished normally, there are no more srcs and we're done.
++        bdl = new BatchedDirectoryListing(
++            partialListingArray,
++            false,
++            new byte[0]);
++      } else if (srcsIndex == srcs.length-1 &&
++          lastListing != null &&
++          !lastListing.hasMore()) {
++        // If we're on the last srcsIndex, then we might be done exactly on an
++        // lsLimit boundary.
++        bdl = new BatchedDirectoryListing(
++            partialListingArray,
++            false,
++            new byte[0]
++        );
++      } else {
++        byte[] lastName = lastListing != null && lastListing.getLastName() !=
++            null ? lastListing.getLastName() : new byte[0];
++        BatchedListingKeyProto proto = BatchedListingKeyProto.newBuilder()
++            .setChecksum(ByteString.copyFrom(getSrcPathsHash(srcs)))
++            .setPathIndex(srcsIndex)
++            .setStartAfter(ByteString.copyFrom(lastName))
++            .build();
++        byte[] returnedStartAfter = proto.toByteArray();
++
++        // Set the startAfter key if the last listing has more entries
++        bdl = new BatchedDirectoryListing(
++            partialListingArray,
++            true,
++            returnedStartAfter);
++      }
++    } finally {
++      readUnlock(operationName);
++    }
++    for (int i = startSrcsIndex; i < srcsIndex; i++) {
++      logAuditEvent(true, operationName, srcs[i]);
++    }
++    return bdl;
++  }
++
+
+MOV26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS23 INS23 INS31 INS31 INS83 INS83 INS39 INS59 INS83 INS83 INS43 INS59 INS83 INS5 INS42 INS44 INS8 INS43 INS42 INS44 INS44 INS44 INS43 INS8 INS42 INS42 INS42 INS39 INS85 INS5 INS42 INS51 INS42 INS5 INS42 INS5 INS42 INS39 INS42 INS42 INS25 INS60 INS60 INS25 INS60 INS60 INS60 INS60 INS21 INS21 INS54 INS24 INS41 INS43 INS85 INS42 INS8 INS43 INS85 INS39 INS85 INS27 INS8 INS39 INS59 INS5 INS59 INS27 INS8 INS83 INS39 INS59 INS83 INS43 INS59 INS83 INS43 INS59 INS43 INS59 INS32 INS32 INS8 INS8 INS58 INS27 INS37 INS8 INS42 INS54 INS21 INS21 INS42 INS70 INS60 INS21 INS41 INS42 INS40 INS22 INS60 INS53 INS42 INS34 INS39 INS85 INS42 INS3 INS40 INS34 INS60 INS21 INS21 INS21 INS25 INS42 INS42 INS42 INS42 INS45 INS42 INS42 INS32 INS42 INS42 INS42 INS40 INS42 INS21 INS60 INS60 INS60 INS24 INS60 INS25 INS21 INS39 INS59 INS42 INS42 INS42 INS21 INS8 INS12 INS7 INS32 INS44 INS42 INS8 INS5 INS59 INS32 INS42 INS52 INS42 INS43 INS59 INS14 INS5 INS34 INS43 INS59 INS32 INS7 INS7 INS27 INS8 INS42 INS32 INS74 INS59 INS43 INS59 INS39 INS59 INS27 INS37 INS8 INS5 INS59 INS27 INS8 INS25 INS32 INS42 INS42 INS32 INS21 INS44 INS8 INS22 INS32 INS42 INS42 INS27 INS27 INS43 INS42 INS21 INS39 INS85 INS42 INS32 INS42 INS42 INS42 INS42 INS32 INS43 INS42 INS39 INS85 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS32 INS42 INS32 INS40 INS34 INS21 INS42 INS40 INS43 INS43 INS43 INS42 INS32 INS42 INS42 INS33 INS42 INS34 INS42 INS40 INS42 INS60 INS60 INS54 INS21 INS25 INS25 INS43 INS85 INS42 INS32 INS42 INS40 INS21 INS27 INS8 INS8 INS42 INS42 INS42 INS9 INS42 INS2 INS7 INS43 INS42 INS53 INS52 INS42 INS42 INS42 INS40 INS40 INS42 INS34 INS40 INS45 INS42 INS32 INS42 INS42 INS42 INS42 INS45 INS40 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS32 INS42 INS42 INS32 INS42 INS37 INS42 INS42 INS42 INS42 INS42 INS43 INS59 INS43 INS59 INS8 INS12 INS32 INS27 INS8 INS27 INS8 INS42 INS32 INS42 INS3 INS7 INS27 INS38 INS21 INS60 INS60 INS60 INS21 INS42 INS42 INS42 INS32 INS42 INS14 INS42 INS42 INS32 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS2 INS42 INS42 INS60 INS25 INS21 INS21 INS21 INS44 INS8 INS42 INS42 INS42 INS42 INS40 INS34 INS21 INS42 INS32 INS10 INS42 INS42 INS5 INS4 INS42 INS14 INS27 INS27 INS32 INS7 INS5 INS59 INS43 INS59 INS5 INS59 INS7 INS42 INS42 INS45 INS43 INS45 INS42 INS42 INS40 INS42 INS42 INS42 INS42 INS43 INS59 INS27 INS8 INS7 INS7 INS7 INS43 INS42 INS25 INS21 INS21 INS21 INS7 INS42 INS42 INS43 INS85 INS43 INS42 INS9 INS3 INS42 INS27 INS42 INS33 INS42 INS42 INS42 INS14 INS39 INS85 INS42 INS16 INS42 INS42 INS32 INS39 INS85 INS42 INS32 INS42 INS14 INS42 INS42 INS42 INS32 INS42 INS33 INS53 INS42 INS14 INS42 INS32 INS42 INS42 INS42 INS62 INS8 INS7 INS7 INS32 INS42 INS3 INS42 INS42 INS5 INS34 INS40 INS34 INS43 INS42 INS9 INS3 INS27 INS32 INS3 INS32 INS42 INS42 INS42 INS43 INS42 INS9 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS14 INS43 INS42 INS32 INS32 INS42 INS42 INS43 INS21 INS42 INS14 INS42 INS33 INS42 INS42 INS45 INS42 INS42 INS5 INS34 INS39 INS85 INS42 INS5 INS34 INS27 INS27 INS42 INS42 INS5 INS34 INS32 INS42 INS32 INS42 INS43 INS27 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS32 INS43 INS42 INS14 INS39 INS85 INS39 INS85 INS42 INS33 INS32 INS33 INS39 INS85 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS45 INS42 INS45 INS42 INS42 INS42 INS9 INS42 INS42 INS42 INS43 INS32 INS32 INS42 INS42 INS32 INS42 INS32 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS42

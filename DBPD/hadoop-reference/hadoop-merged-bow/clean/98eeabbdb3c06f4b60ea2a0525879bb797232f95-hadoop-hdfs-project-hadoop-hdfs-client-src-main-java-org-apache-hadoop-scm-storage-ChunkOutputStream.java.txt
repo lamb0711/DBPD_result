@@ -1,0 +1,261 @@
+HDFS-12794. Ozone: Parallelize ChunkOutputSream Writes to container. Contributed by Shashikant Banerjee.
+
+-import static org.apache.hadoop.scm.storage.ContainerProtocolCalls.putKey;
+-import static org.apache.hadoop.scm.storage.ContainerProtocolCalls.writeChunk;
+-
+-import java.io.IOException;
+-import java.io.OutputStream;
+-import java.nio.ByteBuffer;
+-import java.util.UUID;
+-
++import com.google.common.base.Preconditions;
+-
++import org.apache.commons.lang3.tuple.ImmutablePair;
++import org.apache.hadoop.hdfs.ozone.protocol.proto.ContainerProtos;
++import org.apache.hadoop.util.Time;
++
++import java.io.IOException;
++import java.io.OutputStream;
++import java.nio.ByteBuffer;
++import java.util.LinkedList;
++import java.util.List;
++import java.util.UUID;
++import java.util.concurrent.CompletableFuture;
++import java.util.concurrent.ExecutionException;
++
++import static org.apache.hadoop.hdfs.ozone.protocol.proto.ContainerProtos
++    .Result.SUCCESS;
++import static org.apache.hadoop.scm.storage.ContainerProtocolCalls.putKey;
++import static org.apache.hadoop.scm.storage.ContainerProtocolCalls.writeChunk;
++
++  private final String streamId;
+-  private final String streamId;
+-  private int chunkIndex;
++  private int streamBufferSize;
++   * @param maxBufferSize -- Controls the maximum amount of memory that we need
++   * to allocate data buffering.
+-      String traceID, int chunkSize) {
++      String traceID, int chunkSize, int maxBufferSize) {
++    this.streamBufferSize = maxBufferSize;
++
+-    this.buffer = ByteBuffer.allocate(chunkSize);
++    this.buffer = ByteBuffer.allocate(maxBufferSize);
+-    this.chunkIndex = 0;
++  /**
++   * {@inheritDoc}
++   */
+-    int rollbackPosition = buffer.position();
+-    int rollbackLimit = buffer.limit();
+-    buffer.put((byte)b);
+-    if (buffer.position() == chunkSize) {
+-      flushBufferToChunk(rollbackPosition, rollbackLimit);
+-    }
++    byte[] c = new byte[1];
++    c[0] = (byte) b;
++    write(c, 0, 1);
++  /**
++   * {@inheritDoc}
++   */
+-    while (len > 0) {
+-      int writeLen = Math.min(chunkSize - buffer.position(), len);
+-      int rollbackPosition = buffer.position();
+-      int rollbackLimit = buffer.limit();
+-      buffer.put(b, off, writeLen);
+-      if (buffer.position() == chunkSize) {
+-        flushBufferToChunk(rollbackPosition, rollbackLimit);
++    int rollbackPosition = buffer.position();
++    int rollbackLimit = buffer.limit();
++    try {
++      List<ImmutablePair<CompletableFuture<ContainerProtos
++              .ContainerCommandResponseProto>, ChunkInfo>>
++          writeFutures = writeInParallel(b, off, len);
++      // This is a rendezvous point for this function call, all chunk I/O
++      // for this block must complete before we can declare this call as
++      // complete.
++
++      // Wait until all the futures complete or throws an exception if any of
++      // the calls ended with an exception this call will throw.
++      // if futures is null, it means that we wrote the data to the buffer and
++      // returned.
++      if (writeFutures != null) {
++        CompletableFuture.allOf(writeFutures.toArray(new
++            CompletableFuture[writeFutures.size()])).join();
++
++        // Wrote this data, we will clear this buffer now.
++        buffer.clear();
+-      off += writeLen;
+-      len -= writeLen;
++    } catch (InterruptedException | ExecutionException e) {
++      buffer.position(rollbackPosition);
++      buffer.limit(rollbackLimit);
++      throw new IOException("Unexpected error in write. ", e);
++  /**
++   * Write a given block into many small chunks in parallel.
++   *
++   * @param b
++   * @param off
++   * @param len
++   * @throws IOException
++   * @throws ExecutionException
++   * @throws InterruptedException
++   */
++  public List<ImmutablePair<CompletableFuture<ContainerProtos
++          .ContainerCommandResponseProto>, ChunkInfo>>
++      writeInParallel(byte[] b, int off, int len)
++      throws IOException, ExecutionException, InterruptedException {
++
++    Preconditions.checkArgument(len <= streamBufferSize,
++        "A chunk write cannot be " + "larger than max buffer size limit.");
++    long newBlockCount = len / chunkSize;
++    buffer.put(b, off, len);
++    List<ImmutablePair<CompletableFuture<ContainerProtos
++            .ContainerCommandResponseProto>, ChunkInfo>>
++        writeFutures = new LinkedList<>();
++
++    // We if must have at least a chunkSize of data ready to write, if so we
++    // will go ahead and start writing that data.
++    if (buffer.position() >= chunkSize) {
++      // Allocate new byte slices which will point to each chunk of data
++      // that we want to write. Divide the byte buffer into individual chunks
++      // each of length equals to chunkSize max where each chunk will be
++      // assigned a chunkId where, for each chunk the async write requests will
++      // be made and wait for all of them to return before the write call
++      // returns.
++      for (int chunkId = 0; chunkId < newBlockCount; chunkId++) {
++        // Please note : We are not flipping the slice when we write since
++        // the slices are pointing the buffer start and end as needed for
++        // the chunk write. Also please note, Duplicate does not create a
++        // copy of data, it only creates metadata that points to the data
++        // stream.
++        ByteBuffer chunk = buffer.duplicate();
++        Preconditions.checkState((chunkId * chunkSize) < buffer.limit(),
++            "Chunk offset cannot be beyond the limits of the buffer.");
++        chunk.position(chunkId * chunkSize);
++        // Min handles the case where the last block might be lesser than
++        // chunk Size.
++        chunk.limit(chunk.position() +
++            Math.min(chunkSize, chunk.remaining() - (chunkId * chunkSize)));
++
++        // Schedule all the writes, this is a non-block call which returns
++        // futures. We collect these futures and wait for all  of them to
++        // complete in the next line.
++        writeFutures.add(writeChunkToContainer(chunk, 0, chunkSize));
++      }
++      return writeFutures;
++    }
++    // Nothing to do , return null.
++    return null;
++  }
++
+-      flushBufferToChunk(rollbackPosition, rollbackLimit);
++      ByteBuffer chunk = buffer.duplicate();
++      try {
++
++        ImmutablePair<CompletableFuture<ContainerProtos
++            .ContainerCommandResponseProto>, ChunkInfo>
++            result = writeChunkToContainer(chunk, 0, chunkSize);
++        updateChunkInfo(result);
++        buffer.clear();
++      } catch (ExecutionException | InterruptedException e) {
++        buffer.position(rollbackPosition);
++        buffer.limit(rollbackLimit);
++        throw new IOException("Failure in flush", e);
++      }
+-          writeChunkToContainer();
++          // This flip is needed since this is the real buffer to which we
++          // are writing and position will have moved each time we did a put.
++          buffer.flip();
++
++          // Call get immediately to make this call Synchronous.
++
++          ImmutablePair<CompletableFuture<ContainerProtos
++              .ContainerCommandResponseProto>, ChunkInfo>
++              result = writeChunkToContainer(buffer, 0, buffer.limit());
++          updateChunkInfo(result);
++          buffer.clear();
+-      } catch (IOException e) {
++      } catch (IOException | InterruptedException | ExecutionException e) {
++  private void updateChunkInfo(
++      ImmutablePair<
++          CompletableFuture<ContainerProtos.ContainerCommandResponseProto>,
++          ChunkInfo
++          > result) throws InterruptedException, ExecutionException {
++    // Wait for this call to complete.
++    ContainerProtos.ContainerCommandResponseProto response =
++        result.getLeft().get();
++
++    // If the write call to the chunk is successful, we need to add that
++    // chunk information to the containerKeyData.
++    // TODO: Clean up the garbage in case of failure.
++    if(response.getResult() == SUCCESS) {
++      ChunkInfo chunk = result.getRight();
++      containerKeyData.addChunks(chunk);
++    }
++  }
++
+-   * Attempts to flush buffered writes by writing a new chunk to the container.
+-   * If successful, then clears the buffer to prepare to receive writes for a
+-   * new chunk.
+-   *
+-   * @param rollbackPosition position to restore in buffer if write fails
+-   * @param rollbackLimit limit to restore in buffer if write fails
+-   * @throws IOException if there is an I/O error while performing the call
+-   */
+-  private synchronized void flushBufferToChunk(int rollbackPosition,
+-      int rollbackLimit) throws IOException {
+-    boolean success = false;
+-    try {
+-      writeChunkToContainer();
+-      success = true;
+-    } finally {
+-      if (success) {
+-        buffer.clear();
+-      } else {
+-        buffer.position(rollbackPosition);
+-        buffer.limit(rollbackLimit);
+-      }
+-    }
+-  }
+-
+-  /**
+-   * @throws IOException if there is an I/O error while performing the call
++   * @param data -- Data to write.
++   * @param offset - offset to the data buffer
++   * @param len - Length in bytes
++   * @return Returns a Immutable pair -- A future object that will contian
++   * the result of the operation, and the chunkInfo that we wrote.
++   *
++   * @throws IOException
++   * @throws ExecutionException
++   * @throws InterruptedException
+-  private synchronized void writeChunkToContainer() throws IOException {
+-    buffer.flip();
+-    ByteString data = ByteString.copyFrom(buffer);
+-    ChunkInfo chunk = ChunkInfo
+-        .newBuilder()
+-        .setChunkName(
++  private ImmutablePair<
++      CompletableFuture<ContainerProtos.ContainerCommandResponseProto>,
++      ChunkInfo>
++      writeChunkToContainer(ByteBuffer data, int offset, int len)
++      throws IOException, ExecutionException, InterruptedException {
++
++
++    ByteString dataString = ByteString.copyFrom(data);
++    ChunkInfo chunk = ChunkInfo.newBuilder().setChunkName(
+-                + streamId + "_chunk_" + ++chunkIndex)
++                + streamId + "_chunk_" + Time.monotonicNowNanos())
+-        .setLen(data.size())
++        .setLen(len)
+-    try {
+-      writeChunk(xceiverClient, chunk, key, data, traceID);
+-    } catch (IOException e) {
+-      throw new IOException(
+-          "Unexpected Storage Container Exception: " + e.toString(), e);
+-    }
+-    containerKeyData.addChunks(chunk);
++    CompletableFuture<ContainerProtos.ContainerCommandResponseProto> response =
++        writeChunk(xceiverClient, chunk, key, dataString, traceID);
++    return new ImmutablePair(response, chunk);
+
+MOV26 MOV26 MOV26 MOV26 MOV26 MOV26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 MOV23 MOV23 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS31 INS31 INS31 INS31 INS31 INS44 MOV21 MOV21 INS29 MOV78 MOV83 MOV83 MOV39 MOV42 MOV44 MOV43 INS8 INS29 INS29 INS83 INS74 INS42 INS44 INS44 INS44 MOV43 INS43 INS43 INS8 MOV78 MOV83 MOV83 MOV39 MOV42 MOV43 INS8 INS83 INS39 INS42 INS44 INS43 INS43 INS8 MOV29 MOV83 INS74 INS42 MOV44 MOV44 INS44 MOV43 INS43 INS43 MOV8 UPD42 INS65 INS39 INS42 INS65 MOV21 INS60 MOV21 INS21 INS65 MOV60 MOV60 INS54 INS65 INS65 INS65 INS65 INS65 INS65 INS65 INS43 INS74 INS5 INS42 INS39 INS42 INS39 INS42 INS42 INS42 INS21 INS60 INS21 INS60 INS25 INS41 INS25 INS74 INS42 UPD42 MOV42 INS42 INS60 INS25 MOV65 UPD65 INS65 INS65 INS65 INS43 INS74 INS43 INS43 INS42 UPD42 INS39 INS42 INS42 INS42 INS60 INS41 INS42 INS66 INS66 INS65 INS5 INS59 INS7 INS32 INS65 INS8 INS12 INS66 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS43 INS74 INS43 INS39 INS85 INS32 INS39 INS59 INS32 INS74 INS59 UPD27 MOV27 INS8 INS33 MOV27 INS8 MOV27 INS8 INS43 INS74 INS43 INS43 INS59 INS27 INS8 INS42 UPD66 UPD42 UPD66 UPD42 UPD66 INS66 INS66 INS42 INS42 INS42 INS43 INS43 INS42 INS42 INS74 INS59 INS14 INS22 INS42 MOV22 INS32 INS39 INS85 INS42 INS3 INS2 MOV11 INS42 INS42 INS34 INS34 INS60 INS25 INS44 INS8 INS42 INS43 INS43 INS42 INS42 INS42 INS27 INS27 INS42 INS27 MOV42 UPD42 MOV42 INS42 INS42 INS42 INS43 INS74 INS42 INS14 INS24 INS41 MOV60 MOV60 INS60 INS54 INS54 UPD42 MOV42 INS43 INS43 INS42 INS40 INS42 INS32 MOV32 INS42 INS60 MOV21 INS42 INS40 UPD42 INS43 INS43 INS42 INS32 INS43 INS42 INS42 INS52 INS42 INS42 INS42 INS42 INS5 INS34 INS42 INS34 INS74 INS59 INS27 INS8 INS84 INS42 MOV21 MOV21 INS53 INS42 INS40 INS42 INS42 INS45 INS45 INS42 INS42 INS42 INS43 INS74 INS43 INS74 INS58 INS27 INS37 INS8 INS42 INS43 INS59 INS8 INS12 MOV8 MOV12 MOV8 INS42 INS40 INS32 INS42 UPD42 UPD42 INS43 INS59 UPD42 INS42 INS40 MOV42 MOV42 MOV42 MOV42 UPD42 MOV42 MOV42 INS42 INS39 INS85 INS43 INS74 INS42 INS32 INS42 INS33 INS21 MOV21 INS43 INS43 INS32 INS14 INS42 INS43 INS43 INS42 INS43 INS39 INS59 INS42 INS42 INS42 INS60 INS21 INS21 INS21 MOV21 INS42 INS42 INS32 INS60 MOV21 INS21 INS44 MOV8 INS42 INS42 INS42 INS42 INS32 UPD42 MOV42 INS42 INS43 INS74 INS43 INS42 INS42 INS42 INS42 INS32 INS42 INS42 UPD42 UPD42 UPD42 INS42 INS42 INS42 MOV43 INS45 INS42 INS42 INS40 INS42 INS42 INS34 INS43 INS59 INS32 INS32 INS32 INS32 INS42 INS42 INS74 INS59 INS32 INS84 INS42 INS53 MOV27 INS84 INS42 INS42 INS42 INS43 INS43 INS42 INS32 UPD42 MOV42 INS42 INS42 INS42 INS32 INS42 INS42 INS27 INS45 INS42 INS42 INS27 INS42 INS42 INS27 INS42 INS42 INS32 INS43 INS74 INS43 INS42 INS32 UPD42 UPD42 INS42 INS42 INS43 INS43 INS14 MOV21 INS60 INS21 INS43 INS43 INS43 INS42 INS40 UPD42 MOV42 UPD42 MOV42 INS32 INS42 INS42 INS36 INS32 INS42 INS42 MOV32 INS32 UPD42 MOV42 UPD42 MOV42 INS34 UPD42 MOV42 INS42 INS43 INS43 INS42 INS42 INS42 INS34 INS42 INS42 INS42 MOV43 INS45 INS42 INS74 INS59 INS32 MOV42 INS42 INS42 INS32 INS42 INS42 INS3 INS27 MOV42 MOV42 UPD42 INS42 INS42 INS42 INS27 INS42 INS40 INS42 INS43 INS74 INS43 INS42 INS32 UPD42 INS42 INS42 INS42 INS42 INS42 INS5 INS32 INS42 INS42 INS32 INS36 INS42 INS43 INS43 INS42 INS42 INS42 INS34 INS32 INS43 INS85 UPD42 MOV42 UPD42 MOV42 INS42 INS42 INS27 INS42 INS40 INS42 INS42 INS42 INS42 INS42 DEL42 DEL42 DEL42 DEL32 DEL52 DEL42 DEL22 DEL34 DEL42 DEL42 DEL32 DEL39 DEL42 DEL32 DEL59 DEL60 DEL39 DEL42 DEL32 DEL59 DEL60 DEL42 DEL27 DEL8 DEL25 DEL8 DEL31 DEL42 DEL42 DEL7 DEL42 DEL34 DEL27 DEL39 DEL42 DEL42 DEL32 DEL27 DEL32 DEL59 DEL60 DEL42 DEL42 DEL42 DEL32 DEL21 DEL8 DEL25 DEL42 DEL42 DEL7 DEL21 DEL8 DEL61 DEL32 DEL42 DEL8 DEL42 DEL44 DEL43 DEL45 DEL27 DEL42 DEL14 DEL53 DEL8 DEL12 DEL54 DEL8 DEL25 DEL8 DEL31 DEL66 DEL66 DEL66 DEL39 DEL42 DEL42 DEL38 DEL42 DEL32 DEL32 DEL21 DEL8 DEL54 DEL83 DEL39 DEL42 DEL39 DEL42 DEL9 DEL59 DEL60 DEL42 DEL32 DEL21 DEL42 DEL9 DEL7 DEL21 DEL8 DEL42 DEL8 DEL25 DEL8 DEL54 DEL8 DEL31 DEL42 DEL66 DEL65 DEL29 DEL83 DEL83 DEL39 DEL42 DEL31

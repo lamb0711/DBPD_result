@@ -1,0 +1,180 @@
+YARN-6669.  Implemented Kerberos security for YARN service framework.  (Contributed by Jian He)
+
++import org.apache.hadoop.io.DataOutputBuffer;
++import org.apache.hadoop.security.Credentials;
++import org.apache.hadoop.security.token.Token;
++import org.apache.hadoop.yarn.client.util.YarnClientUtils;
++import java.net.URI;
++import java.net.URISyntaxException;
++import java.nio.ByteBuffer;
+-  private Map<String, ApplicationId> cachedAppIds = new ConcurrentHashMap<>();
++  private Map<String, AppInfo> cachedAppInfo = new ConcurrentHashMap<>();
+-    cachedAppIds.put(serviceName, appId);
++    cachedAppInfo.put(serviceName, new AppInfo(appId, service
++        .getKerberosPrincipal().getPrincipalName()));
+-      cachedAppIds.put(persistedService.getName(),
+-          ApplicationId.fromString(persistedService.getId()));
++      cachedAppInfo.put(persistedService.getName(), new AppInfo(
++          ApplicationId.fromString(persistedService.getId()),
++          persistedService.getKerberosPrincipal().getPrincipalName()));
+-    cachedAppIds.put(persistedService.getName(),
+-        ApplicationId.fromString(persistedService.getId()));
++    cachedAppInfo.put(persistedService.getName(), new AppInfo(
++        ApplicationId.fromString(persistedService.getId()), persistedService
++        .getKerberosPrincipal().getPrincipalName()));
+-        createAMProxy(appReport.getHost(), appReport.getRpcPort());
++        createAMProxy(serviceName, appReport);
+-          createAMProxy(report.getHost(), report.getRpcPort());
+-      cachedAppIds.remove(serviceName);
++          createAMProxy(serviceName, report);
++      cachedAppInfo.remove(serviceName);
+-      LOG.info("Failed to stop " + serviceName
+-          + " gracefully, forcefully kill the app.");
++      LOG.info("Failed to stop " + serviceName + " gracefully due to: "
++          + e.getMessage() + ", forcefully kill the app.");
+-    cachedAppIds.remove(serviceName);
++    cachedAppInfo.remove(serviceName);
+-    addKeytabResourceIfSecure(fs, localResources, conf, serviceName);
++    addKeytabResourceIfSecure(fs, localResources, app);
++    addHdfsDelegationTokenIfSecure(amLaunchContext);
+-  private void addKeytabResourceIfSecure(SliderFileSystem fileSystem,
+-      Map<String, LocalResource> localResource, Configuration conf,
+-      String serviceName) throws IOException, BadConfigException {
++  private void addHdfsDelegationTokenIfSecure(ContainerLaunchContext amContext)
++      throws IOException {
+-    String keytabPreInstalledOnHost =
+-        conf.get(YarnServiceConf.KEY_AM_KEYTAB_LOCAL_PATH);
+-    if (StringUtils.isEmpty(keytabPreInstalledOnHost)) {
+-      String amKeytabName =
+-          conf.get(YarnServiceConf.KEY_AM_LOGIN_KEYTAB_NAME);
+-      String keytabDir = conf.get(YarnServiceConf.KEY_HDFS_KEYTAB_DIR);
+-      Path keytabPath =
+-          fileSystem.buildKeytabPath(keytabDir, amKeytabName, serviceName);
+-      if (fileSystem.getFileSystem().exists(keytabPath)) {
+-        LocalResource keytabRes =
+-            fileSystem.createAmResource(keytabPath, LocalResourceType.FILE);
+-        localResource
+-            .put(YarnServiceConstants.KEYTAB_DIR + "/" + amKeytabName, keytabRes);
+-        LOG.info("Adding AM keytab on hdfs: " + keytabPath);
+-      } else {
+-        LOG.warn("No keytab file was found at {}.", keytabPath);
+-        if (conf.getBoolean(YarnServiceConf.KEY_AM_LOGIN_KEYTAB_REQUIRED, false)) {
+-          throw new BadConfigException("No keytab file was found at %s.",
+-              keytabPath);
+-        } else {
+-          LOG.warn("The AM will be "
+-              + "started without a kerberos authenticated identity. "
+-              + "The service is therefore not guaranteed to remain "
+-              + "operational beyond 24 hours.");
+-        }
++    Credentials credentials = new Credentials();
++    String tokenRenewer = YarnClientUtils.getRmPrincipal(getConfig());
++    if (StringUtils.isEmpty(tokenRenewer)) {
++      throw new IOException(
++          "Can't get Master Kerberos principal for the RM to use as renewer");
++    }
++    // Get hdfs dt
++    final org.apache.hadoop.security.token.Token<?>[] tokens =
++        fs.getFileSystem().addDelegationTokens(tokenRenewer, credentials);
++    if (tokens != null && tokens.length != 0) {
++      for (Token<?> token : tokens) {
++        LOG.debug("Got DT: " + token);
++      DataOutputBuffer dob = new DataOutputBuffer();
++      credentials.writeTokenStorageToStream(dob);
++      ByteBuffer fsTokens = ByteBuffer.wrap(dob.getData(), 0, dob.getLength());
++      amContext.setTokens(fsTokens);
++    }
++  }
++
++  private void addKeytabResourceIfSecure(SliderFileSystem fileSystem,
++      Map<String, LocalResource> localResource, Service service)
++      throws IOException, YarnException {
++    if (!UserGroupInformation.isSecurityEnabled()) {
++      return;
++    }
++    String principalName = service.getKerberosPrincipal().getPrincipalName();
++    if (StringUtils.isEmpty(principalName)) {
++      LOG.warn("No Kerberos principal name specified for " + service.getName());
++      return;
++    }
++    if(StringUtils.isEmpty(service.getKerberosPrincipal().getKeytab())) {
++      LOG.warn("No Kerberos keytab specified for " + service.getName());
++      return;
++    }
++
++    URI keytabURI;
++    try {
++      keytabURI = new URI(service.getKerberosPrincipal().getKeytab());
++    } catch (URISyntaxException e) {
++      throw new YarnException(e);
++    }
++
++    switch (keytabURI.getScheme()) {
++    case "hdfs":
++      Path keytabOnhdfs = new Path(keytabURI);
++      if (!fileSystem.getFileSystem().exists(keytabOnhdfs)) {
++        LOG.warn(service.getName() + "'s keytab (principalName = " +
++            principalName + ") doesn't exist at: " + keytabOnhdfs);
++        return;
++      }
++      LocalResource keytabRes =
++          fileSystem.createAmResource(keytabOnhdfs, LocalResourceType.FILE);
++      localResource.put(String.format(YarnServiceConstants.KEYTAB_LOCATION,
++          service.getName()), keytabRes);
++      LOG.debug("Adding " + service.getName() + "'s keytab for " +
++          "localization, uri = " + keytabOnhdfs);
++      break;
++    case "file":
++      LOG.debug("Using a keytab from localhost: " + keytabURI);
++      break;
++    default:
++      LOG.warn("Unsupported URI scheme " + keytabURI);
++      break;
+-        createAMProxy(appReport.getHost(), appReport.getRpcPort());
++        createAMProxy(appReport.getName(), appReport);
+-        createAMProxy(appReport.getHost(), appReport.getRpcPort());
++        createAMProxy(serviceName, appReport);
+-  protected ClientAMProtocol createAMProxy(String host, int port)
+-      throws IOException {
++  protected ClientAMProtocol createAMProxy(String serviceName,
++      ApplicationReport appReport) throws IOException, YarnException {
++
++    if (UserGroupInformation.isSecurityEnabled()) {
++      if (!cachedAppInfo.containsKey(serviceName)) {
++        Service persistedService  = ServiceApiUtil.loadService(fs, serviceName);
++        cachedAppInfo.put(serviceName, new AppInfo(appReport.getApplicationId(),
++            persistedService.getKerberosPrincipal().getPrincipalName()));
++      }
++      String principalName = cachedAppInfo.get(serviceName).principalName;
++      // Inject the principal into hadoop conf, because Hadoop
++      // SaslRpcClient#getServerPrincipal requires a config for the
++      // principal
++      if (!StringUtils.isEmpty(principalName)) {
++        getConfig().set(PRINCIPAL, principalName);
++      } else {
++        throw new YarnException("No principal specified in the persisted " +
++            "service definition, fail to connect to AM.");
++      }
++    }
+-        NetUtils.createSocketAddrForHost(host, port);
++        NetUtils.createSocketAddrForHost(appReport.getHost(), appReport
++            .getRpcPort());
+-    if (cachedAppIds.containsKey(serviceName)) {
+-      return cachedAppIds.get(serviceName);
++    if (cachedAppInfo.containsKey(serviceName)) {
++      return cachedAppInfo.get(serviceName).appId;
+-    cachedAppIds.put(serviceName, currentAppId);
++    cachedAppInfo.put(serviceName, new AppInfo(currentAppId, persistedService
++        .getKerberosPrincipal().getPrincipalName()));
++
++  private static class AppInfo {
++    ApplicationId appId;
++    String principalName;
++
++    AppInfo(ApplicationId appId, String principalName) {
++      this.appId = appId;
++      this.principalName = principalName;
++    }
++  }
+
+INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS31 INS31 INS31 INS55 UPD74 MOV83 MOV39 UPD42 MOV42 MOV44 UPD43 MOV43 INS8 INS83 INS39 INS42 MOV44 MOV44 INS44 MOV43 INS43 INS8 INS83 MOV43 INS42 MOV44 INS44 MOV43 INS43 INS8 INS83 INS83 INS42 INS23 INS23 INS31 INS43 UPD42 INS21 UPD43 UPD42 UPD42 INS25 INS60 MOV60 INS25 MOV60 INS25 INS43 INS42 INS42 MOV25 INS60 INS25 INS25 INS60 INS54 INS50 INS60 INS43 INS42 INS42 MOV25 MOV60 MOV41 MOV43 INS59 MOV43 INS59 INS42 MOV44 INS44 INS8 INS42 INS32 UPD42 INS38 INS8 INS43 INS59 MOV43 MOV32 INS8 INS83 INS5 INS27 INS8 INS42 MOV43 INS59 INS32 INS8 INS32 INS8 INS43 INS59 INS8 INS12 INS32 INS49 INS60 INS25 INS60 INS21 INS21 INS10 INS49 INS21 INS10 INS49 INS21 INS10 INS43 MOV43 INS59 INS42 INS32 INS8 UPD43 INS42 INS42 INS43 INS42 INS43 INS42 INS21 INS21 UPD42 INS14 UPD42 INS14 UPD42 UPD42 INS42 INS42 INS32 INS41 INS42 INS42 INS14 UPD42 UPD42 INS53 INS74 INS85 UPD42 INS32 INS27 INS27 INS70 INS60 INS21 MOV60 INS21 INS42 INS32 INS42 INS42 INS42 INS21 INS41 INS42 INS42 INS32 INS21 INS41 INS42 UPD42 MOV42 INS21 INS44 INS8 UPD42 MOV42 INS42 INS45 MOV43 INS59 INS38 INS8 MOV43 MOV59 MOV32 MOV32 INS45 INS32 MOV32 INS42 INS42 INS32 INS42 INS42 INS25 INS60 INS25 UPD42 UPD42 UPD42 UPD42 INS14 INS42 UPD42 MOV42 INS7 INS7 INS43 INS42 INS32 INS43 MOV32 INS32 UPD42 MOV42 MOV42 INS42 INS42 INS43 UPD42 INS42 INS32 INS14 INS43 INS76 INS32 INS42 INS42 INS42 INS42 INS33 INS40 INS34 INS44 INS42 INS8 INS43 INS59 INS32 INS43 INS32 INS32 INS42 INS32 INS32 INS42 INS32 INS7 INS43 INS42 INS53 INS42 INS14 MOV32 INS21 INS41 INS32 UPD42 INS42 INS42 INS27 INS27 MOV42 INS42 INS42 INS42 INS38 MOV8 MOV43 INS59 INS38 INS8 INS8 INS42 UPD42 INS22 INS43 INS42 INS32 INS22 INS42 INS22 INS42 INS42 INS32 INS42 UPD42 INS14 INS42 INS32 INS42 UPD42 INS42 UPD42 MOV42 INS43 INS45 INS40 UPD42 MOV42 UPD42 MOV42 INS74 INS42 INS21 INS42 INS42 INS14 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS27 INS42 INS42 INS42 INS42 INS27 INS42 INS14 INS42 INS14 INS43 INS42 UPD42 INS32 UPD42 INS42 INS42 INS40 INS32 UPD45 INS32 INS45 INS45 UPD42 INS45 INS42 INS45 INS42 UPD42 INS32 INS60 INS21 INS42 INS22 INS32 INS21 INS53 INS32 INS42 INS42 INS32 INS42 INS52 INS42 INS52 INS42 INS42 INS42 INS43 MOV32 INS32 INS42 INS42 UPD42 MOV42 MOV42 INS42 INS43 INS76 INS32 INS43 INS42 INS42 INS32 INS34 INS32 INS45 INS32 INS45 INS32 INS43 INS32 INS43 INS42 INS42 INS42 INS42 INS27 INS42 INS42 INS42 INS42 INS42 UPD42 MOV42 UPD42 MOV42 INS43 INS59 INS32 INS32 INS42 INS42 INS42 INS42 INS32 INS14 UPD42 MOV42 MOV42 MOV42 INS42 INS42 INS42 INS32 INS42 INS45 INS32 UPD45 INS42 INS42 INS42 INS27 INS42 UPD42 MOV42 UPD42 MOV42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 UPD42 MOV42 INS42 INS32 INS45 INS42 INS45 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS14 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS43 INS27 INS42 INS42 INS42 INS42 INS45 INS42 INS42 INS42 UPD42 MOV42 INS42 INS42 INS42 INS42 INS42 UPD43 MOV43 INS32 INS32 INS42 INS42 UPD45 MOV45 UPD45 MOV45 UPD42 INS42 INS42 INS32 INS42 INS42 INS42 DEL42 DEL42 DEL32 DEL42 DEL32 DEL42 DEL32 DEL42 DEL32 DEL42 DEL40 DEL40 DEL32 DEL42 DEL40 DEL32 DEL40 DEL45 DEL42 DEL27 DEL45 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL60 DEL21 DEL21 DEL8 DEL21 DEL8 DEL25 DEL8 DEL25 DEL8 DEL31 DEL42 DEL32 DEL45 DEL42 DEL14 DEL53 DEL40 DEL9 DEL32 DEL42 DEL42 DEL45 DEL45 DEL27 DEL32 DEL21 DEL8 DEL83 DEL42 DEL42 DEL44 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL8 DEL31 DEL32 DEL42 DEL39 DEL42

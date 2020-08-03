@@ -1,0 +1,415 @@
+YARN-694. Starting to use NMTokens to authenticate all communication with NodeManagers. Contributed by Omkar Vinit Joshi.
+
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/trunk@1494369 13f79535-47bb-0310-9956-ffa450edef68
+
++import java.util.Arrays;
++import org.apache.hadoop.security.token.SecretManager.InvalidToken;
++import org.apache.hadoop.yarn.security.NMTokenIdentifier;
+-            this.context.getContainerTokenSecretManager(),
++            this.context.getNMTokenSecretManager(),
++    this.context.getNMTokenSecretManager().setNodeId(nodeId);
++    this.context.getContainerTokenSecretManager().setNodeId(nodeId);
+-  private UserGroupInformation getRemoteUgi()
++  protected UserGroupInformation getRemoteUgi()
+-  private ContainerTokenIdentifier selectContainerTokenIdentifier(
++  @Private
++  @VisibleForTesting
++  protected NMTokenIdentifier selectNMTokenIdentifier(
+-    ContainerTokenIdentifier resultId = null;
++    NMTokenIdentifier resultId = null;
+-      if (id instanceof ContainerTokenIdentifier) {
+-        resultId = (ContainerTokenIdentifier) id;
++      if (id instanceof NMTokenIdentifier) {
++        resultId = (NMTokenIdentifier) id;
+-  @Private
+-  @VisibleForTesting
+-  protected ContainerTokenIdentifier getContainerTokenIdentifier(
+-      UserGroupInformation remoteUgi,
+-      ContainerTokenIdentifier containerTokenIdentifier)
+-      throws YarnException {
+-    if (UserGroupInformation.isSecurityEnabled()) {
+-      if (LOG.isDebugEnabled()) {
+-        LOG.debug("Number of TokenIdentifiers in the UGI from RPC: "
+-            + remoteUgi.getTokenIdentifiers().size());
+-      }
+-      // Get the tokenId from the remote user ugi
+-      return selectContainerTokenIdentifier(remoteUgi);
+-    } else {
+-      return containerTokenIdentifier;
+-    }
+-  }
+-  
+-   * Authorize the request.
+-   * 
+-   * @param containerIDStr
+-   *          of the container
+-   * @param launchContext
+-   *          passed if verifying the startContainer, null otherwise.
+-   * @param remoteUgi
++   * @param containerTokenIdentifier
++   *          of the container to be started
++   * @param ugi
+-  protected void authorizeRequest(String containerIDStr,
+-      ContainerLaunchContext launchContext,
+-      UserGroupInformation remoteUgi, ContainerTokenIdentifier tokenId)
+-      throws YarnException {
++  protected void authorizeStartRequest(NMTokenIdentifier nmTokenIdentifier,
++      ContainerTokenIdentifier containerTokenIdentifier,
++      UserGroupInformation ugi) throws YarnException {
++    ContainerId containerId = containerTokenIdentifier.getContainerID();
++    String containerIDStr = containerId.toString();
+-
+-    if (!remoteUgi.getUserName().equals(containerIDStr)) {
++    if (!nmTokenIdentifier.getApplicationAttemptId().equals(
++        containerId.getApplicationAttemptId())) {
+-      messageBuilder.append("\nExpected containerId: "
+-          + remoteUgi.getUserName() + " Found: " + containerIDStr);
+-    } else if (launchContext != null) {
+-      // Verify other things also for startContainer() request.
+-
+-
+-      if (tokenId == null) {
+-        unauthorized = true;
+-        messageBuilder
+-          .append("\nNo ContainerToken found for " + containerIDStr);
+-      } else {
+-        
+-        // Is the container being relaunched? Or RPC layer let startCall with 
+-      	//  tokens generated off old-secret through?
+-        if (!this.context.getContainerTokenSecretManager()
+-          .isValidStartContainerRequest(tokenId.getContainerID())) {
+-          unauthorized = true;
+-          messageBuilder.append("\n Attempt to relaunch the same "
+-              + "container with id " + containerIDStr + ".");
+-        }
+-
+-        // Ensure the token is not expired. 
+-        // Token expiry is not checked for stopContainer/getContainerStatus
+-        if (tokenId.getExpiryTimeStamp() < System.currentTimeMillis()) {
+-          unauthorized = true;
+-          messageBuilder.append("\nThis token is expired. current time is "
+-              + System.currentTimeMillis() + " found "
+-              + tokenId.getExpiryTimeStamp());
+-        }
+-      }
++      messageBuilder.append("\nNMToken for application attempt : ")
++        .append(nmTokenIdentifier.getApplicationAttemptId())
++        .append(" was used for starting container with container token")
++        .append(" issued for application attempt : ")
++        .append(containerId.getApplicationAttemptId());
++    } else if (!ugi.getUserName().equals(
++        nmTokenIdentifier.getApplicationAttemptId().toString())) {
++      unauthorized = true;
++      messageBuilder.append("\nExpected applicationAttemptId: ")
++        .append(ugi.getUserName()).append(" Found: ")
++        .append(nmTokenIdentifier.getApplicationAttemptId().toString());
++    } else if (!this.context.getContainerTokenSecretManager()
++        .isValidStartContainerRequest(containerId)) {
++      // Is the container being relaunched? Or RPC layer let startCall with
++      // tokens generated off old-secret through?
++      unauthorized = true;
++      messageBuilder.append("\n Attempt to relaunch the same ")
++        .append("container with id ").append(containerIDStr).append(".");
++    } else if (containerTokenIdentifier.getExpiryTimeStamp() < System
++      .currentTimeMillis()) {
++      // Ensure the token is not expired.
++      unauthorized = true;
++      messageBuilder.append("\nThis token is expired. current time is ")
++        .append(System.currentTimeMillis()).append(" found ")
++        .append(containerTokenIdentifier.getExpiryTimeStamp());
+-  
++
+-          "Rejecting new containers as NodeManager has not" +
+-          " yet connected with ResourceManager");
++        "Rejecting new containers as NodeManager has not"
++            + " yet connected with ResourceManager");
++    /*
++     * 1) It should save the NMToken into NMTokenSecretManager. This is done
++     * here instead of RPC layer because at the time of opening/authenticating
++     * the connection it doesn't know what all RPC calls user will make on it.
++     * Also new NMToken is issued only at startContainer (once it gets renewed).
++     * 
++     * 2) It should validate containerToken. Need to check below things. a) It
++     * is signed by correct master key (part of retrieve password). b) It
++     * belongs to correct Node Manager (part of retrieve password). c) It has
++     * correct RMIdentifier. d) It is not expired.
++     */
++    // update NMToken
++
++    UserGroupInformation remoteUgi = getRemoteUgi();
++    NMTokenIdentifier nmTokenIdentifier = selectNMTokenIdentifier(remoteUgi);
++    
++    // Validate containerToken
++    ContainerTokenIdentifier containerTokenIdentifier =
++        verifyAndGetContainerTokenIdentifier(request.getContainerToken());
++
++    authorizeStartRequest(nmTokenIdentifier, containerTokenIdentifier,
++      remoteUgi);
++
++    if (containerTokenIdentifier.getRMIdentifer() != nodeStatusUpdater
++        .getRMIdentifier()) {
++        // Is the container coming from unknown RM
++        StringBuilder sb = new StringBuilder("\nContainer ");
++        sb.append(containerTokenIdentifier.getContainerID().toString())
++          .append(" rejected as it is allocated by a previous RM");
++        throw new InvalidContainerException(sb.toString());
++    }
++    
++    updateNMTokenIdentifier(nmTokenIdentifier);
++    
++    ContainerId containerId = containerTokenIdentifier.getContainerID();
++    String containerIdStr = containerId.toString();
++    String user = containerTokenIdentifier.getApplicationSubmitter();
++
++    LOG.info("Start request for " + containerIdStr + " by user " + user);
+-    org.apache.hadoop.yarn.api.records.Token token = request.getContainerToken();
+-    ContainerTokenIdentifier tokenIdentifier = null;
++    Credentials credentials = parseCredentials(launchContext);
++
++    Container container =
++        new ContainerImpl(getConfig(), this.dispatcher, launchContext,
++          credentials, metrics, containerTokenIdentifier);
++    ApplicationId applicationID =
++        containerId.getApplicationAttemptId().getApplicationId();
++    if (context.getContainers().putIfAbsent(containerId, container) != null) {
++      NMAuditLogger.logFailure(user, AuditConstants.START_CONTAINER,
++        "ContainerManagerImpl", "Container already running on this node!",
++        applicationID, containerId);
++      throw RPCUtil.getRemoteException("Container " + containerIdStr
++          + " already is running on this node!!");
++    }
++
++    // Create the application
++    Application application =
++        new ApplicationImpl(dispatcher, this.aclsManager, user, applicationID,
++          credentials, context);
++    if (null == context.getApplications().putIfAbsent(applicationID,
++      application)) {
++      LOG.info("Creating a new application reference for app " + applicationID);
++
++      dispatcher.getEventHandler().handle(
++        new ApplicationInitEvent(applicationID, container.getLaunchContext()
++          .getApplicationACLs()));
++    }
++
++    dispatcher.getEventHandler().handle(
++      new ApplicationContainerInitEvent(container));
++
++    this.context.getContainerTokenSecretManager().startContainerSuccessful(
++      containerTokenIdentifier);
++    NMAuditLogger.logSuccess(user, AuditConstants.START_CONTAINER,
++      "ContainerManageImpl", applicationID, containerId);
++    StartContainerResponse response =
++        recordFactory.newRecordInstance(StartContainerResponse.class);
++    response.setAllServicesMetaData(auxiliaryServices.getMetaData());
++    // TODO launchedContainer misplaced -> doesn't necessarily mean a container
++    // launch. A finished Application will not launch containers.
++    metrics.launchedContainer();
++    metrics.allocateContainer(containerTokenIdentifier.getResource());
++    return response;
++  }
++
++  protected ContainerTokenIdentifier verifyAndGetContainerTokenIdentifier(
++      org.apache.hadoop.yarn.api.records.Token token) throws YarnException,
++      InvalidToken {
++    ContainerTokenIdentifier containerTokenIdentifier = null;
+-      tokenIdentifier = BuilderUtils.newContainerTokenIdentifier(token);
++      containerTokenIdentifier =
++          BuilderUtils.newContainerTokenIdentifier(token);
+-
+-    UserGroupInformation remoteUgi = getRemoteUgi();
+-    ContainerTokenIdentifier tokenId = 
+-        getContainerTokenIdentifier(remoteUgi, tokenIdentifier);
+-
+-    ContainerId containerID = tokenId.getContainerID();
+-    String containerIDStr = containerID.toString();
+-
+-    authorizeRequest(containerIDStr, launchContext, remoteUgi, tokenId);
+-
+-    // Is the container coming from unknown RM
+-    if (tokenId.getRMIdentifer() != nodeStatusUpdater
+-      .getRMIdentifier()) {
+-      String msg = "\nContainer "+ containerIDStr
+-          + " rejected as it is allocated by a previous RM";
+-      LOG.error(msg);
+-      throw new InvalidContainerException(msg);
++    byte[] password =
++        context.getContainerTokenSecretManager().retrievePassword(
++          containerTokenIdentifier);
++    byte[] tokenPass = token.getPassword().array();
++    if (password == null || tokenPass == null
++        || !Arrays.equals(password, tokenPass)) {
++      throw new InvalidToken(
++        "Invalid container token used for starting container on : "
++            + context.getNodeId().toString());
++    return containerTokenIdentifier;
++  }
+-    LOG.info("Start request for " + containerIDStr + " by user "
+-        + tokenId.getApplicationSubmitter());
++  @Private
++  @VisibleForTesting
++  protected void updateNMTokenIdentifier(NMTokenIdentifier nmTokenIdentifier)
++      throws InvalidToken {
++    context.getNMTokenSecretManager().appAttemptStartContainer(
++      nmTokenIdentifier);
++  }
++  private Credentials parseCredentials(ContainerLaunchContext launchContext)
++      throws YarnException {
++    Credentials credentials = new Credentials();
+-    Credentials credentials = new Credentials();
++
+-          for (Token<? extends TokenIdentifier> tk : credentials
+-              .getAllTokens()) {
++          for (Token<? extends TokenIdentifier> tk : credentials.getAllTokens()) {
+-    String user = tokenId.getApplicationSubmitter();
+-
+-    Container container =
+-        new ContainerImpl(getConfig(), this.dispatcher, launchContext,
+-          credentials, metrics, tokenId);
+-    ApplicationId applicationID = 
+-        containerID.getApplicationAttemptId().getApplicationId();
+-    if (context.getContainers().putIfAbsent(containerID, container) != null) {
+-      NMAuditLogger.logFailure(user, 
+-          AuditConstants.START_CONTAINER, "ContainerManagerImpl",
+-          "Container already running on this node!",
+-          applicationID, containerID);
+-      throw RPCUtil.getRemoteException("Container " + containerIDStr
+-          + " already is running on this node!!");
+-    }
+-
+-    // Create the application
+-    Application application =
+-        new ApplicationImpl(dispatcher, this.aclsManager,
+-          user, applicationID, credentials,
+-          context);
+-    if (null ==
+-        context.getApplications().putIfAbsent(applicationID, application)) {
+-      LOG.info("Creating a new application reference for app "
+-          + applicationID);
+-      dispatcher.getEventHandler().handle(
+-          new ApplicationInitEvent(applicationID, container
+-              .getLaunchContext().getApplicationACLs()));
+-    }
+-
+-    // TODO: Validate the request
+-    dispatcher.getEventHandler().handle(
+-        new ApplicationContainerInitEvent(container));
+-    
+-    this.context.getContainerTokenSecretManager().startContainerSuccessful(
+-      tokenId);
+-    NMAuditLogger.logSuccess(user, 
+-        AuditConstants.START_CONTAINER, "ContainerManageImpl", 
+-        applicationID, containerID);
+-
+-    StartContainerResponse response =
+-        StartContainerResponse.newInstance(auxiliaryServices.getMetaData());
+-    // TODO launchedContainer misplaced -> doesn't necessarily mean a container
+-    // launch. A finished Application will not launch containers.
+-    metrics.launchedContainer();
+-    metrics.allocateContainer(tokenId.getResource());
+-    return response;
++    return credentials;
+-
+-    // TODO: Only the container's owner can kill containers today.
+-
+-    UserGroupInformation remoteUgi = getRemoteUgi();
++    LOG.info("Getting container-status for " + containerIDStr);
++    authorizeGetAndStopContainerRequest(containerID, container, true);
++
+-    if (container == null) {
+-      LOG.warn("Trying to stop unknown container " + containerID);
+-      NMAuditLogger.logFailure("UnknownUser",
+-          AuditConstants.STOP_CONTAINER, "ContainerManagerImpl",
+-          "Trying to stop unknown container!",
+-          containerID.getApplicationAttemptId().getApplicationId(), 
+-          containerID);
+-      return response; // Return immediately.
+-    }
+-    authorizeRequest(containerIDStr, null, remoteUgi,
+-      getContainerTokenIdentifier(remoteUgi, container.getContainerTokenIdentifier()));
+-
+-        new ContainerKillEvent(containerID,
+-            "Container killed by the ApplicationMaster."));
+- 
+-    NMAuditLogger.logSuccess(container.getUser(), 
+-        AuditConstants.STOP_CONTAINER, "ContainerManageImpl", 
+-        containerID.getApplicationAttemptId().getApplicationId(), 
+-        containerID);
++      new ContainerKillEvent(containerID,
++        "Container killed by the ApplicationMaster."));
++
++    NMAuditLogger.logSuccess(container.getUser(),
++      AuditConstants.STOP_CONTAINER, "ContainerManageImpl", containerID
++        .getApplicationAttemptId().getApplicationId(), containerID);
+-      GetContainerStatusRequest request) throws YarnException,
+-      IOException {
++      GetContainerStatusRequest request) throws YarnException, IOException {
+-
+-    // TODO: Only the container's owner can get containers' status today.
+-
+-    UserGroupInformation remoteUgi = getRemoteUgi();
+-    LOG.info("Getting container-status for " + containerIDStr);
+-    if (container == null) {
+-      throw RPCUtil.getRemoteException("Container " + containerIDStr
+-        + " is not handled by this NodeManager"); 
+-    }
+-    authorizeRequest(containerIDStr, null, remoteUgi,
+-      getContainerTokenIdentifier(remoteUgi, container.getContainerTokenIdentifier()));
++
++    LOG.info("Getting container-status for " + containerIDStr);
++    authorizeGetAndStopContainerRequest(containerID, container, false);
++  @Private
++  @VisibleForTesting
++  protected void authorizeGetAndStopContainerRequest(ContainerId containerId,
++      Container container, boolean stopRequest) throws YarnException {
++
++    UserGroupInformation remoteUgi = getRemoteUgi();
++    NMTokenIdentifier identifier = selectNMTokenIdentifier(remoteUgi);
++
++    /*
++     * For get/stop container status; we need to verify that 1) User (NMToken)
++     * application attempt only has started container. 2) Requested containerId
++     * belongs to the same application attempt (NMToken) which was used. (Note:-
++     * This will prevent user in knowing another application's containers).
++     */
++
++    if ((!identifier.getApplicationAttemptId().equals(
++      containerId.getApplicationAttemptId()))
++        || (container != null && !identifier.getApplicationAttemptId().equals(
++          container.getContainerId().getApplicationAttemptId()))) {
++      if (stopRequest) {
++        LOG.warn(identifier.getApplicationAttemptId()
++            + " attempted to stop non-application container : "
++            + container.getContainerId().toString());
++        NMAuditLogger.logFailure("UnknownUser", AuditConstants.STOP_CONTAINER,
++          "ContainerManagerImpl", "Trying to stop unknown container!",
++          identifier.getApplicationAttemptId().getApplicationId(),
++          container.getContainerId());
++      } else {
++        LOG.warn(identifier.getApplicationAttemptId()
++            + " attempted to get get status for non-application container : "
++            + container.getContainerId().toString());
++      }
++      throw RPCUtil.getRemoteException("Container " + containerId.toString()
++          + " is not started by this application attempt.");
++    }
++
++    if (container == null) {
++      throw RPCUtil.getRemoteException("Container " + containerId.toString()
++          + " is not handled by this NodeManager");
++    }
++  }
++
++  @Private
++  @VisibleForTesting
++  public boolean getBlockNewContainerRequestsStatus() {
++    return this.blockNewContainerRequests.get();
++  }
++  
++  
++  public Context getContext() {
++    return this.context;
++  }
+
+INS26 INS26 INS26 INS40 INS40 INS40 MOV44 INS31 INS31 INS31 INS31 INS31 INS31 UPD83 MOV78 MOV78 UPD83 UPD43 UPD42 INS29 MOV78 MOV78 INS39 INS42 INS44 MOV43 MOV60 MOV60 INS83 MOV43 INS42 INS44 INS43 INS43 INS8 INS78 INS78 MOV83 MOV39 UPD42 MOV42 MOV44 INS43 INS8 INS83 INS43 INS42 MOV44 INS43 INS8 MOV60 MOV21 INS78 INS78 INS83 INS39 INS42 MOV44 MOV44 INS44 MOV43 MOV8 INS78 INS78 INS83 INS39 INS42 INS8 INS83 INS43 INS42 INS8 INS21 INS21 UPD42 INS65 INS65 MOV65 INS43 INS42 UPD42 INS60 INS60 MOV60 MOV60 MOV25 INS21 INS25 INS21 INS60 MOV60 INS60 INS21 MOV43 INS42 INS42 INS42 INS60 MOV54 INS60 INS60 INS25 MOV41 INS42 INS42 INS43 INS42 INS42 INS21 INS42 INS42 MOV60 MOV60 MOV25 INS41 MOV21 INS42 INS42 UPD43 UPD42 UPD43 UPD42 INS39 INS42 MOV60 INS60 INS25 MOV25 INS42 INS42 INS41 INS42 INS41 INS32 INS32 UPD43 INS42 INS66 INS42 INS66 UPD42 MOV42 INS43 INS59 MOV43 INS59 INS38 INS8 INS25 UPD43 INS43 INS32 MOV27 INS8 INS32 MOV43 INS59 MOV43 INS59 INS43 INS43 MOV32 MOV43 INS59 INS5 INS59 INS5 INS59 INS27 INS8 INS42 INS32 INS42 UPD42 UPD42 INS43 INS59 INS27 INS8 MOV27 INS32 INS22 INS32 INS42 INS42 MOV32 INS42 INS42 UPD42 INS42 INS42 INS32 INS42 INS32 INS32 MOV21 INS21 INS38 MOV8 INS25 UPD42 UPD42 INS42 UPD42 INS32 INS42 UPD42 MOV42 UPD42 MOV42 INS42 MOV60 MOV21 MOV53 INS42 INS42 INS42 INS32 UPD42 INS32 INS42 INS32 INS42 UPD42 UPD42 UPD42 INS42 INS32 UPD42 UPD42 INS42 INS33 INS39 INS85 INS42 INS32 INS39 INS85 INS42 INS32 INS27 INS38 INS53 INS32 INS42 INS42 UPD42 UPD42 UPD42 MOV42 INS9 UPD42 UPD42 MOV42 INS9 INS42 INS42 INS32 INS36 INS36 INS25 INS53 INS53 INS22 INS42 INS52 INS42 INS32 INS22 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS32 INS32 INS32 MOV21 MOV38 INS8 INS25 UPD42 INS42 MOV32 UPD42 UPD43 INS42 INS42 INS42 INS42 UPD42 MOV42 UPD42 MOV42 UPD42 INS42 UPD42 UPD42 UPD42 UPD42 INS42 INS42 INS57 UPD42 INS32 INS42 INS42 INS32 INS42 INS27 INS27 INS32 INS14 INS42 INS42 UPD45 UPD42 INS42 INS42 INS38 INS27 INS42 INS8 MOV8 INS32 INS32 INS52 INS42 INS22 INS42 INS52 INS42 INS43 INS42 UPD42 MOV42 UPD42 MOV42 INS42 INS32 INS42 INS32 INS32 INS42 INS32 MOV21 INS21 INS27 MOV8 UPD42 UPD42 INS14 INS32 UPD42 INS45 INS32 UPD42 UPD42 MOV43 UPD42 INS42 INS42 INS42 INS42 INS42 INS33 INS42 INS33 INS42 INS42 INS42 INS42 INS43 INS27 INS32 INS27 INS38 MOV21 INS21 UPD42 MOV42 UPD42 MOV42 MOV27 UPD42 MOV42 UPD42 MOV42 MOV27 INS52 INS42 INS42 INS32 INS42 INS45 INS42 INS42 INS42 INS42 INS32 INS42 INS32 INS42 INS32 UPD42 MOV42 INS32 INS32 MOV32 MOV21 INS21 INS43 INS45 INS42 UPD42 MOV42 INS32 INS42 INS42 UPD42 INS42 INS45 INS32 INS32 INS42 INS32 INS42 INS33 MOV32 INS32 UPD45 MOV45 INS32 UPD45 UPD45 INS45 INS32 INS42 INS45 INS42 INS42 INS32 INS42 INS45 MOV32 UPD42 MOV42 INS32 INS42 INS45 UPD42 MOV42 UPD42 MOV42 INS32 INS42 INS32 UPD42 MOV42 INS32 INS42 INS42 INS42 INS42 INS42 INS32 UPD42 UPD42 INS42 INS42 INS45 INS40 INS45 INS45 INS32 INS32 UPD42 UPD42 INS42 INS42 UPD42 UPD42 UPD43 INS32 INS42 INS32 INS32 INS42 INS32 UPD42 UPD42 INS32 INS42 INS42 INS32 INS42 INS32 UPD42 MOV42 UPD42 MOV42 INS42 INS42 UPD42 UPD42 INS32 INS42 UPD45 INS32 INS32 INS42 INS42 INS42 INS32 UPD45 INS32 UPD42 UPD42 MOV42 UPD42 MOV42 INS45 INS42 INS42 UPD42 MOV42 UPD42 MOV42 INS45 INS42 INS42 INS32 INS42 INS45 INS32 INS42 INS45 INS42 INS42 UPD42 MOV42 INS42 UPD42 UPD42 INS32 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS45 INS32 INS42 MOV32 INS42 INS42 INS42 INS42 INS42 INS42 INS45 DEL43 DEL42 DEL45 DEL32 DEL27 DEL42 DEL32 DEL32 DEL32 DEL25 DEL32 DEL41 DEL8 DEL66 DEL65 DEL42 DEL66 DEL65 DEL42 DEL66 DEL65 DEL42 DEL66 DEL65 DEL29 DEL31 DEL42 DEL33 DEL59 DEL60 DEL42 DEL42 DEL42 DEL32 DEL42 DEL45 DEL42 DEL45 DEL27 DEL42 DEL32 DEL59 DEL60 DEL42 DEL32 DEL21 DEL8 DEL25 DEL42 DEL42 DEL32 DEL42 DEL42 DEL43 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL33 DEL27 DEL42 DEL42 DEL45 DEL40 DEL45 DEL45 DEL42 DEL42 DEL32 DEL42 DEL32 DEL42 DEL32 DEL21 DEL42 DEL41 DEL8 DEL25 DEL33 DEL42 DEL42 DEL42 DEL42 DEL32 DEL32 DEL42 DEL42 DEL45 DEL42 DEL45 DEL27 DEL32 DEL53 DEL8 DEL25 DEL33 DEL42 DEL42 DEL42 DEL42 DEL32 DEL32 DEL45 DEL42 DEL42 DEL45 DEL27 DEL42 DEL42 DEL42 DEL32 DEL27 DEL45 DEL32 DEL21 DEL38 DEL8 DEL42 DEL33 DEL27 DEL42 DEL33 DEL27 DEL32 DEL21 DEL8 DEL25 DEL8 DEL25 DEL8 DEL25 DEL25

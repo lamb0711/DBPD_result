@@ -1,0 +1,441 @@
+HADOOP-4012. Provide splitting support for bzip2 compressed files. Contributed by Abdul Qadeer
+
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/trunk@813581 13f79535-47bb-0310-9956-ffa450edef68
+
++import java.io.BufferedInputStream;
++import org.apache.hadoop.io.compress.SplittableCompressionCodec.READ_MODE;
++
++
++ * This Ant code was enhanced so that it can de-compress blocks of bzip2 data.
++ * Current position in the stream is an important statistic for Hadoop. For
++ * example in LineRecordReader, we solely depend on the current position in the
++ * stream to know about the progess. The notion of position becomes complicated
++ * for compressed files. The Hadoop splitting is done in terms of compressed
++ * file. But a compressed file deflates to a large amount of data. So we have
++ * handled this problem in the following way.
++ *
++ * On object creation time, we find the next block start delimiter. Once such a
++ * marker is found, the stream stops there (we discard any read compressed data
++ * in this process) and the position is updated (i.e. the caller of this class
++ * will find out the stream location). At this point we are ready for actual
++ * reading (i.e. decompression) of data.
++ *
++ * The subsequent read calls give out data. The position is updated when the
++ * caller of this class has read off the current block + 1 bytes. In between the
++ * block reading, position is not updated. (We can only update the postion on
++ * block boundaries).
++ * </p>
++ *
++ * <p>
+-  private static void reportCRCError() throws IOException {
+-    throw new IOException("BZip2 CRC error");
+-
+-  }
+-
+-  private void makeMaps() {
+-    final boolean[] inUse = this.data.inUse;
+-    final byte[] seqToUnseq = this.data.seqToUnseq;
+-
+-    int nInUseShadow = 0;
+-
+-    for (int i = 0; i < 256; i++) {
+-      if (inUse[i])
+-        seqToUnseq[nInUseShadow++] = (byte) i;
+-    }
+-
+-    this.nInUse = nInUseShadow;
+-  }
++  public static final long BLOCK_DELIMITER = 0X314159265359L;// start of block
++  public static final long EOS_DELIMITER = 0X177245385090L;// end of bzip2 stream
++  private static final int DELIMITER_BIT_LENGTH = 48;
++  READ_MODE readMode = READ_MODE.CONTINUOUS;
++  // The variable records the current advertised position of the stream.
++  private long reportedBytesReadFromCompressedStream = 0L;
++  // The following variable keep record of compressed bytes read.
++  private long bytesReadFromCompressedStream = 0L;
++  private boolean lazyInitialization = false;
++  private byte array[] = new byte[1];
+-  private boolean blockRandomised;
++  private boolean blockRandomised = false;
+-  private int bsBuff;
+-  private int bsLive;
++  private long bsBuff;
++  private long bsLive;
+-  private InputStream in;
++  private BufferedInputStream in;
+-  private static final int EOF = 0;
+-  private static final int START_BLOCK_STATE = 1;
+-  private static final int RAND_PART_A_STATE = 2;
+-  private static final int RAND_PART_B_STATE = 3;
+-  private static final int RAND_PART_C_STATE = 4;
+-  private static final int NO_RAND_PART_A_STATE = 5;
+-  private static final int NO_RAND_PART_B_STATE = 6;
+-  private static final int NO_RAND_PART_C_STATE = 7;
++  /**
++   * A state machine to keep track of current state of the de-coder
++   *
++   */
++  public enum STATE {
++    EOF, START_BLOCK_STATE, RAND_PART_A_STATE, RAND_PART_B_STATE, RAND_PART_C_STATE, NO_RAND_PART_A_STATE, NO_RAND_PART_B_STATE, NO_RAND_PART_C_STATE, NO_PROCESS_STATE
++  };
+-  private int currentState = START_BLOCK_STATE;
++  private STATE currentState = STATE.START_BLOCK_STATE;
++  private boolean skipResult = false;// used by skipToNextMarker
++  private static boolean skipDecompression = false;
++
++  * This method reports the processed bytes so far. Please note that this
++  * statistic is only updated on block boundaries and only when the stream is
++  * initiated in BYBLOCK mode.
++  */
++  public long getProcessedByteCount() {
++    return reportedBytesReadFromCompressedStream;
++  }
++
++  /**
++   * This method keeps track of raw processed compressed
++   * bytes.
++   *
++   * @param count count is the number of bytes to be
++   *           added to raw processed bytes
++   */
++
++  protected void updateProcessedByteCount(int count) {
++    this.bytesReadFromCompressedStream += count;
++  }
++
++  /**
++   * This method is called by the client of this
++   * class in case there are any corrections in
++   * the stream position.  One common example is
++   * when client of this code removes starting BZ
++   * characters from the compressed stream.
++   *
++   * @param count count bytes are added to the reported bytes
++   *
++   */
++  public void updateReportedByteCount(int count) {
++    this.reportedBytesReadFromCompressedStream += count;
++    this.updateProcessedByteCount(count);
++  }
++
++  /**
++  * This method reads a Byte from the compressed stream. Whenever we need to
++  * read from the underlying compressed stream, this method should be called
++  * instead of directly calling the read method of the underlying compressed
++  * stream. This method does important record keeping to have the statistic
++  * that how many bytes have been read off the compressed stream.
++  */
++  private int readAByte(InputStream inStream) throws IOException {
++    int read = inStream.read();
++    if (read >= 0) {
++      this.updateProcessedByteCount(1);
++    }
++    return read;
++  }
++
++  /**
++  * This method tries to find the marker (passed to it as the first parameter)
++  * in the stream.  It can find bit patterns of length <= 63 bits.  Specifically
++  * this method is used in CBZip2InputStream to find the end of block (EOB)
++  * delimiter in the stream, starting from the current position of the stream.
++  * If marker is found, the stream position will be right after marker at the
++  * end of this call.
++  *
++  * @param marker  The bit pattern to be found in the stream
++  * @param markerBitLength  No of bits in the marker
++  *
++  * @throws IOException
++  * @throws IllegalArgumentException  if marketBitLength is greater than 63
++  */
++  public boolean skipToNextMarker(long marker, int markerBitLength)
++      throws IOException, IllegalArgumentException {
++    try {
++      if (markerBitLength > 63) {
++        throw new IllegalArgumentException(
++            "skipToNextMarker can not find patterns greater than 63 bits");
++      }
++      // pick next marketBitLength bits in the stream
++      long bytes = 0;
++      bytes = this.bsR(markerBitLength);
++      if (bytes == -1) {
++        return false;
++      }
++      while (true) {
++        if (bytes == marker) {
++          return true;
++
++        } else {
++          bytes = bytes << 1;
++          bytes = bytes & ((1L << markerBitLength) - 1);
++          int oneBit = (int) this.bsR(1);
++          if (oneBit != -1) {
++            bytes = bytes | oneBit;
++          } else
++            return false;
++        }
++      }
++    } catch (IOException ex) {
++      return false;
++    }
++  }
++
++  protected void reportCRCError() throws IOException {
++    throw new IOException("crc error");
++  }
++
++  private void makeMaps() {
++    final boolean[] inUse = this.data.inUse;
++    final byte[] seqToUnseq = this.data.seqToUnseq;
++
++    int nInUseShadow = 0;
++
++    for (int i = 0; i < 256; i++) {
++      if (inUse[i])
++        seqToUnseq[nInUseShadow++] = (byte) i;
++    }
++
++    this.nInUse = nInUseShadow;
++  }
++
++  /**
+-  public CBZip2InputStream(final InputStream in) throws IOException {
+-    super();
++  public CBZip2InputStream(final InputStream in, READ_MODE readMode)
++      throws IOException {
+-    this.in = in;
++    super();
++    int blockSize = 0X39;// i.e 9
++    this.blockSize100k = blockSize - '0';
++    this.in = new BufferedInputStream(in, 1024 * 9);// >1 MB buffer
++    this.readMode = readMode;
++    if (readMode == READ_MODE.CONTINUOUS) {
++      currentState = STATE.START_BLOCK_STATE;
++      lazyInitialization = (in.available() == 0)?true:false;
++      if(!lazyInitialization){
++    } else if (readMode == READ_MODE.BYBLOCK) {
++      this.currentState = STATE.NO_PROCESS_STATE;
++      skipResult = this.skipToNextMarker(CBZip2InputStream.BLOCK_DELIMITER,DELIMITER_BIT_LENGTH);
++      this.reportedBytesReadFromCompressedStream = this.bytesReadFromCompressedStream;
++      if(!skipDecompression){
++        changeStateToProcessABlock();
++      }
++    }
++  }
++
++  /**
++   * Returns the number of bytes between the current stream position
++   * and the immediate next BZip2 block marker.
++   *
++   * @param in
++   *             The InputStream
++   *
++   * @return long Number of bytes between current stream position and the
++   * next BZip2 block start marker.
++ * @throws IOException
++   *
++   */
++  public static long numberOfBytesTillNextMarker(final InputStream in) throws IOException{
++    CBZip2InputStream.skipDecompression = true;
++    CBZip2InputStream anObject = null;
++
++    anObject = new CBZip2InputStream(in, READ_MODE.BYBLOCK);
++
++    return anObject.getProcessedByteCount();
++  }
++
++  public CBZip2InputStream(final InputStream in) throws IOException {
++    this(in, READ_MODE.CONTINUOUS);
++  }
++
++  private void changeStateToProcessABlock() throws IOException {
++    if (skipResult == true) {
++      initBlock();
++      setupBlock();
++    } else {
++      this.currentState = STATE.EOF;
++    }
++  }
++
++
+-      return read0();
++      int result = this.read(array, 0, 1);
++      int value = 0XFF & array[0];
++      return (result > 0 ? value : result);
++
++  /**
++   * In CONTINOUS reading mode, this read method starts from the
++   * start of the compressed stream and end at the end of file by
++   * emitting un-compressed data.  In this mode stream positioning
++   * is not announced and should be ignored.
++   *
++   * In BYBLOCK reading mode, this read method informs about the end
++   * of a BZip2 block by returning EOB.  At this event, the compressed
++   * stream position is also announced.  This announcement tells that
++   * how much of the compressed stream has been de-compressed and read
++   * out of this class.  In between EOB events, the stream position is
++   * not updated.
++   *
++   *
++   * @throws IOException
++   *             if the stream content is malformed or an I/O error occurs.
++   *
++   * @return int The return value greater than 0 are the bytes read.  A value
++   * of -1 means end of stream while -2 represents end of block
++   */
++
++
+-    final int hi = offs + len;
+-    int destOffs = offs;
+-    for (int b; (destOffs < hi) && ((b = read0()) >= 0);) {
+-      dest[destOffs++] = (byte) b;
++    if(lazyInitialization){
++      this.init();
++      this.lazyInitialization = false;
+-    return (destOffs == offs) ? -1 : (destOffs - offs);
++    if(skipDecompression){
++      changeStateToProcessABlock();
++      CBZip2InputStream.skipDecompression = false;
++    }
++
++    final int hi = offs + len;
++    int destOffs = offs;
++    int b = 0;
++
++
++
++    for (; ((destOffs < hi) && ((b = read0())) >= 0);) {
++      dest[destOffs++] = (byte) b;
++
++    }
++
++    int result = destOffs - offs;
++    if (result == 0) {
++      //report 'end of block' or 'end of stream'
++      result = b;
++
++      skipResult = this.skipToNextMarker(CBZip2InputStream.BLOCK_DELIMITER, DELIMITER_BIT_LENGTH);
++      //Exactly when we are about to start a new block, we advertise the stream position.
++      this.reportedBytesReadFromCompressedStream = this.bytesReadFromCompressedStream;
++
++      changeStateToProcessABlock();
++    }
++    return result;
+-      return -1;
++      return END_OF_STREAM;// return -1
++
++    case NO_PROCESS_STATE:
++      return END_OF_BLOCK;// return -2
+-    int magic2 = this.in.read();
++    int magic2 = this.readAByte(in);
+-    int blockSize = this.in.read();
++    int blockSize = this.readAByte(in);
++    if (this.readMode == READ_MODE.BYBLOCK) {
++      // this.checkBlockIntegrity();
++      this.storedBlockCRC = bsGetInt();
++      this.blockRandomised = bsR(1) == 1;
++
++      /**
++      * Allocate data here instead in constructor, so we do not allocate
++      * it if the input file is empty.
++      */
++      if (this.data == null) {
++        this.data = new Data(this.blockSize100k);
++      }
++
++      // currBlockNo++;
++      getAndMoveToFrontDecode();
++
++      this.crc.initialiseCRC();
++      this.currentState = STATE.START_BLOCK_STATE;
++      return;
++    }
++
+-      this.currentState = EOF;
++      this.currentState = STATE.EOF;
+-      this.currentState = START_BLOCK_STATE;
++      this.currentState = STATE.START_BLOCK_STATE;
+-    this.currentState = EOF;
++    this.currentState = STATE.EOF;
+-  private int bsR(final int n) throws IOException {
+-    int bsLiveShadow = this.bsLive;
+-    int bsBuffShadow = this.bsBuff;
++  private long bsR(final long n) throws IOException {
++    long bsLiveShadow = this.bsLive;
++    long bsBuffShadow = this.bsBuff;
+-        int thech = inShadow.read();
++        int thech = readAByte(inShadow);
+-    return (bsBuffShadow >> (bsLiveShadow - n)) & ((1 << n) - 1);
++    return (bsBuffShadow >> (bsLiveShadow - n)) & ((1L << n) - 1);
+-    int bsLiveShadow = this.bsLive;
+-    int bsBuffShadow = this.bsBuff;
++    long bsLiveShadow = this.bsLive;
++    long bsBuffShadow = this.bsBuff;
+-      int thech = this.in.read();
++      int thech = this.readAByte(in);
+-    return (((((bsR(8) << 8) | bsR(8)) << 8) | bsR(8)) << 8) | bsR(8);
++    return (int) ((((((bsR(8) << 8) | bsR(8)) << 8) | bsR(8)) << 8) | bsR(8));
+-    final int nGroups = bsR(3);
+-    final int nSelectors = bsR(15);
++    final int nGroups = (int) bsR(3);
++    final int nSelectors = (int) bsR(15);
+-      int curr = bsR(5);
++      int curr = (int) bsR(5);
+-    this.origPtr = bsR(24);
++    this.origPtr = (int) bsR(24);
+-    int bsBuffShadow = this.bsBuff;
+-    int bsLiveShadow = this.bsLive;
++    int bsBuffShadow = (int) this.bsBuff;
++    int bsLiveShadow = (int) this.bsLive;
+-          // Inlined:
+-          // int zvec = bsR(zn);
+-            final int thech = inShadow.read();
++            final int thech = readAByte(inShadow);
+-          int zvec = (bsBuffShadow >> (bsLiveShadow - zn))
++          long zvec = (bsBuffShadow >> (bsLiveShadow - zn))
+-              final int thech = inShadow.read();
++              final int thech = readAByte(inShadow);
+-          nextSym = perm_zt[zvec - base_zt[zn]];
++          nextSym = perm_zt[(int) (zvec - base_zt[zn])];
+-        // Inlined:
+-        // int zvec = bsR(zn);
+-          final int thech = inShadow.read();
++          final int thech = readAByte(inShadow);
+-            final int thech = inShadow.read();
++            final int thech = readAByte(inShadow);
+-          zvec = (zvec << 1) | ((bsBuffShadow >> bsLiveShadow) & 1);
++          zvec = ((zvec << 1) | ((bsBuffShadow >> bsLiveShadow) & 1));
+-    int zvec = bsR(zn);
+-    int bsLiveShadow = this.bsLive;
+-    int bsBuffShadow = this.bsBuff;
++    int zvec = (int) bsR(zn);
++    int bsLiveShadow = (int) this.bsLive;
++    int bsBuffShadow = (int) this.bsBuff;
+-        final int thech = inShadow.read();
++        final int thech = readAByte(inShadow);
+-      this.currentState = RAND_PART_B_STATE;
++      this.currentState = STATE.RAND_PART_B_STATE;
++      if (readMode == READ_MODE.CONTINUOUS) {
++      } else if (readMode == READ_MODE.BYBLOCK) {
++        this.currentState = STATE.NO_PROCESS_STATE;
++      }
+-      this.currentState = NO_RAND_PART_B_STATE;
++      this.currentState = STATE.NO_RAND_PART_B_STATE;
+-      this.currentState = NO_RAND_PART_A_STATE;
++      this.currentState = STATE.NO_RAND_PART_A_STATE;
++      if (readMode == READ_MODE.CONTINUOUS) {
++      } else if (readMode == READ_MODE.BYBLOCK) {
++        this.currentState = STATE.NO_PROCESS_STATE;
++      }
+-      this.currentState = RAND_PART_A_STATE;
++      this.currentState = STATE.RAND_PART_A_STATE;
+-      this.currentState = RAND_PART_C_STATE;
++      this.currentState = STATE.RAND_PART_C_STATE;
+-      this.currentState = RAND_PART_A_STATE;
++      this.currentState = STATE.RAND_PART_A_STATE;
+-      this.currentState = RAND_PART_A_STATE;
++      this.currentState = STATE.RAND_PART_A_STATE;
+-      this.currentState = NO_RAND_PART_C_STATE;
++      this.currentState = STATE.NO_RAND_PART_C_STATE;
+
+INS26 INS26 MOV31 MOV23 MOV23 MOV23 MOV23 MOV23 MOV23 MOV23 INS40 INS40 INS23 INS23 INS23 INS23 INS71 INS23 INS23 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS83 INS83 UPD83 MOV83 UPD39 MOV39 MOV59 UPD83 UPD39 INS43 INS59 UPD39 UPD39 UPD39 UPD39 MOV83 INS39 INS59 UPD39 UPD39 INS83 INS43 MOV59 INS29 INS83 INS42 INS72 INS72 INS72 INS72 INS72 INS72 INS72 INS72 INS72 UPD83 MOV83 INS43 INS59 INS83 UPD39 MOV39 MOV59 UPD39 INS29 INS83 INS39 INS42 INS8 INS29 INS83 INS39 INS42 INS44 INS8 INS29 INS39 INS42 INS44 INS8 INS29 UPD83 UPD42 INS44 MOV43 INS29 UPD83 MOV83 MOV39 UPD42 MOV42 INS44 INS44 INS43 INS43 INS8 INS83 INS39 INS42 INS43 INS8 MOV29 INS83 INS42 MOV44 INS44 MOV43 INS8 INS29 INS83 INS83 INS39 INS42 INS44 INS43 INS8 INS83 INS42 INS44 INS43 INS8 INS83 INS39 INS42 INS43 INS8 INS83 INS39 INS42 MOV43 INS8 INS29 UPD39 INS83 INS39 INS42 MOV43 MOV8 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 UPD42 INS34 UPD42 UPD34 UPD42 UPD34 INS42 INS42 INS40 UPD42 UPD34 UPD42 UPD34 UPD42 INS9 UPD42 INS85 INS3 INS42 INS9 INS42 INS65 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS40 UPD42 INS9 UPD42 INS9 INS65 INS41 INS65 INS65 INS39 INS42 INS21 INS65 INS65 INS39 INS42 INS21 INS21 INS65 MOV43 INS42 INS60 INS41 INS65 INS65 INS65 INS65 INS65 INS39 INS42 INS39 INS42 INS42 INS42 INS54 INS42 MOV53 INS43 INS42 INS46 INS60 MOV21 MOV21 MOV21 INS25 INS65 INS65 INS65 INS65 INS83 INS43 INS42 INS42 INS21 INS60 INS21 INS41 INS83 INS43 INS42 INS42 INS17 INS42 INS25 INS25 INS65 INS65 INS65 INS25 INS25 INS60 INS60 INS25 INS41 MOV53 MOV49 MOV25 UPD39 INS25 INS60 INS60 INS25 INS21 MOV41 MOV61 INS5 INS34 INS66 INS66 INS66 INS66 INS42 INS66 INS66 INS42 INS66 INS66 INS7 INS66 INS66 INS66 INS66 INS66 INS42 INS66 INS7 INS32 INS66 INS66 INS66 INS66 INS66 INS39 INS59 INS27 INS42 INS66 INS66 INS66 INS66 INS66 INS66 INS42 INS66 INS42 INS66 INS42 INS42 INS66 INS8 INS12 INS42 INS39 INS59 UPD7 INS27 INS8 INS25 INS66 INS66 INS42 INS66 INS66 INS66 INS42 INS42 INS7 INS43 INS59 INS7 INS32 INS42 INS42 INS40 INS27 INS8 INS8 MOV27 INS8 MOV8 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS42 INS66 INS66 INS66 INS42 INS8 INS42 INS8 INS39 INS59 MOV36 INS39 INS59 INS27 INS8 INS42 INS49 INS41 INS27 INS25 UPD39 MOV59 UPD39 MOV27 INS8 INS39 INS59 INS39 INS59 MOV27 MOV8 INS7 INS11 MOV27 INS8 INS8 INS8 INS39 INS85 INS22 INS42 INS22 INS42 INS52 INS42 INS42 INS42 INS32 INS42 INS34 INS21 INS25 INS60 INS21 INS25 INS61 INS44 INS8 UPD45 INS42 INS34 INS22 INS27 MOV22 INS14 UPD42 INS42 INS40 INS21 MOV21 INS25 INS27 INS8 INS40 INS9 INS42 INS42 INS33 INS42 INS14 INS42 INS42 INS42 INS9 INS21 INS21 MOV21 INS60 INS60 INS41 INS21 INS21 INS21 INS21 INS42 INS34 INS27 INS42 MOV27 UPD42 MOV42 INS34 INS21 INS21 INS21 INS21 INS42 INS42 INS42 INS22 INS40 INS21 INS41 MOV27 INS8 INS8 INS40 MOV22 MOV22 MOV60 INS19 MOV21 INS42 MOV22 INS42 MOV22 INS42 INS34 INS21 MOV22 MOV27 INS39 INS36 INS11 INS11 INS11 INS11 INS11 INS11 INS11 INS11 MOV21 MOV61 MOV21 MOV21 INS21 MOV21 INS25 INS21 INS21 MOV21 INS25 MOV21 INS52 INS42 INS52 INS42 INS42 INS42 INS32 INS27 INS8 UPD39 MOV39 INS59 INS7 INS27 INS8 INS9 INS8 MOV43 INS42 INS41 INS52 INS42 UPD42 MOV42 INS13 INS43 INS42 INS27 UPD42 INS7 INS38 MOV8 INS42 INS40 MOV21 INS21 INS21 INS25 INS43 INS42 INS40 INS32 INS32 INS39 INS59 INS39 INS59 INS36 INS32 INS7 INS32 INS7 MOV36 MOV27 INS7 INS7 INS7 INS32 INS52 INS42 INS42 INS52 UPD42 INS42 INS52 INS42 INS7 INS21 MOV53 INS21 INS21 INS25 INS21 INS21 INS21 MOV52 MOV42 INS8 MOV27 INS52 INS42 INS52 INS42 INS7 INS34 MOV27 INS39 MOV32 INS39 MOV32 INS39 MOV32 INS39 INS22 INS39 INS22 INS39 MOV32 INS39 INS22 INS39 INS22 INS27 INS7 INS27 MOV8 INS25 INS7 INS7 INS27 MOV8 INS25 MOV21 MOV21 INS52 UPD42 MOV42 INS34 INS42 INS34 INS53 UPD42 MOV42 INS34 INS42 INS32 INS42 MOV38 INS41 INS25 INS9 INS42 INS34 INS34 INS42 INS40 INS42 INS16 INS42 INS7 INS7 INS38 INS8 INS42 INS42 INS42 INS40 INS42 INS32 INS42 INS27 INS16 INS52 INS42 INS22 INS9 INS42 INS40 INS9 INS36 INS42 INS42 INS42 INS32 INS22 INS22 INS42 INS22 INS40 INS7 INS7 INS7 INS27 INS8 INS32 INS32 INS7 INS60 MOV25 INS21 INS21 INS22 INS42 INS11 MOV52 MOV42 MOV52 MOV42 MOV61 MOV52 MOV42 MOV52 MOV42 INS42 INS34 INS22 INS40 INS42 INS40 INS27 INS8 MOV22 INS40 MOV22 INS40 INS42 INS40 INS27 INS8 INS40 INS40 INS40 INS14 INS52 INS42 INS42 INS9 INS27 INS8 INS8 INS36 INS9 INS9 INS40 INS42 INS32 INS22 INS22 INS42 INS21 INS52 INS42 INS42 INS34 INS34 INS34 INS2 INS27 INS42 INS42 INS52 INS42 MOV36 INS52 INS42 INS40 INS42 INS52 INS42 INS52 INS42 INS52 INS42 INS22 INS40 INS22 INS32 INS22 INS27 INS22 INS33 INS21 INS42 INS22 INS42 INS22 INS40 INS39 INS59 INS27 MOV8 INS7 INS7 INS52 UPD42 UPD42 INS52 INS42 INS39 MOV32 MOV27 MOV27 INS52 INS42 INS42 INS40 INS21 INS42 INS40 INS21 INS40 INS40 INS43 INS45 INS42 INS42 INS41 INS21 INS21 MOV60 INS25 INS27 INS52 INS42 INS40 INS42 INS52 INS42 INS52 INS42 INS32 INS42 INS34 INS42 INS34 INS52 INS42 INS52 INS42 INS42 INS52 INS42 INS32 INS34 INS52 INS42 INS7 INS52 INS42 INS52 INS42 INS42 INS32 INS42 MOV34 INS53 MOV42 MOV27 MOV42 MOV34 UPD34 INS61 INS60 INS61 MOV21 MOV21 INS7 INS7 INS42 INS9 INS7 INS7 UPD27 MOV27 INS8 INS41 INS32 UPD34 MOV34 INS42 INS42 INS34 INS22 INS14 INS42 INS42 INS14 MOV27 INS8 INS39 MOV59 MOV27 INS8 MOV27 INS42 INS22 INS40 MOV22 INS40 INS42 INS27 INS42 INS27 UPD42 INS11 UPD42 MOV38 INS21 INS9 INS42 INS42 INS52 INS42 INS43 INS22 INS43 INS45 INS60 MOV25 MOV21 INS61 MOV21 MOV21 MOV42 MOV34 INS36 INS52 INS42 UPD42 MOV42 MOV34 INS42 INS36 INS39 INS32 INS7 INS42 INS52 INS42 INS42 INS42 INS83 MOV39 INS59 MOV27 INS8 INS11 INS42 INS27 INS27 INS52 INS42 INS34 INS42 INS27 INS42 INS32 INS60 MOV25 INS39 INS36 MOV36 MOV36 INS36 INS34 INS42 INS42 INS42 INS42 INS83 INS39 INS59 INS27 INS42 INS27 INS42 INS32 MOV42 MOV2 INS34 INS42 INS42 INS42 DEL83 DEL83 DEL83 DEL83 DEL83 DEL83 DEL34 DEL83 DEL83 DEL34 DEL83 DEL83 DEL39 DEL42 DEL45 DEL14 DEL53 DEL8 DEL31 DEL23 DEL83 DEL23 DEL83 DEL23 DEL83 DEL39 DEL42 DEL42 DEL59 DEL23 DEL34 DEL83 DEL34 DEL42 DEL32 DEL41 DEL52 DEL42 DEL22 DEL42 DEL32 DEL46 DEL52 DEL42 DEL22 DEL42 DEL7 DEL21 DEL42 DEL42 DEL39 DEL42 DEL59 DEL58 DEL27 DEL42 DEL27 DEL36 DEL36 DEL16 DEL41 DEL52 DEL42 DEL22 DEL42 DEL8 DEL42 DEL19 DEL39 DEL60 DEL60 DEL8 DEL25 DEL8 DEL31 DEL60 DEL27 DEL42 DEL42 DEL27 DEL83 DEL39 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL8 DEL61 DEL8 DEL61 DEL22 DEL22 DEL42 DEL83 DEL39 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL8 DEL8 DEL61 DEL42 DEL42 DEL7 DEL21 DEL42 DEL42 DEL7 DEL21 DEL42 DEL42 DEL7 DEL21 DEL42 DEL42

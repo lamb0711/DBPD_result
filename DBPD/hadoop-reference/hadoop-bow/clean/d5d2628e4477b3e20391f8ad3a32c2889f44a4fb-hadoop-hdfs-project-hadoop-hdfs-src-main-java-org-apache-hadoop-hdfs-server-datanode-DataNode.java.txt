@@ -1,0 +1,160 @@
+Merge r1360400 through r1399945 from trunk.
+
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/branches/HDFS-2802@1399950 13f79535-47bb-0310-9956-ffa450edef68
+
++import static org.apache.hadoop.util.ExitUtil.terminate;
++import java.io.InputStream;
++import java.io.PrintStream;
++import org.apache.hadoop.hdfs.protocol.HdfsBlocksMetadata;
++import org.apache.hadoop.hdfs.protocol.datatransfer.DataTransferEncryptor;
++import org.apache.hadoop.hdfs.protocol.datatransfer.IOStreamPair;
+-
+-import static org.apache.hadoop.util.ExitUtil.terminate;
+-
++import org.apache.hadoop.io.ReadaheadPool;
++import org.apache.hadoop.util.Time;
++import com.google.common.annotations.VisibleForTesting;
+-import com.google.common.annotations.VisibleForTesting;
++  
++  private static final String USAGE = "Usage: java DataNode [-rollback | -regular]";
+-  private boolean heartbeatsDisabledForTests = false;
++  private volatile boolean heartbeatsDisabledForTests = false;
+-  private final String userWithLocalPathAccess;
++  private final List<String> usersWithLocalPathAccess;
++  private boolean connectToDnViaHostname;
++  ReadaheadPool readaheadPool;
++  private final boolean getHdfsBlockLocationsEnabled;
+-    this.userWithLocalPathAccess = conf
+-        .get(DFSConfigKeys.DFS_BLOCK_LOCAL_PATH_ACCESS_USER_KEY);
++    this.usersWithLocalPathAccess = Arrays.asList(
++        conf.getTrimmedStrings(DFSConfigKeys.DFS_BLOCK_LOCAL_PATH_ACCESS_USER_KEY));
++    this.connectToDnViaHostname = conf.getBoolean(
++        DFSConfigKeys.DFS_DATANODE_USE_DN_HOSTNAME,
++        DFSConfigKeys.DFS_DATANODE_USE_DN_HOSTNAME_DEFAULT);
++    this.getHdfsBlockLocationsEnabled = conf.getBoolean(
++        DFSConfigKeys.DFS_HDFS_BLOCKS_METADATA_ENABLED, 
++        DFSConfigKeys.DFS_HDFS_BLOCKS_METADATA_ENABLED_DEFAULT);
+-    ipcServer = RPC.getServer(ClientDatanodeProtocolPB.class, service, ipcAddr
+-        .getHostName(), ipcAddr.getPort(), conf.getInt(
+-        DFS_DATANODE_HANDLER_COUNT_KEY, DFS_DATANODE_HANDLER_COUNT_DEFAULT),
+-        false, conf, blockPoolTokenSecretManager);
++    ipcServer = new RPC.Builder(conf)
++        .setProtocol(ClientDatanodeProtocolPB.class)
++        .setInstance(service)
++        .setBindAddress(ipcAddr.getHostName())
++        .setPort(ipcAddr.getPort())
++        .setNumHandlers(
++            conf.getInt(DFS_DATANODE_HANDLER_COUNT_KEY,
++                DFS_DATANODE_HANDLER_COUNT_DEFAULT)).setVerbose(false)
++        .setSecretManager(blockPoolTokenSecretManager).build();
+-      directoryScanner = new DirectoryScanner(this, data, conf);
++      directoryScanner = new DirectoryScanner(data, conf);
++
++    // Create the ReadaheadPool from the DataNode context so we can
++    // exit without having to explicitly shutdown its thread pool.
++    readaheadPool = ReadaheadPool.getInstance();
+-    // TODO should we check that all federated nns are either enabled or
+-    // disabled?
+-        new BlockTokenSecretManager(0, blockTokenLifetime);
++          new BlockTokenSecretManager(0, blockTokenLifetime, blockPoolId,
++              dnConf.encryptionAlgorithm);
+-   * transfer, and that may be be a different address.
++   * transfer, and that may be a different address.
+-      DatanodeID datanodeid, final Configuration conf, final int socketTimeout)
+-    throws IOException {
+-    final InetSocketAddress addr =
+-      NetUtils.createSocketAddr(datanodeid.getIpcAddr());
+-    if (InterDatanodeProtocol.LOG.isDebugEnabled()) {
+-      InterDatanodeProtocol.LOG.debug("InterDatanodeProtocol addr=" + addr);
++      DatanodeID datanodeid, final Configuration conf, final int socketTimeout,
++      final boolean connectToDnViaHostname) throws IOException {
++    final String dnAddr = datanodeid.getIpcAddr(connectToDnViaHostname);
++    final InetSocketAddress addr = NetUtils.createSocketAddr(dnAddr);
++    if (LOG.isDebugEnabled()) {
++      LOG.debug("Connecting to datanode " + dnAddr + " addr=" + addr);
++            @Override
+-        + System.currentTimeMillis();
++        + Time.now();
+-    if (!currentUser.equals(this.userWithLocalPathAccess)) {
++    if (!usersWithLocalPathAccess.contains(currentUser)) {
++
++  @Override
++  public HdfsBlocksMetadata getHdfsBlocksMetadata(List<ExtendedBlock> blocks,
++      List<Token<BlockTokenIdentifier>> tokens) throws IOException, 
++      UnsupportedOperationException {
++    if (!getHdfsBlockLocationsEnabled) {
++      throw new UnsupportedOperationException("Datanode#getHdfsBlocksMetadata "
++          + " is not enabled in datanode config");
++    }
++    if (blocks.size() != tokens.size()) {
++      throw new IOException("Differing number of blocks and tokens");
++    }
++    // Check access for each block
++    for (int i = 0; i < blocks.size(); i++) {
++      checkBlockToken(blocks.get(i), tokens.get(i), 
++          BlockTokenSecretManager.AccessMode.READ);
++    }
++    return data.getHdfsBlocksMetadata(blocks);
++  }
++    this.shouldRun = false;
+-    this.shouldRun = false;
+-  UpgradeManagerDatanode getUpgradeManagerDatanode(String bpid) {
+-    BPOfferService bpos = blockPoolManager.get(bpid);
+-    if(bpos==null) {
+-      return null;
+-    }
+-    return bpos.getUpgradeManager();
+-  }
+-
+-  private void transferBlock( ExtendedBlock block, 
+-                              DatanodeInfo xferTargets[] 
+-                              ) throws IOException {
++  private void transferBlock(ExtendedBlock block, DatanodeInfo xferTargets[])
++      throws IOException {
++    @Override
+-        InetSocketAddress curTarget = 
+-          NetUtils.createSocketAddr(targets[0].getXferAddr());
++        final String dnAddr = targets[0].getXferAddr(connectToDnViaHostname);
++        InetSocketAddress curTarget = NetUtils.createSocketAddr(dnAddr);
++        if (LOG.isDebugEnabled()) {
++          LOG.debug("Connecting to datanode " + dnAddr);
++        }
+-        OutputStream baseStream = NetUtils.getOutputStream(sock, writeTimeout);
+-        out = new DataOutputStream(new BufferedOutputStream(baseStream,
++        OutputStream unbufOut = NetUtils.getOutputStream(sock, writeTimeout);
++        InputStream unbufIn = NetUtils.getInputStream(sock);
++        if (dnConf.encryptDataTransfer) {
++          IOStreamPair encryptedStreams =
++              DataTransferEncryptor.getEncryptedStreams(
++                  unbufOut, unbufIn,
++                  blockPoolTokenSecretManager.generateDataEncryptionKey(
++                      b.getBlockPoolId()));
++          unbufOut = encryptedStreams.out;
++          unbufIn = encryptedStreams.in;
++        }
++        
++        out = new DataOutputStream(new BufferedOutputStream(unbufOut,
++        in = new DataInputStream(unbufIn);
+-        blockSender.sendBlock(out, baseStream, null);
++        blockSender.sendBlock(out, unbufOut, null);
+-          in = new DataInputStream(NetUtils.getInputStream(sock));
+-      printUsage();
++      printUsage(System.err);
+-  private static void printUsage() {
+-    System.err.println("Usage: java DataNode");
+-    System.err.println("           [-rollback]");
++  private static void printUsage(PrintStream out) {
++    out.println(USAGE + "\n");
+-      terminate(1);
++      terminate(1, e);
++    if (DFSUtil.parseHelpArgument(args, DataNode.USAGE, System.out, true)) {
++      System.exit(0);
++    }
++
++      @Override
+-    DatanodeInfo[] targets = rBlock.getLocations();
+-    DatanodeID[] datanodeids = (DatanodeID[])targets;
++    DatanodeID[] datanodeids = rBlock.getLocations();
+-                dnConf.socketTimeout);
++                dnConf.socketTimeout, dnConf.connectToDnViaHostname);

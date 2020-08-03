@@ -1,0 +1,233 @@
+HDFS-3056.  Add a new interface RollingLogs for DataBlockScanner logging.
+
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/trunk@1299139 13f79535-47bb-0310-9956-ffa450edef68
+
++import java.io.BufferedReader;
++import java.io.FileReader;
++import java.io.PrintStream;
++import java.util.concurrent.atomic.AtomicInteger;
+-    public File getDirectory(String bpid) throws IOException {
+-      return getBlockPoolSlice(bpid).getDirectory();
++    public String getPath(String bpid) throws IOException {
++      return getBlockPoolSlice(bpid).getDirectory().getAbsolutePath();
+-                + diskMetaFile.getAbsolutePath());
++                + (diskMetaFile == null? null: diskMetaFile.getAbsolutePath()));
++
++  @Override
++  public RollingLogs createRollingLogs(String bpid, String prefix
++      ) throws IOException {
++    String dir = null;
++    final List<FSVolume> volumes = getVolumes();
++    for (FSVolume vol : volumes) {
++      String bpDir = vol.getPath(bpid);
++      if (RollingLogsImpl.isFilePresent(bpDir, prefix)) {
++        dir = bpDir;
++        break;
++      }
++    }
++    if (dir == null) {
++      dir = volumes.get(0).getPath(bpid);
++    }
++    return new RollingLogsImpl(dir, prefix);
++  }
++
++  static class RollingLogsImpl implements RollingLogs {
++    private static final String CURR_SUFFIX = ".curr";
++    private static final String PREV_SUFFIX = ".prev";
++
++    static boolean isFilePresent(String dir, String filePrefix) {
++      return new File(dir, filePrefix + CURR_SUFFIX).exists() ||
++             new File(dir, filePrefix + PREV_SUFFIX).exists();
++    }
++
++    private final File curr;
++    private final File prev;
++    private PrintStream out; //require synchronized access
++
++    private Appender appender = new Appender() {
++      @Override
++      public Appendable append(CharSequence csq) {
++        synchronized(RollingLogsImpl.this) {
++          if (out == null) {
++            throw new IllegalStateException(RollingLogsImpl.this
++                + " is not yet opened.");
++          }
++          out.print(csq);
++        }
++        return this;
++      }
++
++      @Override
++      public Appendable append(char c) {
++        throw new UnsupportedOperationException();
++      }
++
++      @Override
++      public Appendable append(CharSequence csq, int start, int end) {
++        throw new UnsupportedOperationException();
++      }
++
++      @Override
++      public void close() {
++        synchronized(RollingLogsImpl.this) {
++          if (out != null) {
++            out.close();
++            out = null;
++          }
++        }
++      }
++    };
++
++
++    private final AtomicInteger numReaders = new AtomicInteger();
++
++    private RollingLogsImpl(String dir, String filePrefix) throws FileNotFoundException{
++      curr = new File(dir, filePrefix + CURR_SUFFIX);
++      prev = new File(dir, filePrefix + PREV_SUFFIX);
++      out = new PrintStream(new FileOutputStream(curr, true));
++    }
++
++    @Override
++    public Reader iterator(boolean skipPrevFile) throws IOException {
++      numReaders.incrementAndGet(); 
++      return new Reader(skipPrevFile);
++    }
++
++    @Override
++    public Appender appender() {
++      return appender;
++    }
++
++    @Override
++    public boolean roll() throws IOException {
++      if (numReaders.get() > 0) {
++        return false;
++      }
++      if (!prev.delete() && prev.exists()) {
++        throw new IOException("Failed to delete " + prev);
++      }
++
++      synchronized(this) {
++        appender.close();
++        final boolean renamed = curr.renameTo(prev);
++        out = new PrintStream(new FileOutputStream(curr, true));
++        if (!renamed) {
++          throw new IOException("Failed to rename " + curr + " to " + prev);
++        }
++      }
++      return true;
++    }
++
++    @Override
++    public String toString() {
++      return curr.toString();
++    }
++    
++    /**
++     * This is used to read the lines in order.
++     * If the data is not read completely (i.e, untill hasNext() returns
++     * false), it needs to be explicitly 
++     */
++    private class Reader implements RollingLogs.LineIterator {
++      private File file;
++      private BufferedReader reader;
++      private String line;
++      private boolean closed = false;
++      
++      private Reader(boolean skipPrevFile) throws IOException {
++        reader = null;
++        file = skipPrevFile? curr : prev;
++        readNext();        
++      }
++
++      @Override
++      public boolean isPrevious() {
++        return file == prev;
++      }
++
++      private boolean openFile() throws IOException {
++
++        for(int i=0; i<2; i++) {
++          if (reader != null || i > 0) {
++            // move to next file
++            file = isPrevious()? curr : null;
++          }
++          if (file == null) {
++            return false;
++          }
++          if (file.exists()) {
++            break;
++          }
++        }
++        
++        if (reader != null ) {
++          reader.close();
++          reader = null;
++        }
++        
++        reader = new BufferedReader(new FileReader(file));
++        return true;
++      }
++      
++      // read next line if possible.
++      private void readNext() throws IOException {
++        line = null;
++        try {
++          if (reader != null && (line = reader.readLine()) != null) {
++            return;
++          }
++          if (line == null) {
++            // move to the next file.
++            if (openFile()) {
++              readNext();
++            }
++          }
++        } finally {
++          if (!hasNext()) {
++            close();
++          }
++        }
++      }
++      
++      @Override
++      public boolean hasNext() {
++        return line != null;
++      }
++
++      @Override
++      public String next() {
++        String curLine = line;
++        try {
++          readNext();
++        } catch (IOException e) {
++          DataBlockScanner.LOG.warn("Failed to read next line.", e);
++        }
++        return curLine;
++      }
++
++      @Override
++      public void remove() {
++        throw new UnsupportedOperationException();
++      }
++
++      @Override
++      public void close() throws IOException {
++        if (!closed) {
++          try {
++            if (reader != null) {
++              reader.close();
++            }
++          } finally {
++            file = null;
++            reader = null;
++            closed = true;
++            final int n = numReaders.decrementAndGet();
++            assert(n >= 0);
++          }
++        }
++      }
++    }
++  }
+
+INS26 INS26 INS26 INS26 INS40 INS40 INS40 INS40 INS31 INS55 INS78 INS83 INS43 INS42 INS44 INS44 INS43 INS8 INS83 INS42 INS43 INS23 INS23 INS31 INS23 INS23 INS23 INS23 INS23 INS31 INS31 INS31 INS31 INS31 INS55 INS43 UPD42 INS42 INS42 INS43 INS42 INS43 INS42 INS42 INS60 INS60 INS70 INS25 INS41 INS42 INS83 INS83 INS83 INS43 INS59 INS83 INS83 INS83 INS43 INS59 INS83 INS39 INS42 INS44 INS44 INS8 INS83 INS83 MOV43 INS59 INS83 INS83 INS43 INS59 INS83 INS43 INS59 INS83 INS43 INS59 INS83 INS83 INS43 INS59 INS83 INS42 INS44 INS44 INS43 INS8 INS78 INS83 INS43 INS42 INS44 INS43 INS8 INS78 INS83 INS43 INS42 INS8 INS78 INS83 INS39 INS42 INS43 INS8 INS78 INS83 INS43 INS42 INS8 INS29 INS83 INS42 INS43 INS23 INS23 INS23 INS23 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS42 INS42 INS42 INS43 INS59 INS83 INS74 INS59 INS44 INS42 INS8 INS27 INS8 INS14 INS42 INS42 INS45 INS42 INS42 INS45 INS43 INS42 INS43 INS42 INS41 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS14 INS42 INS42 INS14 INS43 INS42 INS43 INS42 INS42 INS21 INS21 INS21 INS42 INS42 INS39 INS42 INS42 INS21 INS41 INS42 INS42 INS41 INS42 INS42 INS25 INS25 INS51 INS41 INS42 INS42 INS41 INS65 INS40 INS83 INS43 INS59 INS83 INS43 INS59 INS83 INS43 INS59 INS83 INS39 INS59 INS83 INS42 INS44 INS43 INS8 INS78 INS83 INS39 INS42 INS8 INS83 INS39 INS42 INS43 INS8 INS83 INS39 INS42 INS43 INS8 INS78 INS83 INS39 INS42 INS8 INS78 INS83 INS43 INS42 INS8 INS78 INS83 INS39 INS42 INS8 INS78 INS83 INS39 INS42 INS43 INS8 INS32 INS42 INS42 INS33 INS43 INS43 INS42 INS32 INS43 INS42 INS60 INS25 INS42 INS33 INS21 INS43 INS42 INS42 INS42 INS42 INS27 INS43 INS1 INS43 INS42 INS42 INS7 INS7 INS7 INS32 INS14 INS42 INS27 INS8 INS27 INS8 INS52 INS8 INS9 INS32 INS66 INS66 INS66 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS9 INS39 INS42 INS42 INS21 INS21 INS21 INS42 INS41 INS42 INS24 INS25 INS21 INS41 INS42 INS21 INS54 INS42 INS41 INS42 INS42 INS60 INS54 INS41 INS42 INS53 INS42 INS42 INS25 MOV32 INS42 INS42 INS42 INS42 INS42 INS43 INS59 INS32 INS8 INS7 INS42 INS32 INS32 INS42 INS31 INS31 INS31 INS31 INS42 INS42 INS14 INS42 INS14 INS42 INS14 INS42 INS42 INS43 INS42 INS32 INS34 INS41 INS38 INS32 INS53 INS21 INS60 INS21 INS25 INS42 INS42 INS7 INS7 INS32 INS27 INS58 INS27 INS37 INS8 INS27 INS8 INS7 INS9 INS7 INS8 INS8 INS27 INS43 INS59 INS8 INS12 INS42 INS14 INS38 INS8 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS21 INS10 INS42 INS32 INS14 INS42 INS14 INS42 INS78 INS83 INS43 INS42 INS44 INS8 INS78 INS83 INS43 INS42 INS44 INS8 INS78 INS83 INS43 INS42 INS44 INS44 INS44 INS8 INS78 INS83 INS39 INS42 INS8 INS43 INS42 INS27 INS43 INS42 INS27 INS43 INS14 INS42 INS42 INS42 INS9 INS32 INS42 INS42 INS14 INS32 INS83 INS39 INS59 INS7 INS38 INS8 INS42 INS33 INS42 INS16 INS42 INS42 INS42 INS39 INS59 INS42 INS34 INS42 INS25 INS25 INS25 INS42 INS33 INS21 INS21 INS42 INS14 INS42 INS33 INS25 INS25 INS25 INS42 INS33 INS42 INS42 INS42 INS21 INS44 INS8 INS43 INS42 INS54 INS42 INS42 INS42 INS7 INS32 INS42 INS42 INS43 INS42 INS27 INS43 INS42 INS27 INS42 INS42 INS43 INS42 INS51 INS41 INS42 INS42 INS39 INS42 INS53 INS42 INS42 INS43 INS42 INS39 INS42 INS39 INS42 INS53 INS42 INS51 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS43 INS42 INS9 INS42 INS42 INS43 INS27 INS42 INS42 INS42 INS32 INS42 INS14 INS42 INS53 INS42 INS42 INS42 INS42 INS34 INS27 INS8 INS27 INS8 INS32 INS8 INS32 INS7 INS43 INS14 INS27 INS8 INS27 INS8 INS38 INS8 INS32 INS43 INS42 INS21 INS42 INS8 INS8 INS42 INS42 INS42 INS42 INS34 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS52 INS8 INS52 INS14 INS42 INS14 INS52 INS8 INS42 INS42 INS45 INS42 INS42 INS42 INS42 INS43 INS14 INS14 INS27 INS27 INS21 INS42 INS33 INS41 INS42 INS42 INS10 INS42 INS42 INS42 INS33 INS42 INS43 INS42 INS27 INS27 INS41 INS42 INS33 INS25 INS32 INS21 INS42 INS42 INS32 INS25 INS21 INS21 INS21 INS60 INS6 INS42 INS25 INS21 INS43 INS43 INS42 INS25 INS42 INS43 INS42 INS9 INS43 INS27 INS42 INS33 INS42 INS34 INS7 INS9 INS42 INS42 INS33 INS36 INS33 INS32 INS8 INS42 INS32 INS40 INS42 INS45 INS42 INS27 INS8 INS7 INS7 INS7 INS83 INS39 INS59 INS36 INS27 INS8 INS32 INS42 INS42 INS27 INS8 INS42 INS42 INS45 INS42 INS45 INS42 INS42 INS16 INS7 INS42 INS21 INS42 INS42 INS33 INS21 INS42 INS33 INS42 INS33 INS42 INS9 INS42 INS32 INS27 INS42 INS33 INS53 INS42 INS42 INS42 INS42 INS33 INS21 INS21 INS32 INS42 INS33 INS42 INS32 INS32 INS32 INS42 INS42 INS42 INS34 INS14 INS32 INS7 INS42 INS42 INS42 INS42 INS42 INS42 INS36 INS43 INS27 INS42 INS42 INS42 INS33 INS16 INS42 INS52 INS45 INS27 INS33 MOV32 INS42 INS42 INS33

@@ -1,0 +1,293 @@
+HDDS-972. Add support for configuring multiple OMs. Contributed by Hanisha Koneru.
+
++import java.util.Collection;
++import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.ozone.OzoneIllegalArgumentException;
+-import static org.apache.hadoop.ozone.OmUtils.getOmAddress;
++
++import static org.apache.hadoop.ozone.om.OMConfigKeys.OZONE_OM_NODE_ID_KEY;
++import static org.apache.hadoop.ozone.om.OMConfigKeys
++    .OZONE_OM_RATIS_PORT_DEFAULT;
++import static org.apache.hadoop.ozone.om.OMConfigKeys.OZONE_OM_SERVICE_IDS_KEY;
++import static org.apache.hadoop.ozone.om.OMConfigKeys.OZONE_OM_RATIS_PORT_KEY;
++  private OMNodeDetails omNodeDetails;
++  private List<OMNodeDetails> peerNodes;
++  private boolean isRatisEnabled;
+-  private OzoneManager(OzoneConfiguration conf) throws IOException {
++  private OzoneManager(OzoneConfiguration conf) throws IOException,
++      AuthenticationException {
++    // Load HA related configurations
++    loadOMHAConfigs(configuration);
++
++    // Authenticate KSM if security is enabled
++    if (securityEnabled) {
++      loginOMUser(configuration);
++    }
++
+-
++    startRatisServer();
++    startRatisClient();
+-    omRpcAddressTxt = new Text(OmUtils.getOmRpcAddress(configuration));
++    InetSocketAddress omNodeRpcAddr = omNodeDetails.getRpcAddress();
++    omRpcAddressTxt = new Text(omNodeDetails.getRpcAddressString());
++
+-    InetSocketAddress omNodeRpcAddr = getOmAddress(configuration);
++
++  }
++  /**
++   * Inspects and loads OM node configurations.
++   *
++   * If {@link OMConfigKeys#OZONE_OM_SERVICE_IDS_KEY} is configured with
++   * multiple ids and/ or if {@link OMConfigKeys#OZONE_OM_NODE_ID_KEY} is not
++   * specifically configured , this method determines the omServiceId
++   * and omNodeId by matching the node's address with the configured
++   * addresses. When a match is found, it sets the omServicId and omNodeId from
++   * the corresponding configuration key. This method also finds the OM peers
++   * nodes belonging to the same OM service.
++   *
++   * @param conf
++   */
++  private void loadOMHAConfigs(Configuration conf) {
++    InetSocketAddress localRpcAddress = null;
++    String localOMServiceId = null;
++    String localOMNodeId = null;
++    int localRatisPort = 0;
++    Collection<String> omServiceIds = conf.getTrimmedStringCollection(
++        OZONE_OM_SERVICE_IDS_KEY);
++
++    String knownOMNodeId = conf.get(OZONE_OM_NODE_ID_KEY);
++    int found = 0;
++    boolean isOMAddressSet = false;
++
++    for (String serviceId : OmUtils.emptyAsSingletonNull(omServiceIds)) {
++      Collection<String> omNodeIds = OmUtils.getOMNodeIds(conf, serviceId);
++
++      List<OMNodeDetails> peerNodesList = new ArrayList<>();
++      boolean isPeer = false;
++      for (String nodeId : OmUtils.emptyAsSingletonNull(omNodeIds)) {
++        if (knownOMNodeId != null && !knownOMNodeId.equals(nodeId)) {
++          isPeer = true;
++        } else {
++          isPeer = false;
++        }
++        String rpcAddrKey = OmUtils.addKeySuffixes(OZONE_OM_ADDRESS_KEY,
++            serviceId, nodeId);
++        String rpcAddrStr = conf.get(rpcAddrKey);
++        if (rpcAddrStr == null) {
++          continue;
++        }
++
++        // If OM address is set for any node id, we will not fallback to the
++        // default
++        isOMAddressSet = true;
++
++        String ratisPortKey = OmUtils.addKeySuffixes(OZONE_OM_RATIS_PORT_KEY,
++            serviceId, nodeId);
++        int ratisPort = conf.getInt(ratisPortKey, OZONE_OM_RATIS_PORT_DEFAULT);
++
++        InetSocketAddress addr = null;
++        try {
++          addr = NetUtils.createSocketAddr(rpcAddrStr);
++        } catch (Exception e) {
++          LOG.warn("Exception in creating socket address " + addr, e);
++          continue;
++        }
++        if (!addr.isUnresolved()) {
++          if (!isPeer && OmUtils.isAddressLocal(addr)) {
++            localRpcAddress = addr;
++            localOMServiceId = serviceId;
++            localOMNodeId = nodeId;
++            localRatisPort = ratisPort;
++            found++;
++          } else {
++            // This OMNode belongs to same OM service as the current OMNode.
++            // Add it to peerNodes list.
++            OMNodeDetails peerNodeInfo = new OMNodeDetails.Builder()
++                .setOMServiceId(serviceId)
++                .setOMNodeId(nodeId)
++                .setRpcAddress(addr)
++                .setRatisPort(ratisPort)
++                .build();
++            peerNodesList.add(peerNodeInfo);
++          }
++        }
++      }
++      if (found == 1) {
++        LOG.debug("Found one matching OM address with service ID: {} and node" +
++                " ID: {}", localOMServiceId, localOMNodeId);
++
++        setOMNodeDetails(localOMServiceId, localOMNodeId, localRpcAddress,
++            localRatisPort);
++        this.peerNodes = peerNodesList;
++
++        LOG.info("Found matching OM address with OMServiceId: {}, " +
++            "OMNodeId: {}, RPC Address: {} and Ratis port: {}",
++            localOMServiceId, localOMNodeId,
++            NetUtils.getHostPortString(localRpcAddress), localRatisPort);
++        return;
++      } else if (found > 1) {
++        String msg = "Configuration has multiple " + OZONE_OM_ADDRESS_KEY +
++            " addresses that match local node's address. Please configure the" +
++            " system with " + OZONE_OM_SERVICE_IDS_KEY + " and " +
++            OZONE_OM_ADDRESS_KEY;
++        throw new OzoneIllegalArgumentException(msg);
++      }
++    }
++
++    if (!isOMAddressSet) {
++      // No OM address is set. Fallback to default
++      InetSocketAddress omAddress = OmUtils.getOmAddress(conf);
++      int ratisPort = conf.getInt(OZONE_OM_RATIS_PORT_KEY,
++          OZONE_OM_RATIS_PORT_DEFAULT);
++
++      LOG.info("Configuration either no {} set. Falling back to the default " +
++          "OM address {}", OZONE_OM_ADDRESS_KEY, omAddress);
++
++      setOMNodeDetails(null, null, omAddress, ratisPort);
++
++    } else {
++      String msg = "Configuration has no " + OZONE_OM_ADDRESS_KEY + " " +
++          "address that matches local node's address. Please configure the " +
++          "system with " + OZONE_OM_ADDRESS_KEY;
++      LOG.info(msg);
++      throw new OzoneIllegalArgumentException(msg);
++    }
++  }
++
++  /**
++   * Builds and sets OMNodeDetails object.
++   */
++  private void setOMNodeDetails(String serviceId, String nodeId,
++      InetSocketAddress rpcAddress, int ratisPort) {
++
++    if (serviceId == null) {
++      // If no serviceId is set, take the default serviceID om-service
++      serviceId = OzoneConsts.OM_SERVICE_ID_DEFAULT;
++      LOG.info("OM Service ID is not set. Setting it to the default ID: {}",
++          serviceId);
++    }
++    if (nodeId == null) {
++      // If no nodeId is set, take the omId from omStorage as the nodeID
++      nodeId = omId;
++      LOG.info("OM Node ID is not set. Setting it to the OmStorage's " +
++          "OmID: {}", nodeId);
++    }
++
++    this.omNodeDetails = new OMNodeDetails.Builder()
++        .setOMServiceId(serviceId)
++        .setOMNodeId(nodeId)
++        .setRpcAddress(rpcAddress)
++        .setRatisPort(ratisPort)
++        .build();
++
++    // Set this nodes OZONE_OM_ADDRESS_KEY to the discovered address.
++    configuration.set(OZONE_OM_ADDRESS_KEY,
++        NetUtils.getHostPortString(rpcAddress));
+-  private static void loginOMUser(OzoneConfiguration conf)
++  private void loginOMUser(OzoneConfiguration conf)
+-      InetSocketAddress socAddr = getOmAddress(conf);
++      InetSocketAddress socAddr = OmUtils.getOmAddress(conf);
+-    // Authenticate KSM if security is enabled
+-    if (securityEnabled) {
+-      loginOMUser(conf);
+-    }
++
++  public OzoneManagerRatisServer getOmRatisServer() {
++    return omRatisServer;
++  }
++
++  @VisibleForTesting
++  public InetSocketAddress getOmRpcServerAddr() {
++    return omRpcAddress;
++  }
++
++  @VisibleForTesting
+-
++
++    startRatisServer();
++    startRatisClient();
++
+-    InetSocketAddress omNodeRpcAddr = getOmAddress(configuration);
+-    // This is a temporary check. Once fully implemented, all OM state change
+-    // should go through Ratis - either standalone (for non-HA) or replicated
+-    // (for HA).
+-    boolean omRatisEnabled = configuration.getBoolean(
+-        OMConfigKeys.OZONE_OM_RATIS_ENABLE_KEY,
+-        OMConfigKeys.OZONE_OM_RATIS_ENABLE_DEFAULT);
+-    if (omRatisEnabled) {
+-      omRatisServer = OzoneManagerRatisServer.newOMRatisServer(this, omId,
+-          omNodeRpcAddr.getAddress(), configuration);
+-      omRatisServer.start();
+-
+-      LOG.info("OzoneManager Ratis server started at port {}",
+-          omRatisServer.getServerPort());
+-
+-      omRatisClient = OzoneManagerRatisClient.newOzoneManagerRatisClient(
+-          omId, omRatisServer.getRaftGroup(), configuration);
+-      omRatisClient.connect();
+-    } else {
+-      omRatisServer = null;
+-      omRatisClient = null;
+-    }
++    InetSocketAddress omNodeRpcAddr = OmUtils.getOmAddress(configuration);
+-            omRatisEnabled));
++            isRatisEnabled));
++   * Creates an instance of ratis server.
++   */
++  private void startRatisServer() throws IOException {
++    // This is a temporary check. Once fully implemented, all OM state change
++    // should go through Ratis - be it standalone (for non-HA) or replicated
++    // (for HA).
++    isRatisEnabled = configuration.getBoolean(
++        OMConfigKeys.OZONE_OM_RATIS_ENABLE_KEY,
++        OMConfigKeys.OZONE_OM_RATIS_ENABLE_DEFAULT);
++    if (isRatisEnabled) {
++      if (omRatisServer == null) {
++        omRatisServer = OzoneManagerRatisServer.newOMRatisServer(
++            configuration, this, omNodeDetails, peerNodes);
++      }
++      omRatisServer.start();
++
++      LOG.info("OzoneManager Ratis server started at port {}",
++          omRatisServer.getServerPort());
++    } else {
++      omRatisServer = null;
++    }
++  }
++
++  /**
++   * Creates an instance of ratis client.
++   */
++  private void startRatisClient() throws IOException {
++    // This is a temporary check. Once fully implemented, all OM state change
++    // should go through Ratis - be it standalone (for non-HA) or replicated
++    // (for HA).
++    isRatisEnabled = configuration.getBoolean(
++      OMConfigKeys.OZONE_OM_RATIS_ENABLE_KEY,
++      OMConfigKeys.OZONE_OM_RATIS_ENABLE_DEFAULT);
++    if (isRatisEnabled) {
++      if (omRatisClient == null) {
++        omRatisClient = OzoneManagerRatisClient.newOzoneManagerRatisClient(
++            omNodeDetails.getOMNodeId(), omRatisServer.getRaftGroup(),
++            configuration);
++      }
++      omRatisClient.connect();
++    } else {
++      omRatisClient = null;
++    }
++  }
++
++  /**
++      if (omRatisClient != null) {
++        omRatisClient.close();
++      }
++
++  public String getOMNodId() {
++    return omNodeDetails.getOMNodeId();
++  }
++
++  public String getOMServiceId() {
++    return omNodeDetails.getOMServiceId();
++  }
+
+MOV26 INS26 INS26 INS26 INS26 INS26 INS26 INS40 INS40 UPD40 INS40 INS40 INS40 INS40 INS23 INS23 INS23 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS83 INS43 INS59 INS83 INS74 INS59 INS83 INS39 INS59 INS43 MOV21 MOV60 INS29 INS83 INS39 INS42 INS44 INS8 INS29 INS83 INS39 INS42 INS44 INS44 INS44 INS44 INS8 INS78 INS83 INS43 INS42 INS8 INS78 INS83 INS43 INS42 INS8 INS29 INS83 INS39 INS42 INS43 INS8 INS29 INS83 INS39 INS42 INS43 INS8 INS83 INS43 INS42 INS8 INS83 INS43 INS42 INS8 INS42 INS42 INS43 INS43 INS42 INS42 INS42 INS25 INS21 INS21 INS21 INS65 INS65 INS43 INS42 INS60 INS60 INS60 INS60 INS60 INS60 INS60 INS60 INS70 INS25 INS65 INS43 INS42 INS43 INS42 MOV43 INS42 INS39 INS42 INS25 INS25 INS21 INS21 INS42 INS42 INS41 INS42 INS42 INS41 INS21 INS21 INS65 INS42 INS21 INS25 INS65 INS42 INS21 INS25 INS42 INS41 INS42 INS41 INS42 INS42 INS32 INS42 INS8 INS32 INS32 INS7 INS66 INS66 INS65 INS66 INS66 INS65 INS66 INS66 INS66 INS66 INS66 INS66 INS42 INS42 INS43 INS59 INS43 INS59 INS43 INS59 INS39 INS59 INS74 INS59 INS43 INS59 INS39 INS59 INS39 INS59 INS44 INS32 INS8 INS38 INS8 INS8 INS66 INS42 INS42 INS27 INS8 INS27 INS8 INS7 INS32 INS42 INS42 INS32 INS32 INS66 INS7 INS42 INS8 MOV8 INS66 INS7 INS42 INS8 INS8 INS32 INS32 UPD42 MOV42 MOV42 INS21 INS42 INS42 INS42 INS14 INS67 INS67 INS42 INS42 INS33 INS42 INS42 INS33 INS42 INS42 INS33 INS42 INS34 INS43 INS43 INS42 INS32 INS42 INS42 INS32 INS42 INS34 INS42 INS9 INS43 INS42 INS42 INS42 INS42 INS60 INS60 INS60 INS70 INS25 INS42 INS60 INS60 INS21 INS21 INS60 INS21 INS53 INS42 INS33 INS21 INS21 INS42 INS33 INS21 INS21 INS22 INS32 INS42 INS42 INS42 INS32 INS42 INS42 INS42 MOV32 INS25 MOV21 MOV21 INS42 INS32 INS25 MOV21 MOV21 INS25 INS42 INS42 INS42 INS42 INS32 UPD42 UPD42 MOV43 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS74 INS59 INS74 INS59 INS39 INS59 INS44 INS32 INS8 INS27 INS8 INS25 INS43 INS59 INS39 INS59 INS32 INS32 INS43 INS59 INS32 INS14 INS7 INS32 INS7 INS32 INS52 INS42 INS32 INS42 INS42 INS42 INS42 INS43 INS42 INS27 INS8 INS42 INS42 INS40 INS40 INS27 INS8 INS27 INS8 INS42 INS42 INS42 INS42 INS43 INS43 INS42 INS32 INS43 INS43 INS42 INS14 INS42 INS9 INS43 INS42 INS42 INS42 INS42 INS25 INS60 INS60 INS25 INS21 INS60 INS60 INS60 INS54 INS25 INS42 INS34 INS21 INS21 INS21 INS21 INS41 INS27 INS8 INS42 INS42 INS32 INS42 INS32 INS42 INS42 INS27 INS42 INS42 INS42 INS33 INS33 INS42 INS42 INS42 INS42 INS27 INS42 INS42 INS42 INS43 INS42 INS42 INS40 INS42 INS42 INS45 INS42 INS42 INS42 INS42 INS42 INS27 INS42 INS32 INS42 INS42 INS42 UPD42 INS42 INS33 INS21 INS42 INS33 INS21 INS42 INS33 INS21 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS74 INS42 INS27 INS8 INS8 INS43 INS59 INS43 INS59 INS27 INS8 INS7 INS43 INS59 INS39 INS59 INS43 INS59 INS8 INS12 INS38 INS8 INS32 INS32 INS7 INS32 INS42 INS34 INS60 INS53 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS45 INS45 INS45 INS42 INS45 INS45 INS45 INS42 INS42 INS45 INS45 INS32 INS42 INS42 INS42 INS7 INS7 INS32 INS43 INS27 INS38 INS21 INS21 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS33 INS18 INS42 INS9 INS42 INS42 INS32 INS42 INS32 INS42 INS42 INS33 INS21 INS44 INS8 INS32 INS25 INS42 INS42 INS27 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS22 INS42 INS42 INS42 INS27 INS42 INS42 INS32 INS42 INS43 INS59 INS14 INS32 INS42 INS42 INS42 INS32 INS42 INS32 INS42 INS42 INS42 INS42 INS33 INS32 INS7 INS7 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS7 INS43 INS42 INS21 INS18 INS42 INS42 INS27 INS8 INS8 INS45 INS45 INS52 INS42 INS45 INS45 INS42 INS42 INS42 INS42 INS42 INS27 INS43 INS42 INS14 INS42 INS42 INS42 INS42 INS42 INS52 INS42 INS42 INS42 INS42 INS32 MOV32 INS42 INS42 INS42 INS42 INS42 INS9 INS42 INS9 INS42 INS32 INS42 INS32 INS38 INS32 INS21 INS21 INS21 INS21 INS21 INS60 INS21 INS45 INS42 INS45 INS45 INS42 INS45 INS42 INS42 INS43 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS27 INS42 INS42 INS42 INS42 INS42 INS7 INS7 INS7 INS7 INS37 INS43 INS59 INS32 INS40 INS45 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS32 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS14 INS42 INS42 INS43 INS40 DEL42 DEL42 DEL32 DEL14 DEL7 DEL83 DEL42 DEL42 DEL42 DEL32 DEL21 DEL8 DEL25 DEL39 DEL42 DEL59 DEL60 DEL42 DEL42 DEL42 DEL42 DEL52 DEL42 DEL42 DEL42 DEL32 DEL42 DEL32 DEL7 DEL21 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL7 DEL21 DEL8 DEL25

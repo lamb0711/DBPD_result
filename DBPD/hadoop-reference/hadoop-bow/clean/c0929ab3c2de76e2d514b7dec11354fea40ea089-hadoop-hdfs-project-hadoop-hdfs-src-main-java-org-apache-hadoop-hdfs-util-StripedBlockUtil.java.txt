@@ -1,0 +1,219 @@
+HDFS-8319. Erasure Coding: support decoding for stateful read. Contributed by Jing Zhao.
+
++import java.nio.ByteBuffer;
+-    // TODO not considering missing blocks for now, only identify data blocks
+-      DFSClient.LOG.error("ExecutionException " + e);
++      DFSClient.LOG.warn("ExecutionException " + e);
+-    for (int i = 0; i < alignedStripe.chunks.length; i++) {
++    // read the full data aligned stripe
++    for (int i = 0; i < dataBlkNum; i++) {
+-        alignedStripe.chunks[i].offsetsInBuf.add(0);
+-        alignedStripe.chunks[i].lengthsInBuf.add((int) alignedStripe.getSpanInBlock());
++        alignedStripe.chunks[i].addByteArraySlice(0,
++            (int) alignedStripe.getSpanInBlock());
+-      if (chunk.state == StripingChunk.FETCHED) {
+-        int posInBuf = 0;
+-        for (int j = 0; j < chunk.offsetsInBuf.size(); j++) {
+-          System.arraycopy(chunk.buf, chunk.offsetsInBuf.get(j),
+-              decodeInputs[decodeIndex], posInBuf, chunk.lengthsInBuf.get(j));
+-          posInBuf += chunk.lengthsInBuf.get(j);
+-        }
+-      } else if (chunk.state == StripingChunk.ALLZERO) {
++      if (chunk != null && chunk.state == StripingChunk.FETCHED) {
++        chunk.copyTo(decodeInputs[decodeIndex]);
++      } else if (chunk != null && chunk.state == StripingChunk.ALLZERO) {
+-      byte[] buf, AlignedStripe alignedStripe, int dataBlkNum, int parityBlkNum,
++      AlignedStripe alignedStripe, int dataBlkNum, int parityBlkNum,
+-      if (alignedStripe.chunks[i].state == StripingChunk.MISSING){
++      if (alignedStripe.chunks[i] != null &&
++          alignedStripe.chunks[i].state == StripingChunk.MISSING){
+-        int srcPos = 0;
+-        for (int j = 0; j < chunk.offsetsInBuf.size(); j++) {
+-          System.arraycopy(decodeOutputs[i], srcPos, buf,
+-              chunk.offsetsInBuf.get(j), chunk.lengthsInBuf.get(j));
+-          srcPos += chunk.lengthsInBuf.get(j);
+-        }
++        chunk.copyFrom(decodeOutputs[i]);
++   * Similar functionality with {@link #divideByteRangeIntoStripes}, but is used
++   * by stateful read and uses ByteBuffer as reading target buffer. Besides the
++   * read range is within a single stripe thus the calculation logic is simpler.
++   */
++  public static AlignedStripe[] divideOneStripe(ECSchema ecSchema,
++      int cellSize, LocatedStripedBlock blockGroup, long rangeStartInBlockGroup,
++      long rangeEndInBlockGroup, ByteBuffer buf) {
++    final int dataBlkNum = ecSchema.getNumDataUnits();
++    // Step 1: map the byte range to StripingCells
++    StripingCell[] cells = getStripingCellsOfByteRange(ecSchema, cellSize,
++        blockGroup, rangeStartInBlockGroup, rangeEndInBlockGroup);
++
++    // Step 2: get the unmerged ranges on each internal block
++    VerticalRange[] ranges = getRangesForInternalBlocks(ecSchema, cellSize,
++        cells);
++
++    // Step 3: merge into stripes
++    AlignedStripe[] stripes = mergeRangesForInternalBlocks(ecSchema, ranges);
++
++    // Step 4: calculate each chunk's position in destination buffer. Since the
++    // whole read range is within a single stripe, the logic is simpler here.
++    int bufOffset = (int) (rangeStartInBlockGroup % (cellSize * dataBlkNum));
++    for (StripingCell cell : cells) {
++      long cellStart = cell.idxInInternalBlk * cellSize + cell.offset;
++      long cellEnd = cellStart + cell.size - 1;
++      for (AlignedStripe s : stripes) {
++        long stripeEnd = s.getOffsetInBlock() + s.getSpanInBlock() - 1;
++        long overlapStart = Math.max(cellStart, s.getOffsetInBlock());
++        long overlapEnd = Math.min(cellEnd, stripeEnd);
++        int overLapLen = (int) (overlapEnd - overlapStart + 1);
++        if (overLapLen > 0) {
++          Preconditions.checkState(s.chunks[cell.idxInStripe] == null);
++          final int pos = (int) (bufOffset + overlapStart - cellStart);
++          buf.position(pos);
++          buf.limit(pos + overLapLen);
++          s.chunks[cell.idxInStripe] = new StripingChunk(buf.slice());
++        }
++      }
++      bufOffset += cell.size;
++    }
++
++    // Step 5: prepare ALLZERO blocks
++    prepareAllZeroChunks(blockGroup, stripes, cellSize, dataBlkNum);
++    return stripes;
++  }
++
++  /**
+-    int dataBlkNum = ecSchema.getNumDataUnits();
++    final int dataBlkNum = ecSchema.getNumDataUnits();
+-    prepareAllZeroChunks(blockGroup, buf, stripes, cellSize, dataBlkNum);
++    prepareAllZeroChunks(blockGroup, stripes, cellSize, dataBlkNum);
+-    int len = (int) (rangeEndInBlockGroup - rangeStartInBlockGroup + 1);
++    long len = rangeEndInBlockGroup - rangeStartInBlockGroup + 1;
+-    cells[0] = new StripingCell(ecSchema, cellSize, firstCellIdxInBG);
+-    cells[numCells - 1] = new StripingCell(ecSchema, cellSize, lastCellIdxInBG);
+-    cells[0].offset = (int) (rangeStartInBlockGroup % cellSize);
+-    cells[0].size =
+-        Math.min(cellSize - (int) (rangeStartInBlockGroup % cellSize), len);
++    final int firstCellOffset = (int) (rangeStartInBlockGroup % cellSize);
++    final int firstCellSize =
++        (int) Math.min(cellSize - (rangeStartInBlockGroup % cellSize), len);
++    cells[0] = new StripingCell(ecSchema, firstCellSize, firstCellIdxInBG,
++        firstCellOffset);
+-      cells[numCells - 1].size = (int) (rangeEndInBlockGroup % cellSize) + 1;
++      final int lastCellSize = (int) (rangeEndInBlockGroup % cellSize) + 1;
++      cells[numCells - 1] = new StripingCell(ecSchema, lastCellSize,
++          lastCellIdxInBG, 0);
+-      cells[i] = new StripingCell(ecSchema, cellSize, i + firstCellIdxInBG);
++      cells[i] = new StripingCell(ecSchema, cellSize, i + firstCellIdxInBG, 0);
+-    StripingCell firstCell = new StripingCell(ecSchema, cellSize, firstCellIdxInBG);
+-    firstCell.offset = (int) (rangeStartInBlockGroup % cellSize);
++    StripingCell firstCell = new StripingCell(ecSchema, cellSize,
++        firstCellIdxInBG, (int) (rangeStartInBlockGroup % cellSize));
+-      StripingCell cell = new StripingCell(ecSchema, cellSize, idx);
++      StripingCell cell = new StripingCell(ecSchema, cellSize, idx, 0);
+-
+-        s.chunks[cell.idxInStripe].offsetsInBuf.
+-            add((int)(offsetInBuf + done + overlapStart - cellStart));
+-        s.chunks[cell.idxInStripe].lengthsInBuf.add(overLapLen);
++        s.chunks[cell.idxInStripe].addByteArraySlice(
++            (int)(offsetInBuf + done + overlapStart - cellStart), overLapLen);
+-      byte[] buf, AlignedStripe[] stripes, int cellSize, int dataBlkNum) {
++      AlignedStripe[] stripes, int cellSize, int dataBlkNum) {
+-          s.chunks[i] = new StripingChunk(buf);
+-          s.chunks[i].state = StripingChunk.ALLZERO;
++          s.chunks[i] = new StripingChunk(); // chunk state is set to ALLZERO
+-    public final ECSchema schema;
++    final ECSchema schema;
+-    int offset;
+-    int size;
++    final int offset;
++    final int size;
+-    StripingCell(ECSchema ecSchema, int cellSize, int idxInBlkGroup) {
++    StripingCell(ECSchema ecSchema, int cellSize, int idxInBlkGroup,
++        int offset) {
+-      this.offset = 0;
+-      this.size = cellSize;
+-    }
+-
+-    StripingCell(ECSchema ecSchema, int cellSize, int idxInInternalBlk,
+-        int idxInStripe) {
+-      this.schema = ecSchema;
+-      this.idxInInternalBlk = idxInInternalBlk;
+-      this.idxInStripe = idxInStripe;
+-      this.idxInBlkGroup =
+-          idxInInternalBlk * ecSchema.getNumDataUnits() + idxInStripe;
+-      this.offset = 0;
++      this.offset = offset;
+-    public AlignedStripe(VerticalRange range, int width) {
+-      this.range = range;
+-      this.chunks = new StripingChunk[width];
+-    }
+-
+-   *
+-   * The class also carries {@link #buf}, {@link #offsetsInBuf}, and
+-   * {@link #lengthsInBuf} to define how read task for this chunk should
+-   * deliver the returned data.
+-    public byte[] buf;
+-    public List<Integer> offsetsInBuf;
+-    public List<Integer> lengthsInBuf;
++
++    public final ChunkByteArray byteArray;
++    public final ByteBuffer byteBuffer;
++      this.byteArray = new ChunkByteArray(buf);
++      byteBuffer = null;
++    }
++
++    public StripingChunk(ByteBuffer buf) {
++      this.byteArray = null;
++      this.byteBuffer = buf;
++    }
++
++    public StripingChunk() {
++      this.byteArray = null;
++      this.byteBuffer = null;
++      this.state = ALLZERO;
++    }
++
++    public void addByteArraySlice(int offset, int length) {
++      assert byteArray != null;
++      byteArray.offsetsInBuf.add(offset);
++      byteArray.lengthsInBuf.add(length);
++    }
++
++    void copyTo(byte[] target) {
++      assert byteArray != null;
++      byteArray.copyTo(target);
++    }
++
++    void copyFrom(byte[] src) {
++      assert byteArray != null;
++      byteArray.copyFrom(src);
++    }
++  }
++
++  public static class ChunkByteArray {
++    private final byte[] buf;
++    private final List<Integer> offsetsInBuf;
++    private final List<Integer> lengthsInBuf;
++
++    ChunkByteArray(byte[] buf) {
++
++    public byte[] buf() {
++      return buf;
++    }
++
++    void copyTo(byte[] target) {
++      int posInBuf = 0;
++      for (int i = 0; i < offsetsInBuf.size(); i++) {
++        System.arraycopy(buf, offsetsInBuf.get(i),
++            target, posInBuf, lengthsInBuf.get(i));
++        posInBuf += lengthsInBuf.get(i);
++      }
++    }
++
++    void copyFrom(byte[] src) {
++      int srcPos = 0;
++      for (int j = 0; j < offsetsInBuf.size(); j++) {
++        System.arraycopy(src, srcPos, buf, offsetsInBuf.get(j),
++            lengthsInBuf.get(j));
++        srcPos += lengthsInBuf.get(j);
++      }
++    }

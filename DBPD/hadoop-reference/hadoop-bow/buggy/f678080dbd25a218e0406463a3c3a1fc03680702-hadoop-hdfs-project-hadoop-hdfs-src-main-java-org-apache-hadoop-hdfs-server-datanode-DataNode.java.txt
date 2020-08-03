@@ -1,0 +1,132 @@
+HDFS-11182. Update DataNode to use DatasetVolumeChecker. Contributed by Arpit Agarwal.
+
++import java.util.HashSet;
+-import java.util.concurrent.ThreadLocalRandom;
++import org.apache.hadoop.hdfs.server.datanode.checker.DatasetVolumeChecker;
+-  private Thread checkDiskErrorThread = null;
+-  protected final int checkDiskErrorInterval;
+-  private boolean checkDiskErrorFlag = false;
+-  private Object checkDiskErrorMutex = new Object();
+-  private long lastDiskErrorCheck;
++  private volatile long lastDiskErrorCheck;
++  private final DatasetVolumeChecker volumeChecker;
+-  DataNode(final Configuration conf) {
++  DataNode(final Configuration conf) throws DiskErrorException {
+-    this.checkDiskErrorInterval =
+-        ThreadLocalRandom.current().nextInt(5000, (int) (5000 * 1.25));
++    volumeChecker = new DatasetVolumeChecker(conf, new Timer());
+-    this.checkDiskErrorInterval =
+-        ThreadLocalRandom.current().nextInt(5000, (int) (5000 * 1.25));
++    this.volumeChecker = new DatasetVolumeChecker(conf, new Timer());
+-    // Interrupt the checkDiskErrorThread and terminate it.
+-    if(this.checkDiskErrorThread != null) {
+-      this.checkDiskErrorThread.interrupt();
+-    }
+-    
++    volumeChecker.shutdownAndWait(1, TimeUnit.SECONDS);
++
+-    synchronized(checkDiskErrorMutex) {
+-      checkDiskErrorFlag = true;
+-      if(checkDiskErrorThread == null) {
+-        startCheckDiskErrorThread();
+-        checkDiskErrorThread.start();
+-        LOG.info("Starting CheckDiskError Thread");
+-      }
+-    }
++    volumeChecker.checkAllVolumesAsync(
++        data, (healthyVolumes, failedVolumes) -> {
++          if (failedVolumes.size() > 0) {
++            LOG.warn("checkDiskErrorAsync callback got {} failed volumes: {}",
++                failedVolumes.size(), failedVolumes);
++          } else {
++            LOG.debug("checkDiskErrorAsync: no volume failures detected");
++          }
++          lastDiskErrorCheck = Time.monotonicNow();
++          handleVolumeFailures(failedVolumes);
++        });
+-  
++
+-   * Check the disk error
++   * Check the disk error synchronously.
+-  private void checkDiskError() {
+-    Set<StorageLocation> unhealthyLocations = data.checkDataDir();
+-    if (unhealthyLocations != null && !unhealthyLocations.isEmpty()) {
++  @VisibleForTesting
++  public void checkDiskError() throws IOException {
++    Set<FsVolumeSpi> unhealthyVolumes;
++    try {
++      unhealthyVolumes = volumeChecker.checkAllVolumes(data);
++      lastDiskErrorCheck = Time.monotonicNow();
++    } catch (InterruptedException e) {
++      LOG.error("Interruped while running disk check", e);
++      throw new IOException("Interrupted while running disk check", e);
++    }
++
++    if (unhealthyVolumes.size() > 0) {
++      LOG.warn("checkDiskError got {} failed volumes - {}",
++          unhealthyVolumes.size(), unhealthyVolumes);
++      handleVolumeFailures(unhealthyVolumes);
++    } else {
++      LOG.debug("checkDiskError encountered no failures");
++    }
++  }
++
++  private void handleVolumeFailures(Set<FsVolumeSpi> unhealthyVolumes) {
++    data.handleVolumeFailures(unhealthyVolumes);
++    Set<StorageLocation> unhealthyLocations = new HashSet<>(
++        unhealthyVolumes.size());
++
++    if (!unhealthyVolumes.isEmpty()) {
++      StringBuilder sb = new StringBuilder("DataNode failed volumes:");
++      for (FsVolumeSpi vol : unhealthyVolumes) {
++        unhealthyLocations.add(vol.getStorageLocation());
++        sb.append(vol.getStorageLocation()).append(";");
++      }
++
+-      StringBuilder sb = new StringBuilder("DataNode failed volumes:");
+-      for (StorageLocation location : unhealthyLocations) {
+-        sb.append(location + ";");
+-      }
++      LOG.info(sb.toString());
+-  /**
+-   * Starts a new thread which will check for disk error check request 
+-   * every 5 sec
+-   */
+-  private void startCheckDiskErrorThread() {
+-    checkDiskErrorThread = new Thread(new Runnable() {
+-          @Override
+-          public void run() {
+-            while(shouldRun) {
+-              boolean tempFlag ;
+-              synchronized(checkDiskErrorMutex) {
+-                tempFlag = checkDiskErrorFlag;
+-                checkDiskErrorFlag = false;
+-              }
+-              if(tempFlag) {
+-                try {
+-                  checkDiskError();
+-                } catch (Exception e) {
+-                  LOG.warn("Unexpected exception occurred while checking disk error  " + e);
+-                  checkDiskErrorThread = null;
+-                  return;
+-                }
+-                synchronized(checkDiskErrorMutex) {
+-                  lastDiskErrorCheck = Time.monotonicNow();
+-                }
+-              }
+-              try {
+-                Thread.sleep(checkDiskErrorInterval);
+-              } catch (InterruptedException e) {
+-                LOG.debug("InterruptedException in check disk error thread", e);
+-                checkDiskErrorThread = null;
+-                return;
+-              }
+-            }
+-          }
+-    });
+-  }
+-  
+-    synchronized(checkDiskErrorMutex) {
+-      return lastDiskErrorCheck;
+-    }
++    return lastDiskErrorCheck;

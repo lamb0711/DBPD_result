@@ -1,0 +1,173 @@
+Merge trunk into the HDFS-347 branch.
+
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/branches/HDFS-347@1467511 13f79535-47bb-0310-9956-ffa450edef68
+
++import java.util.concurrent.atomic.AtomicLong;
++import org.apache.hadoop.conf.Configuration;
+-import org.apache.hadoop.yarn.server.nodemanager.containermanager.localizer.event.ResourceEventType;
++import org.apache.hadoop.yarn.server.nodemanager.containermanager.localizer.event.ResourceReleaseEvent;
++
++  private Configuration conf;
++  /*
++   * This flag controls whether this resource tracker uses hierarchical
++   * directories or not. For PRIVATE and PUBLIC resource trackers it
++   * will be set whereas for APPLICATION resource tracker it would
++   * be false.
++   */
++  private final boolean useLocalCacheDirectoryManager;
++  private ConcurrentHashMap<Path, LocalCacheDirectoryManager> directoryManagers;
++  /*
++   * It is used to keep track of resource into hierarchical directory
++   * while it is getting downloaded. It is useful for reference counting
++   * in case resource localization fails.
++   */
++  private ConcurrentHashMap<LocalResourceRequest, Path>
++    inProgressLocalResourcesMap;
++  /*
++   * starting with 10 to accommodate 0-9 directories created as a part of
++   * LocalCacheDirectoryManager. So there will be one unique number generator
++   * per APPLICATION, USER and PUBLIC cache.
++   */
++  private AtomicLong uniqueNumberGenerator = new AtomicLong(9);
+-  public LocalResourcesTrackerImpl(String user, Dispatcher dispatcher) {
++  public LocalResourcesTrackerImpl(String user, Dispatcher dispatcher,
++      boolean useLocalCacheDirectoryManager, Configuration conf) {
+-        new ConcurrentHashMap<LocalResourceRequest,LocalizedResource>());
++      new ConcurrentHashMap<LocalResourceRequest, LocalizedResource>(),
++      useLocalCacheDirectoryManager, conf);
+-      ConcurrentMap<LocalResourceRequest,LocalizedResource> localrsrc) {
++      ConcurrentMap<LocalResourceRequest,LocalizedResource> localrsrc,
++      boolean useLocalCacheDirectoryManager, Configuration conf) {
++    this.useLocalCacheDirectoryManager = useLocalCacheDirectoryManager;
++    if ( this.useLocalCacheDirectoryManager) {
++      directoryManagers = new ConcurrentHashMap<Path, LocalCacheDirectoryManager>();
++      inProgressLocalResourcesMap =
++        new ConcurrentHashMap<LocalResourceRequest, Path>();
++    }
++    this.conf = conf;
++  /*
++   * Synchronizing this method for avoiding races due to multiple ResourceEvent's
++   * coming to LocalResourcesTracker from Public/Private localizer and
++   * Resource Localization Service.
++   */
+-  public void handle(ResourceEvent event) {
++  public synchronized void handle(ResourceEvent event) {
+-    case REQUEST:
++      if (useLocalCacheDirectoryManager) {
++        inProgressLocalResourcesMap.remove(req);
++      }
++      break;
++    case REQUEST:
++        decrementFileCountForLocalCacheDirectory(req, rsrc);
+-        LOG.info("Release unknown rsrc null (discard)");
++        // The container sent a release event on a resource which 
++        // 1) Failed
++        // 2) Removed for some reason (ex. disk is no longer accessible)
++        ResourceReleaseEvent relEvent = (ResourceReleaseEvent) event;
++        LOG.info("Container " + relEvent.getContainer()
++            + " sent RELEASE event on a resource request " + req
++            + " not present in cache.");
++    case LOCALIZATION_FAILED:
++      decrementFileCountForLocalCacheDirectory(req, null);
++      /*
++       * If resource localization fails then Localized resource will be
++       * removed from local cache.
++       */
++      localrsrc.remove(req);
++      break;
+-  /**
++  /*
++   * Update the file-count statistics for a local cache-directory.
++   * This will retrieve the localized path for the resource from
++   * 1) inProgressRsrcMap if the resource was under localization and it
++   * failed.
++   * 2) LocalizedResource if the resource is already localized.
++   * From this path it will identify the local directory under which the
++   * resource was localized. Then rest of the path will be used to decrement
++   * file count for the HierarchicalSubDirectory pointing to this relative
++   * path.
++   */
++  private void decrementFileCountForLocalCacheDirectory(LocalResourceRequest req,
++      LocalizedResource rsrc) {
++    if ( useLocalCacheDirectoryManager) {
++      Path rsrcPath = null;
++      if (inProgressLocalResourcesMap.containsKey(req)) {
++        // This happens when localization of a resource fails.
++        rsrcPath = inProgressLocalResourcesMap.remove(req);
++      } else if (rsrc != null && rsrc.getLocalPath() != null) {
++        rsrcPath = rsrc.getLocalPath().getParent().getParent();
++      }
++      if (rsrcPath != null) {
++        Path parentPath = new Path(rsrcPath.toUri().getRawPath());
++        while (!directoryManagers.containsKey(parentPath)) {
++          parentPath = parentPath.getParent();
++          if ( parentPath == null) {
++            return;
++          }
++        }
++        if ( parentPath != null) {
++          String parentDir = parentPath.toUri().getRawPath().toString();
++          LocalCacheDirectoryManager dir = directoryManagers.get(parentPath);
++          String rsrcDir = rsrcPath.toUri().getRawPath(); 
++          if (rsrcDir.equals(parentDir)) {
++            dir.decrementFileCountForPath("");
++          } else {
++            dir.decrementFileCountForPath(
++              rsrcDir.substring(
++              parentDir.length() + 1));
++          }
++        }
++      }
++    }
++  }
++
++/**
+-      File file = new File(rsrc.getLocalPath().toUri().getRawPath().toString());
++      File file = new File(rsrc.getLocalPath().toUri().getRawPath().
++        toString());
++      decrementFileCountForLocalCacheDirectory(rem.getRequest(), rsrc);
+-
+-}
++
++  /**
++   * @return {@link Path} absolute path for localization which includes local
++   *         directory path and the relative hierarchical path (if use local
++   *         cache directory manager is enabled)
++   * 
++   * @param {@link LocalResourceRequest} Resource localization request to
++   *        localize the resource.
++   * @param {@link Path} local directory path
++   */
++  @Override
++  public Path
++      getPathForLocalization(LocalResourceRequest req, Path localDirPath) {
++    if (useLocalCacheDirectoryManager && localDirPath != null) {
++
++      if (!directoryManagers.containsKey(localDirPath)) {
++        directoryManagers.putIfAbsent(localDirPath,
++          new LocalCacheDirectoryManager(conf));
++      }
++      LocalCacheDirectoryManager dir = directoryManagers.get(localDirPath);
++
++      Path rPath = localDirPath;
++      String hierarchicalPath = dir.getRelativePathForLocalization();
++      // For most of the scenarios we will get root path only which
++      // is an empty string
++      if (!hierarchicalPath.isEmpty()) {
++        rPath = new Path(localDirPath, hierarchicalPath);
++      }
++      inProgressLocalResourcesMap.put(req, rPath);
++      return rPath;
++    } else {
++      return localDirPath;
++    }
++  }
++
++  @Override
++  public long nextUniqueNumber() {
++    return uniqueNumberGenerator.incrementAndGet();
++  }
++}
+
+INS26 INS26 INS40 INS40 UPD40 INS23 INS23 INS23 INS23 INS23 INS31 INS31 INS31 INS83 INS43 INS59 INS83 INS83 INS39 INS59 INS83 INS74 INS59 INS83 INS74 INS59 INS83 INS43 INS59 INS44 INS44 INS44 INS44 INS83 INS83 INS39 INS42 INS44 INS44 INS8 INS29 INS78 INS83 INS43 INS42 INS44 INS44 INS8 INS78 INS83 INS39 INS42 INS8 INS42 INS42 INS42 INS43 INS43 INS43 INS42 INS43 INS43 INS43 INS42 INS42 INS42 INS14 INS39 INS42 INS43 INS42 INS39 INS42 INS43 INS42 INS21 INS25 INS21 MOV49 MOV10 INS43 INS42 INS43 INS42 INS25 INS65 INS65 INS65 INS42 INS42 INS43 INS42 INS43 INS42 INS25 INS42 INS41 INS42 INS42 INS42 INS42 INS42 INS42 INS43 INS34 INS42 INS42 INS42 INS42 INS7 INS22 INS8 INS7 INS25 INS10 INS49 INS21 INS21 INS10 INS42 INS42 INS42 INS8 INS66 INS65 INS66 INS66 INS66 INS66 INS65 INS66 INS66 INS66 INS65 INS66 INS42 INS42 INS27 INS8 INS8 INS32 INS42 INS22 INS42 INS52 INS42 INS21 INS21 INS22 INS42 INS42 INS8 INS42 INS32 INS32 INS60 INS25 INS25 INS21 INS42 INS42 INS42 INS42 INS27 INS25 INS60 INS60 INS60 INS25 INS21 INS41 INS41 INS42 INS42 INS52 INS42 INS7 INS7 INS52 INS42 INS21 INS21 INS60 INS42 INS42 INS33 INS42 INS42 INS42 INS43 INS59 INS32 INS8 INS25 INS27 INS8 INS32 INS42 INS33 INS38 INS8 INS43 INS59 INS43 INS59 INS43 INS59 INS38 INS8 INS32 INS42 INS42 INS42 INS14 INS42 INS14 INS32 INS32 INS43 INS59 INS42 INS42 INS33 INS42 INS42 INS42 INS21 INS27 INS8 INS42 INS33 INS60 INS61 INS25 INS42 INS32 INS42 INS32 INS21 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS32 INS32 INS21 INS42 INS42 INS42 INS42 INS74 INS74 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS11 INS27 INS7 INS27 INS27 INS21 INS43 INS59 INS38 INS8 INS27 INS8 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS7 INS43 INS43 INS43 INS43 INS43 INS43 INS43 INS42 INS45 INS32 INS45 INS42 INS45 INS42 INS32 INS42 INS33 INS32 INS33 INS7 INS42 INS42 INS14 INS32 INS21 INS25 INS42 INS33 INS60 INS60 INS60 INS25 INS42 INS42 INS42 INS14 INS42 INS14 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS43 INS32 INS42 INS42 INS42 INS7 INS27 INS8 INS43 INS59 INS43 INS59 INS43 INS59 INS32 INS8 INS8 INS43 INS42 INS43 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS33 INS41 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS42 INS21 INS21 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS32 INS42 INS32 INS32 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS45 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS27 INS32 INS34 INS42 INS42 DEL45

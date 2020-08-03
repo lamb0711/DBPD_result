@@ -1,0 +1,268 @@
+HDDS-360. Use RocksDBStore and TableStore for SCM Metadata.
+Contributed by Anu Engineer.
+
+-import com.google.common.annotations.VisibleForTesting;
+-import com.google.common.primitives.Longs;
+-import org.apache.hadoop.conf.Configuration;
+-import org.apache.hadoop.hdds.protocol.DatanodeDetails;
+-import org.apache.hadoop.hdds.protocol.proto
+-    .StorageContainerDatanodeProtocolProtos.ContainerBlocksDeletionACKProto;
+-import org.apache.hadoop.hdds.protocol.proto
+-    .StorageContainerDatanodeProtocolProtos.ContainerBlocksDeletionACKProto
+-    .DeleteBlockTransactionResult;
+-import org.apache.hadoop.hdds.scm.command
+-    .CommandStatusReportHandler.DeleteBlockStatus;
+-import org.apache.hadoop.hdds.scm.container.ContainerID;
+-import org.apache.hadoop.hdds.scm.container.ContainerInfo;
+-import org.apache.hadoop.hdds.scm.container.ContainerManager;
+-import org.apache.hadoop.hdds.scm.container.ContainerReplica;
+-import org.apache.hadoop.hdds.server.ServerUtils;
+-import org.apache.hadoop.hdds.server.events.EventHandler;
+-import org.apache.hadoop.hdds.server.events.EventPublisher;
+-import org.apache.hadoop.hdfs.DFSUtil;
+-import org.apache.hadoop.hdds.protocol.proto
+-    .StorageContainerDatanodeProtocolProtos.DeletedBlocksTransaction;
+-import org.apache.hadoop.ozone.OzoneConsts;
+-import org.apache.hadoop.utils.BatchOperation;
+-import org.apache.hadoop.utils.MetadataStore;
+-import org.apache.hadoop.utils.MetadataStoreBuilder;
+-import org.eclipse.jetty.util.ConcurrentHashSet;
+-import org.slf4j.Logger;
+-import org.slf4j.LoggerFactory;
+-
+-import java.io.File;
+-import java.util.Arrays;
++import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.hdds.protocol.DatanodeDetails;
++import org.apache.hadoop.hdds.protocol.proto.StorageContainerDatanodeProtocolProtos.ContainerBlocksDeletionACKProto;
++import org.apache.hadoop.hdds.protocol.proto.StorageContainerDatanodeProtocolProtos.ContainerBlocksDeletionACKProto.DeleteBlockTransactionResult;
++import org.apache.hadoop.hdds.protocol.proto.StorageContainerDatanodeProtocolProtos.DeletedBlocksTransaction;
++import org.apache.hadoop.hdds.scm.command.CommandStatusReportHandler.DeleteBlockStatus;
++import org.apache.hadoop.hdds.scm.container.ContainerID;
++import org.apache.hadoop.hdds.scm.container.ContainerInfo;
++import org.apache.hadoop.hdds.scm.container.ContainerManager;
++import org.apache.hadoop.hdds.scm.container.ContainerReplica;
++import org.apache.hadoop.hdds.scm.metadata.SCMMetadataStore;
++import org.apache.hadoop.hdds.server.events.EventHandler;
++import org.apache.hadoop.hdds.server.events.EventPublisher;
++import org.apache.hadoop.utils.db.BatchOperation;
++import org.apache.hadoop.utils.db.Table;
++import org.apache.hadoop.utils.db.TableIterator;
++import org.eclipse.jetty.util.ConcurrentHashSet;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
+-import static org.apache.hadoop.hdds.scm.ScmConfigKeys
+-    .OZONE_SCM_BLOCK_DELETION_MAX_RETRY;
+-import static org.apache.hadoop.hdds.scm.ScmConfigKeys
+-    .OZONE_SCM_BLOCK_DELETION_MAX_RETRY_DEFAULT;
+-import static org.apache.hadoop.hdds.scm.ScmConfigKeys
+-    .OZONE_SCM_DB_CACHE_SIZE_DEFAULT;
+-import static org.apache.hadoop.hdds.scm.ScmConfigKeys
+-    .OZONE_SCM_DB_CACHE_SIZE_MB;
+-import static org.apache.hadoop.ozone.OzoneConsts.DELETED_BLOCK_DB;
++import static org.apache.hadoop.hdds.scm.ScmConfigKeys.OZONE_SCM_BLOCK_DELETION_MAX_RETRY;
++import static org.apache.hadoop.hdds.scm.ScmConfigKeys.OZONE_SCM_BLOCK_DELETION_MAX_RETRY_DEFAULT;
+-  private static final byte[] LATEST_TXID =
+-      DFSUtil.string2Bytes("#LATEST_TXID#");
+-
+-  private final MetadataStore deletedStore;
++  private final SCMMetadataStore scmMetadataStore;
+-  // The latest id of deleted blocks in the db.
+-  private long lastTxID;
+-      ContainerManager containerManager) throws IOException {
++                             ContainerManager containerManager,
++                             SCMMetadataStore scmMetadataStore) {
+-
+-    final File metaDir = ServerUtils.getScmDbDir(conf);
+-    final String scmMetaDataDir = metaDir.getPath();
+-    final File deletedLogDbPath = new File(scmMetaDataDir, DELETED_BLOCK_DB);
+-    final int cacheSize = conf.getInt(OZONE_SCM_DB_CACHE_SIZE_MB,
+-        OZONE_SCM_DB_CACHE_SIZE_DEFAULT);
+-    // Load store of all transactions.
+-    deletedStore = MetadataStoreBuilder.newBuilder()
+-        .setCreateIfMissing(true)
+-        .setConf(conf)
+-        .setDbFile(deletedLogDbPath)
+-        .setCacheSize(cacheSize * OzoneConsts.MB)
+-        .build();
+-
++    this.scmMetadataStore = scmMetadataStore;
+-    // start from the head of deleted store.
+-    lastTxID = findLatestTxIDInStore();
+-  @VisibleForTesting
+-  public MetadataStore getDeletedStore() {
+-    return deletedStore;
+-  }
+-
+-  /**
+-   * There is no need to lock before reading because
+-   * it's only used in construct method.
+-   *
+-   * @return latest txid.
+-   * @throws IOException
+-   */
+-  private long findLatestTxIDInStore() throws IOException {
+-    long txid = 0;
+-    byte[] value = deletedStore.get(LATEST_TXID);
+-    if (value != null) {
+-      txid = Longs.fromByteArray(value);
+-    }
+-    return txid;
+-  }
+-      deletedStore.iterate(null, (key, value) -> {
+-        if (!Arrays.equals(LATEST_TXID, key)) {
+-          DeletedBlocksTransaction delTX =
+-              DeletedBlocksTransaction.parseFrom(value);
++      try (TableIterator<Long,
++          ? extends Table.KeyValue<Long, DeletedBlocksTransaction>> iter =
++               scmMetadataStore.getDeletedBlocksTXTable().iterator()) {
++        while (iter.hasNext()) {
++          DeletedBlocksTransaction delTX = iter.next().getValue();
+-        return true;
+-      });
++      }
+-    BatchOperation batch = new BatchOperation();
+-    lock.lock();
+-    try {
+-      for(Long txID : txIDs) {
+-        try {
+-          byte[] deleteBlockBytes =
+-              deletedStore.get(Longs.toByteArray(txID));
+-          if (deleteBlockBytes == null) {
+-            LOG.warn("Delete txID {} not found", txID);
+-            continue;
+-          }
+-          DeletedBlocksTransaction block = DeletedBlocksTransaction
+-              .parseFrom(deleteBlockBytes);
+-          DeletedBlocksTransaction.Builder builder = block.toBuilder();
+-          int currentCount = block.getCount();
+-          if (currentCount > -1) {
+-            builder.setCount(++currentCount);
+-          }
+-          // if the retry time exceeds the maxRetry value
+-          // then set the retry value to -1, stop retrying, admins can
+-          // analyze those blocks and purge them manually by SCMCli.
+-          if (currentCount > maxRetry) {
+-            builder.setCount(-1);
+-          }
+-          deletedStore.put(Longs.toByteArray(txID),
+-              builder.build().toByteArray());
+-        } catch (IOException ex) {
+-          LOG.warn("Cannot increase count for txID " + txID, ex);
++    for (Long txID : txIDs) {
++      lock.lock();
++      try {
++        DeletedBlocksTransaction block =
++            scmMetadataStore.getDeletedBlocksTXTable().get(txID);
++        if (block == null) {
++          // Should we make this an error ? How can we not find the deleted
++          // TXID?
++          LOG.warn("Deleted TXID not found.");
++          continue;
++        DeletedBlocksTransaction.Builder builder = block.toBuilder();
++        int currentCount = block.getCount();
++        if (currentCount > -1) {
++          builder.setCount(++currentCount);
++        }
++        // if the retry time exceeds the maxRetry value
++        // then set the retry value to -1, stop retrying, admins can
++        // analyze those blocks and purge them manually by SCMCli.
++        if (currentCount > maxRetry) {
++          builder.setCount(-1);
++        }
++        scmMetadataStore.getDeletedBlocksTXTable().put(txID,
++            builder.build());
++      } catch (IOException ex) {
++        LOG.warn("Cannot increase count for txID " + txID, ex);
++        // We do not throw error here, since we don't want to abort the loop.
++        // Just log and continue processing the rest of txids.
++      } finally {
++        lock.unlock();
+-      deletedStore.writeBatch(batch);
+-    } finally {
+-      lock.unlock();
++
+-      long containerID, List<Long> blocks) {
++                                                           long containerID,
++                                                           List<Long> blocks) {
+-   * @param dnID - Id of Datanode which has acknowledged a delete block command.
++   * @param dnID               - Id of Datanode which has acknowledged
++   *                           a delete block command.
+-          final ContainerInfo container = containerManager
+-              .getContainer(containerId);
++          final ContainerInfo container =
++              containerManager.getContainer(containerId);
+-              deletedStore.delete(Longs.toByteArray(txID));
++              scmMetadataStore.getDeletedBlocksTXTable().delete(txID);
+-   * @param blocks - blocks that belong to the same container.
++   * @param blocks      - blocks that belong to the same container.
+-    BatchOperation batch = new BatchOperation();
+-      DeletedBlocksTransaction tx = constructNewTransaction(lastTxID + 1,
+-          containerID, blocks);
+-      byte[] key = Longs.toByteArray(lastTxID + 1);
+-
+-      batch.put(key, tx.toByteArray());
+-      batch.put(LATEST_TXID, Longs.toByteArray(lastTxID + 1));
+-
+-      deletedStore.writeBatch(batch);
+-      lastTxID += 1;
++      Long nextTXID = scmMetadataStore.getNextDeleteBlockTXID();
++      DeletedBlocksTransaction tx =
++          constructNewTransaction(nextTXID, containerID, blocks);
++      scmMetadataStore.getDeletedBlocksTXTable().put(nextTXID, tx);
+-      deletedStore.iterate(null, (key, value) -> {
+-        // Exclude latest txid record
+-        if (!Arrays.equals(LATEST_TXID, key)) {
+-          DeletedBlocksTransaction delTX =
+-              DeletedBlocksTransaction.parseFrom(value);
++      try (TableIterator<Long,
++          ? extends Table.KeyValue<Long, DeletedBlocksTransaction>> iter =
++               scmMetadataStore.getDeletedBlocksTXTable().iterator()) {
++        while (iter.hasNext()) {
++          DeletedBlocksTransaction delTX = iter.next().getValue();
+-        return true;
+-      });
++      }
+-  public void addTransactions(
+-      Map<Long, List<Long>> containerBlocksMap)
++  public void addTransactions(Map<Long, List<Long>> containerBlocksMap)
+-    BatchOperation batch = new BatchOperation();
+-      long currentLatestID = lastTxID;
+-      for (Map.Entry<Long, List<Long>> entry :
+-          containerBlocksMap.entrySet()) {
+-        currentLatestID += 1;
+-        byte[] key = Longs.toByteArray(currentLatestID);
+-        DeletedBlocksTransaction tx = constructNewTransaction(currentLatestID,
++      BatchOperation batch = scmMetadataStore.getStore().initBatchOperation();
++      for (Map.Entry<Long, List<Long>> entry : containerBlocksMap.entrySet()) {
++        long nextTXID = scmMetadataStore.getNextDeleteBlockTXID();
++        DeletedBlocksTransaction tx = constructNewTransaction(nextTXID,
+-        batch.put(key, tx.toByteArray());
++        scmMetadataStore.getDeletedBlocksTXTable().putWithBatch(batch,
++            nextTXID, tx);
+-      lastTxID = currentLatestID;
+-      batch.put(LATEST_TXID, Longs.toByteArray(lastTxID));
+-      deletedStore.writeBatch(batch);
++      scmMetadataStore.getStore().commitBatchOperation(batch);
+-    if (deletedStore != null) {
+-      deletedStore.close();
+-    }
+-      deletedStore.iterate(null, (key, value) -> {
+-        if (!Arrays.equals(LATEST_TXID, key)) {
+-          DeletedBlocksTransaction block = DeletedBlocksTransaction
+-              .parseFrom(value);
+-
++      try (TableIterator<Long,
++          ? extends Table.KeyValue<Long, DeletedBlocksTransaction>> iter =
++               scmMetadataStore.getDeletedBlocksTXTable().iterator()) {
++        while (iter.hasNext()) {
++          Table.KeyValue<Long, DeletedBlocksTransaction> keyValue = iter.next();
++          DeletedBlocksTransaction block = keyValue.getValue();
+-          return !transactions.isFull();
+-        return true;
+-      });
++      }
+-      EventPublisher publisher) {
++                        EventPublisher publisher) {
+
+MOV26 MOV26 MOV26 MOV26 MOV26 MOV26 MOV26 MOV26 MOV26 MOV26 MOV26 MOV26 MOV23 UPD40 UPD40 UPD40 UPD40 UPD43 INS44 INS8 MOV8 INS8 INS8 UPD42 UPD42 INS43 INS42 MOV21 MOV21 MOV21 MOV21 MOV21 MOV21 INS54 UPD42 MOV42 UPD66 INS66 UPD66 INS8 MOV8 INS22 INS42 INS54 MOV21 MOV60 MOV60 INS21 INS54 INS60 INS54 INS52 INS42 INS58 MOV8 MOV8 INS43 MOV43 INS32 INS58 MOV8 MOV43 INS59 INS58 MOV8 INS74 INS59 INS61 INS42 UPD42 INS32 INS32 MOV42 UPD42 MOV42 MOV42 INS74 INS59 INS61 INS42 INS32 INS32 UPD42 INS74 INS59 INS61 INS43 INS43 INS76 INS42 INS32 INS32 MOV8 MOV43 MOV32 MOV32 INS42 INS42 INS42 UPD42 MOV42 UPD42 MOV42 INS43 INS43 INS76 INS42 INS32 INS32 MOV8 INS32 UPD42 MOV42 INS39 INS42 UPD42 MOV42 INS43 INS43 INS76 INS42 INS32 INS32 MOV8 INS42 INS42 INS74 INS32 INS42 UPD42 MOV42 UPD42 MOV42 UPD42 UPD42 INS32 INS42 UPD42 INS42 INS42 INS74 INS32 INS42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 UPD42 INS32 UPD42 UPD42 UPD42 MOV42 UPD42 MOV42 INS42 INS42 INS74 INS32 INS42 UPD42 MOV42 UPD42 MOV42 INS60 INS43 INS43 INS43 INS42 INS42 MOV43 INS32 UPD42 MOV42 MOV42 INS42 INS42 INS43 INS43 INS43 INS42 INS42 MOV43 UPD42 UPD42 UPD42 UPD42 MOV42 INS42 INS43 INS43 INS43 INS42 INS42 INS74 INS59 MOV43 INS59 INS40 INS42 INS42 UPD42 MOV42 UPD42 MOV42 UPD45 INS40 INS42 INS42 INS40 INS42 INS42 INS43 INS43 INS43 INS42 INS32 INS42 INS32 INS32 UPD42 INS32 UPD42 INS40 INS42 INS42 UPD42 MOV42 INS42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 INS32 UPD42 MOV42 MOV42 UPD42 MOV42 UPD42 MOV42 DEL40 DEL26 DEL40 DEL26 DEL40 DEL26 DEL40 DEL26 DEL40 DEL26 DEL40 DEL26 DEL40 DEL26 DEL40 DEL26 DEL40 DEL26 DEL83 DEL83 DEL83 DEL39 DEL85 DEL5 DEL42 DEL42 DEL42 DEL45 DEL32 DEL59 DEL23 DEL83 DEL39 DEL42 DEL59 DEL23 DEL42 DEL42 DEL42 DEL32 DEL42 DEL9 DEL32 DEL42 DEL42 DEL32 DEL42 DEL42 DEL32 DEL42 DEL42 DEL40 DEL27 DEL32 DEL42 DEL32 DEL42 DEL43 DEL83 DEL43 DEL42 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL83 DEL42 DEL43 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL83 DEL42 DEL43 DEL42 DEL42 DEL43 DEL42 DEL42 DEL14 DEL59 DEL60 DEL83 DEL39 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL42 DEL32 DEL7 DEL21 DEL8 DEL42 DEL78 DEL83 DEL42 DEL43 DEL42 DEL42 DEL41 DEL8 DEL31 DEL66 DEL66 DEL65 DEL66 DEL65 DEL42 DEL65 DEL29 DEL83 DEL39 DEL42 DEL42 DEL43 DEL39 DEL42 DEL34 DEL59 DEL60 DEL39 DEL85 DEL5 DEL42 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL33 DEL27 DEL42 DEL42 DEL42 DEL42 DEL32 DEL7 DEL21 DEL8 DEL25 DEL42 DEL41 DEL8 DEL31 DEL42 DEL42 DEL32 DEL38 DEL25 DEL9 DEL41 DEL42 DEL42 DEL33 DEL42 DEL59 DEL42 DEL59 DEL86 DEL32 DEL21 DEL39 DEL85 DEL5 DEL42 DEL32 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL32 DEL42 DEL42 DEL42 DEL32 DEL21 DEL42 DEL43 DEL42 DEL42 DEL43 DEL14 DEL59 DEL60 DEL54 DEL8 DEL42 DEL32 DEL42 DEL43 DEL14 DEL42 DEL34 DEL27 DEL39 DEL85 DEL5 DEL42 DEL42 DEL34 DEL27 DEL32 DEL59 DEL60 DEL42 DEL42 DEL32 DEL32 DEL21 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL34 DEL27 DEL32 DEL32 DEL21 DEL42 DEL42 DEL42 DEL32 DEL21 DEL42 DEL34 DEL7 DEL21 DEL8 DEL54 DEL8 DEL42 DEL42 DEL32 DEL38 DEL25 DEL9 DEL41 DEL42 DEL42 DEL33 DEL42 DEL59 DEL42 DEL59 DEL86 DEL32 DEL21 DEL42 DEL43 DEL42 DEL42 DEL43 DEL14 DEL59 DEL60 DEL39 DEL42 DEL42 DEL59 DEL60 DEL42 DEL34 DEL7 DEL21 DEL39 DEL85 DEL5 DEL42 DEL32 DEL42 DEL42 DEL7 DEL21 DEL42 DEL42 DEL42 DEL32 DEL32 DEL21 DEL42 DEL33 DEL27 DEL42 DEL42 DEL32 DEL21 DEL8 DEL25 DEL8 DEL42 DEL42 DEL42 DEL32 DEL59 DEL32 DEL38 DEL41 DEL42 DEL42 DEL32 DEL38 DEL25 DEL9 DEL41 DEL42 DEL42 DEL33 DEL42 DEL59 DEL42 DEL59 DEL86 DEL32 DEL21

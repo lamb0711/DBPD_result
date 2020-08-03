@@ -1,0 +1,183 @@
+MAPREDUCE-5652. NM Recovery. ShuffleHandler should handle NM restarts. (Jason Lowe via kasha)
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/trunk@1594329 13f79535-47bb-0310-9956-ffa450edef68
+
++import static org.fusesource.leveldbjni.JniDBFactory.asString;
++import static org.fusesource.leveldbjni.JniDBFactory.bytes;
++import org.apache.hadoop.io.Text;
++import org.apache.hadoop.mapred.proto.ShuffleHandlerRecoveryProtos.JobShuffleInfoProto;
++import org.apache.hadoop.security.proto.SecurityProtos.TokenProto;
++import org.apache.hadoop.yarn.server.utils.LeveldbIterator;
++import org.fusesource.leveldbjni.JniDBFactory;
++import org.fusesource.leveldbjni.internal.NativeDB;
++import org.iq80.leveldb.DB;
++import org.iq80.leveldb.DBException;
++import org.iq80.leveldb.Logger;
++import org.iq80.leveldb.Options;
++import com.google.protobuf.ByteString;
++  private static final String STATE_DB_NAME = "mapreduce_shuffle_state";
++  private static final String STATE_DB_SCHEMA_VERSION_KEY = "schema-version";
++  private static final String STATE_DB_SCHEMA_VERSION = "1.0";
++
++  private Map<String,String> userRsrc;
++  private JobTokenSecretManager secretManager;
++
++  private DB stateDb = null;
++
+-  private static final Map<String,String> userRsrc =
+-    new ConcurrentHashMap<String,String>();
+-  private static final JobTokenSecretManager secretManager =
+-    new JobTokenSecretManager();
+-
+-      userRsrc.put(jobId.toString(), user);
+-      LOG.info("Added token for " + jobId.toString());
+-      secretManager.addTokenForJob(jobId.toString(), jt);
++      recordJobShuffleInfo(jobId, user, jt);
+-    secretManager.removeTokenForJob(jobId.toString());
+-    userRsrc.remove(jobId.toString());
++    try {
++      removeJobShuffleInfo(jobId);
++    } catch (IOException e) {
++      LOG.error("Error during stopApp", e);
++      // TODO add API to AuxiliaryServices to report failures
++    }
++    userRsrc = new ConcurrentHashMap<String,String>();
++    secretManager = new JobTokenSecretManager();
++    recoverState(conf);
++    if (stateDb != null) {
++      stateDb.close();
++    }
++  private void recoverState(Configuration conf) throws IOException {
++    Path recoveryRoot = getRecoveryPath();
++    if (recoveryRoot != null) {
++      startStore(recoveryRoot);
++      Pattern jobPattern = Pattern.compile(JobID.JOBID_REGEX);
++      LeveldbIterator iter = null;
++      try {
++        iter = new LeveldbIterator(stateDb);
++        iter.seek(bytes(JobID.JOB));
++        while (iter.hasNext()) {
++          Map.Entry<byte[],byte[]> entry = iter.next();
++          String key = asString(entry.getKey());
++          if (!jobPattern.matcher(key).matches()) {
++            break;
++          }
++          recoverJobShuffleInfo(key, entry.getValue());
++        }
++      } catch (DBException e) {
++        throw new IOException("Database error during recovery", e);
++      } finally {
++        if (iter != null) {
++          iter.close();
++        }
++      }
++    }
++  }
++
++  private void startStore(Path recoveryRoot) throws IOException {
++    Options options = new Options();
++    options.createIfMissing(false);
++    options.logger(new LevelDBLogger());
++    Path dbPath = new Path(recoveryRoot, STATE_DB_NAME);
++    LOG.info("Using state database at " + dbPath + " for recovery");
++    File dbfile = new File(dbPath.toString());
++    byte[] schemaVersionData;
++    try {
++      stateDb = JniDBFactory.factory.open(dbfile, options);
++      schemaVersionData = stateDb.get(bytes(STATE_DB_SCHEMA_VERSION_KEY));
++    } catch (NativeDB.DBException e) {
++      if (e.isNotFound() || e.getMessage().contains(" does not exist ")) {
++        LOG.info("Creating state database at " + dbfile);
++        options.createIfMissing(true);
++        try {
++          stateDb = JniDBFactory.factory.open(dbfile, options);
++          schemaVersionData = bytes(STATE_DB_SCHEMA_VERSION);
++          stateDb.put(bytes(STATE_DB_SCHEMA_VERSION_KEY), schemaVersionData);
++        } catch (DBException dbExc) {
++          throw new IOException("Unable to create state store", dbExc);
++        }
++      } else {
++        throw e;
++      }
++    }
++    if (schemaVersionData != null) {
++      String schemaVersion = asString(schemaVersionData);
++      // only support exact schema matches for now
++      if (!STATE_DB_SCHEMA_VERSION.equals(schemaVersion)) {
++        throw new IOException("Incompatible state database schema, found "
++            + schemaVersion + " expected " + STATE_DB_SCHEMA_VERSION);
++      }
++    } else {
++      throw new IOException("State database schema version not found");
++    }
++  }
++
++  private void addJobToken(JobID jobId, String user,
++      Token<JobTokenIdentifier> jobToken) {
++    userRsrc.put(jobId.toString(), user);
++    secretManager.addTokenForJob(jobId.toString(), jobToken);
++    LOG.info("Added token for " + jobId.toString());
++  }
++
++  private void recoverJobShuffleInfo(String jobIdStr, byte[] data)
++      throws IOException {
++    JobID jobId;
++    try {
++      jobId = JobID.forName(jobIdStr);
++    } catch (IllegalArgumentException e) {
++      throw new IOException("Bad job ID " + jobIdStr + " in state store", e);
++    }
++
++    JobShuffleInfoProto proto = JobShuffleInfoProto.parseFrom(data);
++    String user = proto.getUser();
++    TokenProto tokenProto = proto.getJobToken();
++    Token<JobTokenIdentifier> jobToken = new Token<JobTokenIdentifier>(
++        tokenProto.getIdentifier().toByteArray(),
++        tokenProto.getPassword().toByteArray(),
++        new Text(tokenProto.getKind()), new Text(tokenProto.getService()));
++    addJobToken(jobId, user, jobToken);
++  }
++
++  private void recordJobShuffleInfo(JobID jobId, String user,
++      Token<JobTokenIdentifier> jobToken) throws IOException {
++    if (stateDb != null) {
++      TokenProto tokenProto = TokenProto.newBuilder()
++          .setIdentifier(ByteString.copyFrom(jobToken.getIdentifier()))
++          .setPassword(ByteString.copyFrom(jobToken.getPassword()))
++          .setKind(jobToken.getKind().toString())
++          .setService(jobToken.getService().toString())
++          .build();
++      JobShuffleInfoProto proto = JobShuffleInfoProto.newBuilder()
++          .setUser(user).setJobToken(tokenProto).build();
++      try {
++        stateDb.put(bytes(jobId.toString()), proto.toByteArray());
++      } catch (DBException e) {
++        throw new IOException("Error storing " + jobId, e);
++      }
++    }
++    addJobToken(jobId, user, jobToken);
++  }
++
++  private void removeJobShuffleInfo(JobID jobId) throws IOException {
++    String jobIdStr = jobId.toString();
++    secretManager.removeTokenForJob(jobIdStr);
++    userRsrc.remove(jobIdStr);
++    if (stateDb != null) {
++      try {
++        stateDb.delete(bytes(jobIdStr));
++      } catch (DBException e) {
++        throw new IOException("Unable to remove " + jobId
++            + " from state store", e);
++      }
++    }
++  }
++
++  private static class LevelDBLogger implements Logger {
++    private static final Log LOG = LogFactory.getLog(LevelDBLogger.class);
++
++    @Override
++    public void log(String message) {
++      LOG.info(message);
++    }
++  }
++

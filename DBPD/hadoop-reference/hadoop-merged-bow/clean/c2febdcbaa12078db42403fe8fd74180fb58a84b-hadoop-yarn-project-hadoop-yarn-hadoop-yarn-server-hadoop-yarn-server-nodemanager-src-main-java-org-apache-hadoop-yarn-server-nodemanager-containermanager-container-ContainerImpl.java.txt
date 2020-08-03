@@ -1,0 +1,171 @@
+YARN-1337. Recover containers upon nodemanager restart. (Contributed by Jason Lowe)
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/trunk@1617448 13f79535-47bb-0310-9956-ffa450edef68
+
++import java.io.IOException;
++import org.apache.hadoop.yarn.server.nodemanager.recovery.NMStateStoreService;
++import org.apache.hadoop.yarn.server.nodemanager.recovery.NMStateStoreService.RecoveredContainerStatus;
++  private final NMStateStoreService stateStore;
++  // whether container has been recovered after a restart
++  private RecoveredContainerStatus recoveredStatus =
++      RecoveredContainerStatus.REQUESTED;
++  // whether container was marked as killed after recovery
++  private boolean recoveredAsKilled = false;
++
+-      ContainerLaunchContext launchContext, Credentials creds,
+-      NodeManagerMetrics metrics,
++      NMStateStoreService stateStore, ContainerLaunchContext launchContext,
++      Credentials creds, NodeManagerMetrics metrics,
++    this.stateStore = stateStore;
++  // constructor for a recovered container
++  public ContainerImpl(Configuration conf, Dispatcher dispatcher,
++      NMStateStoreService stateStore, ContainerLaunchContext launchContext,
++      Credentials creds, NodeManagerMetrics metrics,
++      ContainerTokenIdentifier containerTokenIdentifier,
++      RecoveredContainerStatus recoveredStatus, int exitCode,
++      String diagnostics, boolean wasKilled) {
++    this(conf, dispatcher, stateStore, launchContext, creds, metrics,
++        containerTokenIdentifier);
++    this.recoveredStatus = recoveredStatus;
++    this.exitCode = exitCode;
++    this.recoveredAsKilled = wasKilled;
++    this.diagnostics.append(diagnostics);
++  }
++
+-        EnumSet.of(ContainerState.LOCALIZING, ContainerState.LOCALIZED,
+-            ContainerState.LOCALIZATION_FAILED),
++        EnumSet.of(ContainerState.LOCALIZING,
++            ContainerState.LOCALIZED,
++            ContainerState.LOCALIZATION_FAILED,
++            ContainerState.DONE),
+-        ContainerEventType.KILL_CONTAINER)
++        EnumSet.of(ContainerEventType.KILL_CONTAINER,
++            ContainerEventType.CONTAINER_EXITED_WITH_SUCCESS,
++            ContainerEventType.CONTAINER_EXITED_WITH_FAILURE))
+-        ContainerEventType.RESOURCE_FAILED)
++        EnumSet.of(ContainerEventType.RESOURCE_FAILED,
++            ContainerEventType.CONTAINER_EXITED_WITH_SUCCESS,
++            ContainerEventType.CONTAINER_EXITED_WITH_FAILURE))
+-  @SuppressWarnings({"fallthrough", "unchecked"})
++  @SuppressWarnings("fallthrough")
++    sendFinishedEvents();
++  }
++  @SuppressWarnings("unchecked")
++  private void sendFinishedEvents() {
++  private void sendLaunchEvent() {
++    ContainersLauncherEventType launcherEvent =
++        ContainersLauncherEventType.LAUNCH_CONTAINER;
++    if (recoveredStatus == RecoveredContainerStatus.LAUNCHED) {
++      // try to recover a container that was previously launched
++      launcherEvent = ContainersLauncherEventType.RECOVER_CONTAINER;
++    }
++    dispatcher.getEventHandler().handle(
++        new ContainersLauncherEvent(this, launcherEvent));
++  }
++
++  // Inform the ContainersMonitor to start monitoring the container's
++  // resource usage.
++  @SuppressWarnings("unchecked") // dispatcher not typed
++  private void sendContainerMonitorStartEvent() {
++      long pmemBytes = getResource().getMemory() * 1024 * 1024L;
++      float pmemRatio = daemonConf.getFloat(
++          YarnConfiguration.NM_VMEM_PMEM_RATIO,
++          YarnConfiguration.DEFAULT_NM_VMEM_PMEM_RATIO);
++      long vmemBytes = (long) (pmemRatio * pmemBytes);
++
++      dispatcher.getEventHandler().handle(
++          new ContainerStartMonitoringEvent(containerId,
++              vmemBytes, pmemBytes));
++  }
++
++  private void addDiagnostics(String... diags) {
++    for (String s : diags) {
++      this.diagnostics.append(s);
++    }
++    try {
++      stateStore.storeContainerDiagnostics(containerId, diagnostics);
++    } catch (IOException e) {
++      LOG.warn("Unable to update diagnostics in state store for "
++          + containerId, e);
++    }
++  }
++
++  @SuppressWarnings("unchecked") // dispatcher not typed
++      if (container.recoveredStatus == RecoveredContainerStatus.COMPLETED) {
++        container.sendFinishedEvents();
++        return ContainerState.DONE;
++      } else if (container.recoveredAsKilled &&
++          container.recoveredStatus == RecoveredContainerStatus.REQUESTED) {
++        // container was killed but never launched
++        container.finished();
++        return ContainerState.DONE;
++      }
++
+-        container.dispatcher.getEventHandler().handle(
+-            new ContainersLauncherEvent(container,
+-                ContainersLauncherEventType.LAUNCH_CONTAINER));
++        container.sendLaunchEvent();
+-  @SuppressWarnings("unchecked") // dispatcher not typed
+-      container.dispatcher.getEventHandler().handle(
+-          new ContainersLauncherEvent(container,
+-              ContainersLauncherEventType.LAUNCH_CONTAINER));
++
++      container.sendLaunchEvent();
+-  @SuppressWarnings("unchecked") // dispatcher not typed
++    @SuppressWarnings("unchecked")
+-      // Inform the ContainersMonitor to start monitoring the container's
+-      // resource usage.
+-      long pmemBytes =
+-          container.getResource().getMemory() * 1024 * 1024L;
+-      float pmemRatio = container.daemonConf.getFloat(
+-          YarnConfiguration.NM_VMEM_PMEM_RATIO,
+-          YarnConfiguration.DEFAULT_NM_VMEM_PMEM_RATIO);
+-      long vmemBytes = (long) (pmemRatio * pmemBytes);
+-      
+-      container.dispatcher.getEventHandler().handle(
+-          new ContainerStartMonitoringEvent(container.containerId,
+-              vmemBytes, pmemBytes));
++      container.sendContainerMonitorStartEvent();
++
++      if (container.recoveredAsKilled) {
++        LOG.info("Killing " + container.containerId
++            + " due to recovered as killed");
++        container.addDiagnostics("Container recovered as killed.\n");
++        container.dispatcher.getEventHandler().handle(
++            new ContainersLauncherEvent(container,
++                ContainersLauncherEventType.CLEANUP_CONTAINER));
++      }
+-        container.diagnostics.append(exitEvent.getDiagnosticInfo())
+-          .append('\n');
++        container.addDiagnostics(exitEvent.getDiagnosticInfo(), "\n");
+-      container.diagnostics.append("Killed by external signal\n");
++      container.addDiagnostics("Killed by external signal\n");
+-      container.diagnostics.append(rsrcFailedEvent.getDiagnosticMessage()
+-          + "\n");
+-          
++      container.addDiagnostics(rsrcFailedEvent.getDiagnosticMessage(), "\n");
+-      container.diagnostics.append(killEvent.getDiagnostic()).append("\n");
+-      container.diagnostics.append("Container is killed before being launched.\n");
++      container.addDiagnostics(killEvent.getDiagnostic(), "\n");
++      container.addDiagnostics("Container is killed before being launched.\n");
+-      container.diagnostics.append(killEvent.getDiagnostic()).append("\n");
++      container.addDiagnostics(killEvent.getDiagnostic(), "\n");
+-        container.diagnostics.append(exitEvent.getDiagnosticInfo())
+-          .append('\n');
++        container.addDiagnostics(exitEvent.getDiagnosticInfo(), "\n");
+-      container.diagnostics.append(killEvent.getDiagnostic()).append("\n");
+-      container.diagnostics.append("Container is killed before being launched.\n");
++      container.addDiagnostics(killEvent.getDiagnostic(), "\n");
++      container.addDiagnostics("Container is killed before being launched.\n");
+-      container.diagnostics.append(updateEvent.getDiagnosticsUpdate())
+-          .append("\n");
++      container.addDiagnostics(updateEvent.getDiagnosticsUpdate(), "\n");
++      try {
++        container.stateStore.storeContainerDiagnostics(container.containerId,
++            container.diagnostics);
++      } catch (IOException e) {
++        LOG.warn("Unable to update state store diagnostics for "
++            + container.containerId, e);
++      }
+
+INS26 INS26 INS26 INS40 INS40 INS40 INS23 INS23 INS23 INS31 INS31 INS31 MOV31 INS31 INS55 INS83 INS83 INS43 INS59 INS83 INS43 INS59 INS83 INS39 INS59 INS44 INS83 INS42 INS44 INS44 INS44 INS44 INS44 INS44 INS44 INS44 INS44 INS44 INS44 INS8 INS79 INS83 INS39 INS42 INS8 INS79 INS83 INS39 INS42 INS8 MOV79 UPD83 UPD42 INS83 INS39 INS42 INS44 INS8 MOV29 INS83 INS42 MOV43 INS31 INS42 INS42 INS42 INS42 INS40 INS42 INS9 INS43 INS42 INS21 INS43 INS42 INS43 INS42 INS43 INS42 INS43 INS42 INS43 INS42 INS43 INS42 INS43 INS42 INS43 INS42 INS39 INS42 INS43 INS42 INS39 INS42 INS17 INS21 INS21 INS21 INS21 INS45 INS21 INS42 INS45 MOV60 MOV21 MOV21 MOV21 INS42 INS45 INS60 INS25 INS21 INS43 INS42 INS70 INS54 MOV79 MOV78 INS83 INS39 INS42 MOV44 MOV44 INS8 INS78 INS44 INS44 MOV44 MOV78 MOV44 MOV44 INS42 INS7 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS7 INS7 INS7 INS32 INS32 INS43 INS59 INS27 INS8 INS32 INS42 INS44 INS42 INS8 INS8 INS12 INS25 INS21 MOV21 MOV21 INS25 INS25 INS42 INS43 INS42 INS43 INS42 MOV21 MOV21 INS21 MOV42 MOV43 MOV21 MOV25 MOV21 INS54 INS22 INS42 INS22 INS42 INS22 INS42 INS22 INS42 INS22 INS42 INS42 INS32 INS42 INS42 INS42 INS40 INS42 INS40 INS21 INS32 INS42 MOV14 INS43 INS42 INS21 INS21 INS44 INS8 INS27 INS8 INS25 INS32 INS40 INS8 MOV27 INS8 INS42 INS42 INS32 MOV42 MOV32 MOV32 MOV32 INS8 INS12 INS52 INS42 INS52 INS42 INS52 INS42 INS52 INS42 INS52 INS42 INS42 INS42 MOV40 INS40 INS40 INS7 INS42 INS42 INS52 UPD42 INS42 INS42 INS42 INS42 INS32 INS32 INS43 INS42 INS21 INS40 INS40 INS21 INS41 INS27 INS8 INS21 UPD42 MOV42 INS42 INS42 INS42 INS21 INS21 INS21 INS21 INS42 UPD42 INS42 UPD42 MOV32 INS45 INS42 INS42 MOV32 INS45 INS42 UPD42 INS42 UPD42 INS45 INS42 UPD42 INS45 UPD42 MOV42 UPD42 MOV42 UPD45 INS42 UPD42 INS45 INS21 INS44 INS8 INS42 INS40 INS22 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS32 INS40 INS40 INS27 INS21 INS41 INS32 MOV32 INS32 INS32 INS32 INS32 UPD42 MOV42 INS42 MOV32 INS32 INS43 INS42 INS21 INS52 INS42 INS42 INS42 INS27 INS42 INS42 INS42 INS40 INS40 INS32 INS40 INS42 INS42 UPD42 MOV42 INS42 INS42 INS27 INS42 INS42 INS45 INS32 INS42 INS14 INS42 INS42 MOV32 INS45 INS42 UPD42 INS45 INS40 INS42 INS40 INS40 INS42 INS32 INS32 INS45 INS42 INS42 INS42 INS45 INS40 INS45 INS40 INS42 INS43 INS42 INS40 INS42 INS42 INS27 INS42 INS42 INS42 MOV40 INS40 INS40 INS42 INS45 INS40 INS40 DEL45 DEL45 DEL4 DEL40 DEL42 DEL40 DEL40 DEL40 DEL32 DEL42 DEL32 DEL40 DEL32 DEL42 DEL42 DEL43 DEL42 DEL40 DEL14 DEL83 DEL42 DEL55 DEL40 DEL40 DEL45 DEL27 DEL40 DEL40 DEL42 DEL45 DEL32 DEL40 DEL42 DEL13 DEL32 DEL40 DEL42 DEL32 DEL42 DEL13 DEL32 DEL21 DEL8 DEL25 DEL40 DEL42 DEL45 DEL32 DEL40 DEL32 DEL42 DEL40 DEL42 DEL45 DEL32 DEL21 DEL40 DEL42 DEL45 DEL32

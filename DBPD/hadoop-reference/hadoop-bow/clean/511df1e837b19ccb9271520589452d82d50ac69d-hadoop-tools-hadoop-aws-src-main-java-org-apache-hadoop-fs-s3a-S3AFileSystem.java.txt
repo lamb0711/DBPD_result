@@ -1,0 +1,375 @@
+HADOOP-16430. S3AFilesystem.delete to incrementally update s3guard with deletions
+
+Contributed by Steve Loughran.
+
+This overlaps the scanning for directory entries with batched calls to S3 DELETE and updates of the S3Guard tables.
+It also uses S3Guard to list the files to delete, so find newly created files even when S3 listings are not use consistent.
+
+For path which the client considers S3Guard to be authoritative, we also do a recursive LIST of the store and delete files; this is to find unindexed files and do guarantee that the delete(path, true) call really does delete everything underneath.
+
+Change-Id: Ice2f6e940c506e0b3a78fa534a99721b1698708e
+
++import com.amazonaws.services.s3.model.DeleteObjectsResult;
++import org.apache.hadoop.fs.s3a.impl.DeleteOperation;
++import org.apache.hadoop.fs.s3a.impl.InternalConstants;
++import org.apache.hadoop.fs.s3a.impl.OperationCallbacks;
+-import org.apache.hadoop.fs.PathIsNotEmptyDirectoryException;
+-  // The maximum number of entries that can be deleted in any call to s3
+-  private static final int MAX_ENTRIES_TO_DELETE = 1000;
++  /**
++   * Specific operations used by rename and delete operations.
++   */
++  private final S3AFileSystem.OperationCallbacksImpl
++      operationCallbacks = new OperationCallbacksImpl();
++
+-        new RenameOperationCallbacksImpl());
+-    return renameOperation.executeRename();
++        operationCallbacks);
++    return renameOperation.execute();
+-   * All the callbacks made by the rename operation of the filesystem.
++   * The callbacks made by the rename and delete operations.
+-  private class RenameOperationCallbacksImpl implements
+-      RenameOperation.RenameOperationCallbacks {
++  private class OperationCallbacksImpl implements OperationCallbacks {
+-    public S3ObjectAttributes createObjectAttributes(final S3AFileStatus fileStatus) {
++    public S3ObjectAttributes createObjectAttributes(
++        final S3AFileStatus fileStatus) {
++    @Retries.RetryTranslated
+-        final boolean isFile)
++        final boolean isFile,
++        final BulkOperationState operationState)
+-      S3AFileSystem.this.deleteObjectAtPath(path, key, isFile);
++      once("delete", key, () ->
++          S3AFileSystem.this.deleteObjectAtPath(path, key, isFile,
++              operationState));
+-        final Path path) throws IOException {
+-      return S3AFileSystem.this.listFilesAndEmptyDirectories(path, true);
++        final Path path,
++        final S3AFileStatus status,
++        final boolean collectTombstones,
++        final boolean includeSelf) throws IOException {
++      return innerListFiles(
++          path,
++          true,
++          includeSelf
++              ? Listing.ACCEPT_ALL_BUT_S3N
++              : new Listing.AcceptAllButSelfAndS3nDirs(path),
++          status,
++          collectTombstones);
+-    public void removeKeys(final List<DeleteObjectsRequest.KeyVersion> keysToDelete,
++    public DeleteObjectsResult removeKeys(
++        final List<DeleteObjectsRequest.KeyVersion> keysToDelete,
+-        final List<Path> undeletedObjectsOnFailure)
++        final List<Path> undeletedObjectsOnFailure,
++        final BulkOperationState operationState,
++        final boolean quiet)
+-      S3AFileSystem.this.removeKeys(keysToDelete, deleteFakeDir,
+-          undeletedObjectsOnFailure);
++      return S3AFileSystem.this.removeKeys(keysToDelete, deleteFakeDir,
++          undeletedObjectsOnFailure, operationState, quiet);
++
++    @Override
++    public boolean allowAuthoritative(final Path p) {
++      return S3AFileSystem.this.allowAuthoritative(p);
++    }
++
++    @Override
++    @Retries.RetryTranslated
++    public RemoteIterator<S3AFileStatus> listObjects(
++        final Path path,
++        final String key)
++        throws IOException {
++      return once("listObjects", key, () ->
++          listing.createFileStatusListingIterator(path,
++              createListObjectsRequest(key, null),
++              ACCEPT_ALL,
++              Listing.ACCEPT_ALL_BUT_S3N,
++              null));
++    }
+-    LOG.debug("DELETE {}", key);
+-    invoker.retryUntranslated("Delete "+ bucket + ":/" + key,
+-        DELETE_CONSIDERED_IDEMPOTENT,
+-        ()-> {
+-          incrementStatistic(OBJECT_DELETE_REQUESTS);
+-          s3.deleteObject(bucket, key);
+-          return null;
+-        });
++    try (DurationInfo ignored =
++             new DurationInfo(LOG, false,
++                 "deleting %s", key)) {
++      invoker.retryUntranslated(String.format("Delete %s:/%s", bucket, key),
++          DELETE_CONSIDERED_IDEMPOTENT,
++          ()-> {
++            incrementStatistic(OBJECT_DELETE_REQUESTS);
++            s3.deleteObject(bucket, key);
++            return null;
++          });
++    }
++   * @param operationState (nullable) operational state for a bulk update
+-  void deleteObjectAtPath(Path f, String key, boolean isFile)
++  void deleteObjectAtPath(Path f,
++      String key,
++      boolean isFile,
++      @Nullable final BulkOperationState operationState)
+-    metadataStore.delete(f);
++    metadataStore.delete(f, operationState);
++   * @return the AWS response
+-  private void deleteObjects(DeleteObjectsRequest deleteRequest)
++  private DeleteObjectsResult deleteObjects(DeleteObjectsRequest deleteRequest)
+-      invoker.retryUntranslated("delete",
++      return invoker.retryUntranslated("delete",
++   * @param quiet should a bulk query be quiet, or should its result list
++   * all deleted keys?
++   * @return the deletion result if a multi object delete was invoked
++   * and it returned without a failure.
+-  private void removeKeysS3(List<DeleteObjectsRequest.KeyVersion> keysToDelete,
+-      boolean deleteFakeDir)
++  private DeleteObjectsResult removeKeysS3(
++      List<DeleteObjectsRequest.KeyVersion> keysToDelete,
++      boolean deleteFakeDir,
++      boolean quiet)
++    DeleteObjectsResult result = null;
+-      return;
++      return result;
+-        deleteObjects(new DeleteObjectsRequest(bucket)
+-            .withKeys(keysToDelete)
+-            .withQuiet(true));
++        result = deleteObjects(
++            new DeleteObjectsRequest(bucket)
++                .withKeys(keysToDelete)
++                .withQuiet(quiet));
++    return result;
++   * @param operationState (nullable) operational state for a bulk update
+-      final boolean deleteFakeDir)
++      final boolean deleteFakeDir,
++      final BulkOperationState operationState)
+-    removeKeys(keysToDelete, deleteFakeDir, new ArrayList<>());
++    removeKeys(keysToDelete, deleteFakeDir, new ArrayList<>(), operationState,
++        true);
+-   * Invoke {@link #removeKeysS3(List, boolean)} with handling of
++   * Invoke {@link #removeKeysS3(List, boolean, boolean)} with handling of
++   * @param operationState (nullable) operational state for a bulk update
++   * @param quiet should a bulk query be quiet, or should its result list
++   * all deleted keys
++   * @return the deletion result if a multi object delete was invoked
++   * and it returned without a failure, else null.
+-  @VisibleForTesting
+-  void removeKeys(
++  DeleteObjectsResult removeKeys(
+-      final List<Path> undeletedObjectsOnFailure)
+-      throws MultiObjectDeleteException, AmazonClientException,
+-      IOException {
++      final List<Path> undeletedObjectsOnFailure,
++      final BulkOperationState operationState,
++      final boolean quiet)
++      throws MultiObjectDeleteException, AmazonClientException, IOException {
+-    try(DurationInfo ignored = new DurationInfo(LOG, false, "Deleting")) {
+-      removeKeysS3(keysToDelete, deleteFakeDir);
++    try (DurationInfo ignored = new DurationInfo(LOG, false, "Deleting")) {
++      return removeKeysS3(keysToDelete, deleteFakeDir, quiet);
+-            new MultiObjectDeleteSupport(createStoreContext())
++            new MultiObjectDeleteSupport(createStoreContext(), operationState)
+-      List<Path> paths = new MultiObjectDeleteSupport(createStoreContext())
++      List<Path> paths = new MultiObjectDeleteSupport(
++          createStoreContext(),
++          operationState)
+-      boolean outcome = innerDelete(innerGetFileStatus(f, true), recursive);
++      DeleteOperation deleteOperation = new DeleteOperation(
++          createStoreContext(),
++          innerGetFileStatus(f, true),
++          recursive,
++          operationCallbacks,
++          InternalConstants.MAX_ENTRIES_TO_DELETE);
++      boolean outcome = deleteOperation.execute();
+-   * Delete an object. See {@link #delete(Path, boolean)}.
+-   * This call does not create any fake parent directory; that is
+-   * left to the caller.
+-   * @param status fileStatus object
+-   * @param recursive if path is a directory and set to
+-   * true, the directory is deleted else throws an exception. In
+-   * case of a file the recursive can be set to either true or false.
+-   * @return true, except in the corner cases of root directory deletion
+-   * @throws IOException due to inability to delete a directory or file.
+-   * @throws AmazonClientException on failures inside the AWS SDK
+-   */
+-  @Retries.RetryMixed
+-  private boolean innerDelete(S3AFileStatus status, boolean recursive)
+-      throws IOException, AmazonClientException {
+-    Path f = status.getPath();
+-    LOG.debug("Delete path {} - recursive {}", f, recursive);
+-    LOG.debug("Type = {}",
+-        status.isFile() ? "File"
+-            : (status.isEmptyDirectory() == Tristate.TRUE
+-                ? "Empty Directory"
+-                : "Directory"));
+-
+-    String key = pathToKey(f);
+-
+-    if (status.isDirectory()) {
+-      LOG.debug("delete: Path is a directory: {}", f);
+-      Preconditions.checkArgument(
+-          status.isEmptyDirectory() != Tristate.UNKNOWN,
+-          "File status must have directory emptiness computed");
+-
+-      if (!key.endsWith("/")) {
+-        key = key + "/";
+-      }
+-
+-      if (key.equals("/")) {
+-        return rejectRootDirectoryDelete(status, recursive);
+-      }
+-
+-      if (!recursive && status.isEmptyDirectory() == Tristate.FALSE) {
+-        throw new PathIsNotEmptyDirectoryException(f.toString());
+-      }
+-
+-      if (status.isEmptyDirectory() == Tristate.TRUE) {
+-        LOG.debug("Deleting fake empty directory {}", key);
+-        // HADOOP-13761 s3guard: retries here
+-        deleteObjectAtPath(f, key, false);
+-      } else {
+-        LOG.debug("Getting objects for directory prefix {} to delete", key);
+-
+-        S3ListRequest request = createListObjectsRequest(key, null);
+-
+-        S3ListResult objects = listObjects(request);
+-        List<DeleteObjectsRequest.KeyVersion> keys =
+-            new ArrayList<>(objects.getObjectSummaries().size());
+-        while (true) {
+-          for (S3ObjectSummary summary : objects.getObjectSummaries()) {
+-            keys.add(new DeleteObjectsRequest.KeyVersion(summary.getKey()));
+-            LOG.debug("Got object to delete {}", summary.getKey());
+-
+-            if (keys.size() == MAX_ENTRIES_TO_DELETE) {
+-              // delete a single page of keys
+-              removeKeys(keys, false);
+-              keys.clear();
+-            }
+-          }
+-
+-          if (objects.isTruncated()) {
+-            objects = continueListObjects(request, objects);
+-          } else {
+-            // there is no more data: delete the final set of entries.
+-            removeKeys(keys, false);
+-            break;
+-          }
+-        }
+-      }
+-      try(DurationInfo ignored =
+-              new DurationInfo(LOG, false, "Delete metastore")) {
+-        metadataStore.deleteSubtree(f);
+-      }
+-    } else {
+-      LOG.debug("delete: Path is a file: {}", key);
+-      deleteObjectAtPath(f, key, true);
+-    }
+-
+-    return true;
+-  }
+-
+-  /**
+-   * Implements the specific logic to reject root directory deletion.
+-   * The caller must return the result of this call, rather than
+-   * attempt to continue with the delete operation: deleting root
+-   * directories is never allowed.
+-   * @param status filesystem status
+-   * @param recursive recursive flag from command
+-   * @return a return code for the operation
+-   */
+-  private boolean rejectRootDirectoryDelete(S3AFileStatus status,
+-      boolean recursive) {
+-    LOG.error("S3A: Cannot delete the {} root directory. Path: {}. Recursive: "
+-            + "{}", bucket, status.getPath(), recursive);
+-    return false;
+-  }
+-
+-  /**
+-      boolean allowAuthoritative = S3Guard.allowAuthoritative(f, this,
+-          allowAuthoritativeMetadataStore, allowAuthoritativePaths);
++      boolean allowAuthoritative = allowAuthoritative(f);
++   * Is a path to be considered as authoritative?
++   * True iff there is an authoritative metastore or if there
++   * is a non-auth store with the supplied path under
++   * one of the paths declared as authoritative.
++   * @param path path
++   * @return true if the path is auth
++   */
++  protected boolean allowAuthoritative(final Path path) {
++    return S3Guard.allowAuthoritative(path, this,
++        allowAuthoritativeMetadataStore, allowAuthoritativePaths);
++  }
++
++  /**
+-      boolean allowAuthoritative = S3Guard.allowAuthoritative(f, this,
+-          allowAuthoritativeMetadataStore, allowAuthoritativePaths);
++      boolean allowAuthoritative = allowAuthoritative(f);
+-      removeKeys(keysToRemove, true);
++      removeKeys(keysToRemove, true, null);
+-   * generator classes; an architecture which may become less convoluted
+-   * using lambda-expressions.
++   * generator classes.
+-  @Retries.OnceTranslated
++  @Retries.RetryTranslated
+-        new Listing.AcceptFilesOnly(qualify(f))));
++        new Listing.AcceptFilesOnly(qualify(f)), null, true));
+-    return invoker.retry("list", f.toString(), true,
+-        () -> innerListFiles(f, recursive, new Listing.AcceptAllButS3nDirs()));
++    return innerListFiles(f, recursive, Listing.ACCEPT_ALL_BUT_S3N, null, true);
+-  @Retries.OnceTranslated
+-  private RemoteIterator<S3ALocatedFileStatus> innerListFiles(Path f, boolean
+-      recursive, Listing.FileStatusAcceptor acceptor) throws IOException {
++  /**
++   * List files under the path.
++   * <ol>
++   *   <li>
++   *     If the path is authoritative on the client,
++   *     only S3Guard will be queried.
++   *   </li>
++   *   <li>
++   *     Otherwise, the S3Guard values are returned first, then the S3
++   *     entries will be retrieved and returned if not already listed.</li>
++   *   <li>
++   *     when collectTombstones} is true, S3Guard tombstones will
++   *     be used to filter out deleted files.
++   *     They MUST be used for normal listings; it is only for
++   *     deletion and low-level operations that they MAY be bypassed.
++   *   </li>
++   *   <li>
++   *     The optional {@code status} parameter will be used to skip the
++   *     initial getFileStatus call.
++   *   </li>
++   * </ol>
++   *
++   * @param f path
++   * @param recursive recursive listing?
++   * @param acceptor file status filter
++   * @param status optional status of path to list.
++   * @param collectTombstones should tombstones be collected from S3Guard?
++   * @return an iterator over the listing.
++   * @throws IOException failure
++   */
++  @Retries.RetryTranslated
++  private RemoteIterator<S3ALocatedFileStatus> innerListFiles(
++      final Path f,
++      final boolean recursive,
++      final Listing.FileStatusAcceptor acceptor,
++      final S3AFileStatus status,
++      final boolean collectTombstones) throws IOException {
+-      // lookup dir triggers existence check
+-      final S3AFileStatus fileStatus = (S3AFileStatus) getFileStatus(path);
++      // if a status was given, that is used, otherwise
++      // call getFileStatus, which triggers an existence check
++      final S3AFileStatus fileStatus = status != null
++          ? status
++          : (S3AFileStatus) getFileStatus(path);
+-        boolean allowAuthoritative = S3Guard.allowAuthoritative(f, this,
+-            allowAuthoritativeMetadataStore, allowAuthoritativePaths);
++        boolean allowAuthoritative = allowAuthoritative(f);
+-            tombstones);
++            collectTombstones ? tombstones : null);
+-              boolean allowAuthoritative = S3Guard.allowAuthoritative(f, this,
+-                  allowAuthoritativeMetadataStore, allowAuthoritativePaths);
++              boolean allowAuthoritative = allowAuthoritative(f);
+-          : null, status.getETag(), status.getVersionId());
++          : null);

@@ -1,0 +1,252 @@
+HADOOP-13560. S3ABlockOutputStream to support huge (many GB) file writes. Contributed by Steve Loughran
+
+-import com.google.common.base.Preconditions;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
++import java.io.Closeable;
++import java.util.concurrent.atomic.AtomicLong;
++  private static final Logger LOG = LoggerFactory.getLogger(
++      S3AInstrumentation.class);
++
+-      OBJECT_PUT_REQUESTS
++      OBJECT_PUT_REQUESTS,
++      OBJECT_PUT_REQUESTS_COMPLETED,
++      STREAM_WRITE_FAILURES,
++      STREAM_WRITE_BLOCK_UPLOADS,
++      STREAM_WRITE_BLOCK_UPLOADS_COMMITTED,
++      STREAM_WRITE_BLOCK_UPLOADS_ABORTED,
++      STREAM_WRITE_TOTAL_TIME,
++      STREAM_WRITE_TOTAL_DATA,
++  };
++
++
++  private static final Statistic[] GAUGES_TO_CREATE = {
++      OBJECT_PUT_REQUESTS_ACTIVE,
++      OBJECT_PUT_BYTES_PENDING,
++      STREAM_WRITE_BLOCK_UPLOADS_ACTIVE,
++      STREAM_WRITE_BLOCK_UPLOADS_PENDING,
++      STREAM_WRITE_BLOCK_UPLOADS_DATA_PENDING,
++    for (Statistic statistic : GAUGES_TO_CREATE) {
++      gauge(statistic.getSymbol(), statistic.getDescription());
++    }
++   * @throws IllegalStateException if the metric is not a counter
+-    Preconditions.checkNotNull(metric, "not found: " + name);
++   * Look up a gauge.
++   * @param name gauge name
++   * @return the gauge or null
++   * @throws ClassCastException if the metric is not a Gauge.
++   */
++  public MutableGaugeLong lookupGauge(String name) {
++    MutableMetric metric = lookupMetric(name);
++    if (metric == null) {
++      LOG.debug("No gauge {}", name);
++    }
++    return (MutableGaugeLong) metric;
++  }
++
++  /**
++  /**
++   * Increment a specific counter.
++   * No-op if not defined.
++   * @param op operation
++   * @param count atomic long containing value
++   */
++  public void incrementCounter(Statistic op, AtomicLong count) {
++    incrementCounter(op, count.get());
++  }
++
++  /**
++   * Increment a specific gauge.
++   * No-op if not defined.
++   * @param op operation
++   * @param count increment value
++   * @throws ClassCastException if the metric is of the wrong type
++   */
++  public void incrementGauge(Statistic op, long count) {
++    MutableGaugeLong gauge = lookupGauge(op.getSymbol());
++    if (gauge != null) {
++      gauge.incr(count);
++    } else {
++      LOG.debug("No Gauge: "+ op);
++    }
++  }
++
++  /**
++   * Decrement a specific gauge.
++   * No-op if not defined.
++   * @param op operation
++   * @param count increment value
++   * @throws ClassCastException if the metric is of the wrong type
++   */
++  public void decrementGauge(Statistic op, long count) {
++    MutableGaugeLong gauge = lookupGauge(op.getSymbol());
++    if (gauge != null) {
++      gauge.decr(count);
++    } else {
++      LOG.debug("No Gauge: " + op);
++    }
++  }
++
++  /**
++   * Create a stream output statistics instance.
++   * @return the new instance
++   */
++
++  OutputStreamStatistics newOutputStreamStatistics() {
++    return new OutputStreamStatistics();
++  }
++
++  /**
++   * Merge in the statistics of a single output stream into
++   * the filesystem-wide statistics.
++   * @param statistics stream statistics
++   */
++  private void mergeOutputStreamStatistics(OutputStreamStatistics statistics) {
++    incrementCounter(STREAM_WRITE_TOTAL_TIME, statistics.totalUploadDuration());
++    incrementCounter(STREAM_WRITE_QUEUE_DURATION, statistics.queueDuration);
++    incrementCounter(STREAM_WRITE_TOTAL_DATA, statistics.bytesUploaded);
++    incrementCounter(STREAM_WRITE_BLOCK_UPLOADS,
++        statistics.blockUploadsCompleted);
++  }
++
++  /**
++   * Statistics updated by an output stream during its actual operation.
++   * Some of these stats may be relayed. However, as block upload is
++   * spans multiple
++   */
++  @InterfaceAudience.Private
++  @InterfaceStability.Unstable
++  public final class OutputStreamStatistics implements Closeable {
++    private final AtomicLong blocksSubmitted = new AtomicLong(0);
++    private final AtomicLong blocksInQueue = new AtomicLong(0);
++    private final AtomicLong blocksActive = new AtomicLong(0);
++    private final AtomicLong blockUploadsCompleted = new AtomicLong(0);
++    private final AtomicLong blockUploadsFailed = new AtomicLong(0);
++    private final AtomicLong bytesPendingUpload = new AtomicLong(0);
++
++    private final AtomicLong bytesUploaded = new AtomicLong(0);
++    private final AtomicLong transferDuration = new AtomicLong(0);
++    private final AtomicLong queueDuration = new AtomicLong(0);
++    private final AtomicLong exceptionsInMultipartFinalize = new AtomicLong(0);
++
++    /**
++     * Block is queued for upload.
++     */
++    void blockUploadQueued(int blockSize) {
++      blocksSubmitted.incrementAndGet();
++      blocksInQueue.incrementAndGet();
++      bytesPendingUpload.addAndGet(blockSize);
++      incrementGauge(STREAM_WRITE_BLOCK_UPLOADS_PENDING, 1);
++      incrementGauge(STREAM_WRITE_BLOCK_UPLOADS_DATA_PENDING, blockSize);
++    }
++
++    /** Queued block has been scheduled for upload. */
++    void blockUploadStarted(long duration, int blockSize) {
++      queueDuration.addAndGet(duration);
++      blocksInQueue.decrementAndGet();
++      blocksActive.incrementAndGet();
++      incrementGauge(STREAM_WRITE_BLOCK_UPLOADS_PENDING, -1);
++      incrementGauge(STREAM_WRITE_BLOCK_UPLOADS_ACTIVE, 1);
++    }
++
++    /** A block upload has completed. */
++    void blockUploadCompleted(long duration, int blockSize) {
++      this.transferDuration.addAndGet(duration);
++      incrementGauge(STREAM_WRITE_BLOCK_UPLOADS_ACTIVE, -1);
++      blocksActive.decrementAndGet();
++      blockUploadsCompleted.incrementAndGet();
++    }
++
++    /**
++     *  A block upload has failed.
++     *  A final transfer completed event is still expected, so this
++     *  does not decrement the active block counter.
++     */
++    void blockUploadFailed(long duration, int blockSize) {
++      blockUploadsFailed.incrementAndGet();
++    }
++
++    /** Intermediate report of bytes uploaded. */
++    void bytesTransferred(long byteCount) {
++      bytesUploaded.addAndGet(byteCount);
++      bytesPendingUpload.addAndGet(-byteCount);
++      incrementGauge(STREAM_WRITE_BLOCK_UPLOADS_DATA_PENDING, -byteCount);
++    }
++
++    /**
++     * Note an exception in a multipart complete.
++     */
++    void exceptionInMultipartComplete() {
++      exceptionsInMultipartFinalize.incrementAndGet();
++    }
++
++    /**
++     * Note an exception in a multipart abort.
++     */
++    void exceptionInMultipartAbort() {
++      exceptionsInMultipartFinalize.incrementAndGet();
++    }
++
++    /**
++     * Get the number of bytes pending upload.
++     * @return the number of bytes in the pending upload state.
++     */
++    public long getBytesPendingUpload() {
++      return bytesPendingUpload.get();
++    }
++
++    /**
++     * Output stream has closed.
++     * Trigger merge in of all statistics not updated during operation.
++     */
++    @Override
++    public void close() {
++      if (bytesPendingUpload.get() > 0) {
++        LOG.warn("Closing output stream statistics while data is still marked" +
++            " as pending upload in {}", this);
++      }
++      mergeOutputStreamStatistics(this);
++    }
++
++    long averageQueueTime() {
++      return blocksSubmitted.get() > 0 ?
++          (queueDuration.get() / blocksSubmitted.get()) : 0;
++    }
++
++    double effectiveBandwidth() {
++      double duration = totalUploadDuration() / 1000.0;
++      return duration > 0 ?
++          (bytesUploaded.get() / duration) : 0;
++    }
++
++    long totalUploadDuration() {
++      return queueDuration.get() + transferDuration.get();
++    }
++
++    @Override
++    public String toString() {
++      final StringBuilder sb = new StringBuilder(
++          "OutputStreamStatistics{");
++      sb.append("blocksSubmitted=").append(blocksSubmitted);
++      sb.append(", blocksInQueue=").append(blocksInQueue);
++      sb.append(", blocksActive=").append(blocksActive);
++      sb.append(", blockUploadsCompleted=").append(blockUploadsCompleted);
++      sb.append(", blockUploadsFailed=").append(blockUploadsFailed);
++      sb.append(", bytesPendingUpload=").append(bytesPendingUpload);
++      sb.append(", bytesUploaded=").append(bytesUploaded);
++      sb.append(", exceptionsInMultipartFinalize=").append(
++          exceptionsInMultipartFinalize);
++      sb.append(", transferDuration=").append(transferDuration).append(" ms");
++      sb.append(", queueDuration=").append(queueDuration).append(" ms");
++      sb.append(", averageQueueTime=").append(averageQueueTime()).append(" ms");
++      sb.append(", totalUploadDuration=").append(totalUploadDuration())
++          .append(" ms");
++      sb.append(", effectiveBandwidth=").append(effectiveBandwidth())
++          .append(" bytes/s");
++      sb.append('}');
++      return sb.toString();
++    }
++  }
+
+MOV26 INS26 INS26 INS26 INS40 INS40 INS40 UPD40 INS23 INS23 INS31 INS31 INS31 INS31 INS31 INS31 INS55 INS83 INS83 INS83 INS43 INS59 INS83 INS83 INS83 INS5 INS59 INS29 INS83 INS43 INS42 INS44 INS8 INS29 INS83 INS39 INS42 INS44 INS44 INS8 INS29 INS83 INS39 INS42 INS44 INS44 INS8 INS29 INS83 INS39 INS42 INS44 INS44 INS8 INS29 INS43 INS42 INS8 INS29 INS83 INS39 INS42 INS44 INS8 INS29 INS78 INS78 INS83 INS83 INS42 INS43 INS23 INS23 INS23 INS23 INS23 INS23 INS23 INS23 INS23 INS23 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS42 INS42 INS32 INS43 INS85 INS42 INS4 INS70 INS65 INS65 INS65 INS65 INS65 INS42 INS43 INS42 INS60 INS25 INS41 INS65 INS65 INS65 INS43 INS42 INS43 INS42 INS21 INS65 INS65 INS65 INS65 INS43 INS42 INS39 INS42 INS60 INS25 INS65 INS65 INS65 INS65 INS43 INS42 INS39 INS42 INS60 INS25 INS65 INS65 INS42 INS41 INS65 INS65 INS43 INS42 INS21 INS21 INS21 INS21 INS65 INS40 INS40 INS42 INS83 INS83 INS43 INS59 INS83 INS83 INS43 INS59 INS83 INS83 INS43 INS59 INS83 INS83 INS43 INS59 INS83 INS83 INS43 INS59 INS83 INS83 INS43 INS59 INS83 INS83 INS43 INS59 INS83 INS83 INS43 INS59 INS83 INS83 INS43 INS59 INS83 INS83 INS43 INS59 INS29 INS39 INS42 INS44 INS8 INS29 INS39 INS42 INS44 INS44 INS8 INS29 INS39 INS42 INS44 INS44 INS8 INS29 INS39 INS42 INS44 INS44 INS8 INS29 INS39 INS42 INS44 INS8 INS29 INS39 INS42 INS8 INS29 INS39 INS42 INS8 INS29 INS83 INS39 INS42 INS8 INS29 INS78 INS83 INS39 INS42 INS8 INS39 INS42 INS8 INS39 INS42 INS8 INS39 INS42 INS8 INS78 INS83 INS43 INS42 INS8 INS42 INS42 INS57 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS44 INS42 INS8 INS42 INS66 INS66 INS42 INS66 INS66 INS42 INS66 INS42 INS43 INS59 INS27 INS8 INS11 INS66 INS66 INS42 INS66 INS42 INS66 INS42 INS42 INS32 INS66 INS66 INS42 INS66 INS42 INS66 INS42 INS66 INS42 INS43 INS59 INS27 INS8 INS8 INS66 INS66 INS42 INS66 INS42 INS66 INS42 INS66 INS42 INS43 INS59 INS27 INS8 INS8 INS66 INS66 INS14 INS66 INS66 INS42 INS66 INS42 INS32 INS32 INS32 INS32 INS66 INS66 INS66 INS42 INS42 INS14 INS42 INS42 INS14 INS42 INS42 INS14 INS42 INS42 INS14 INS42 INS42 INS14 INS42 INS42 INS14 INS42 INS42 INS14 INS42 INS42 INS14 INS42 INS42 INS14 INS42 INS42 INS14 INS65 INS39 INS42 INS21 INS21 INS21 INS21 INS21 INS65 INS39 INS42 INS39 INS42 INS21 INS21 INS21 INS21 INS21 INS65 INS39 INS42 INS39 INS42 INS21 INS21 INS21 INS21 INS65 INS39 INS42 INS39 INS42 INS21 INS65 INS39 INS42 INS21 INS21 INS21 INS65 INS21 INS65 INS21 INS65 INS65 INS41 INS65 INS42 INS25 INS21 INS41 INS60 INS41 INS41 INS42 INS42 INS60 INS21 INS21 INS21 INS21 INS21 INS21 INS21 INS21 INS21 INS21 INS21 INS21 INS21 INS21 INS41 INS43 INS43 INS42 INS21 INS42 INS42 INS32 INS42 INS33 INS21 INS43 INS42 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS33 INS21 INS21 INS42 INS42 INS32 INS42 INS33 INS21 INS21 INS43 INS42 INS42 INS32 INS42 INS42 INS40 INS42 INS42 INS40 INS42 INS42 INS40 INS43 INS34 INS43 INS34 INS43 INS34 INS43 INS34 INS43 INS34 INS43 INS34 INS43 INS34 INS43 INS34 INS43 INS34 INS43 INS34 INS66 INS32 INS32 INS32 INS32 INS32 INS66 INS32 INS32 INS32 INS32 INS32 INS66 INS32 INS32 INS32 INS32 INS66 INS66 INS66 INS32 INS66 INS32 INS32 INS32 INS66 INS32 INS66 INS32 INS66 INS66 INS32 INS66 INS66 INS27 INS8 INS32 INS16 INS39 INS59 INS16 INS27 INS83 INS43 INS59 INS32 INS32 INS32 INS32 INS32 INS32 INS32 INS32 INS32 INS32 INS32 INS32 INS32 INS32 INS32 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS32 INS32 INS32 INS42 INS32 INS32 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS34 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS38 INS42 INS42 INS34 INS22 INS42 INS42 INS42 INS42 INS38 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS38 INS42 INS42 INS38 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS34 INS21 INS42 INS52 INS27 INS36 INS34 INS42 INS27 INS27 INS36 INS34 INS32 INS32 INS42 INS42 INS14 INS32 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS45 INS32 INS42 INS45 INS32 INS42 INS45 INS32 INS42 INS45 INS32 INS42 INS45 INS42 INS42 INS13 INS42 INS42 INS42 INS32 INS32 INS42 INS42 INS45 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS27 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS27 INS34 INS52 INS42 INS34 INS42 INS42 INS42 INS42 INS32 INS32 INS34 INS27 INS32 INS34 INS42 INS34 INS27 INS42 INS42 INS42 INS42 INS43 INS45 INS42 INS42 INS45 INS42 INS42 INS45 INS42 INS42 INS45 INS42 INS42 INS45 INS42 INS42 INS45 INS42 INS42 INS45 INS42 INS42 INS45 INS42 INS42 INS45 INS32 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS32 INS32 INS42 INS32 INS32 INS42 INS32 INS42 INS42 INS42 INS42 INS45 INS42 INS45 INS42 INS42 INS42 INS27 INS52 INS42 INS42 INS32 INS32 INS42 INS32 INS42 INS42 INS42 INS42 INS45 INS42 INS42 INS45 INS42 INS42 INS45 INS42 INS42 INS42 INS45 INS42 INS42 INS42 INS45 INS42 INS45 INS45 INS42 INS42 INS42 INS42 INS42 INS42 DEL42 DEL42 DEL42 DEL45 DEL42 DEL27 DEL32 DEL21

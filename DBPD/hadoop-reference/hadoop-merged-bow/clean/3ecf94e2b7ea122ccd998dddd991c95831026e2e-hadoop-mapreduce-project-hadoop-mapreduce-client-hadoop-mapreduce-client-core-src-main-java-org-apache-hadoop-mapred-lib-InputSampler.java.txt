@@ -1,0 +1,232 @@
+Merge r1480440 through r1480820 from trunk.
+
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/branches/HDFS-2802@1480824 13f79535-47bb-0310-9956-ffa450edef68
+
++import java.util.ArrayList;
++import java.util.Random;
++import org.apache.commons.logging.Log;
++import org.apache.commons.logging.LogFactory;
++import org.apache.hadoop.mapred.InputFormat;
++import org.apache.hadoop.mapred.InputSplit;
++import org.apache.hadoop.mapred.RecordReader;
++import org.apache.hadoop.mapred.Reporter;
++  private static final Log LOG = LogFactory.getLog(InputSampler.class);
++
++  /**
++   * Interface to sample using an {@link org.apache.hadoop.mapred.InputFormat}.
++   */
++  public interface Sampler<K,V> extends
++    org.apache.hadoop.mapreduce.lib.partition.InputSampler.Sampler<K, V> {
++    /**
++     * For a given job, collect and return a subset of the keys from the
++     * input data.
++     */
++    K[] getSample(InputFormat<K,V> inf, JobConf job) throws IOException;
++  }
++
++  /**
++   * Samples the first n records from s splits.
++   * Inexpensive way to sample random data.
++   */
++  public static class SplitSampler<K,V> extends
++      org.apache.hadoop.mapreduce.lib.partition.InputSampler.SplitSampler<K, V>
++          implements Sampler<K,V> {
++
++    /**
++     * Create a SplitSampler sampling <em>all</em> splits.
++     * Takes the first numSamples / numSplits records from each split.
++     * @param numSamples Total number of samples to obtain from all selected
++     *                   splits.
++     */
++    public SplitSampler(int numSamples) {
++      this(numSamples, Integer.MAX_VALUE);
++    }
++
++    /**
++     * Create a new SplitSampler.
++     * @param numSamples Total number of samples to obtain from all selected
++     *                   splits.
++     * @param maxSplitsSampled The maximum number of splits to examine.
++     */
++    public SplitSampler(int numSamples, int maxSplitsSampled) {
++      super(numSamples, maxSplitsSampled);
++    }
++
++    /**
++     * From each split sampled, take the first numSamples / numSplits records.
++     */
++    @SuppressWarnings("unchecked") // ArrayList::toArray doesn't preserve type
++    public K[] getSample(InputFormat<K,V> inf, JobConf job) throws IOException {
++      InputSplit[] splits = inf.getSplits(job, job.getNumMapTasks());
++      ArrayList<K> samples = new ArrayList<K>(numSamples);
++      int splitsToSample = Math.min(maxSplitsSampled, splits.length);
++      int splitStep = splits.length / splitsToSample;
++      int samplesPerSplit = numSamples / splitsToSample;
++      long records = 0;
++      for (int i = 0; i < splitsToSample; ++i) {
++        RecordReader<K,V> reader = inf.getRecordReader(splits[i * splitStep],
++            job, Reporter.NULL);
++        K key = reader.createKey();
++        V value = reader.createValue();
++        while (reader.next(key, value)) {
++          samples.add(key);
++          key = reader.createKey();
++          ++records;
++          if ((i+1) * samplesPerSplit <= records) {
++            break;
++          }
++        }
++        reader.close();
++      }
++      return (K[])samples.toArray();
++    }
++  }
++
++  /**
++   * Sample from random points in the input.
++   * General-purpose sampler. Takes numSamples / maxSplitsSampled inputs from
++   * each split.
++   */
++  public static class RandomSampler<K,V> extends
++      org.apache.hadoop.mapreduce.lib.partition.InputSampler.RandomSampler<K, V>
++          implements Sampler<K,V> {
++
++    /**
++     * Create a new RandomSampler sampling <em>all</em> splits.
++     * This will read every split at the client, which is very expensive.
++     * @param freq Probability with which a key will be chosen.
++     * @param numSamples Total number of samples to obtain from all selected
++     *                   splits.
++     */
++    public RandomSampler(double freq, int numSamples) {
++      this(freq, numSamples, Integer.MAX_VALUE);
++    }
++
++    /**
++     * Create a new RandomSampler.
++     * @param freq Probability with which a key will be chosen.
++     * @param numSamples Total number of samples to obtain from all selected
++     *                   splits.
++     * @param maxSplitsSampled The maximum number of splits to examine.
++     */
++    public RandomSampler(double freq, int numSamples, int maxSplitsSampled) {
++      super(freq, numSamples, maxSplitsSampled);
++    }
++
++    /**
++     * Randomize the split order, then take the specified number of keys from
++     * each split sampled, where each key is selected with the specified
++     * probability and possibly replaced by a subsequently selected key when
++     * the quota of keys from that split is satisfied.
++     */
++    @SuppressWarnings("unchecked") // ArrayList::toArray doesn't preserve type
++    public K[] getSample(InputFormat<K,V> inf, JobConf job) throws IOException {
++      InputSplit[] splits = inf.getSplits(job, job.getNumMapTasks());
++      ArrayList<K> samples = new ArrayList<K>(numSamples);
++      int splitsToSample = Math.min(maxSplitsSampled, splits.length);
++
++      Random r = new Random();
++      long seed = r.nextLong();
++      r.setSeed(seed);
++      LOG.debug("seed: " + seed);
++      // shuffle splits
++      for (int i = 0; i < splits.length; ++i) {
++        InputSplit tmp = splits[i];
++        int j = r.nextInt(splits.length);
++        splits[i] = splits[j];
++        splits[j] = tmp;
++      }
++      // our target rate is in terms of the maximum number of sample splits,
++      // but we accept the possibility of sampling additional splits to hit
++      // the target sample keyset
++      for (int i = 0; i < splitsToSample ||
++                     (i < splits.length && samples.size() < numSamples); ++i) {
++        RecordReader<K,V> reader = inf.getRecordReader(splits[i], job,
++            Reporter.NULL);
++        K key = reader.createKey();
++        V value = reader.createValue();
++        while (reader.next(key, value)) {
++          if (r.nextDouble() <= freq) {
++            if (samples.size() < numSamples) {
++              samples.add(key);
++            } else {
++              // When exceeding the maximum number of samples, replace a
++              // random element with this one, then adjust the frequency
++              // to reflect the possibility of existing elements being
++              // pushed out
++              int ind = r.nextInt(numSamples);
++              if (ind != numSamples) {
++                samples.set(ind, key);
++              }
++              freq *= (numSamples - 1) / (double) numSamples;
++            }
++            key = reader.createKey();
++          }
++        }
++        reader.close();
++      }
++      return (K[])samples.toArray();
++    }
++  }
++
++  /**
++   * Sample from s splits at regular intervals.
++   * Useful for sorted data.
++   */
++  public static class IntervalSampler<K,V> extends
++      org.apache.hadoop.mapreduce.lib.partition.InputSampler.IntervalSampler<K, V>
++          implements Sampler<K,V> {
++
++    /**
++     * Create a new IntervalSampler sampling <em>all</em> splits.
++     * @param freq The frequency with which records will be emitted.
++     */
++    public IntervalSampler(double freq) {
++      this(freq, Integer.MAX_VALUE);
++    }
++
++    /**
++     * Create a new IntervalSampler.
++     * @param freq The frequency with which records will be emitted.
++     * @param maxSplitsSampled The maximum number of splits to examine.
++     * @see #getSample
++     */
++    public IntervalSampler(double freq, int maxSplitsSampled) {
++      super(freq, maxSplitsSampled);
++    }
++
++    /**
++     * For each split sampled, emit when the ratio of the number of records
++     * retained to the total record count is less than the specified
++     * frequency.
++     */
++    @SuppressWarnings("unchecked") // ArrayList::toArray doesn't preserve type
++    public K[] getSample(InputFormat<K,V> inf, JobConf job) throws IOException {
++      InputSplit[] splits = inf.getSplits(job, job.getNumMapTasks());
++      ArrayList<K> samples = new ArrayList<K>();
++      int splitsToSample = Math.min(maxSplitsSampled, splits.length);
++      int splitStep = splits.length / splitsToSample;
++      long records = 0;
++      long kept = 0;
++      for (int i = 0; i < splitsToSample; ++i) {
++        RecordReader<K,V> reader = inf.getRecordReader(splits[i * splitStep],
++            job, Reporter.NULL);
++        K key = reader.createKey();
++        V value = reader.createValue();
++        while (reader.next(key, value)) {
++          ++records;
++          if ((double) kept / records < freq) {
++            ++kept;
++            samples.add(key);
++            key = reader.createKey();
++          }
++        }
++        reader.close();
++      }
++      return (K[])samples.toArray();
++    }
++  }
++
+
+INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS23 INS55 INS55 INS55 INS55 INS83 INS83 INS83 INS43 INS59 INS29 INS83 INS42 INS73 INS73 INS74 INS31 INS29 INS83 INS83 INS42 INS73 INS73 INS74 INS74 INS31 INS31 INS31 INS29 INS83 INS83 INS42 INS73 INS73 INS74 INS74 INS31 INS31 INS31 INS29 INS83 INS83 INS42 INS73 INS73 INS74 INS74 INS31 INS31 INS31 INS42 INS42 INS32 INS65 INS42 INS42 INS43 INS43 INS43 INS29 INS5 INS42 INS44 INS44 INS43 INS65 INS42 INS42 INS43 INS43 INS43 INS43 INS43 INS43 INS29 INS83 INS42 INS44 INS8 INS29 INS83 INS42 INS44 INS44 INS8 INS29 INS79 INS83 INS5 INS42 INS44 INS44 INS43 INS8 INS65 INS42 INS42 INS43 INS43 INS43 INS43 INS43 INS43 INS29 INS83 INS42 INS44 INS44 INS8 INS29 INS83 INS42 INS44 INS44 INS44 INS8 INS29 INS79 INS83 INS5 INS42 INS44 INS44 INS43 INS8 INS65 INS42 INS42 INS43 INS43 INS43 INS43 INS43 INS43 INS29 INS83 INS42 INS44 INS8 INS29 INS83 INS42 INS44 INS44 INS8 INS29 INS79 INS83 INS5 INS42 INS44 INS44 INS43 INS8 INS42 INS42 INS57 INS66 INS65 INS66 INS40 INS42 INS42 INS65 INS43 INS85 INS74 INS42 INS43 INS42 INS42 INS66 INS66 INS40 INS42 INS42 INS42 INS42 INS42 INS65 INS65 INS39 INS42 INS17 INS65 INS65 INS65 INS39 INS42 INS39 INS42 INS46 INS65 INS42 INS45 INS43 INS85 INS74 INS42 INS43 INS42 INS42 INS60 INS60 INS60 INS60 INS60 INS60 INS24 INS41 INS66 INS66 INS66 INS40 INS42 INS42 INS42 INS42 INS42 INS65 INS65 INS65 INS39 INS42 INS39 INS42 INS17 INS65 INS65 INS65 INS65 INS39 INS42 INS39 INS42 INS39 INS42 INS46 INS65 INS42 INS45 INS43 INS85 INS74 INS42 INS43 INS42 INS42 INS60 INS60 INS60 INS60 INS60 INS21 INS21 INS24 INS24 INS41 INS66 INS66 INS40 INS42 INS42 INS42 INS42 INS42 INS65 INS65 INS39 INS42 INS17 INS65 INS65 INS65 INS65 INS39 INS42 INS39 INS42 INS46 INS65 INS42 INS45 INS43 INS85 INS74 INS42 INS43 INS42 INS42 INS60 INS60 INS60 INS60 INS60 INS60 INS24 INS41 INS43 INS40 INS66 INS66 INS42 INS43 INS43 INS43 INS42 INS66 INS66 INS42 INS66 INS66 INS42 INS40 INS66 INS42 INS66 INS66 INS42 INS66 INS42 INS42 INS66 INS42 INS43 INS43 INS43 INS42 INS5 INS59 INS74 INS59 INS39 INS59 INS39 INS59 INS39 INS59 INS39 INS59 INS58 INS27 INS38 INS8 INS11 INS66 INS66 INS42 INS66 INS42 INS66 INS66 INS42 INS42 INS40 INS66 INS42 INS66 INS42 INS66 INS66 INS42 INS66 INS42 INS42 INS42 INS66 INS66 INS66 INS66 INS42 INS43 INS43 INS43 INS42 INS5 INS59 INS74 INS59 INS39 INS59 INS43 INS59 INS39 INS59 INS32 INS32 INS58 INS27 INS38 INS8 INS58 INS27 INS38 INS8 INS11 INS66 INS42 INS66 INS42 INS40 INS66 INS42 INS66 INS42 INS66 INS67 INS42 INS42 INS66 INS66 INS66 INS42 INS43 INS43 INS43 INS42 INS5 INS59 INS74 INS59 INS39 INS59 INS39 INS59 INS39 INS59 INS39 INS59 INS58 INS27 INS38 INS8 INS11 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS43 INS85 INS42 INS32 INS43 INS43 INS42 INS14 INS42 INS32 INS42 INS27 INS42 INS27 INS42 INS34 INS39 INS59 INS42 INS42 INS42 INS60 INS60 INS60 INS61 INS21 INS5 INS32 INS42 INS42 INS42 INS43 INS85 INS42 INS32 INS43 INS43 INS42 INS14 INS42 INS32 INS42 INS42 INS14 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS27 INS39 INS59 INS42 INS40 INS42 INS60 INS60 INS21 INS21 INS39 INS59 INS27 INS36 INS42 INS60 INS60 INS60 INS61 INS21 INS5 INS32 INS42 INS42 INS42 INS42 INS43 INS85 INS42 INS32 INS43 INS43 INS42 INS14 INS42 INS32 INS42 INS27 INS42 INS34 INS42 INS34 INS39 INS59 INS42 INS42 INS42 INS60 INS60 INS60 INS61 INS21 INS5 INS32 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS74 INS42 INS42 INS42 INS42 INS40 INS40 INS42 INS42 INS42 INS42 INS34 INS74 INS59 INS43 INS59 INS43 INS59 INS32 INS8 INS32 INS43 INS85 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS74 INS42 INS42 INS42 INS42 INS40 INS43 INS42 INS42 INS45 INS42 INS42 INS34 INS43 INS59 INS39 INS59 INS7 INS7 INS42 INS34 INS42 INS42 INS27 INS74 INS59 INS43 INS59 INS43 INS59 INS32 INS8 INS32 INS43 INS85 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS74 INS42 INS42 INS42 INS40 INS40 INS42 INS42 INS34 INS74 INS59 INS43 INS59 INS43 INS59 INS32 INS8 INS32 INS43 INS85 INS42 INS42 INS42 INS42 INS43 INS43 INS43 INS43 INS43 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS21 INS21 INS21 INS25 INS42 INS42 INS42 INS42 INS42 INS43 INS43 INS42 INS42 INS42 INS2 INS42 INS32 INS2 INS2 INS2 INS42 INS27 INS27 INS43 INS43 INS43 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS25 INS42 INS42 INS42 INS42 INS42 INS43 INS43 INS43 INS43 INS43 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS21 INS25 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS2 INS42 INS40 INS42 INS42 INS42 INS42 INS32 INS7 INS38 INS27 INS8 INS42 INS42 INS42 INS42 INS42 INS42 INS40 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS40 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS2 INS42 INS40 INS42 INS42 INS42 INS42 INS27 INS8 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS2 INS42 INS40 INS42 INS42 INS42 INS42 INS38 INS27 INS8 INS42 INS27 INS42 INS42 INS42 INS42 INS32 INS42 INS27 INS42 INS10 INS42 INS42 INS42 INS42 INS32 INS42 INS25 INS21 INS42 INS27 INS42 INS27 INS42 INS21 INS21 INS21 INS42 INS42 INS42 INS42 INS36 INS42 INS42 INS42 INS27 INS8 INS8 INS7 INS42 INS42 INS11 INS42 INS38 INS32 INS7 INS27 INS32 INS42 INS21 INS60 INS25 INS21 INS42 INS32 INS39 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS34 INS42 INS42 INS32 INS39 INS59 INS27 INS8 INS7 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS21 INS42 INS27 INS42 INS42 INS42 INS32 INS36 INS11 INS42 INS42 INS42 INS42 INS27 INS39 INS42 INS42 INS34

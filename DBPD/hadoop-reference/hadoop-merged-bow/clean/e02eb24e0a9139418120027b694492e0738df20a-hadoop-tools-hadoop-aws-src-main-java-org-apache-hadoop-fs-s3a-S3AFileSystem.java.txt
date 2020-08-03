@@ -1,0 +1,701 @@
+HADOOP-15183. S3Guard store becomes inconsistent after partial failure of rename.
+
+Contributed by Steve Loughran.
+
+Change-Id: I825b0bc36be960475d2d259b1cdab45ae1bb78eb
+
++import java.time.Instant;
++import java.time.OffsetDateTime;
++import java.time.ZoneOffset;
+-import java.util.HashSet;
++import org.apache.commons.lang3.tuple.Pair;
++import org.apache.commons.lang3.tuple.Triple;
++import org.apache.hadoop.fs.s3a.impl.ContextAccessors;
++import org.apache.hadoop.fs.s3a.impl.MultiObjectDeleteSupport;
++import org.apache.hadoop.fs.s3a.impl.RenameOperation;
++import org.apache.hadoop.fs.s3a.impl.StoreContext;
++import org.apache.hadoop.fs.s3a.s3guard.BulkOperationState;
++import org.apache.hadoop.io.IOUtils;
++import org.apache.hadoop.util.DurationInfo;
++  private int executorCapacity;
++      long authDirTtl = conf.getTimeDuration(METADATASTORE_METADATA_TTL,
++          DEFAULT_METADATASTORE_METADATA_TTL, TimeUnit.MILLISECONDS);
++      ttlTimeProvider = new S3Guard.TtlTimeProvider(authDirTtl);
+-      if (hasMetadataStore()) {
+-        long authDirTtl = conf.getTimeDuration(METADATASTORE_METADATA_TTL,
+-            DEFAULT_METADATASTORE_METADATA_TTL, TimeUnit.MILLISECONDS);
+-        ttlTimeProvider = new S3Guard.TtlTimeProvider(authDirTtl);
+-      }
++  /**
++   * Initialize the thread pool.
++   * This must be re-invoked after replacing the S3Client during test
++   * runs.
++   * @param conf configuration.
++   */
+-        new LinkedBlockingQueue<Runnable>(),
++        new LinkedBlockingQueue<>(),
++    executorCapacity = intOption(conf,
++        EXECUTOR_CAPACITY, DEFAULT_EXECUTOR_CAPACITY, 1);
++  @VisibleForTesting
++   * This does not mark the file for deletion when a process exits.
+-   *  @param pathStr prefix for the temporary file
+-   *  @param size the size of the file that is going to be written
+-   *  @param conf the Configuration object
+-   *  @return a unique temporary file
+-   *  @throws IOException IO problems
++   * @param pathStr prefix for the temporary file
++   * @param size the size of the file that is going to be written
++   * @param conf the Configuration object
++   * @return a unique temporary file
++   * @throws IOException IO problems
+-  synchronized File createTmpFileForWrite(String pathStr, long size,
++  File createTmpFileForWrite(String pathStr, long size,
+-      String bufferDir = conf.get(BUFFER_DIR) != null
+-          ? BUFFER_DIR : HADOOP_TMP_DIR;
+-      directoryAllocator = new LocalDirAllocator(bufferDir);
++      synchronized (this) {
++        String bufferDir = conf.get(BUFFER_DIR) != null
++            ? BUFFER_DIR : HADOOP_TMP_DIR;
++        directoryAllocator = new LocalDirAllocator(bufferDir);
++      }
+-    return directoryAllocator.createTmpFileForWrite(pathStr, size, conf);
++    Path path = directoryAllocator.getLocalPathForWrite(pathStr,
++        size, conf);
++    File dir = new File(path.getParent().toUri().getPath());
++    String prefix = path.getName();
++    // create a temp file on this directory
++    return File.createTempFile(prefix, null, dir);
+-            createObjectAttributes(
+-                path,
+-                fileStatus.getETag(),
+-                fileStatus.getVersionId()),
+-            fileStatus.getLen(),
++            createObjectAttributes(fileStatus),
+-   * Create the attributes of an object for a get/select request.
++   * Create the attributes of an object for subsequent use.
++   * @param len length of the file
+-      final String versionId) {
++      final String versionId,
++      final long len) {
++        f,
+-        versionId);
++        versionId,
++        len);
++  }
++
++  /**
++   * Create the attributes of an object for subsequent use.
++   * @param fileStatus file status to build from.
++   * @return attributes to use when building the query.
++   */
++  private S3ObjectAttributes createObjectAttributes(
++      final S3AFileStatus fileStatus) {
++    return createObjectAttributes(
++        fileStatus.getPath(),
++        fileStatus.getETag(),
++        fileStatus.getVersionId(),
++        fileStatus.getLen());
++  @Retries.RetryTranslated
+-    try {
+-      return innerRename(src, dst);
++    try (DurationInfo ignored = new DurationInfo(LOG, false,
++        "rename(%s, %s", src, dst)) {
++      long bytesCopied = innerRename(src, dst);
++      LOG.debug("Copied {} bytes", bytesCopied);
++      return true;
+-   * The inner rename operation. See {@link #rename(Path, Path)} for
+-   * the description of the operation.
+-   * This operation throws an exception on any failure which needs to be
+-   * reported and downgraded to a failure.
+-   * Retries: retry translated, assuming all operations it is called do
+-   * so. For safely, consider catch and handle AmazonClientException
+-   * because this is such a complex method there's a risk it could surface.
+-   * @param source path to be renamed
+-   * @param dest new path after rename
++   * Validate the rename parameters and status of the filesystem;
++   * returns the source and any destination File Status.
++   * @param src qualified path to be renamed
++   * @param dst qualified path after rename
++   * @return the source and (possibly null) destination status entries.
+-   * @throws AmazonClientException on failures inside the AWS SDK
+-  @Retries.RetryMixed
+-  private boolean innerRename(Path source, Path dest)
+-      throws RenameFailedException, FileNotFoundException, IOException,
+-        AmazonClientException {
+-    Path src = qualify(source);
+-    Path dst = qualify(dest);
+-
+-    LOG.debug("Rename path {} to {}", src, dst);
+-    entryPoint(INVOCATION_RENAME);
+-
++  @Retries.RetryTranslated
++  private Pair<S3AFileStatus, S3AFileStatus> initiateRename(
++      final Path src,
++      final Path dst) throws IOException {
++    return Pair.of(srcStatus, dstStatus);
++  }
+-    // If we have a MetadataStore, track deletions/creations.
+-    Collection<Path> srcPaths = null;
+-    List<PathMetadata> dstMetas = null;
+-    if (hasMetadataStore()) {
+-      srcPaths = new HashSet<>(); // srcPaths need fast look up before put
+-      dstMetas = new ArrayList<>();
++  /**
++   * The inner rename operation. See {@link #rename(Path, Path)} for
++   * the description of the operation.
++   * This operation throws an exception on any failure which needs to be
++   * reported and downgraded to a failure.
++   * Retries: retry translated, assuming all operations it is called do
++   * so. For safely, consider catch and handle AmazonClientException
++   * because this is such a complex method there's a risk it could surface.
++   * @param source path to be renamed
++   * @param dest new path after rename
++   * @throws RenameFailedException if some criteria for a state changing
++   * rename was not met. This means work didn't happen; it's not something
++   * which is reported upstream to the FileSystem APIs, for which the semantics
++   * of "false" are pretty vague.
++   * @return the number of bytes copied.
++   * @throws FileNotFoundException there's no source file.
++   * @throws IOException on IO failure.
++   * @throws AmazonClientException on failures inside the AWS SDK
++   */
++  @Retries.RetryMixed
++  private long innerRename(Path source, Path dest)
++      throws RenameFailedException, FileNotFoundException, IOException,
++        AmazonClientException {
++    Path src = qualify(source);
++    Path dst = qualify(dest);
++
++    LOG.debug("Rename path {} to {}", src, dst);
++    entryPoint(INVOCATION_RENAME);
++
++    String srcKey = pathToKey(src);
++    String dstKey = pathToKey(dst);
++
++    Pair<S3AFileStatus, S3AFileStatus> p = initiateRename(src, dst);
++
++    // Initiate the rename.
++    // this will call back into this class via the rename callbacks
++    // and interact directly with any metastore.
++    RenameOperation renameOperation = new RenameOperation(
++        createStoreContext(),
++        src, srcKey, p.getLeft(),
++        dst, dstKey, p.getRight(),
++        new RenameOperationCallbacksImpl());
++    return renameOperation.executeRename();
++  }
++
++  /**
++   * All the callbacks made by the rename operation of the filesystem.
++   * This separation allows the operation to be factored out and
++   * still avoid knowledge of the S3AFilesystem implementation.
++   */
++  private class RenameOperationCallbacksImpl implements
++      RenameOperation.RenameOperationCallbacks {
++
++    @Override
++    public S3ObjectAttributes createObjectAttributes(final Path path,
++        final String eTag,
++        final String versionId,
++        final long len) {
++      return S3AFileSystem.this.createObjectAttributes(path, eTag, versionId,
++          len);
+-    // TODO S3Guard HADOOP-13761: retries when source paths are not visible yet
+-    // TODO S3Guard: performance: mark destination dirs as authoritative
+-    // Ok! Time to start
+-    if (srcStatus.isFile()) {
+-      LOG.debug("rename: renaming file {} to {}", src, dst);
+-      long length = srcStatus.getLen();
+-      S3ObjectAttributes objectAttributes =
+-          createObjectAttributes(srcStatus.getPath(),
+-              srcStatus.getETag(), srcStatus.getVersionId());
+-      S3AReadOpContext readContext = createReadContext(srcStatus, inputPolicy,
++    @Override
++    public S3ObjectAttributes createObjectAttributes(final S3AFileStatus fileStatus) {
++      return S3AFileSystem.this.createObjectAttributes(fileStatus);
++    }
++
++    @Override
++    public S3AReadOpContext createReadContext(final FileStatus fileStatus) {
++      return S3AFileSystem.this.createReadContext(fileStatus,
++          inputPolicy,
+-      if (dstStatus != null && dstStatus.isDirectory()) {
+-        String newDstKey = maybeAddTrailingSlash(dstKey);
+-        String filename =
+-            srcKey.substring(pathToKey(src.getParent()).length()+1);
+-        newDstKey = newDstKey + filename;
+-        CopyResult copyResult = copyFile(srcKey, newDstKey, length,
+-            objectAttributes, readContext);
+-        S3Guard.addMoveFile(metadataStore, srcPaths, dstMetas, src,
+-            keyToQualifiedPath(newDstKey), length, getDefaultBlockSize(dst),
+-            username, copyResult.getETag(), copyResult.getVersionId());
+-      } else {
+-        CopyResult copyResult = copyFile(srcKey, dstKey, srcStatus.getLen(),
+-            objectAttributes, readContext);
+-        S3Guard.addMoveFile(metadataStore, srcPaths, dstMetas, src, dst,
+-            length, getDefaultBlockSize(dst), username,
+-            copyResult.getETag(), copyResult.getVersionId());
+-      }
+-      innerDelete(srcStatus, false);
+-    } else {
+-      LOG.debug("rename: renaming directory {} to {}", src, dst);
+-
+-      // This is a directory to directory copy
+-      dstKey = maybeAddTrailingSlash(dstKey);
+-      srcKey = maybeAddTrailingSlash(srcKey);
+-
+-      //Verify dest is not a child of the source directory
+-      if (dstKey.startsWith(srcKey)) {
+-        throw new RenameFailedException(srcKey, dstKey,
+-            "cannot rename a directory to a subdirectory of itself ");
+-      }
+-
+-      List<DeleteObjectsRequest.KeyVersion> keysToDelete = new ArrayList<>();
+-      if (dstStatus != null && dstStatus.isEmptyDirectory() == Tristate.TRUE) {
+-        // delete unnecessary fake directory.
+-        keysToDelete.add(new DeleteObjectsRequest.KeyVersion(dstKey));
+-      }
+-
+-      Path parentPath = keyToQualifiedPath(srcKey);
+-      RemoteIterator<S3ALocatedFileStatus> iterator =
+-          listFilesAndEmptyDirectories(parentPath, true);
+-      while (iterator.hasNext()) {
+-        S3ALocatedFileStatus status = iterator.next();
+-        long length = status.getLen();
+-        String key = pathToKey(status.getPath());
+-        if (status.isDirectory() && !key.endsWith("/")) {
+-          key += "/";
+-        }
+-        keysToDelete
+-            .add(new DeleteObjectsRequest.KeyVersion(key));
+-        String newDstKey =
+-            dstKey + key.substring(srcKey.length());
+-        S3ObjectAttributes objectAttributes =
+-            createObjectAttributes(status.getPath(),
+-                status.getETag(), status.getVersionId());
+-        S3AReadOpContext readContext = createReadContext(status, inputPolicy,
+-            changeDetectionPolicy, readAhead);
+-        CopyResult copyResult = copyFile(key, newDstKey, length,
+-            objectAttributes, readContext);
+-
+-        if (hasMetadataStore()) {
+-          // with a metadata store, the object entries need to be updated,
+-          // including, potentially, the ancestors
+-          Path childSrc = keyToQualifiedPath(key);
+-          Path childDst = keyToQualifiedPath(newDstKey);
+-          if (objectRepresentsDirectory(key, length)) {
+-            S3Guard.addMoveDir(metadataStore, srcPaths, dstMetas, childSrc,
+-                childDst, username);
+-          } else {
+-            S3Guard.addMoveFile(metadataStore, srcPaths, dstMetas, childSrc,
+-                childDst, length, getDefaultBlockSize(childDst), username,
+-                copyResult.getETag(), copyResult.getVersionId());
+-          }
+-          // Ancestor directories may not be listed, so we explicitly add them
+-          S3Guard.addMoveAncestors(metadataStore, srcPaths, dstMetas,
+-              keyToQualifiedPath(srcKey), childSrc, childDst, username);
+-        }
+-
+-        if (keysToDelete.size() == MAX_ENTRIES_TO_DELETE) {
+-          removeKeys(keysToDelete, true, false);
+-        }
+-      }
+-      if (!keysToDelete.isEmpty()) {
+-        removeKeys(keysToDelete, false, false);
+-      }
+-
+-      // We moved all the children, now move the top-level dir
+-      // Empty directory should have been added as the object summary
+-      if (hasMetadataStore()
+-          && srcPaths != null
+-          && !srcPaths.contains(src)) {
+-        LOG.debug("To move the non-empty top-level dir src={} and dst={}",
+-            src, dst);
+-        S3Guard.addMoveDir(metadataStore, srcPaths, dstMetas, src, dst,
+-            username);
+-      }
+-    metadataStore.move(srcPaths, dstMetas, ttlTimeProvider);
+-
+-    if (!src.getParent().equals(dst.getParent())) {
+-      LOG.debug("source & dest parents are different; fix up dir markers");
+-      deleteUnnecessaryFakeDirectories(dst.getParent());
+-      maybeCreateFakeParentDirectory(src);
++    @Override
++    public void deleteObjectAtPath(final Path path,
++        final String key,
++        final boolean isFile)
++        throws IOException {
++      S3AFileSystem.this.deleteObjectAtPath(path, key, isFile);
+-    return true;
++
++    @Override
++    @Retries.RetryTranslated
++    public RemoteIterator<S3ALocatedFileStatus> listFilesAndEmptyDirectories(
++        final Path path) throws IOException {
++      return S3AFileSystem.this.listFilesAndEmptyDirectories(path, true);
++    }
++
++    @Override
++    public CopyResult copyFile(final String srcKey,
++        final String destKey,
++        final S3ObjectAttributes srcAttributes,
++        final S3AReadOpContext readContext) throws IOException {
++      return S3AFileSystem.this.copyFile(srcKey, destKey,
++          srcAttributes.getLen(), srcAttributes, readContext);
++    }
++
++    @Override
++    public void removeKeys(final List<DeleteObjectsRequest.KeyVersion> keysToDelete,
++        final boolean deleteFakeDir,
++        final List<Path> undeletedObjectsOnFailure)
++        throws MultiObjectDeleteException, AmazonClientException, IOException {
++      S3AFileSystem.this.removeKeys(keysToDelete, deleteFakeDir,
++          undeletedObjectsOnFailure);
++    }
++
++    @Override
++    public void finishRename(final Path sourceRenamed, final Path destCreated)
++        throws IOException {
++      Path destParent = destCreated.getParent();
++      if (!sourceRenamed.getParent().equals(destParent)) {
++        LOG.debug("source & dest parents are different; fix up dir markers");
++        deleteUnnecessaryFakeDirectories(destParent);
++        maybeCreateFakeParentDirectory(sourceRenamed);
++      }
++    }
++    checkNotClosed();
+-    return invoker.retryUntranslated(
+-        request.toString(),
+-        true,
+-        () -> {
+-          if (useListV1) {
+-            return S3ListResult.v1(s3.listObjects(request.getV1()));
+-          } else {
+-            return S3ListResult.v2(s3.listObjectsV2(request.getV2()));
+-          }
+-        });
++    try(DurationInfo ignored =
++            new DurationInfo(LOG, false, "LIST")) {
++      return invoker.retryUntranslated(
++          request.toString(),
++          true,
++          () -> {
++            if (useListV1) {
++              return S3ListResult.v1(s3.listObjects(request.getV1()));
++            } else {
++              return S3ListResult.v2(s3.listObjectsV2(request.getV2()));
++            }
++          });
++    }
+-    return invoker.retryUntranslated(
+-        request.toString(),
+-        true,
+-        () -> {
+-          incrementStatistic(OBJECT_CONTINUE_LIST_REQUESTS);
+-          if (useListV1) {
+-            return S3ListResult.v1(
+-                s3.listNextBatchOfObjects(prevResult.getV1()));
+-          } else {
+-            request.getV2().setContinuationToken(prevResult.getV2()
+-                .getNextContinuationToken());
+-            return S3ListResult.v2(s3.listObjectsV2(request.getV2()));
+-          }
+-        });
++    try(DurationInfo ignored =
++            new DurationInfo(LOG, false, "LIST (continued)")) {
++      return invoker.retryUntranslated(
++          request.toString(),
++          true,
++          () -> {
++            incrementStatistic(OBJECT_CONTINUE_LIST_REQUESTS);
++            if (useListV1) {
++              return S3ListResult.v1(
++                  s3.listNextBatchOfObjects(prevResult.getV1()));
++            } else {
++              request.getV2().setContinuationToken(prevResult.getV2()
++                  .getNextContinuationToken());
++              return S3ListResult.v2(s3.listObjectsV2(request.getV2()));
++            }
++          });
++    }
++    LOG.debug("DELETE {}", key);
+-   * @throws IOException IO failure
++   * @throws IOException IO failure in the metastore
+-  @Retries.RetryRaw
++  @Retries.RetryMixed
+-    try {
++    try(DurationInfo ignored =
++            new DurationInfo(LOG, false, "DELETE %d keys",
++                deleteRequest.getKeys().size())) {
+-          result.getETag(), result.getVersionId());
++          result.getETag(), result.getVersionId(), null);
+-   * A helper method to delete a list of keys on a s3-backend.
++   * Delete a list of keys on a s3-backend.
++   * This does <i>not</i> update the metastore.
+-   * @param clearKeys clears the keysToDelete-list after processing the list
+-   *            when set to true
+-   * @throws AmazonClientException amazon-layer failure.
++   * The number of rejected objects will be added to the metric
++   * {@link Statistic#FILES_DELETE_REJECTED}.
++   * @throws AmazonClientException other amazon-layer failure.
+-  @VisibleForTesting
+-  void removeKeys(List<DeleteObjectsRequest.KeyVersion> keysToDelete,
+-      boolean clearKeys, boolean deleteFakeDir)
++  private void removeKeysS3(List<DeleteObjectsRequest.KeyVersion> keysToDelete,
++      boolean deleteFakeDir)
+-    if (enableMultiObjectsDelete) {
+-      deleteObjects(new DeleteObjectsRequest(bucket)
+-          .withKeys(keysToDelete)
+-          .withQuiet(true));
+-    } else {
+-      for (DeleteObjectsRequest.KeyVersion keyVersion : keysToDelete) {
+-        deleteObject(keyVersion.getKey());
++    try {
++      if (enableMultiObjectsDelete) {
++        deleteObjects(new DeleteObjectsRequest(bucket)
++            .withKeys(keysToDelete)
++            .withQuiet(true));
++      } else {
++        for (DeleteObjectsRequest.KeyVersion keyVersion : keysToDelete) {
++          deleteObject(keyVersion.getKey());
++        }
++    } catch (MultiObjectDeleteException ex) {
++      // partial delete.
++      // Update the stats with the count of the actual number of successful
++      // deletions.
++      int rejected = ex.getErrors().size();
++      noteDeleted(keysToDelete.size() - rejected, deleteFakeDir);
++      incrementStatistic(FILES_DELETE_REJECTED, rejected);
++      throw ex;
++    noteDeleted(keysToDelete.size(), deleteFakeDir);
++  }
++
++  /**
++   * Note the deletion of files or fake directories deleted.
++   * @param count count of keys deleted.
++   * @param deleteFakeDir are the deletions fake directories?
++   */
++  private void noteDeleted(final int count, final boolean deleteFakeDir) {
+-      instrumentation.fileDeleted(keysToDelete.size());
++      instrumentation.fileDeleted(count);
+-      instrumentation.fakeDirsDeleted(keysToDelete.size());
++      instrumentation.fakeDirsDeleted(count);
+-    if (clearKeys) {
+-      keysToDelete.clear();
++  }
++
++  /**
++   * Invoke {@link #removeKeysS3(List, boolean)} with handling of
++   * {@code MultiObjectDeleteException}.
++   *
++   * @param keysToDelete collection of keys to delete on the s3-backend.
++   *        if empty, no request is made of the object store.
++   * @param deleteFakeDir indicates whether this is for deleting fake dirs
++   * @throws InvalidRequestException if the request was rejected due to
++   * a mistaken attempt to delete the root directory.
++   * @throws MultiObjectDeleteException one or more of the keys could not
++   * be deleted in a multiple object delete operation.
++   * @throws AmazonClientException amazon-layer failure.
++   * @throws IOException other IO Exception.
++   */
++  @VisibleForTesting
++  @Retries.RetryMixed
++  void removeKeys(
++      final List<DeleteObjectsRequest.KeyVersion> keysToDelete,
++      final boolean deleteFakeDir)
++      throws MultiObjectDeleteException, AmazonClientException,
++      IOException {
++    removeKeys(keysToDelete, deleteFakeDir, new ArrayList<>());
++  }
++
++  /**
++   * Invoke {@link #removeKeysS3(List, boolean)} with handling of
++   * {@code MultiObjectDeleteException} before the exception is rethrown.
++   * Specifically:
++   * <ol>
++   *   <li>Failure and !deleteFakeDir: S3Guard is updated with all
++   *    deleted entries</li>
++   *   <li>Failure where deleteFakeDir == true: do nothing with S3Guard</li>
++   *   <li>Success: do nothing with S3Guard</li>
++   * </ol>
++   * @param keysToDelete collection of keys to delete on the s3-backend.
++   *        if empty, no request is made of the object store.
++   * @param deleteFakeDir indicates whether this is for deleting fake dirs.
++   * @param undeletedObjectsOnFailure List which will be built up of all
++   * files that were not deleted. This happens even as an exception
++   * is raised.
++   * @throws InvalidRequestException if the request was rejected due to
++   * a mistaken attempt to delete the root directory.
++   * @throws MultiObjectDeleteException one or more of the keys could not
++   * be deleted in a multiple object delete operation.
++   * @throws AmazonClientException amazon-layer failure.
++   * @throws IOException other IO Exception.
++   */
++  @VisibleForTesting
++  @Retries.RetryMixed
++  void removeKeys(
++      final List<DeleteObjectsRequest.KeyVersion> keysToDelete,
++      final boolean deleteFakeDir,
++      final List<Path> undeletedObjectsOnFailure)
++      throws MultiObjectDeleteException, AmazonClientException,
++      IOException {
++    undeletedObjectsOnFailure.clear();
++    try(DurationInfo ignored = new DurationInfo(LOG, false, "Deleting")) {
++      removeKeysS3(keysToDelete, deleteFakeDir);
++    } catch (MultiObjectDeleteException ex) {
++      LOG.debug("Partial delete failure");
++      // what to do if an IOE was raised? Given an exception was being
++      // raised anyway, and the failures are logged, do nothing.
++      if (!deleteFakeDir) {
++        // when deleting fake directories we don't want to delete metastore
++        // entries so we only process these failures on "real" deletes.
++        Triple<List<Path>, List<Path>, List<Pair<Path, IOException>>> results =
++            new MultiObjectDeleteSupport(createStoreContext())
++                .processDeleteFailure(ex, keysToDelete);
++        undeletedObjectsOnFailure.addAll(results.getMiddle());
++      }
++      throw ex;
++    } catch (AmazonClientException | IOException ex) {
++      List<Path> paths = new MultiObjectDeleteSupport(createStoreContext())
++          .processDeleteFailureGenericException(ex, keysToDelete);
++      // other failures. Assume nothing was deleted
++      undeletedObjectsOnFailure.addAll(paths);
++      throw ex;
+-      LOG.debug("Couldn't delete {} - does not exist", f);
++      LOG.debug("Couldn't delete {} - does not exist: {}", f, e.toString());
+-              removeKeys(keys, true, false);
++              // delete a single page of keys
++              removeKeys(keys, false);
++              keys.clear();
+-            if (!keys.isEmpty()) {
+-              // TODO: HADOOP-13761 S3Guard: retries
+-              removeKeys(keys, false, false);
+-            }
++            // there is no more data: delete the final set of entries.
++            removeKeys(keys, false);
+-      metadataStore.deleteSubtree(f, ttlTimeProvider);
++      try(DurationInfo ignored =
++              new DurationInfo(LOG, false, "Delete metastore")) {
++        metadataStore.deleteSubtree(f, ttlTimeProvider);
++      }
++      // merge the results. This will update the store as needed
++    checkNotClosed();
++        OffsetDateTime deletedAt = OffsetDateTime.ofInstant(
++            Instant.ofEpochMilli(pm.getFileStatus().getModificationTime()),
++            ZoneOffset.UTC);
+-            "deleted by S3Guard");
++            "deleted by S3Guard at " + deletedAt);
+-            LOG.debug("S3Guard metadata for {} is outdated, updating it",
+-                path);
++            LOG.debug("S3Guard metadata for {} is outdated;"
++                + " s3modtime={}; msModTime={} updating metastore",
++                path, s3ModTime, msModTime);
+-        result.getETag(), result.getVersionId());
++        result.getETag(), result.getVersionId(), null);
+-   * {@link S3Guard#addAncestors(MetadataStore, Path, String)}}.
++   * updates any metastore.
++   * @param operationState state of any ongoing bulk operation.
+-  void finishedWrite(String key, long length, String eTag, String versionId)
++  void finishedWrite(String key, long length, String eTag, String versionId,
++      @Nullable final BulkOperationState operationState)
+-    LOG.debug("Finished write to {}, len {}", key, length);
++    LOG.debug("Finished write to {}, len {}. etag {}, version {}",
++        key, length, eTag, versionId);
++    // this is only set if there is a metastore to update and the
++    // operationState parameter passed in was null.
++    BulkOperationState stateToClose = null;
+-        S3Guard.addAncestors(metadataStore, p, username, ttlTimeProvider);
++        BulkOperationState activeState = operationState;
++        if (activeState == null) {
++          // create an operation state if there was none, so that the
++          // information gleaned from addAncestors is preserved into the
++          // subsequent put.
++          stateToClose = S3Guard.initiateBulkWrite(metadataStore,
++              BulkOperationState.OperationType.Put,
++              keyToPath(key));
++          activeState = stateToClose;
++        }
++        S3Guard.addAncestors(metadataStore, p, ttlTimeProvider, activeState);
+-        S3Guard.putAndReturn(metadataStore, status, instrumentation,
+-            ttlTimeProvider);
++        S3Guard.putAndReturn(metadataStore, status,
++            instrumentation,
++            ttlTimeProvider,
++            activeState);
++    } finally {
++      // if a new operation state was created, close it.
++      IOUtils.cleanupWithLogger(LOG, stateToClose);
+-      removeKeys(keysToRemove, false, true);
++      removeKeys(keysToRemove, true);
+-  @Retries.OnceTranslated
++  /**
++   * Recursive List of files and empty directories.
++   * @param f path to list from
++   * @return an iterator.
++   * @throws IOException failure
++   */
++  @Retries.RetryTranslated
+-    return innerListFiles(f, recursive,
+-        new Listing.AcceptAllButS3nDirs());
++    return invoker.retry("list", f.toString(), true,
++        () -> innerListFiles(f, recursive, new Listing.AcceptAllButS3nDirs()));
+-    S3ObjectAttributes objectAttributes = createObjectAttributes(
+-        path, fileStatus.getETag(), fileStatus.getVersionId());
++    S3ObjectAttributes objectAttributes = createObjectAttributes(fileStatus);
++  /**
++   * Build an immutable store context.
++   * If called while the FS is being initialized,
++   * some of the context will be incomplete.
++   * new store context instances should be created as appropriate.
++   * @return the store context of this FS.
++   */
++  @InterfaceAudience.Private
++  public StoreContext createStoreContext() {
++    return new StoreContext(
++        getUri(),
++        getBucket(),
++        getConf(),
++        getUsername(),
++        owner,
++        boundedThreadPool,
++        executorCapacity,
++        invoker,
++        getInstrumentation(),
++        getStorageStatistics(),
++        getInputPolicy(),
++        changeDetectionPolicy,
++        enableMultiObjectsDelete,
++        metadataStore,
++        useListV1,
++        new ContextAccessorsImpl(),
++        getTtlTimeProvider());
++  }
++
++  /**
++   * The implementation of context accessors.
++   */
++  private class ContextAccessorsImpl implements ContextAccessors {
++
++    @Override
++    public Path keyToPath(final String key) {
++      return keyToQualifiedPath(key);
++    }
++
++    @Override
++    public String pathToKey(final Path path) {
++      return S3AFileSystem.this.pathToKey(path);
++    }
++
++    @Override
++    public File createTempFile(final String prefix, final long size)
++        throws IOException {
++      return createTmpFileForWrite(prefix, size, getConf());
++    }
++
++    @Override
++    public String getBucketLocation() throws IOException {
++      return S3AFileSystem.this.getBucketLocation();
++    }
++  }
+
+MOV26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS40 INS40 UPD40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS23 INS31 INS31 INS31 INS55 INS31 INS31 INS31 INS31 INS55 INS83 INS39 INS59 INS29 INS78 INS44 INS29 INS83 INS43 INS42 INS44 INS8 INS78 INS29 INS78 INS83 INS74 INS42 INS44 INS44 MOV43 INS8 MOV29 MOV78 INS83 INS39 INS42 MOV44 MOV44 MOV43 MOV43 INS43 MOV43 INS8 INS29 INS83 INS42 INS43 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS8 MOV65 INS83 UPD42 INS29 INS83 INS39 INS42 INS44 INS44 INS8 INS29 MOV78 INS78 INS39 INS42 INS44 INS44 INS43 INS43 INS43 INS8 INS29 INS78 INS78 INS39 INS42 INS44 INS44 INS44 INS43 INS43 INS43 INS8 INS44 INS29 INS29 INS78 INS83 INS43 INS42 INS8 INS29 INS83 INS42 INS43 INS31 INS31 INS31 INS31 INS42 INS65 INS65 INS21 INS42 INS60 INS60 INS60 INS41 INS41 INS65 INS83 INS39 INS42 INS65 INS65 INS65 UPD42 MOV42 INS83 INS43 INS42 MOV41 INS40 INS65 INS65 INS65 INS65 INS65 INS65 INS65 INS40 UPD43 MOV43 INS43 INS43 INS83 INS43 INS42 INS83 MOV43 INS42 MOV60 MOV60 MOV25 MOV25 MOV60 MOV25 MOV60 MOV54 INS41 INS65 INS42 MOV60 MOV60 MOV21 MOV21 INS60 INS60 INS60 MOV60 INS41 INS65 INS40 INS78 INS83 MOV43 INS42 INS44 INS44 INS44 INS44 INS8 INS78 INS83 MOV43 INS42 INS44 INS8 INS78 INS83 MOV43 INS42 INS44 INS8 INS78 INS83 INS39 INS42 INS44 INS44 INS44 INS43 INS8 INS78 INS78 INS83 MOV74 INS42 INS44 INS43 INS8 INS78 INS83 MOV43 INS42 INS44 INS44 INS44 INS44 INS43 INS8 INS78 INS83 INS39 INS42 INS44 INS44 INS44 INS43 INS43 INS43 INS8 INS78 INS83 INS39 INS42 INS44 INS44 INS43 INS8 INS21 INS54 MOV21 MOV21 INS54 INS21 UPD40 INS65 UPD65 INS65 INS54 MOV21 INS65 INS65 INS65 INS83 INS39 INS42 INS83 INS39 INS42 MOV25 INS65 INS65 INS65 INS65 INS65 INS65 INS65 INS40 INS83 INS74 INS42 INS83 INS39 INS42 UPD42 MOV42 INS42 INS42 INS21 INS65 INS65 INS65 INS65 MOV65 MOV65 MOV65 INS65 INS42 INS40 INS83 INS74 INS42 INS83 INS39 INS42 INS83 INS74 INS42 INS42 INS42 INS42 MOV21 INS54 INS21 INS65 INS78 INS83 INS43 INS42 INS60 INS65 INS65 INS65 INS65 UPD40 INS65 INS65 INS40 INS42 INS41 INS65 INS42 INS78 INS83 MOV43 INS42 INS44 INS8 INS78 INS83 INS43 INS42 INS44 INS8 INS78 INS83 INS43 INS42 INS44 INS44 INS43 INS8 INS78 INS83 INS43 INS42 INS43 INS8 INS66 INS66 INS66 INS42 INS66 INS7 INS66 INS8 MOV43 INS59 INS43 INS59 MOV43 INS59 INS32 INS14 UPD66 INS42 INS66 INS66 INS42 INS66 INS66 INS42 MOV32 INS58 INS66 INS66 INS42 INS66 INS42 INS66 INS66 INS42 INS66 INS66 INS66 INS66 INS42 INS66 INS42 INS66 UPD42 INS42 INS42 UPD42 MOV42 INS32 INS66 INS43 MOV59 INS43 INS59 INS74 INS59 INS43 INS32 INS66 INS66 INS66 INS42 INS83 INS43 INS42 INS83 INS43 INS42 INS83 INS43 INS42 INS83 INS39 INS42 INS41 INS42 INS83 INS43 INS42 INS41 INS42 INS83 INS43 INS42 INS41 INS42 INS83 INS43 INS42 INS83 MOV43 INS42 INS83 INS39 INS42 INS42 INS21 INS42 INS40 INS83 INS43 INS42 INS42 INS41 INS42 INS83 MOV43 INS42 INS83 MOV43 INS42 INS83 INS43 INS42 INS83 MOV43 INS42 INS42 INS41 INS42 INS83 MOV74 INS42 INS83 INS39 INS42 INS83 UPD74 MOV74 INS42 INS42 INS42 INS42 INS21 INS42 INS83 INS43 INS42 INS83 INS43 INS42 INS42 INS60 INS25 INS32 INS58 INS8 INS58 MOV8 INS32 UPD66 INS58 UPD66 INS66 INS42 INS66 INS66 UPD42 UPD66 INS66 UPD66 INS65 INS66 INS42 INS66 INS8 INS12 MOV42 INS66 INS42 INS66 INS42 INS66 MOV38 INS8 INS66 INS65 INS66 INS65 INS66 INS42 INS66 INS66 INS42 INS66 INS42 INS66 INS66 INS42 INS66 INS66 INS42 INS66 INS42 INS66 INS43 INS43 INS32 INS66 INS65 INS66 INS65 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS42 INS66 INS66 INS42 INS66 INS42 INS66 INS66 INS66 INS42 INS66 INS43 INS43 INS43 INS43 INS58 INS8 INS12 INS12 INS32 UPD66 INS42 INS66 INS42 INS42 INS43 INS59 INS8 INS66 INS42 INS66 INS66 INS42 INS66 INS32 INS66 INS66 INS66 INS66 INS66 INS14 INS66 INS42 INS83 MOV43 INS42 INS41 INS42 INS42 INS83 INS43 INS42 INS41 INS42 INS42 INS83 INS43 INS42 INS83 INS39 INS42 INS42 INS41 INS42 INS42 INS42 INS41 MOV60 MOV21 INS42 INS32 INS51 INS42 INS42 INS32 INS42 INS42 INS14 INS42 INS42 INS32 INS42 INS42 INS42 INS33 INS42 MOV43 INS14 INS42 INS42 INS32 MOV32 INS43 INS59 INS60 INS21 MOV41 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 INS42 UPD42 INS42 INS42 INS32 INS43 INS43 INS43 INS42 INS32 INS42 UPD42 INS14 INS42 INS42 INS42 MOV42 INS42 INS32 INS42 INS32 UPD42 MOV42 INS32 INS42 INS32 INS42 INS32 UPD42 MOV42 INS32 UPD43 INS32 INS42 INS42 MOV43 INS59 INS38 INS8 INS42 INS43 INS59 MOV41 INS43 INS59 INS42 INS42 INS45 INS42 INS43 INS59 INS67 MOV25 INS44 INS8 UPD42 UPD42 INS21 INS21 INS68 INS66 INS42 MOV40 UPD42 MOV42 INS42 UPD42 MOV42 MOV14 INS68 INS66 INS42 INS40 INS42 INS42 UPD42 UPD42 INS43 INS59 INS21 INS44 INS8 INS44 INS8 INS54 INS42 INS33 UPD45 INS42 INS42 INS42 INS42 INS33 INS21 INS42 INS42 INS45 INS32 INS9 INS86 INS43 INS32 INS32 INS32 INS32 INS42 INS42 INS42 INS42 INS32 INS32 INS32 INS42 INS42 INS42 INS42 INS14 INS32 MOV32 INS42 INS32 INS42 INS32 INS32 INS42 INS42 INS42 INS42 INS34 INS52 MOV8 MOV42 UPD42 MOV42 MOV42 MOV42 MOV42 INS43 INS32 INS42 INS42 MOV43 INS42 INS32 INS42 INS42 UPD42 MOV42 INS42 INS42 INS14 INS39 INS59 INS32 UPD42 UPD42 UPD42 MOV42 UPD42 MOV42 INS42 INS42 INS42 INS42 UPD42 MOV42 UPD42 MOV42 INS43 INS32 INS42 INS42 INS32 INS42 INS42 INS32 INS14 INS52 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 INS52 INS42 INS42 INS52 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 INS52 INS42 UPD42 MOV42 UPD42 MOV42 INS42 INS52 UPD42 MOV42 INS42 INS9 INS52 MOV42 MOV42 UPD42 MOV42 MOV32 UPD42 MOV42 MOV42 UPD42 INS52 INS42 UPD42 MOV42 UPD42 MOV42 INS42 INS42 INS32 INS32 MOV21 MOV21 MOV21 INS42 INS42 INS14 INS42 INS42 INS14 INS42 INS42 INS14 INS42 INS42 INS43 INS42 INS60 INS21 MOV21 INS53 INS32 INS32 INS42 INS69 INS69 INS42 INS69 INS69 INS42 INS42 INS14 INS32 INS43 INS42 INS21 INS25 INS53 INS84 INS42 INS60 INS21 INS53 INS58 INS8 INS32 INS42 INS42 MOV32 MOV42 INS42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 INS43 UPD42 MOV42 INS52 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 MOV32 INS52 UPD42 MOV42 UPD74 INS42 INS32 INS42 INS42 INS42 INS43 INS42 INS9 INS45 INS42 INS42 INS42 MOV32 INS42 INS42 INS45 INS42 INS42 UPD42 MOV42 INS42 INS42 UPD42 MOV42 INS42 INS43 INS42 INS42 INS42 INS42 INS42 INS42 UPD42 INS42 UPD42 MOV42 UPD42 MOV42 INS32 UPD42 MOV42 UPD42 MOV42 INS32 INS32 INS43 INS42 INS9 INS45 INS43 INS42 INS9 INS45 INS43 INS42 INS9 INS45 INS32 INS33 INS42 INS39 INS59 INS32 INS42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 INS42 INS42 INS42 INS43 INS39 INS43 INS39 INS43 INS42 INS9 INS45 UPD42 MOV42 UPD42 MOV42 INS42 INS42 INS32 INS38 INS8 INS42 INS43 INS43 INS74 INS59 INS32 INS42 INS43 INS59 MOV21 INS60 INS60 INS25 INS42 INS42 INS42 INS42 INS42 INS42 UPD42 INS42 INS32 INS42 INS42 INS42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 INS42 INS42 INS42 INS32 INS42 INS42 INS32 INS42 UPD27 MOV27 INS42 UPD42 UPD42 INS42 INS42 INS42 INS42 UPD42 MOV42 UPD42 MOV42 INS45 INS42 INS60 INS21 INS42 INS42 INS43 INS43 INS42 INS32 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 UPD45 INS32 INS42 INS42 INS14 INS43 INS59 INS43 INS59 INS27 INS8 INS42 INS42 INS42 INS42 INS32 MOV42 UPD42 INS74 MOV59 INS32 INS42 INS42 INS14 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 INS42 INS42 INS43 INS42 INS9 INS45 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS33 INS21 INS21 INS42 INS42 UPD42 MOV42 INS42 INS43 INS74 INS74 INS74 UPD42 UPD42 MOV42 INS42 INS32 INS43 INS32 INS42 INS42 INS42 INS32 INS40 UPD45 INS42 INS7 INS7 INS42 INS43 INS43 INS43 INS43 INS43 INS74 INS14 UPD42 UPD42 UPD42 UPD42 MOV42 UPD42 MOV42 INS42 UPD42 MOV42 MOV21 INS42 INS42 INS32 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS43 MOV43 INS43 INS43 INS32 INS32 INS42 INS42 INS42 INS42 INS40 INS32 INS42 INS42 INS42 UPD42 MOV42 INS21 INS42 INS42 INS27 INS42 INS42 INS42 INS42 INS32 INS45 INS45 INS42 INS42 DEL42 DEL32 DEL8 DEL25 DEL42 DEL43 DEL83 DEL32 DEL41 DEL42 DEL42 DEL14 DEL14 DEL42 DEL42 DEL42 DEL32 DEL42 DEL32 DEL7 DEL42 DEL32 DEL7 DEL83 DEL39 DEL42 DEL43 DEL74 DEL42 DEL33 DEL59 DEL60 DEL42 DEL33 DEL59 DEL60 DEL42 DEL32 DEL42 DEL74 DEL14 DEL7 DEL21 DEL42 DEL43 DEL74 DEL14 DEL7 DEL21 DEL8 DEL25 DEL42 DEL42 DEL32 DEL45 DEL32 DEL21 DEL39 DEL60 DEL42 DEL42 DEL32 DEL42 DEL42 DEL32 DEL32 DEL32 DEL59 DEL60 DEL42 DEL33 DEL27 DEL42 DEL42 DEL32 DEL27 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL42 DEL32 DEL32 DEL32 DEL34 DEL27 DEL32 DEL59 DEL60 DEL42 DEL42 DEL42 DEL27 DEL7 DEL21 DEL43 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL42 DEL42 DEL42 DEL32 DEL42 DEL42 DEL32 DEL42 DEL42 DEL32 DEL32 DEL21 DEL8 DEL43 DEL42 DEL32 DEL59 DEL60 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL42 DEL42 DEL42 DEL32 DEL42 DEL42 DEL32 DEL32 DEL21 DEL8 DEL25 DEL9 DEL32 DEL21 DEL8 DEL45 DEL32 DEL21 DEL42 DEL59 DEL60 DEL42 DEL33 DEL27 DEL42 DEL42 DEL32 DEL40 DEL27 DEL27 DEL42 DEL42 DEL43 DEL42 DEL14 DEL32 DEL21 DEL8 DEL25 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL42 DEL9 DEL32 DEL59 DEL60 DEL42 DEL42 DEL32 DEL42 DEL43 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL39 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL42 DEL42 DEL42 DEL32 DEL32 DEL59 DEL60 DEL42 DEL42 DEL32 DEL42 DEL42 DEL45 DEL32 DEL38 DEL27 DEL42 DEL45 DEL7 DEL21 DEL8 DEL25 DEL42 DEL42 DEL42 DEL42 DEL32 DEL32 DEL27 DEL59 DEL60 DEL42 DEL42 DEL32 DEL42 DEL42 DEL32 DEL42 DEL42 DEL32 DEL32 DEL59 DEL60 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL60 DEL32 DEL42 DEL59 DEL60 DEL42 DEL32 DEL59 DEL60 DEL42 DEL42 DEL42 DEL32 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL21 DEL8 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL42 DEL32 DEL42 DEL32 DEL32 DEL21 DEL8 DEL25 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL42 DEL42 DEL32 DEL21 DEL8 DEL25 DEL42 DEL42 DEL9 DEL9 DEL32 DEL21 DEL8 DEL25 DEL8 DEL61 DEL42 DEL42 DEL32 DEL38 DEL42 DEL42 DEL9 DEL9 DEL32 DEL21 DEL8 DEL25 DEL32 DEL42 DEL33 DEL27 DEL27 DEL42 DEL42 DEL42 DEL32 DEL38 DEL27 DEL42 DEL42 DEL45 DEL42 DEL42 DEL32 DEL21 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL21 DEL8 DEL25 DEL8 DEL25 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL21 DEL32 DEL32 DEL38 DEL42 DEL42 DEL42 DEL32 DEL32 DEL21 DEL42 DEL32 DEL21 DEL8 DEL25 DEL8 DEL31 DEL39 DEL42 DEL44 DEL42 DEL42 DEL32 DEL32 DEL21 DEL8 DEL8 DEL25 DEL42 DEL8 DEL25 DEL32 DEL42 DEL43 DEL42 DEL42 DEL45 DEL14 DEL53 DEL40 DEL43 DEL42 DEL14 DEL42 DEL42 DEL9 DEL9 DEL42 DEL42 DEL32 DEL38 DEL8 DEL25 DEL45 DEL42 DEL42 DEL42 DEL43 DEL69 DEL69 DEL69 DEL68 DEL65 DEL42 DEL9 DEL42 DEL42 DEL32 DEL42 DEL42 DEL32 DEL42

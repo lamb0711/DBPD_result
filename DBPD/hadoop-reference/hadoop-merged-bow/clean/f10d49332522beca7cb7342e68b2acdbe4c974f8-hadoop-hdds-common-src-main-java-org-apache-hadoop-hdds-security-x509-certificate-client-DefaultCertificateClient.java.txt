@@ -1,0 +1,211 @@
+ HDDS-1119. DN get OM certificate from SCM CA for block token validation. Contributed by Ajay Kumar. (#601)
+
+
++import org.apache.hadoop.hdds.HddsUtils;
++import org.apache.hadoop.hdds.conf.OzoneConfiguration;
++import org.apache.hadoop.hdds.protocol.SCMSecurityProtocol;
++import org.apache.hadoop.hdds.protocolPB.SCMSecurityProtocolClientSideTranslatorPB;
++import org.apache.hadoop.hdds.protocolPB.SCMSecurityProtocolPB;
++import org.apache.hadoop.hdds.scm.protocolPB.ScmBlockLocationProtocolPB;
++import org.apache.hadoop.ipc.Client;
++import org.apache.hadoop.ipc.ProtobufRpcEngine;
++import org.apache.hadoop.ipc.RPC;
++import org.apache.hadoop.net.NetUtils;
++import org.apache.hadoop.security.UserGroupInformation;
++import java.io.File;
++import java.net.InetSocketAddress;
+-import java.security.cert.CertificateEncodingException;
++import java.util.Map;
++import java.util.concurrent.ConcurrentHashMap;
++  private static final String CERT_FILE_NAME_FORMAT = "%s.crt";
++  private Map<String, X509Certificate> certificateMap;
++  private String certSerialId;
+-  DefaultCertificateClient(SecurityConfig securityConfig, Logger log) {
++  DefaultCertificateClient(SecurityConfig securityConfig, Logger log,
++      String certSerialId) {
++    this.certificateMap = new ConcurrentHashMap<>();
++    this.certSerialId = certSerialId;
++
++    loadAllCertificates();
+-   * Returns the private key of the specified component if it exists on the
+-   * local system.
++   * Load all certificates from configured location.
++   * */
++  private void loadAllCertificates() {
++    // See if certs directory exists in file system.
++    Path certPath = securityConfig.getCertificateLocation();
++    if (Files.exists(certPath) && Files.isDirectory(certPath)) {
++      getLogger().info("Loading certificate from location:{}.",
++          certPath);
++      File[] certFiles = certPath.toFile().listFiles();
++
++      if (certFiles != null) {
++        CertificateCodec certificateCodec =
++            new CertificateCodec(securityConfig);
++        for (File file : certFiles) {
++          if (file.isFile()) {
++            try {
++              X509CertificateHolder x509CertificateHolder = certificateCodec
++                  .readCertificate(certPath, file.getName());
++              X509Certificate cert =
++                  CertificateCodec.getX509Certificate(x509CertificateHolder);
++              if (cert != null && cert.getSerialNumber() != null) {
++                if (cert.getSerialNumber().toString().equals(certSerialId)) {
++                  x509Certificate = cert;
++                }
++                certificateMap.putIfAbsent(cert.getSerialNumber().toString(),
++                    cert);
++                getLogger().info("Added certificate from file:{}.",
++                    file.getAbsolutePath());
++              } else {
++                getLogger().error("Error reading certificate from file:{}",
++                    file);
++              }
++            } catch (java.security.cert.CertificateException | IOException e) {
++              getLogger().error("Error reading certificate from file:{}.",
++                  file.getAbsolutePath(), e);
++            }
++          }
++        }
++      }
++    }
++  }
++
++  /**
++   * Returns the private key of the specified  if it exists on the local
++   * system.
+-   * Returns the public key of the specified component if it exists on the
+-   * local system.
++   * Returns the public key of the specified if it exists on the local system.
+-   * Returns the certificate  of the specified component if it exists on the
+-   * local system.
++   * Returns the default certificate of given client if it exists.
+-    if(x509Certificate != null){
++    if (x509Certificate != null) {
+-    Path certPath = securityConfig.getCertificateLocation();
+-    if (OzoneSecurityUtil.checkIfFileExist(certPath,
+-        securityConfig.getCertificateFileName())) {
+-      CertificateCodec certificateCodec =
+-          new CertificateCodec(securityConfig);
+-      try {
+-        X509CertificateHolder x509CertificateHolder =
+-            certificateCodec.readCertificate();
+-        x509Certificate =
+-            CertificateCodec.getX509Certificate(x509CertificateHolder);
+-      } catch (java.security.cert.CertificateException | IOException e) {
+-        getLogger().error("Error reading certificate.", e);
+-      }
++    if (certSerialId == null) {
++      getLogger().error("Default certificate serial id is not set. Can't " +
++          "locate the default certificate for this client.");
++      return null;
++    }
++    // Refresh the cache from file system.
++    loadAllCertificates();
++    if (certificateMap.containsKey(certSerialId)) {
++      x509Certificate = certificateMap.get(certSerialId);
++   * Returns the certificate  with the specified certificate serial id if it
++   * exists else try to get it from SCM.
++   * @param  certId
++   *
++   * @return certificate or Null if there is no data.
++   */
++  @Override
++  public X509Certificate getCertificate(String certId)
++      throws CertificateException {
++    // Check if it is in cache.
++    if (certificateMap.containsKey(certId)) {
++      return certificateMap.get(certId);
++    }
++    // Try to get it from SCM.
++    return this.getCertificateFromScm(certId);
++  }
++
++  /**
++   * Get certificate from SCM and store it in local file system.
++   * @param certId
++   * @return certificate
++   */
++  private X509Certificate getCertificateFromScm(String certId)
++      throws CertificateException {
++
++    getLogger().info("Getting certificate with certSerialId:{}.",
++        certId);
++    try {
++      SCMSecurityProtocol scmSecurityProtocolClient = getScmSecurityClient(
++          (OzoneConfiguration) securityConfig.getConfiguration());
++      String pemEncodedCert =
++          scmSecurityProtocolClient.getCertificate(certId);
++      this.storeCertificate(pemEncodedCert, true);
++      return CertificateCodec.getX509Certificate(pemEncodedCert);
++    } catch (Exception e) {
++      getLogger().error("Error while getting Certificate with " +
++          "certSerialId:{} from scm.", certId, e);
++      throw new CertificateException("Error while getting certificate for " +
++          "certSerialId:" + certId, e, CERTIFICATE_ERROR);
++    }
++  }
++
++  /**
+-   * Creates digital signature over the data stream using the components
+-   * private key.
++   * Creates digital signature over the data stream using the s private key.
+-   * Creates digital signature over the data stream using the components
+-   * private key.
++   * Creates digital signature over the data stream using the s private key.
+-   * @param data        - Data to sign.
++   * @param data - Data to sign.
+-   * Stores the Certificate  for this client. Don't use this api to add
+-   * trusted certificates of other components.
++   * Stores the Certificate  for this client. Don't use this api to add trusted
++   * certificates of others.
+-   * @param certificate - X509 Certificate
++   * @param pemEncodedCert - pem encoded X509 Certificate
++   * @param force - override any existing file
++   *
+-  public void storeCertificate(X509Certificate certificate)
++  public void storeCertificate(String pemEncodedCert, boolean force)
+-      certificateCodec.writeCertificate(
+-          new X509CertificateHolder(certificate.getEncoded()));
+-    } catch (IOException | CertificateEncodingException e) {
++      Path basePath = securityConfig.getCertificateLocation();
++
++      X509Certificate cert =
++          CertificateCodec.getX509Certificate(pemEncodedCert);
++      String certName = String.format(CERT_FILE_NAME_FORMAT,
++          cert.getSerialNumber().toString());
++
++      certificateCodec.writeCertificate(basePath, certName,
++          pemEncodedCert, force);
++      certificateMap.putIfAbsent(cert.getSerialNumber().toString(), cert);
++    } catch (IOException | java.security.cert.CertificateException e) {
+-   * Stores the trusted chain of certificates for a specific component.
++   * Stores the trusted chain of certificates for a specific .
+-   * @param ks                    - Key Store.
++   * @param ks - Key Store.
+-   * Stores the trusted chain of certificates for a specific component.
++   * Stores the trusted chain of certificates for a specific .
++
++  /**
++   * Create a scm security client, used to get SCM signed certificate.
++   *
++   * @return {@link SCMSecurityProtocol}
++   */
++  private static SCMSecurityProtocol getScmSecurityClient(
++      OzoneConfiguration conf) throws IOException {
++    RPC.setProtocolEngine(conf, SCMSecurityProtocolPB.class,
++        ProtobufRpcEngine.class);
++    long scmVersion =
++        RPC.getProtocolVersion(ScmBlockLocationProtocolPB.class);
++    InetSocketAddress scmSecurityProtoAdd =
++        HddsUtils.getScmAddressForSecurityProtocol(conf);
++    SCMSecurityProtocolClientSideTranslatorPB scmSecurityClient =
++        new SCMSecurityProtocolClientSideTranslatorPB(
++            RPC.getProxy(SCMSecurityProtocolPB.class, scmVersion,
++                scmSecurityProtoAdd, UserGroupInformation.getCurrentUser(),
++                conf, NetUtils.getDefaultSocketFactory(conf),
++                Client.getRpcTimeout(conf)));
++    return scmSecurityClient;
++  }
+
+MOV26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 MOV31 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 UPD40 INS40 INS40 INS40 INS40 INS23 INS23 INS23 INS31 INS31 INS31 INS31 INS83 INS83 INS83 INS43 INS59 INS83 INS74 INS59 INS83 INS43 INS59 INS44 UPD83 INS39 UPD42 INS29 MOV78 INS83 MOV43 INS42 INS8 INS29 INS78 INS83 INS43 INS42 INS44 INS43 INS8 INS29 INS83 INS43 INS42 INS44 INS43 INS8 INS44 INS29 INS83 INS83 INS43 INS42 INS44 INS43 INS8 INS42 INS42 INS45 INS43 INS43 INS43 INS42 INS42 INS42 INS43 INS42 INS21 INS21 INS21 INS65 MOV65 MOV25 INS25 INS21 INS25 MOV41 INS65 INS65 INS65 INS42 INS42 INS43 INS42 INS42 INS25 INS41 INS65 INS65 INS65 INS42 INS43 INS42 INS42 INS21 INS54 INS65 UPD65 MOV65 INS43 INS42 INS39 UPD42 INS65 INS65 INS42 INS43 INS42 INS42 INS21 INS60 INS60 INS60 INS41 INS42 INS42 INS42 INS42 INS7 INS7 INS32 UPD66 INS27 INS8 UPD66 UPD66 UPD66 INS66 INS27 INS8 INS32 INS32 INS8 INS66 INS66 INS42 INS66 INS42 INS32 INS8 INS32 INS66 INS42 INS66 INS42 INS32 INS8 INS12 UPD66 UPD66 UPD66 INS42 INS66 UPD66 UPD66 UPD42 UPD66 UPD42 UPD66 INS42 UPD66 UPD66 UPD66 INS66 INS66 INS65 INS42 INS32 INS39 INS59 INS43 INS59 INS43 INS59 INS42 INS22 INS14 INS22 INS42 INS42 INS32 INS32 INS21 INS60 INS25 INS42 INS33 INS21 INS41 INS42 INS42 INS42 INS42 INS21 INS42 INS42 INS42 INS41 INS52 INS42 INS42 INS32 INS42 INS45 INS42 INS60 INS60 INS21 INS41 INS44 INS8 INS60 INS60 INS60 INS21 INS42 INS42 INS42 INS42 INS57 INS57 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS14 INS52 INS42 INS74 INS52 INS42 UPD42 MOV42 INS42 INS42 INS42 INS42 INS42 INS32 INS5 INS59 INS27 INS8 INS32 INS33 INS7 INS32 INS42 INS43 INS59 INS43 INS59 INS32 INS32 INS43 INS42 INS21 INS53 INS43 INS59 MOV43 INS59 INS43 INS59 INS32 UPD84 INS43 INS43 INS42 INS42 INS57 INS42 INS42 INS42 INS43 INS32 INS43 INS32 INS42 INS45 INS42 INS43 INS85 INS42 INS32 INS42 INS33 MOV60 INS70 INS32 INS42 INS27 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS32 INS52 INS42 INS42 INS9 INS42 INS42 INS42 INS42 INS32 INS14 INS42 INS42 INS32 INS42 INS32 INS42 INS42 INS32 INS42 UPD42 MOV42 UPD42 MOV42 INS42 INS42 INS42 INS32 INS42 UPD43 INS42 INS42 INS43 INS42 INS42 INS42 INS57 INS42 INS42 INS32 INS42 INS32 INS32 INS42 INS42 INS42 INS32 INS42 INS44 INS42 INS8 INS42 INS45 INS45 INS42 INS42 INS42 INS42 INS11 INS42 INS42 INS42 INS32 INS42 INS27 INS42 INS42 INS43 INS27 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS32 INS42 INS40 INS42 INS43 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 MOV42 INS42 INS43 INS42 INS25 INS43 INS32 INS42 INS45 INS45 INS42 INS45 INS45 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS32 MOV8 INS42 INS42 INS42 INS42 INS42 UPD42 MOV42 UPD42 MOV42 INS60 INS25 INS43 INS59 INS27 INS8 INS8 INS42 INS42 MOV32 INS27 INS27 INS25 INS21 INS21 INS21 INS42 INS32 INS42 INS33 INS32 INS33 INS32 INS8 INS32 INS32 INS32 INS32 UPD45 INS32 INS42 INS42 INS42 INS42 INS32 INS42 INS42 MOV21 INS42 INS42 INS32 INS42 INS32 INS42 INS45 INS32 MOV32 INS42 INS45 INS42 INS42 INS42 INS42 INS32 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 DEL66 DEL42 DEL32 DEL32 DEL66 DEL66 DEL66 DEL42 DEL43 DEL32 DEL14 DEL42

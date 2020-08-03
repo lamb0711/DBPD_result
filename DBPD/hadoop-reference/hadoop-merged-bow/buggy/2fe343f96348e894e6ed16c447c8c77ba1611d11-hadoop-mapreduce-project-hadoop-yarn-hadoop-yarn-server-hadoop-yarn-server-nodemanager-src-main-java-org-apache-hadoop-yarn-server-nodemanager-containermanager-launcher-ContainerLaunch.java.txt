@@ -1,0 +1,184 @@
+MAPREDUCE-3240. Fixed NodeManager to be able to forcefully cleanup its containers (process-trees) irrespective of whether the container succeeded, or killed. Contributed by Hitesh Shah.
+
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/trunk@1189711 13f79535-47bb-0310-9956-ffa450edef68
+
++import java.util.concurrent.atomic.AtomicBoolean;
++import org.apache.hadoop.yarn.api.records.ContainerId;
++import org.apache.hadoop.yarn.server.nodemanager.ContainerExecutor.DelayedProcessKiller;
++import org.apache.hadoop.yarn.server.nodemanager.ContainerExecutor.Signal;
+-import org.apache.hadoop.yarn.util.ConverterUtils;
++import org.apache.hadoop.yarn.server.nodemanager.util.ProcessIdFileReader;
++import org.apache.hadoop.yarn.util.ConverterUtils;
++
++  private static final String PID_FILE_NAME_FMT = "%s.pid";
++
++  
++  private volatile AtomicBoolean shouldLaunchContainer = new AtomicBoolean(false);
++  private volatile AtomicBoolean completed = new AtomicBoolean(false);
++
++  private long sleepDelayBeforeSigKill = 250;
++  private long maxKillWaitTime = 2000;
++
++  private Path pidFilePath = null;
++    this.sleepDelayBeforeSigKill =
++        conf.getLong(YarnConfiguration.NM_SLEEP_DELAY_BEFORE_SIGKILL_MS,
++            YarnConfiguration.DEFAULT_NM_SLEEP_DELAY_BEFORE_SIGKILL_MS);
++    this.maxKillWaitTime =
++        conf.getLong(YarnConfiguration.NM_PROCESS_KILL_WAIT_MS,
++            YarnConfiguration.DEFAULT_NM_PROCESS_KILL_WAIT_MS);
+-    String containerIdStr = ConverterUtils.toString(container.getContainerID());
++    ContainerId containerID = container.getContainerID();
++    String containerIdStr = ConverterUtils.toString(containerID);
++
++      String pidFileSuffix = String.format(ContainerLaunch.PID_FILE_NAME_FMT,
++          containerIdStr);
++
++      // pid file should be in nm private dir so that it is not 
++      // accessible by users
++      pidFilePath = lDirAllocator.getLocalPathForWrite(
++          ResourceLocalizationService.NM_PRIVATE_DIR + Path.SEPARATOR 
++          + pidFileSuffix,
++          this.conf);
++
+-            container.getContainerID(),
++            containerID,
+-      ret =
+-          exec.launchContainer(container, nmPrivateContainerScriptPath,
+-              nmPrivateTokensPath, user, appIdStr, containerWorkDir);
++      // Check if the container is signalled to be killed.
++      if (!shouldLaunchContainer.compareAndSet(false, true)) {
++        LOG.info("Container " + containerIdStr + " not launched as "
++            + "cleanup already called");
++        ret = ExitCode.TERMINATED.getExitCode();
++      }
++      else {
++        exec.activateContainer(containerID, pidFilePath);
++        ret =
++            exec.launchContainer(container, nmPrivateContainerScriptPath,
++                nmPrivateTokensPath, user, appIdStr, containerWorkDir);
++      }
++    } finally {
++      completed.set(true);
++      exec.deactivateContainer(containerID);
+-    if (ret == ExitCode.KILLED.getExitCode()) {
++    LOG.debug("Container " + containerIdStr + " completed with exit code "
++        + ret);
++    if (ret == ExitCode.FORCE_KILLED.getExitCode()
++        || ret == ExitCode.TERMINATED.getExitCode()) {
++  
++  /**
++   * Cleanup the container.
++   * Cancels the launch if launch has not started yet or signals
++   * the executor to not execute the process if not already done so.
++   * Also, sends a SIGTERM followed by a SIGKILL to the process if
++   * the process id is available.
++   * @throws IOException
++   */
++  public void cleanupContainer() throws IOException {
++    ContainerId containerId = container.getContainerID();
++    String containerIdStr = ConverterUtils.toString(containerId);
++    LOG.info("Cleaning up container " + containerIdStr);
++
++    // launch flag will be set to true if process already launched
++    boolean alreadyLaunched = !shouldLaunchContainer.compareAndSet(false, true);
++    if (!alreadyLaunched) {
++      LOG.info("Container " + containerIdStr + " not launched."
++          + " No cleanup needed to be done");
++      return;
++    }
++
++    LOG.debug("Marking container " + containerIdStr + " as inactive");
++    // this should ensure that if the container process has not launched 
++    // by this time, it will never be launched
++    exec.deactivateContainer(containerId);
++
++    LOG.debug("Getting pid for container " + containerIdStr + " to kill"
++        + " from pid file " 
++        + (pidFilePath != null ? pidFilePath.toString() : "null"));
++
++    // however the container process may have already started
++    try {
++
++      // get process id from pid file if available
++      // else if shell is still active, get it from the shell
++      String processId = null;
++      if (pidFilePath != null) {
++        processId = getContainerPid(pidFilePath);
++      }
++
++      // kill process
++      if (processId != null) {
++        String user = container.getLaunchContext().getUser();
++        LOG.debug("Sending signal to pid " + processId
++            + " as user " + user
++            + " for container " + containerIdStr);
++        if (sleepDelayBeforeSigKill > 0) {
++          boolean result = exec.signalContainer(user,
++              processId, Signal.TERM);
++          LOG.debug("Sent signal to pid " + processId
++              + " as user " + user
++              + " for container " + containerIdStr
++              + ", result=" + (result? "success" : "failed"));
++          new DelayedProcessKiller(user,
++              processId, sleepDelayBeforeSigKill, Signal.KILL, exec).start();
++        }
++      }
++    } catch (Exception e) {
++      LOG.warn("Got error when trying to cleanup container " + containerIdStr
++          + ", error=" + e.getMessage());
++    } finally {
++      // cleanup pid file if present
++      if (pidFilePath != null) {
++        FileContext lfs = FileContext.getLocalFSFileContext();
++        lfs.delete(pidFilePath, false);
++      }
++    }
++  }
++
++  /**
++   * Loop through for a time-bounded interval waiting to
++   * read the process id from a file generated by a running process.
++   * @param pidFilePath File from which to read the process id
++   * @return Process ID
++   * @throws Exception
++   */
++  private String getContainerPid(Path pidFilePath) throws Exception {
++    String containerIdStr = 
++        ConverterUtils.toString(container.getContainerID());
++    String processId = null;
++    LOG.debug("Accessing pid for container " + containerIdStr
++        + " from pid file " + pidFilePath);
++    int sleepCounter = 0;
++    final int sleepInterval = 100;
++
++    // loop waiting for pid file to show up 
++    // until either the completed flag is set which means something bad 
++    // happened or our timer expires in which case we admit defeat
++    while (!completed.get()) {
++      processId = ProcessIdFileReader.getProcessId(pidFilePath);
++      if (processId != null) {
++        LOG.debug("Got pid " + processId + " for container "
++            + containerIdStr);
++        break;
++      }
++      else if ((sleepCounter*sleepInterval) > maxKillWaitTime) {
++        LOG.info("Could not get pid for " + containerIdStr
++        		+ ". Waited for " + maxKillWaitTime + " ms.");
++        break;
++      }
++      else {
++        ++sleepCounter;
++        Thread.sleep(sleepInterval);
++      }
++    }
++    return processId;
++  }
+-  
++
++
+-    cmd.add(ContainerExecutor.isSetsidAvailable ? "exec setsid " : "exec ");
+-    cmd.add("/bin/bash ");
++    cmd.add("exec /bin/bash ");
+
+MOV26 INS26 INS26 INS26 INS26 INS26 INS40 INS40 INS40 INS40 INS40 INS23 INS23 INS23 INS23 INS23 INS23 INS31 INS31 INS83 INS83 INS83 INS43 INS59 INS83 INS83 INS43 INS59 INS83 INS83 INS43 INS59 INS83 INS39 INS59 INS83 INS39 INS59 INS83 INS43 INS59 INS29 INS83 INS39 INS42 INS43 INS8 INS29 INS83 INS43 INS42 INS44 INS43 INS8 INS42 INS42 INS45 INS42 INS42 INS14 INS42 INS42 INS14 INS42 INS34 INS42 INS34 INS42 INS42 INS33 INS21 INS21 INS60 INS60 INS21 INS65 INS65 INS42 INS60 INS60 INS21 INS60 INS25 INS21 INS21 INS21 INS54 INS65 INS65 INS65 INS65 INS42 INS43 INS42 INS42 MOV60 INS60 INS21 INS60 INS60 INS61 INS41 INS43 INS9 INS43 INS9 INS7 INS7 INS43 INS59 INS43 INS59 INS8 INS32 INS27 INS66 INS66 INS66 INS66 INS66 INS42 INS43 INS59 INS43 INS59 INS32 INS39 INS59 INS38 INS8 INS32 INS32 INS32 INS8 INS12 INS8 INS66 INS66 INS42 INS66 INS66 INS42 INS42 INS43 INS59 INS32 INS39 INS59 INS83 INS39 INS59 INS38 INS8 INS42 INS42 INS42 INS22 INS32 INS22 INS32 INS42 INS42 INS32 INS42 INS42 INS32 INS60 INS21 INS25 INS21 INS21 INS42 INS42 INS27 INS27 INS27 INS42 INS42 MOV32 INS42 INS42 INS32 INS42 INS42 INS27 INS42 INS38 INS42 INS21 INS41 INS42 INS42 INS27 INS42 INS42 INS42 INS42 INS42 INS27 INS60 INS25 INS25 INS44 INS8 INS25 INS42 INS42 INS33 INS42 INS42 INS27 INS42 INS34 INS42 INS34 INS32 INS21 INS25 UPD45 INS52 INS42 INS42 INS42 INS40 INS40 INS52 INS42 INS42 INS42 INS40 INS40 INS42 INS42 INS42 INS42 INS42 INS43 INS59 INS7 INS38 INS8 INS8 INS32 INS32 INS45 INS42 INS45 INS42 MOV42 MOV32 INS42 INS32 INS42 INS42 INS42 INS45 INS42 INS32 INS32 INS45 INS42 INS45 INS45 INS42 INS45 INS45 INS36 INS43 INS59 INS27 INS8 INS27 INS8 INS43 INS42 INS21 INS27 INS8 INS45 INS42 INS45 INS42 INS42 INS42 INS7 INS27 INS8 INS25 INS42 INS42 INS32 INS42 INS32 INS32 INS21 INS21 INS21 MOV21 INS42 INS42 INS9 INS42 INS42 INS42 UPD40 INS40 INS42 INS42 INS42 INS9 INS9 INS42 INS42 INS27 INS16 INS42 INS42 INS33 INS42 INS33 INS21 INS42 INS33 INS60 INS21 INS25 INS42 INS32 INS42 INS33 INS60 INS21 INS42 INS32 INS42 INS33 INS21 INS10 INS27 INS8 INS8 INS42 INS42 INS40 INS42 INS42 INS42 INS27 INS22 INS42 INS42 INS42 INS9 INS9 INS32 INS7 INS32 INS45 INS42 INS45 INS45 INS27 INS32 INS45 INS7 INS43 INS59 INS32 INS27 INS8 INS42 INS42 INS27 INS43 INS59 INS32 INS42 INS42 INS42 INS32 INS36 INS42 INS21 INS10 INS21 INS21 INS40 INS40 INS42 INS52 INS42 INS42 INS42 INS27 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS33 INS42 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS27 INS42 INS34 INS60 INS21 INS21 INS45 INS42 INS45 INS32 INS42 INS42 INS32 INS42 INS42 INS42 INS9 INS42 INS42 INS27 INS27 INS32 INS38 INS32 INS45 INS42 INS45 INS45 INS40 INS42 INS42 INS42 INS32 INS42 INS45 INS42 INS45 INS42 INS45 INS42 INS39 INS59 INS32 INS32 INS42 INS42 INS42 INS42 INS45 INS42 INS45 INS42 INS42 INS42 INS42 INS42 INS27 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS27 INS14 INS42 INS45 INS42 INS45 INS42 INS45 INS42 INS42 INS42 INS42 INS40 INS45 INS42 INS45 INS42 INS45 INS42 INS45 INS36 INS43 INS42 INS42 INS42 INS40 INS42 INS16 INS42 INS42 INS45 INS45 DEL27 DEL42 DEL42 DEL40 DEL45 DEL45 DEL16 DEL32 DEL21

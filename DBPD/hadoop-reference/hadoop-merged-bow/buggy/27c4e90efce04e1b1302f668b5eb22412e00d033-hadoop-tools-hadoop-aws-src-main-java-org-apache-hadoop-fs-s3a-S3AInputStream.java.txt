@@ -1,0 +1,350 @@
+HADOOP-13028 add low level counter metrics for S3A; use in read performance tests. contributed by: stevel
+patch includes
+HADOOP-12844 Recover when S3A fails on IOException in read()
+HADOOP-13058 S3A FS fails during init against a read-only FS if multipart purge
+HADOOP-13047 S3a Forward seek in stream length to be configurable
+
++import com.google.common.base.Preconditions;
++import org.apache.commons.lang.StringUtils;
++import org.apache.hadoop.classification.InterfaceAudience;
++import org.apache.hadoop.classification.InterfaceStability;
++import org.apache.hadoop.fs.CanSetReadahead;
+-
+-import java.net.SocketTimeoutException;
+-import java.net.SocketException;
+-public class S3AInputStream extends FSInputStream {
++/**
++ * The input stream for an S3A object.
++ *
++ * As this stream seeks withing an object, it may close then re-open the stream.
++ * When this happens, any updated stream data may be retrieved, and, given
++ * the consistency model of Amazon S3, outdated data may in fact be picked up.
++ *
++ * As a result, the outcome of reading from a stream of an object which is
++ * actively manipulated during the read process is "undefined".
++ *
++ * The class is marked as private as code should not be creating instances
++ * themselves. Any extra feature (e.g instrumentation) should be considered
++ * unstable.
++ *
++ * Because it prints some of the state of the instrumentation,
++ * the output of {@link #toString()} must also be considered unstable.
++ */
++@InterfaceAudience.Private
++@InterfaceStability.Evolving
++public class S3AInputStream extends FSInputStream implements CanSetReadahead {
++  /**
++   * This is the public position; the one set in {@link #seek(long)}
++   * and returned in {@link #getPos()}.
++   */
+-  private boolean closed;
++  /**
++   * Closed bit. Volatile so reads are non-blocking.
++   * Updates must be in a synchronized block to guarantee an atomic check and
++   * set
++   */
++  private volatile boolean closed;
++  private final S3AInstrumentation.InputStreamStatistics streamStatistics;
++  private long readahead;
+-  // Used by lazy seek
++  /**
++   * This is the actual position within the object, used by
++   * lazy seek to decide whether to seek on the next read or not.
++   */
+-  //Amount of data requested from the request
++  /* Amount of data desired from the request */
+-  public S3AInputStream(String bucket, String key, long contentLength,
+-      AmazonS3Client client, FileSystem.Statistics stats) {
++  public S3AInputStream(String bucket,
++      String key,
++      long contentLength,
++      AmazonS3Client client,
++      FileSystem.Statistics stats,
++      S3AInstrumentation instrumentation,
++      long readahead) {
++    Preconditions.checkArgument(StringUtils.isNotEmpty(bucket), "No Bucket");
++    Preconditions.checkArgument(StringUtils.isNotEmpty(key), "No Key");
++    Preconditions.checkArgument(contentLength >= 0 , "Negative content length");
+-    this.pos = 0;
+-    this.nextReadPos = 0;
+-    this.closed = false;
+-    this.wrappedStream = null;
++    this.streamStatistics = instrumentation.newInputStreamStatistics();
++    setReadahead(readahead);
++   * @param reason reason for reopen
+-  private synchronized void reopen(long targetPos, long length)
++  private synchronized void reopen(String reason, long targetPos, long length)
+-    requestedStreamLen = (length < 0) ? this.contentLength :
+-        Math.max(this.contentLength, (CLOSE_THRESHOLD + (targetPos + length)));
++    requestedStreamLen = this.contentLength;
+-      if (LOG.isDebugEnabled()) {
+-        LOG.debug("Closing the previous stream");
+-      }
+-      closeStream(requestedStreamLen);
++      closeStream("reopen(" + reason + ")", requestedStreamLen);
++    LOG.debug("reopen({}) for {} at targetPos={}, length={}," +
++        " requestedStreamLen={}, streamPosition={}, nextReadPosition={}",
++        uri, reason, targetPos, length, requestedStreamLen, pos, nextReadPos);
+-    if (LOG.isDebugEnabled()) {
+-      LOG.debug("Requesting for "
+-          + "targetPos=" + targetPos
+-          + ", length=" + length
+-          + ", requestedStreamLen=" + requestedStreamLen
+-          + ", streamPosition=" + pos
+-          + ", nextReadPosition=" + nextReadPos
+-      );
+-    }
+-
++    streamStatistics.streamOpened();
+-      throw new IOException("Null IO stream");
++      throw new IOException("Null IO stream from reopen of (" + reason +  ") "
++          + uri);
++   * Seek without raising any exception. This is for use in
++   * {@code finally} clauses
++   * @param positiveTargetPos a target position which must be positive.
++   */
++  private void seekQuietly(long positiveTargetPos) {
++    try {
++      seek(positiveTargetPos);
++    } catch (IOException ioe) {
++      LOG.debug("Ignoring IOE on seek of {} to {}",
++          uri, positiveTargetPos, ioe);
++    }
++  }
++
++  /**
+-
+-    if (targetPos > pos) {
+-      if ((diff + length) <= wrappedStream.available()) {
+-        // already available in buffer
+-        pos += wrappedStream.skip(diff);
+-        if (pos != targetPos) {
+-          throw new IOException("Failed to seek to " + targetPos
+-              + ". Current position " + pos);
++    if (diff > 0) {
++      // forward seek -this is where data can be skipped
++
++      int available = wrappedStream.available();
++      // always seek at least as far as what is available
++      long forwardSeekRange = Math.max(readahead, available);
++      // work out how much is actually left in the stream
++      // then choose whichever comes first: the range or the EOF
++      long forwardSeekLimit = Math.min(remaining(), forwardSeekRange);
++      if (diff <= forwardSeekLimit) {
++        // the forward seek range is within the limits
++        LOG.debug("Forward seek on {}, of {} bytes", uri, diff);
++        streamStatistics.seekForwards(diff);
++        long skipped = wrappedStream.skip(diff);
++        if (skipped > 0) {
++          pos += skipped;
++          // as these bytes have been read, they are included in the counter
++          incrementBytesRead(diff);
+-        return;
++
++        if (pos == targetPos) {
++          // all is well
++          return;
++        } else {
++          // log a warning; continue to attempt to re-open
++          LOG.warn("Failed to seek on {} to {}. Current position {}",
++              uri, targetPos,  pos);
++        }
++    } else if (diff < 0) {
++      // backwards seek
++      streamStatistics.seekBackwards(diff);
++    } else {
++      // targetPos == pos
++      // this should never happen as the caller filters it out.
++      // Retained just in case
++      LOG.debug("Ignoring seek {} to {} as target position == current",
++          uri, targetPos);
+-    closeStream(this.requestedStreamLen);
++    closeStream("seekInStream()", this.requestedStreamLen);
+-      reopen(targetPos, len);
++      reopen("read from new offset", targetPos, len);
++    }
++  }
++
++  /**
++   * Increment the bytes read counter if there is a stats instance
++   * and the number of bytes read is more than zero.
++   * @param bytesRead number of bytes read
++   */
++  private void incrementBytesRead(long bytesRead) {
++    streamStatistics.bytesRead(bytesRead);
++    if (stats != null && bytesRead > 0) {
++      stats.incrementBytesRead(bytesRead);
+-    } catch (SocketTimeoutException | SocketException e) {
+-      LOG.info("Got exception while trying to read from stream,"
+-          + " trying to recover " + e);
+-      reopen(pos, 1);
+-      byteRead = wrappedStream.read();
++    } catch (IOException e) {
++      onReadFailure(e, 1);
++      byteRead = wrappedStream.read();
+-    if (stats != null && byteRead >= 0) {
+-      stats.incrementBytesRead(1);
++    if (byteRead >= 0) {
++      incrementBytesRead(1);
++  /**
++   * Handle an IOE on a read by attempting to re-open the stream.
++   * The filesystem's readException count will be incremented.
++   * @param ioe exception caught.
++   * @param length length of data being attempted to read
++   * @throws IOException any exception thrown on the re-open attempt.
++   */
++  private void onReadFailure(IOException ioe, int length) throws IOException {
++    LOG.info("Got exception while trying to read from stream {}"
++        + " trying to recover: "+ ioe, uri);
++    LOG.debug("While trying to read from stream {}", uri, ioe);
++    streamStatistics.readException();
++    reopen("failure recovery", pos, length);
++  }
++
++  /**
++   * {@inheritDoc}
++   *
++   * This updates the statistics on read operations started and whether
++   * or not the read operation "completed", that is: returned the exact
++   * number of bytes requested.
++   * @throws EOFException if there is no more data
++   * @throws IOException if there are other problems
++   */
++    streamStatistics.readOperationStarted(nextReadPos, len);
+-    int byteRead;
++    int bytesRead;
+-      byteRead = wrappedStream.read(buf, off, len);
+-    } catch (SocketTimeoutException | SocketException e) {
+-      LOG.info("Got exception while trying to read from stream,"
+-          + " trying to recover " + e);
+-      reopen(pos, len);
+-      byteRead = wrappedStream.read(buf, off, len);
++      bytesRead = wrappedStream.read(buf, off, len);
++    } catch (EOFException e) {
++      throw e;
++    } catch (IOException e) {
++      onReadFailure(e, len);
++      bytesRead = wrappedStream.read(buf, off, len);
+-    if (byteRead > 0) {
+-      pos += byteRead;
+-      nextReadPos += byteRead;
++    if (bytesRead > 0) {
++      pos += bytesRead;
++      nextReadPos += bytesRead;
+-
+-    if (stats != null && byteRead > 0) {
+-      stats.incrementBytesRead(byteRead);
+-    }
+-
+-    return byteRead;
++    incrementBytesRead(bytesRead);
++    streamStatistics.readOperationCompleted(len, bytesRead);
++    return bytesRead;
++  /**
++   * Verify that the input stream is open. Non blocking; this gives
++   * the last state of the volatile {@link #closed} field.
++   * @throws IOException if the connection is closed.
++   */
+-      throw new IOException(FSExceptionMessages.STREAM_IS_CLOSED);
++      throw new IOException(uri + ": " + FSExceptionMessages.STREAM_IS_CLOSED);
++  /**
++   * Close the stream.
++   * This triggers publishing of the stream statistics back to the filesystem
++   * statistics.
++   * This operation is synchronized, so that only one thread can attempt to
++   * close the connection; all later/blocked calls are no-ops.
++   * @throws IOException on any problem
++   */
+-    super.close();
+-    closed = true;
+-    closeStream(this.contentLength);
++    if (!closed) {
++      closed = true;
++      try {
++        // close or abort the stream
++        closeStream("close() operation", this.contentLength);
++        // this is actually a no-op
++        super.close();
++      } finally {
++        // merge the statistics back into the FS statistics.
++        streamStatistics.close();
++      }
++    }
++   * If a close() is attempted and fails, the operation escalates to
++   * an abort.
++   *
++   * @param reason reason for stream being closed; used in messages
+-   * @throws IOException
+-  private void closeStream(long length) throws IOException {
++  private void closeStream(String reason, long length) {
+-      String reason = null;
+-          reason = "Closed stream";
++          // clean close. This will read to the end of the stream,
++          // so, while cleaner, can be pathological on a multi-GB object
++          streamStatistics.streamClose(false);
+-          LOG.debug("When closing stream", e);
++          LOG.debug("When closing {} stream for {}", uri, reason, e);
+-        reason = "Closed stream with abort";
++        streamStatistics.streamClose(true);
+-      if (LOG.isDebugEnabled()) {
+-        LOG.debug(reason + "; streamPos=" + pos
+-            + ", nextReadPos=" + nextReadPos
+-            + ", contentLength=" + length);
+-      }
++      LOG.debug("Stream {} {}: {}; streamPos={}, nextReadPos={}," +
++          " length={}",
++          uri, (shouldAbort ? "aborted":"closed"), reason, pos, nextReadPos,
++          length);
+-    long remaining = this.contentLength - this.pos;
++    long remaining = remaining();
++  /**
++   * Bytes left in stream.
++   * @return how many bytes are left to read
++   */
++  protected long remaining() {
++    return this.contentLength - this.pos;
++  }
++
++  /**
++   * String value includes statistics as well as stream state.
++   * <b>Important: there are no guarantees as to the stability
++   * of this value.</b>
++   * @return a string value for printing in logs/diagnostics
++   */
++  @InterfaceStability.Unstable
++    sb.append(" ").append(streamStatistics.toString());
++    streamStatistics.readFullyOperationStarted(position, length);
+-
+-        seek(oldPos);
++        seekQuietly(oldPos);
++
++  /**
++   * Access the input stream statistics.
++   * This is for internal testing and may be removed without warning.
++   * @return the statistics for this input stream
++   */
++  @InterfaceAudience.Private
++  @InterfaceStability.Unstable
++  public S3AInstrumentation.InputStreamStatistics getS3AStreamStatistics() {
++    return streamStatistics;
++  }
++
++  @Override
++  public void setReadahead(Long readahead) {
++    if (readahead == null) {
++      this.readahead = Constants.DEFAULT_READAHEAD_RANGE;
++    } else {
++      Preconditions.checkArgument(readahead >= 0, "Negative readahead value");
++      this.readahead = readahead;
++    }
++  }
++
++  /**
++   * Get the current readahead value.
++   * @return a non-negative readahead value
++   */
++  public long getReadahead() {
++    return readahead;
++  }
+
+MOV26 MOV26 INS26 INS26 INS26 UPD40 INS40 UPD40 INS40 INS40 INS29 INS78 INS78 INS43 INS23 INS23 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS65 INS40 INS40 INS42 INS29 INS29 INS83 INS83 INS83 INS43 INS59 INS59 INS29 INS83 INS39 MOV59 INS44 INS44 MOV21 MOV21 MOV21 INS44 INS29 INS83 INS39 INS42 INS44 INS8 INS29 INS83 INS39 INS42 INS44 INS8 INS29 INS83 INS39 INS42 INS44 INS44 MOV43 INS8 INS29 MOV29 INS29 INS8 INS29 INS44 INS29 INS83 INS39 INS42 INS8 INS29 INS78 INS29 INS78 INS78 INS83 INS43 INS42 INS8 INS78 INS83 INS39 INS42 INS44 INS8 INS29 INS83 INS39 INS42 INS8 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS65 INS66 INS65 INS65 INS40 INS42 INS42 INS65 INS43 INS42 INS39 INS42 INS21 INS65 INS43 INS42 MOV21 INS21 INS65 INS65 INS39 INS42 INS54 INS65 INS65 INS39 INS42 INS21 MOV25 MOV12 INS65 INS65 INS65 INS65 MOV43 INS42 INS39 INS42 INS21 INS21 INS21 INS21 INS65 INS65 INS65 INS21 INS21 INS21 INS65 INS65 INS25 INS65 INS65 MOV65 MOV43 INS42 INS65 INS65 INS41 INS65 INS65 INS40 INS21 INS21 INS65 INS65 INS40 INS40 INS40 INS41 INS42 INS43 INS42 INS25 INS65 INS65 INS41 INS68 INS66 INS65 INS66 INS65 INS66 INS66 INS66 INS66 INS66 INS66 INS42 INS32 INS32 INS32 INS32 INS42 INS66 INS42 INS32 INS66 INS65 INS66 INS42 INS66 INS8 INS12 INS25 INS66 INS66 INS42 INS66 INS32 MOV27 INS66 INS66 INS42 INS66 INS42 INS66 INS42 INS66 INS32 INS32 INS32 INS32 INS65 INS66 INS66 INS66 INS42 INS66 INS42 INS66 INS32 MOV8 INS12 INS12 INS32 INS32 UPD42 UPD66 UPD66 UPD66 INS66 INS66 INS66 INS66 INS66 INS66 INS42 INS66 INS38 INS8 INS66 INS66 INS66 INS66 INS66 INS65 INS66 INS42 INS66 INS66 INS66 MOV27 INS66 INS66 INS66 INS66 INS32 INS32 INS66 INS66 INS66 INS42 INS42 INS27 INS8 INS8 INS66 INS66 INS42 INS42 INS68 INS68 INS42 INS42 INS32 INS45 INS42 INS42 INS32 INS45 INS42 INS42 INS27 INS45 INS32 INS42 INS42 MOV22 INS27 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS66 INS21 INS44 INS8 UPD42 INS34 INS60 INS60 INS60 INS27 INS8 INS8 INS45 INS42 INS42 INS42 INS42 INS42 INS27 INS42 INS42 INS42 INS45 INS42 INS42 INS42 INS42 INS42 INS45 INS42 INS42 INS42 INS42 INS42 INS42 UPD42 INS44 INS8 INS44 MOV8 UPD42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 MOV21 INS54 INS67 MOV21 INS32 INS32 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS33 INS21 INS21 INS21 INS42 INS69 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS34 UPD42 INS42 INS42 UPD45 MOV45 UPD45 MOV45 INS32 MOV43 INS42 INS21 INS39 INS59 INS39 INS59 INS39 INS59 INS42 INS34 INS21 INS21 UPD42 INS43 INS45 INS45 INS42 INS43 INS42 INS53 INS43 MOV42 INS21 INS8 INS8 INS42 INS42 INS42 INS42 INS45 INS42 INS42 INS7 INS32 INS7 INS39 INS27 INS27 INS42 INS42 INS32 INS42 MOV32 INS42 INS32 INS42 INS32 MOV42 UPD42 MOV42 INS21 INS21 INS60 INS25 INS32 INS32 INS45 UPD42 UPD42 MOV42 UPD42 UPD42 MOV42 INS42 UPD42 MOV42 INS32 UPD42 UPD42 INS43 INS27 INS21 MOV21 MOV21 INS27 INS42 INS36 INS42 INS42 INS42 INS42 INS22 INS40 INS42 INS42 INS27 INS45 INS22 INS42 INS45 INS42 INS45 INS45 INS42 INS45 INS42 INS42 INS42 INS45 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS32 INS32 INS39 INS59 INS27 INS8 UPD27 INS8 INS42 INS42 INS42 INS42 INS42 INS45 INS42 INS42 UPD42 UPD42 INS42 INS42 INS42 UPD42 INS42 INS42 INS45 INS40 INS32 MOV21 INS32 INS45 INS45 INS16 INS52 INS42 INS42 INS34 INS52 INS42 INS42 INS42 INS42 INS45 INS42 INS42 INS42 INS42 INS42 INS42 MOV32 INS42 INS34 MOV21 INS21 INS41 INS21 INS42 INS45 MOV22 UPD42 INS42 INS42 INS42 INS9 INS42 INS45 INS45 UPD42 INS32 INS32 INS32 INS42 INS42 INS42 INS42 INS42 INS45 INS42 INS42 INS42 INS42 INS42 INS9 UPD45 INS42 INS42 DEL52 DEL42 DEL22 DEL34 DEL7 DEL52 DEL42 DEL22 DEL34 DEL7 DEL9 DEL52 DEL42 DEL22 DEL33 DEL7 DEL42 DEL34 DEL27 DEL36 DEL42 DEL42 DEL42 DEL42 DEL42 DEL27 DEL36 DEL27 DEL36 DEL32 DEL16 DEL42 DEL42 DEL32 DEL42 DEL42 DEL45 DEL32 DEL21 DEL8 DEL25 DEL27 DEL42 DEL45 DEL42 DEL45 DEL42 DEL45 DEL42 DEL45 DEL42 DEL27 DEL42 DEL42 DEL32 DEL8 DEL25 DEL45 DEL42 DEL27 DEL36 DEL45 DEL42 DEL45 DEL42 DEL27 DEL14 DEL53 DEL41 DEL42 DEL43 DEL43 DEL84 DEL42 DEL42 DEL45 DEL45 DEL42 DEL27 DEL32 DEL21 DEL42 DEL33 DEL27 DEL27 DEL42 DEL42 DEL42 DEL45 DEL45 DEL42 DEL27 DEL32 DEL21 DEL42 DEL42 DEL42 DEL32 DEL21 DEL43 DEL43 DEL84 DEL44 DEL12 DEL66 DEL40 DEL52 DEL42 DEL22 DEL8 DEL42 DEL33 DEL59 DEL60 DEL42 DEL45 DEL7 DEL42 DEL45 DEL7 DEL42 DEL45 DEL42 DEL45 DEL42 DEL45 DEL42 DEL27 DEL42 DEL42 DEL32 DEL8 DEL25

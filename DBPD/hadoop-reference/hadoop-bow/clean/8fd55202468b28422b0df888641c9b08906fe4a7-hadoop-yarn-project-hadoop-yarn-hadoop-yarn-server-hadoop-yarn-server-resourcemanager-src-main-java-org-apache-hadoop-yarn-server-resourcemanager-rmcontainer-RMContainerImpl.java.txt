@@ -1,0 +1,138 @@
+Merge remote-tracking branch 'apache/trunk' into HDFS-7285
+
+Conflicts:
+	hadoop-hdfs-project/hadoop-hdfs-client/src/main/java/org/apache/hadoop/hdfs/DFSClient.java
+	hadoop-hdfs-project/hadoop-hdfs-client/src/main/java/org/apache/hadoop/hdfs/DFSOutputStream.java
+	hadoop-hdfs-project/hadoop-hdfs-client/src/main/proto/hdfs.proto
+	hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSConfigKeys.java
+	hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSUtil.java
+	hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/protocolPB/PBHelper.java
+	hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/DataNode.java
+	hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSDirStatAndListingOp.java
+	hadoop-hdfs-project/hadoop-hdfs/src/main/proto/DatanodeProtocol.proto
+	hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/blockmanagement/TestBlockTokenWithDFS.java
+	hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestFsck.java
+
+Change-Id: Ic7946c4ea35bed587fe879ce58b959b25ecc0823
+
+-        RMContainerEventType.EXPIRE)
++        RMContainerEventType.RESERVED, new ContainerReservedTransition())
++    .addTransition(RMContainerState.RUNNING, RMContainerState.EXPIRED,
++        RMContainerEventType.EXPIRE,
++        new ContainerExpiredWhileRunningTransition())
++    .addTransition(RMContainerState.RUNNING, RMContainerState.RUNNING,
++        RMContainerEventType.CHANGE_RESOURCE, new ChangeResourceTransition())
++    .addTransition(RMContainerState.RUNNING, RMContainerState.RUNNING,
++        RMContainerEventType.ACQUIRE_UPDATED_CONTAINER, 
++        new ContainerAcquiredWhileRunningTransition())
++    .addTransition(RMContainerState.RUNNING, RMContainerState.RUNNING,
++        RMContainerEventType.NM_DONE_CHANGE_RESOURCE, 
++        new NMReportedContainerChangeIsDoneTransition())
+-    .installTopology(); 
+-                        
+-                        
++    .installTopology();
++
++  private volatile boolean hasIncreaseReservation = false;
+-    return container.getResource();
++    try {
++      readLock.lock();
++      return container.getResource();
++    } finally {
++      readLock.unlock();
++    }
+-  private static final class ContainerReservedTransition extends
+-  BaseTransition {
++  private static final class ContainerReservedTransition
++      extends BaseTransition {
++      
++      if (!EnumSet.of(RMContainerState.NEW, RMContainerState.RESERVED)
++          .contains(container.getState())) {
++        // When container's state != NEW/RESERVED, it is an increase reservation
++        container.hasIncreaseReservation = true;
++      }
++  
++  private static final class ContainerAcquiredWhileRunningTransition extends
++      BaseTransition {
++
++    @Override
++    public void transition(RMContainerImpl container, RMContainerEvent event) {
++      RMContainerUpdatesAcquiredEvent acquiredEvent =
++          (RMContainerUpdatesAcquiredEvent) event;
++      if (acquiredEvent.isIncreasedContainer()) {
++        // If container is increased but not acquired by AM, we will start
++        // containerAllocationExpirer for this container in this transition. 
++        container.containerAllocationExpirer.register(event.getContainerId());
++      }
++    }
++  }
++  
++  private static final class NMReportedContainerChangeIsDoneTransition
++      extends BaseTransition {
++
++    @Override
++    public void transition(RMContainerImpl container, RMContainerEvent event) {
++      // Unregister the allocation expirer, it is already increased..
++      container.containerAllocationExpirer.unregister(event.getContainerId());
++    }
++  }
++  
++  private static final class ContainerExpiredWhileRunningTransition extends
++      BaseTransition {
++
++    @Override
++    public void transition(RMContainerImpl container, RMContainerEvent event) {
++      // When the container expired, and it has a pending increased request, we
++      // will kill the container.
++      // TODO, we can do better for this: roll back container resource to the
++      // resource before increase, and notify scheduler about this decrease as
++      // well. Will do that in a separated JIRA.
++      new KillTransition().transition(container, event);
++    }
++  }
++  
++  private static final class ChangeResourceTransition extends BaseTransition {
++
++    @Override
++    public void transition(RMContainerImpl container, RMContainerEvent event) {
++      RMContainerChangeResourceEvent changeEvent = (RMContainerChangeResourceEvent)event;
++      
++      // Register with containerAllocationExpirer.
++      // For now, we assume timeout for increase is as same as container
++      // allocation.
++      if (!changeEvent.isIncrease()) {
++        // if this is a decrease request, if container was increased but not
++        // told to NM, we can consider previous increase is cancelled,
++        // unregister from the containerAllocationExpirer
++        container.containerAllocationExpirer.unregister(container
++            .getContainerId());
++      }
++      
++      container.container.setResource(changeEvent.getTargetResource());
++      
++      // We reach here means we either allocated increase reservation OR
++      // decreased container, reservation will be cancelled anyway. 
++      container.hasIncreaseReservation = false;
++    }
++  }
+-      if (ContainerExitStatus.PREEMPTED == container.finishedStatus
+-        .getExitStatus()) {
+-        rmAttempt.getRMAppAttemptMetrics().updatePreemptionInfo(resource,
+-          container);
+-      }
++        if (ContainerExitStatus.PREEMPTED == container.finishedStatus
++            .getExitStatus()) {
++            rmAttempt.getRMAppAttemptMetrics().updatePreemptionInfo(resource,
++              container);
++          }
++        
++
++  @Override
++  public boolean hasIncreaseReservation() {
++    return hasIncreaseReservation;
++  }
++
++  @Override
++  public void cancelIncreaseReservation() {
++    hasIncreaseReservation = false;
++  }

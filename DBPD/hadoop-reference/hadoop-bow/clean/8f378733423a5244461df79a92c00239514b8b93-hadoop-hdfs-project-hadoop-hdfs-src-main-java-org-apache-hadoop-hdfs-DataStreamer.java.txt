@@ -1,0 +1,547 @@
+HDFS-8397. Refactor the error handling code in DataStreamer. Contributed by Tsz Wo Nicholas Sze.
+
+-import java.util.concurrent.atomic.AtomicInteger;
++import org.apache.hadoop.hdfs.client.HdfsClientConfigKeys.BlockWrite;
++  static class ErrorState {
++    private boolean error = false;
++    private int badNodeIndex = -1;
++    private int restartingNodeIndex = -1;
++    private long restartingNodeDeadline = 0;
++    private final long datanodeRestartTimeout;
++
++    ErrorState(long datanodeRestartTimeout) {
++      this.datanodeRestartTimeout = datanodeRestartTimeout;
++    }
++
++    synchronized void reset() {
++      error = false;
++      badNodeIndex = -1;
++      restartingNodeIndex = -1;
++      restartingNodeDeadline = 0;
++    }
++
++    synchronized boolean hasError() {
++      return error;
++    }
++
++    synchronized boolean hasDatanodeError() {
++      return error && isNodeMarked();
++    }
++
++    synchronized void setError(boolean err) {
++      this.error = err;
++    }
++
++    synchronized void setBadNodeIndex(int index) {
++      this.badNodeIndex = index;
++    }
++
++    synchronized int getBadNodeIndex() {
++      return badNodeIndex;
++    }
++
++    synchronized int getRestartingNodeIndex() {
++      return restartingNodeIndex;
++    }
++
++    synchronized void initRestartingNode(int i, String message) {
++      restartingNodeIndex = i;
++      restartingNodeDeadline =  Time.monotonicNow() + datanodeRestartTimeout;
++      // If the data streamer has already set the primary node
++      // bad, clear it. It is likely that the write failed due to
++      // the DN shutdown. Even if it was a real failure, the pipeline
++      // recovery will take care of it.
++      badNodeIndex = -1;
++      LOG.info(message);
++    }
++
++    synchronized boolean isRestartingNode() {
++      return restartingNodeIndex >= 0;
++    }
++
++    synchronized boolean isNodeMarked() {
++      return badNodeIndex >= 0 || isRestartingNode();
++    }
++
++    /**
++     * This method is used when no explicit error report was received, but
++     * something failed. The first node is a suspect or unsure about the cause
++     * so that it is marked as failed.
++     */
++    synchronized void markFirstNodeIfNotMarked() {
++      // There should be no existing error and no ongoing restart.
++      if (!isNodeMarked()) {
++        badNodeIndex = 0;
++      }
++    }
++
++    synchronized void adjustState4RestartingNode() {
++      // Just took care of a node error while waiting for a node restart
++      if (restartingNodeIndex >= 0) {
++        // If the error came from a node further away than the restarting
++        // node, the restart must have been complete.
++        if (badNodeIndex > restartingNodeIndex) {
++          restartingNodeIndex = -1;
++        } else if (badNodeIndex < restartingNodeIndex) {
++          // the node index has shifted.
++          restartingNodeIndex--;
++        } else {
++          throw new IllegalStateException("badNodeIndex = " + badNodeIndex
++              + " = restartingNodeIndex = " + restartingNodeIndex);
++        }
++      }
++
++      if (!isRestartingNode()) {
++        error = false;
++      }
++      badNodeIndex = -1;
++    }
++
++    synchronized void checkRestartingNodeDeadline(DatanodeInfo[] nodes) {
++      if (restartingNodeIndex >= 0) {
++        if (!error) {
++          throw new IllegalStateException("error=false while checking" +
++              " restarting node deadline");
++        }
++
++        // check badNodeIndex
++        if (badNodeIndex == restartingNodeIndex) {
++          // ignore, if came from the restarting node
++          badNodeIndex = -1;
++        }
++        // not within the deadline
++        if (Time.monotonicNow() >= restartingNodeDeadline) {
++          // expired. declare the restarting node dead
++          restartingNodeDeadline = 0;
++          final int i = restartingNodeIndex;
++          restartingNodeIndex = -1;
++          LOG.warn("Datanode " + i + " did not restart within "
++              + datanodeRestartTimeout + "ms: " + nodes[i]);
++          // Mark the restarting node as failed. If there is any other failed
++          // node during the last pipeline construction attempt, it will not be
++          // overwritten/dropped. In this case, the restarting node will get
++          // excluded in the following attempt, if it still does not come up.
++          if (badNodeIndex == -1) {
++            badNodeIndex = i;
++          }
++        }
++      }
++    }
++  }
++
+-  volatile boolean hasError = false;
+-  volatile int errorIndex = -1;
+-  // Restarting node index
+-  AtomicInteger restartingNodeIndex = new AtomicInteger(-1);
+-  private long restartDeadline = 0; // Deadline of DN restart
++  private final ErrorState errorState;
++
+-    this.dfsclientSlowLogThresholdMs =
+-        dfsClient.getConf().getSlowIoWarningThresholdMs();
+-    this.excludedNodes = initExcludedNodes();
++
++    final DfsClientConf conf = dfsClient.getConf();
++    this.dfsclientSlowLogThresholdMs = conf.getSlowIoWarningThresholdMs();
++    this.excludedNodes = initExcludedNodes(conf.getExcludedNodesCacheExpiry());
++    this.errorState = new ErrorState(conf.getDatanodeRestartTimeout());
+-    errorIndex = -1;   // no errors yet.
++  private boolean shouldStop() {
++    return streamerClosed || errorState.hasError() || !dfsClient.clientRunning;
++  }
++
+-      if (hasError && response != null) {
++      if (errorState.hasError() && response != null) {
+-        boolean doSleep = false;
+-        if (hasError && (errorIndex >= 0 || restartingNodeIndex.get() >= 0)) {
+-          doSleep = processDatanodeError();
+-        }
++        boolean doSleep = processDatanodeError();
+-          while ((!streamerClosed && !hasError && dfsClient.clientRunning
+-              && dataQueue.size() == 0 &&
++          while ((!shouldStop() && dataQueue.size() == 0 &&
+-          if (streamerClosed || hasError || !dfsClient.clientRunning) {
++          if (shouldStop()) {
+-            assert one != null;
+-          if (true == streamerClosed) {
++          if (streamerClosed) {
+-            while (!streamerClosed && !hasError &&
+-                ackQueue.size() != 0 && dfsClient.clientRunning) {
++            while (!shouldStop() && ackQueue.size() != 0) {
+-          if (streamerClosed || hasError || !dfsClient.clientRunning) {
++          if (shouldStop()) {
+-          tryMarkPrimaryDatanodeFailed();
++          errorState.markFirstNodeIfNotMarked();
+-        if (streamerClosed || hasError || !dfsClient.clientRunning) {
++        if (shouldStop()) {
+-            while (!streamerClosed && !hasError &&
+-                ackQueue.size() != 0 && dfsClient.clientRunning) {
++            while (!shouldStop() && ackQueue.size() != 0) {
+-          if (streamerClosed || hasError || !dfsClient.clientRunning) {
++          if (shouldStop()) {
+-        if (restartingNodeIndex.get() == -1) {
++        if (!errorState.isRestartingNode()) {
+-        hasError = true;
+-        if (errorIndex == -1 && restartingNodeIndex.get() == -1) {
++        errorState.setError(true);
++        if (!errorState.isNodeMarked()) {
+-  // The following synchronized methods are used whenever
+-  // errorIndex or restartingNodeIndex is set. This is because
+-  // check & set needs to be atomic. Simply reading variables
+-  // does not require a synchronization. When responder is
+-  // not running (e.g. during pipeline recovery), there is no
+-  // need to use these methods.
+-
+-  /** Set the error node index. Called by responder */
+-  synchronized void setErrorIndex(int idx) {
+-    errorIndex = idx;
+-  }
+-
+-  /** Set the restarting node index. Called by responder */
+-  synchronized void setRestartingNodeIndex(int idx) {
+-    restartingNodeIndex.set(idx);
+-    // If the data streamer has already set the primary node
+-    // bad, clear it. It is likely that the write failed due to
+-    // the DN shutdown. Even if it was a real failure, the pipeline
+-    // recovery will take care of it.
+-    errorIndex = -1;
+-  }
+-
+-  /**
+-   * This method is used when no explicit error report was received,
+-   * but something failed. When the primary node is a suspect or
+-   * unsure about the cause, the primary node is marked as failed.
+-   */
+-  synchronized void tryMarkPrimaryDatanodeFailed() {
+-    // There should be no existing error and no ongoing restart.
+-    if ((errorIndex == -1) && (restartingNodeIndex.get() == -1)) {
+-      errorIndex = 0;
+-    }
+-  }
+-
+-              restartDeadline = dfsClient.getConf().getDatanodeRestartTimeout()
+-                  + Time.monotonicNow();
+-              setRestartingNodeIndex(i);
+-              String message = "A datanode is restarting: " + targets[i];
+-              LOG.info(message);
++              final String message = "Datanode " + i + " is restarting: "
++                  + targets[i];
++              errorState.initRestartingNode(i, message);
+-              setErrorIndex(i); // first bad datanode
++              errorState.setBadNodeIndex(i); // mark bad datanode
+-                  " for block " + block +
+-                  " from datanode " +
+-                  targets[i]);
++                  " for " + block + " from datanode " + targets[i]);
+-            hasError = true;
+-            // If no explicit error report was received, mark the primary
+-            // node as failed.
+-            tryMarkPrimaryDatanodeFailed();
++            errorState.setError(true);
++            errorState.markFirstNodeIfNotMarked();
+-            if (restartingNodeIndex.get() == -1) {
++            if (!errorState.isRestartingNode()) {
+-  // If this stream has encountered any errors so far, shutdown
+-  // threads and mark stream as closed. Returns true if we should
+-  // sleep for a while after returning from this call.
+-  //
++  /**
++   * If this stream has encountered any errors, shutdown threads
++   * and mark the stream as closed.
++   *
++   * @return true if it should sleep for a while after returning.
++   */
++    if (!errorState.hasDatanodeError()) {
++      return false;
++    }
+-              .append(HdfsClientConfigKeys.BlockWrite.ReplaceDatanodeOnFailure.POLICY_KEY)
++              .append(BlockWrite.ReplaceDatanodeOnFailure.POLICY_KEY)
+-      // Sleep before reconnect if a dn is restarting.
+-      // This process will be repeated until the deadline or the datanode
+-      // starts back up.
+-      if (restartingNodeIndex.get() >= 0) {
+-        // 4 seconds or the configured deadline period, whichever is shorter.
+-        // This is the retry interval and recovery will be retried in this
+-        // interval until timeout or success.
+-        long delay = Math.min(dfsClient.getConf().getDatanodeRestartTimeout(),
+-            4000L);
+-        try {
+-          Thread.sleep(delay);
+-        } catch (InterruptedException ie) {
+-          lastException.set(new IOException("Interrupted while waiting for " +
+-              "datanode to restart. " + nodes[restartingNodeIndex.get()]));
+-          streamerClosed = true;
+-          return false;
+-        }
+-      }
+-      boolean isRecovery = hasError;
+-      // remove bad datanode from list of datanodes.
+-      // If errorIndex was not set (i.e. appends), then do not remove
+-      // any datanodes
+-      //
+-      if (errorIndex >= 0) {
+-        StringBuilder pipelineMsg = new StringBuilder();
+-        for (int j = 0; j < nodes.length; j++) {
+-          pipelineMsg.append(nodes[j]);
+-          if (j < nodes.length - 1) {
+-            pipelineMsg.append(", ");
+-          }
+-        }
+-        if (nodes.length <= 1) {
+-          lastException.set(new IOException("All datanodes " + pipelineMsg
+-              + " are bad. Aborting..."));
+-          streamerClosed = true;
+-          return false;
+-        }
+-        LOG.warn("Error Recovery for block " + block +
+-            " in pipeline " + pipelineMsg +
+-            ": bad datanode " + nodes[errorIndex]);
+-        failed.add(nodes[errorIndex]);
+-
+-        DatanodeInfo[] newnodes = new DatanodeInfo[nodes.length-1];
+-        arraycopy(nodes, newnodes, errorIndex);
+-
+-        final StorageType[] newStorageTypes = new StorageType[newnodes.length];
+-        arraycopy(storageTypes, newStorageTypes, errorIndex);
+-
+-        final String[] newStorageIDs = new String[newnodes.length];
+-        arraycopy(storageIDs, newStorageIDs, errorIndex);
+-
+-        setPipeline(newnodes, newStorageTypes, newStorageIDs);
+-
+-        // Just took care of a node error while waiting for a node restart
+-        if (restartingNodeIndex.get() >= 0) {
+-          // If the error came from a node further away than the restarting
+-          // node, the restart must have been complete.
+-          if (errorIndex > restartingNodeIndex.get()) {
+-            restartingNodeIndex.set(-1);
+-          } else if (errorIndex < restartingNodeIndex.get()) {
+-            // the node index has shifted.
+-            restartingNodeIndex.decrementAndGet();
+-          } else {
+-            // this shouldn't happen...
+-            assert false;
+-          }
+-        }
+-
+-        if (restartingNodeIndex.get() == -1) {
+-          hasError = false;
+-        }
+-        lastException.clear();
+-        errorIndex = -1;
++      if (!handleRestartingDatanode()) {
++        return false;
+-      // Check if replace-datanode policy is satisfied.
+-      if (dfsClient.dtpReplaceDatanodeOnFailure.satisfy(stat.getReplication(),
+-          nodes, isAppend, isHflushed)) {
+-        try {
+-          addDatanode2ExistingPipeline();
+-        } catch(IOException ioe) {
+-          if (!dfsClient.dtpReplaceDatanodeOnFailure.isBestEffort()) {
+-            throw ioe;
+-          }
+-          LOG.warn("Failed to replace datanode."
+-              + " Continue with the remaining datanodes since "
+-              + HdfsClientConfigKeys.BlockWrite.ReplaceDatanodeOnFailure.BEST_EFFORT_KEY
+-              + " is set to true.", ioe);
+-        }
++      final boolean isRecovery = errorState.hasError();
++      if (!handleBadDatanode()) {
++        return false;
++      handleDatanodeReplacement();
++
+-      LocatedBlock lb = dfsClient.namenode.updateBlockForPipeline(block, dfsClient.clientName);
++      final LocatedBlock lb = updateBlockForPipeline();
+-      if (failPacket) { // for testing
+-        success = createBlockOutputStream(nodes, storageTypes, newGS, isRecovery);
+-        failPacket = false;
+-        try {
+-          // Give DNs time to send in bad reports. In real situations,
+-          // good reports should follow bad ones, if client committed
+-          // with those nodes.
+-          Thread.sleep(2000);
+-        } catch (InterruptedException ie) {}
+-      } else {
+-        success = createBlockOutputStream(nodes, storageTypes, newGS, isRecovery);
+-      }
++      success = createBlockOutputStream(nodes, storageTypes, newGS, isRecovery);
+-      if (restartingNodeIndex.get() >= 0) {
+-        assert hasError == true;
+-        // check errorIndex set above
+-        if (errorIndex == restartingNodeIndex.get()) {
+-          // ignore, if came from the restarting node
+-          errorIndex = -1;
+-        }
+-        // still within the deadline
+-        if (Time.monotonicNow() < restartDeadline) {
+-          continue; // with in the deadline
+-        }
+-        // expired. declare the restarting node dead
+-        restartDeadline = 0;
+-        int expiredNodeIndex = restartingNodeIndex.get();
+-        restartingNodeIndex.set(-1);
+-        LOG.warn("Datanode did not restart in time: " +
+-            nodes[expiredNodeIndex]);
+-        // Mark the restarting node as failed. If there is any other failed
+-        // node during the last pipeline construction attempt, it will not be
+-        // overwritten/dropped. In this case, the restarting node will get
+-        // excluded in the following attempt, if it still does not come up.
+-        if (errorIndex == -1) {
+-          errorIndex = expiredNodeIndex;
+-        }
+-        // From this point on, normal pipeline recovery applies.
+-      }
++      failPacket4Testing();
++
++      errorState.checkRestartingNodeDeadline(nodes);
+-      // update pipeline at the namenode
+-      ExtendedBlock newBlock = new ExtendedBlock(
+-          block.getBlockPoolId(), block.getBlockId(), block.getNumBytes(), newGS);
+-      dfsClient.namenode.updatePipeline(dfsClient.clientName, block, newBlock,
+-          nodes, storageIDs);
+-      // update client side generation stamp
+-      block = newBlock;
++      block = updatePipeline(newGS);
++   * Sleep if a node is restarting.
++   * This process is repeated until the deadline or the node starts back up.
++   * @return true if it should continue.
++   */
++  private boolean handleRestartingDatanode() {
++    if (errorState.isRestartingNode()) {
++      // 4 seconds or the configured deadline period, whichever is shorter.
++      // This is the retry interval and recovery will be retried in this
++      // interval until timeout or success.
++      final long delay = Math.min(errorState.datanodeRestartTimeout, 4000L);
++      try {
++        Thread.sleep(delay);
++      } catch (InterruptedException ie) {
++        lastException.set(new IOException(
++            "Interrupted while waiting for restarting "
++            + nodes[errorState.getRestartingNodeIndex()]));
++        streamerClosed = true;
++        return false;
++      }
++    }
++    return true;
++  }
++
++  /**
++   * Remove bad node from list of nodes if badNodeIndex was set.
++   * @return true if it should continue.
++   */
++  private boolean handleBadDatanode() {
++    final int badNodeIndex = errorState.getBadNodeIndex();
++    if (badNodeIndex >= 0) {
++      if (nodes.length <= 1) {
++        lastException.set(new IOException("All datanodes "
++            + Arrays.toString(nodes) + " are bad. Aborting..."));
++        streamerClosed = true;
++        return false;
++      }
++
++      LOG.warn("Error Recovery for " + block + " in pipeline "
++          + Arrays.toString(nodes) + ": datanode " + badNodeIndex
++          + "("+ nodes[badNodeIndex] + ") is bad.");
++      failed.add(nodes[badNodeIndex]);
++
++      DatanodeInfo[] newnodes = new DatanodeInfo[nodes.length-1];
++      arraycopy(nodes, newnodes, badNodeIndex);
++
++      final StorageType[] newStorageTypes = new StorageType[newnodes.length];
++      arraycopy(storageTypes, newStorageTypes, badNodeIndex);
++
++      final String[] newStorageIDs = new String[newnodes.length];
++      arraycopy(storageIDs, newStorageIDs, badNodeIndex);
++
++      setPipeline(newnodes, newStorageTypes, newStorageIDs);
++
++      errorState.adjustState4RestartingNode();
++      lastException.clear();
++    }
++    return true;
++  }
++
++  /** Add a datanode if replace-datanode policy is satisfied. */
++  private void handleDatanodeReplacement() throws IOException {
++    if (dfsClient.dtpReplaceDatanodeOnFailure.satisfy(stat.getReplication(),
++        nodes, isAppend, isHflushed)) {
++      try {
++        addDatanode2ExistingPipeline();
++      } catch(IOException ioe) {
++        if (!dfsClient.dtpReplaceDatanodeOnFailure.isBestEffort()) {
++          throw ioe;
++        }
++        LOG.warn("Failed to replace datanode."
++            + " Continue with the remaining datanodes since "
++            + BlockWrite.ReplaceDatanodeOnFailure.BEST_EFFORT_KEY
++            + " is set to true.", ioe);
++      }
++    }
++  }
++
++  private void failPacket4Testing() {
++    if (failPacket) { // for testing
++      failPacket = false;
++      try {
++        // Give DNs time to send in bad reports. In real situations,
++        // good reports should follow bad ones, if client committed
++        // with those nodes.
++        Thread.sleep(2000);
++      } catch (InterruptedException ie) {}
++    }
++  }
++
++  LocatedBlock updateBlockForPipeline() throws IOException {
++    return dfsClient.namenode.updateBlockForPipeline(
++        block, dfsClient.clientName);
++  }
++
++  /** update pipeline at the namenode */
++  ExtendedBlock updatePipeline(long newGS) throws IOException {
++    final ExtendedBlock newBlock = new ExtendedBlock(
++        block.getBlockPoolId(), block.getBlockId(), block.getNumBytes(), newGS);
++    dfsClient.namenode.updatePipeline(dfsClient.clientName, block, newBlock,
++        nodes, storageIDs);
++    return newBlock;
++  }
++
++  /**
+-      hasError = false;
++      errorState.reset();
+-      errorIndex = -1;
+-        LOG.info("Excluding datanode " + nodes[errorIndex]);
+-        excludedNodes.put(nodes[errorIndex], nodes[errorIndex]);
++        final DatanodeInfo badNode = nodes[errorState.getBadNodeIndex()];
++        LOG.info("Excluding datanode " + badNode);
++        excludedNodes.put(badNode, badNode);
+-            restartingNodeIndex.get() == -1) {
++            !errorState.isRestartingNode()) {
+-        restartingNodeIndex.set(-1);
+-        hasError = false;
++        errorState.reset();
+-        if (restartingNodeIndex.get() == -1) {
++        if (!errorState.isRestartingNode()) {
+-              errorIndex = i;
++              errorState.setBadNodeIndex(i);
+-          errorIndex = 0;
++          errorState.setBadNodeIndex(0);
++
++        final int i = errorState.getBadNodeIndex();
+-        if (checkRestart && shouldWaitForRestart(errorIndex)) {
+-          restartDeadline = dfsClient.getConf().getDatanodeRestartTimeout()
+-              + Time.monotonicNow();
+-          restartingNodeIndex.set(errorIndex);
+-          errorIndex = -1;
+-          LOG.info("Waiting for the datanode to be restarted: " +
+-              nodes[restartingNodeIndex.get()]);
++        if (checkRestart && shouldWaitForRestart(i)) {
++          errorState.initRestartingNode(i, "Datanode " + i + " is restarting: " + nodes[i]);
+-        hasError = true;
++        errorState.setError(true);
+-  private LoadingCache<DatanodeInfo, DatanodeInfo> initExcludedNodes() {
+-    return CacheBuilder.newBuilder().expireAfterWrite(
+-        dfsClient.getConf().getExcludedNodesCacheExpiry(),
+-        TimeUnit.MILLISECONDS)
++  private static LoadingCache<DatanodeInfo, DatanodeInfo> initExcludedNodes(
++      long excludedNodesCacheExpiry) {
++    return CacheBuilder.newBuilder()
++        .expireAfterWrite(excludedNodesCacheExpiry, TimeUnit.MILLISECONDS)

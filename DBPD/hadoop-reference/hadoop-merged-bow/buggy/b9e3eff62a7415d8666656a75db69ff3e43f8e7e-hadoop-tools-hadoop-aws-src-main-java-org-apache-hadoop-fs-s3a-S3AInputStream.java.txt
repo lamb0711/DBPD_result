@@ -1,0 +1,235 @@
+HADOOP-12444 Support lazy seek in S3AInputStream. Rajesh Balamohan via stevel
+
+-import com.amazonaws.services.s3.model.S3Object;
+-  private FileSystem.Statistics stats;
+-  private AmazonS3Client client;
+-  private String bucket;
+-  private String key;
+-  private long contentLength;
++  private final FileSystem.Statistics stats;
++  private final AmazonS3Client client;
++  private final String bucket;
++  private final String key;
++  private final long contentLength;
++  private final String uri;
+-  public S3AInputStream(String bucket, String key, long contentLength, AmazonS3Client client,
+-                        FileSystem.Statistics stats) {
++  // Used by lazy seek
++  private long nextReadPos;
++
++  //Amount of data requested from the request
++  private long requestedStreamLen;
++
++  public S3AInputStream(String bucket, String key, long contentLength,
++      AmazonS3Client client, FileSystem.Statistics stats) {
++    this.nextReadPos = 0;
++    this.uri = "s3a://" + this.bucket + "/" + this.key;
+-  private void openIfNeeded() throws IOException {
+-    if (wrappedStream == null) {
+-      reopen(0);
+-    }
+-  }
+-
+-  private synchronized void reopen(long pos) throws IOException {
++  /**
++   * Opens up the stream at specified target position and for given length.
++   *
++   * @param targetPos target position
++   * @param length length requested
++   * @throws IOException
++   */
++  private synchronized void reopen(long targetPos, long length)
++      throws IOException {
++    requestedStreamLen = (length < 0) ? this.contentLength :
++        Math.max(this.contentLength, (CLOSE_THRESHOLD + (targetPos + length)));
+-        LOG.debug("Aborting old stream to open at pos " + pos);
++        LOG.debug("Closing the previous stream");
+-      wrappedStream.abort();
++      closeStream(requestedStreamLen);
+-    if (pos < 0) {
+-      throw new EOFException(FSExceptionMessages.NEGATIVE_SEEK
+-          +" " + pos);
++    if (LOG.isDebugEnabled()) {
++      LOG.debug("Requesting for "
++          + "targetPos=" + targetPos
++          + ", length=" + length
++          + ", requestedStreamLen=" + requestedStreamLen
++          + ", streamPosition=" + pos
++          + ", nextReadPosition=" + nextReadPos
++      );
+-    if (contentLength > 0 && pos > contentLength-1) {
+-      throw new EOFException(
+-          FSExceptionMessages.CANNOT_SEEK_PAST_EOF
+-          + " " + pos);
+-    }
+-
+-    LOG.debug("Actually opening file " + key + " at pos " + pos);
+-
+-    GetObjectRequest request = new GetObjectRequest(bucket, key);
+-    request.setRange(pos, contentLength-1);
+-
++    GetObjectRequest request = new GetObjectRequest(bucket, key)
++        .withRange(targetPos, requestedStreamLen);
+-    this.pos = pos;
++    this.pos = targetPos;
+-    return pos;
++    return (nextReadPos < 0) ? 0 : nextReadPos;
+-  public synchronized void seek(long pos) throws IOException {
++  public synchronized void seek(long targetPos) throws IOException {
+-    if (this.pos == pos) {
++    // Do not allow negative seek
++    if (targetPos < 0) {
++      throw new EOFException(FSExceptionMessages.NEGATIVE_SEEK
++          + " " + targetPos);
++    }
++
++    if (this.contentLength <= 0) {
+-    LOG.debug(
+-        "Reopening " + this.key + " to seek to new offset " + (pos - this.pos));
+-    reopen(pos);
++    // Lazy seek
++    nextReadPos = targetPos;
++  }
++
++  /**
++   * Adjust the stream to a specific position.
++   *
++   * @param targetPos target seek position
++   * @param length length of content that needs to be read from targetPos
++   * @throws IOException
++   */
++  private void seekInStream(long targetPos, long length) throws IOException {
++    checkNotClosed();
++    if (wrappedStream == null) {
++      return;
++    }
++
++    // compute how much more to skip
++    long diff = targetPos - pos;
++    if (targetPos > pos) {
++      if ((diff + length) <= wrappedStream.available()) {
++        // already available in buffer
++        pos += wrappedStream.skip(diff);
++        if (pos != targetPos) {
++          throw new IOException("Failed to seek to " + targetPos
++              + ". Current position " + pos);
++        }
++        return;
++      }
++    }
++
++    // close the stream; if read the object will be opened at the new pos
++    closeStream(this.requestedStreamLen);
++    pos = targetPos;
++  /**
++   * Perform lazy seek and adjust stream to correct position for reading.
++   *
++   * @param targetPos position from where data should be read
++   * @param len length of the content that needs to be read
++   */
++  private void lazySeek(long targetPos, long len) throws IOException {
++    //For lazy seek
++    if (targetPos != this.pos) {
++      seekInStream(targetPos, len);
++    }
++
++    //re-open at specific location if needed
++    if (wrappedStream == null) {
++      reopen(targetPos, len);
++    }
++  }
++
++    if (this.contentLength == 0 || (nextReadPos >= contentLength)) {
++      return -1;
++    }
+-    openIfNeeded();
++    lazySeek(nextReadPos, 1);
+-    } catch (SocketTimeoutException e) {
+-      LOG.info("Got timeout while trying to read from stream, trying to recover " + e);
+-      reopen(pos);
+-      byteRead = wrappedStream.read();
+-    } catch (SocketException e) {
+-      LOG.info("Got socket exception while trying to read from stream, trying to recover " + e);
+-      reopen(pos);
++    } catch (SocketTimeoutException | SocketException e) {
++      LOG.info("Got exception while trying to read from stream,"
++          + " trying to recover " + e);
++      reopen(pos, 1);
++      nextReadPos++;
+-  public synchronized int read(byte[] buf, int off, int len) throws IOException {
++  public synchronized int read(byte[] buf, int off, int len)
++      throws IOException {
+-    openIfNeeded();
++    validatePositionedReadArgs(nextReadPos, buf, off, len);
++    if (len == 0) {
++      return 0;
++    }
++
++    if (this.contentLength == 0 || (nextReadPos >= contentLength)) {
++      return -1;
++    }
++
++    lazySeek(nextReadPos, len);
+-    } catch (SocketTimeoutException e) {
+-      LOG.info("Got timeout while trying to read from stream, trying to recover " + e);
+-      reopen(pos);
+-      byteRead = wrappedStream.read(buf, off, len);
+-    } catch (SocketException e) {
+-      LOG.info("Got socket exception while trying to read from stream, trying to recover " + e);
+-      reopen(pos);
++    } catch (SocketTimeoutException | SocketException e) {
++      LOG.info("Got exception while trying to read from stream,"
++          + " trying to recover " + e);
++      reopen(pos, len);
++      nextReadPos += byteRead;
++    closeStream(this.contentLength);
++  }
++
++  /**
++   * Close a stream: decide whether to abort or close, based on
++   * the length of the stream and the current position.
++   *
++   * This does not set the {@link #closed} flag.
++   * @param length length of the stream.
++   * @throws IOException
++   */
++  private void closeStream(long length) throws IOException {
+-      if (contentLength - pos <= CLOSE_THRESHOLD) {
+-        // Close, rather than abort, so that the http connection can be reused.
+-        wrappedStream.close();
+-      } else {
++      String reason = null;
++      boolean shouldAbort = length - pos > CLOSE_THRESHOLD;
++      if (!shouldAbort) {
++        try {
++          reason = "Closed stream";
++          wrappedStream.close();
++        } catch (IOException e) {
++          // exception escalates to an abort
++          LOG.debug("When closing stream", e);
++          shouldAbort = true;
++        }
++      }
++      if (shouldAbort) {
++        reason = "Closed stream with abort";
++      if (LOG.isDebugEnabled()) {
++        LOG.debug(reason + "; streamPos=" + pos
++            + ", nextReadPos=" + nextReadPos
++            + ", contentLength=" + length);
++      }
++      wrappedStream = null;
++  @Override
++  public String toString() {
++    final StringBuilder sb = new StringBuilder(
++        "S3AInputStream{");
++    sb.append(uri);
++    sb.append(" pos=").append(pos);
++    sb.append(" nextReadPos=").append(nextReadPos);
++    sb.append(" contentLength=").append(contentLength);
++    sb.append('}');
++    return sb.toString();
++  }
++
++    checkNotClosed();
+
+MOV31 MOV31 INS23 INS23 INS23 INS31 INS31 INS31 INS31 INS31 INS31 INS83 INS83 INS83 INS83 INS83 INS83 INS83 INS43 INS59 INS83 INS39 INS59 INS83 INS39 INS59 INS29 INS83 MOV83 MOV39 MOV42 MOV44 INS44 MOV43 INS8 MOV78 INS83 INS83 INS39 INS42 MOV43 INS8 MOV78 INS83 INS83 INS39 INS42 INS44 MOV43 INS8 INS29 INS83 INS39 INS42 INS44 INS44 INS43 INS8 INS29 UPD83 INS39 INS42 INS44 INS44 INS43 INS8 MOV78 MOV83 MOV83 MOV39 UPD42 MOV42 MOV43 INS8 INS29 INS83 INS39 INS42 MOV44 MOV43 INS8 INS78 INS43 INS42 INS8 INS42 INS42 INS42 INS42 INS21 INS21 INS65 INS65 INS65 INS65 UPD42 INS39 INS42 INS21 INS25 MOV25 MOV60 MOV21 MOV25 MOV21 INS41 INS39 INS42 MOV21 MOV25 INS25 INS21 INS65 INS65 INS65 INS65 INS39 INS42 INS39 INS42 INS42 INS21 MOV25 INS60 INS25 MOV21 MOV21 INS65 INS65 INS65 INS39 INS42 INS39 INS42 INS42 INS25 INS25 INS25 MOV21 INS54 INS21 INS25 INS25 INS21 INS54 MOV21 MOV21 INS21 INS65 INS65 INS65 UPD42 INS25 INS42 INS42 INS60 INS21 INS21 INS21 INS21 INS21 INS41 INS21 INS7 INS7 INS66 INS42 INS66 INS42 INS66 INS42 INS7 MOV27 INS8 INS32 INS7 INS16 INS27 MOV8 INS7 INS66 INS42 INS66 INS42 INS66 INS42 INS32 INS39 INS59 INS27 INS8 INS66 INS42 INS66 INS42 INS66 UPD27 MOV27 INS8 INS27 INS8 INS27 INS8 INS32 MOV8 MOV12 MOV12 INS32 INS27 INS8 INS27 INS8 INS32 MOV8 MOV12 INS32 INS66 INS66 INS66 INS65 INS66 INS42 INS66 INS42 MOV27 INS8 INS83 INS43 INS59 INS32 INS32 INS32 INS32 INS32 INS32 INS32 INS22 INS34 INS22 INS27 INS42 INS16 INS25 INS21 INS42 INS42 INS32 MOV22 INS42 INS36 INS34 INS42 UPD42 INS22 MOV34 INS42 INS42 INS42 INS41 INS42 INS27 INS42 MOV42 INS25 UPD42 INS22 INS42 UPD42 UPD42 INS21 INS42 INS33 INS21 INS27 INS36 INS41 UPD42 MOV42 UPD42 MOV42 INS34 INS21 UPD42 MOV42 INS42 INS42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 INS34 INS41 INS27 INS36 INS41 UPD42 MOV42 UPD42 MOV42 MOV42 INS21 INS42 INS22 INS67 INS60 INS60 INS25 INS25 INS25 INS21 INS42 INS42 INS14 INS42 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS13 INS42 INS42 INS42 INS52 INS42 INS52 INS42 INS45 INS22 INS45 MOV22 INS36 INS22 INS32 MOV32 INS8 INS32 MOV14 INS42 INS42 INS42 INS27 INS52 INS42 UPD42 MOV42 INS42 INS27 INS8 INS52 INS42 INS32 INS32 INS22 INS34 INS27 INS38 INS84 INS37 INS34 INS22 INS34 INS27 INS38 INS84 INS7 INS52 INS42 INS42 INS43 INS59 INS39 INS59 INS38 INS8 INS42 MOV8 INS32 INS8 INS7 INS43 INS45 INS42 INS42 INS45 INS42 INS42 INS45 INS42 INS42 INS45 INS52 INS42 INS27 INS52 INS42 INS42 INS42 INS22 INS36 INS21 INS42 INS42 INS42 INS34 MOV43 INS36 INS32 INS21 INS25 INS41 INS42 INS42 INS42 INS42 INS42 INS42 INS52 INS42 INS42 INS42 INS34 MOV43 MOV43 INS42 INS52 INS42 INS42 INS42 INS34 MOV43 MOV43 INS42 INS42 INS42 INS42 INS33 INS42 INS27 INS42 INS54 INS21 INS42 INS42 MOV21 INS42 INS33 INS42 INS42 INS34 INS52 INS42 INS27 INS32 INS27 INS42 INS45 INS42 INS45 INS42 UPD45 INS45 INS42 UPD42 INS27 INS42 INS42 INS7 INS27 INS8 INS34 INS42 INS27 INS42 MOV8 INS12 INS7 INS42 INS36 INS42 INS42 INS45 INS45 INS45 INS42 INS42 INS42 INS32 INS42 INS42 INS53 UPD45 INS45 UPD45 INS45 INS42 MOV42 INS21 INS44 INS8 INS42 INS45 INS42 INS42 INS27 INS27 INS42 INS42 UPD42 MOV42 INS14 INS7 INS43 INS42 MOV21 INS21 INS42 INS45 INS42 INS45 INS42 INS45 INS42 INS42 INS42 INS43 INS27 INS42 INS45 INS42 INS7 INS42 UPD45 MOV45 UPD42 MOV42 UPD45 MOV45 MOV42 INS45 INS42 INS42 INS9 DEL40 DEL26 DEL42 DEL42 DEL32 DEL42 DEL43 DEL42 DEL34 DEL32 DEL21 DEL42 DEL42 DEL42 DEL34 DEL27 DEL52 DEL42 DEL22 DEL83 DEL39 DEL42 DEL8 DEL31 DEL83 DEL8 DEL25 DEL42 DEL27 DEL42 DEL34 DEL27 DEL27 DEL27 DEL40 DEL45 DEL27 DEL14 DEL53 DEL8 DEL25 DEL42 DEL27 DEL32 DEL21 DEL8 DEL31 DEL27 DEL25 DEL8 DEL31 DEL83 DEL39 DEL42 DEL42 DEL41 DEL8 DEL42 DEL32 DEL7 DEL42 DEL32 DEL21 DEL42 DEL44 DEL42 DEL42 DEL45 DEL42 DEL27 DEL32 DEL21 DEL42 DEL42 DEL32 DEL21 DEL8 DEL12 DEL54 DEL32 DEL21 DEL42 DEL44 DEL45 DEL27 DEL32 DEL21 DEL42 DEL42 DEL32 DEL21 DEL42 DEL42 DEL42 DEL32 DEL7 DEL21 DEL8 DEL12 DEL54 DEL45 DEL45 DEL36 DEL27 DEL42 DEL42 DEL83 DEL39 DEL42 DEL42 DEL42 DEL27 DEL42 DEL27 DEL25 DEL8 DEL25 DEL8

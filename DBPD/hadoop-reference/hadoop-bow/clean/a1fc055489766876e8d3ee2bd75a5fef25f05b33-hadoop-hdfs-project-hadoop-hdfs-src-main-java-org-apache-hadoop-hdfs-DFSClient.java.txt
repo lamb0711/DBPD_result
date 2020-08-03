@@ -1,0 +1,141 @@
+HDFS-1623. High Availability Framework for HDFS NN. Contributed by Todd Lipcon, Aaron T. Myers, Eli Collins, Uma Maheswara Rao G, Bikas Saha, Suresh Srinivas, Jitendra Nath Pandey, Hari Mankude, Brandon Li, Sanjay Radia, Mingjie Lai, and Gregory Chanan
+
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/trunk@1296534 13f79535-47bb-0310-9956-ffa450edef68
+
+-
++import java.net.URI;
++import java.net.URISyntaxException;
++
++import org.apache.hadoop.hdfs.security.token.block.InvalidBlockTokenException;
+-import org.apache.hadoop.hdfs.security.token.block.InvalidBlockTokenException;
++
++import com.google.common.base.Preconditions;
+-  private final InetSocketAddress nnAddress;
++  /* The service used for delegation tokens */
++  private Text dtService;
++
++    final int maxFailoverAttempts;
++    final int failoverSleepBaseMillis;
++    final int failoverSleepMaxMillis;
++      maxFailoverAttempts = conf.getInt(
++          DFS_CLIENT_FAILOVER_MAX_ATTEMPTS_KEY,
++          DFS_CLIENT_FAILOVER_MAX_ATTEMPTS_DEFAULT);
++      failoverSleepBaseMillis = conf.getInt(
++          DFS_CLIENT_FAILOVER_SLEEPTIME_BASE_KEY,
++          DFS_CLIENT_FAILOVER_SLEEPTIME_BASE_DEFAULT);
++      failoverSleepMaxMillis = conf.getInt(
++          DFS_CLIENT_FAILOVER_SLEEPTIME_MAX_KEY,
++          DFS_CLIENT_FAILOVER_SLEEPTIME_MAX_DEFAULT);
++
++
++  
++  public DFSClient(InetSocketAddress address, Configuration conf) throws IOException {
++    this(NameNode.getUri(address), conf);
++  }
+-   * Same as this(nameNodeAddr, conf, null);
++   * Same as this(nameNodeUri, conf, null);
+-  public DFSClient(InetSocketAddress nameNodeAddr, Configuration conf
++  public DFSClient(URI nameNodeUri, Configuration conf
+-    this(nameNodeAddr, conf, null);
++    this(nameNodeUri, conf, null);
+-   * Same as this(nameNodeAddr, null, conf, stats);
++   * Same as this(nameNodeUri, null, conf, stats);
+-  public DFSClient(InetSocketAddress nameNodeAddr, Configuration conf,
++  public DFSClient(URI nameNodeUri, Configuration conf,
+-    this(nameNodeAddr, null, conf, stats);
++    this(nameNodeUri, null, conf, stats);
+-
++  
+-   * Create a new DFSClient connected to the given nameNodeAddr or rpcNamenode.
+-   * Exactly one of nameNodeAddr or rpcNamenode must be null.
++   * Create a new DFSClient connected to the given nameNodeUri or rpcNamenode.
++   * Exactly one of nameNodeUri or rpcNamenode must be null.
+-  DFSClient(InetSocketAddress nameNodeAddr, ClientProtocol rpcNamenode,
++  DFSClient(URI nameNodeUri, ClientProtocol rpcNamenode,
+-    this.nnAddress = nameNodeAddr;
+-    final String authority = nameNodeAddr == null? "null":
+-        nameNodeAddr.getHostName() + ":" + nameNodeAddr.getPort();
++    
++    final String authority = nameNodeUri == null? "null": nameNodeUri.getAuthority();
++    
+-    if (nameNodeAddr != null && rpcNamenode == null) {
+-      this.namenode = DFSUtil.createNamenode(nameNodeAddr, conf, ugi);
+-    } else if (nameNodeAddr == null && rpcNamenode != null) {
+-      //This case is used for testing.
++    
++    
++    if (rpcNamenode != null) {
++      // This case is used for testing.
++      Preconditions.checkArgument(nameNodeUri == null);
++      dtService = null;
+-      throw new IllegalArgumentException(
+-          "Expecting exactly one of nameNodeAddr and rpcNamenode being null: "
+-          + "nameNodeAddr=" + nameNodeAddr + ", rpcNamenode=" + rpcNamenode);
++      Preconditions.checkArgument(nameNodeUri != null,
++          "null URI");
++      NameNodeProxies.ProxyAndInfo<ClientProtocol> proxyInfo =
++        NameNodeProxies.createProxy(conf, nameNodeUri, ClientProtocol.class);
++      this.dtService = proxyInfo.getDelegationTokenService();
++      this.namenode = proxyInfo.getProxy();
++
+-   * The namenode variable is either a rpcProxy passed by a test or 
+-   * created using the protocolTranslator which is closeable.
+-   * If closeable then call close, else close using RPC.stopProxy().
+-    if (namenode instanceof Closeable) {
+-      try {
+-        ((Closeable) namenode).close();
+-        return;
+-      } catch (IOException e) {
+-        // fall through - lets try the stopProxy
+-        LOG.warn("Exception closing namenode, stopping the proxy");
+-      }     
+-    }
+-    Token<DelegationTokenIdentifier> result =
++    assert dtService != null;
++    Token<DelegationTokenIdentifier> token =
+-    SecurityUtil.setTokenService(result, nnAddress);
+-    LOG.info("Created " + DelegationTokenIdentifier.stringifyToken(result));
+-    return result;
++    token.setService(this.dtService);
++
++    LOG.info("Created " + DelegationTokenIdentifier.stringifyToken(token));
++    return token;
+-          (Token<DelegationTokenIdentifier>) token;
+-      LOG.info("Renewing " + 
+-               DelegationTokenIdentifier.stringifyToken(delToken));
+-      ClientProtocol nn = 
+-        DFSUtil.createNamenode
+-           (SecurityUtil.getTokenServiceAddr(delToken),
+-            conf, UserGroupInformation.getCurrentUser());
++        (Token<DelegationTokenIdentifier>) token;
++      ClientProtocol nn = getNNProxy(delToken, conf);
+-      ClientProtocol nn = DFSUtil.createNamenode(
+-          SecurityUtil.getTokenServiceAddr(delToken), conf,
+-          UserGroupInformation.getCurrentUser());
++      ClientProtocol nn = getNNProxy(delToken, conf);
++    
++    private static ClientProtocol getNNProxy(
++        Token<DelegationTokenIdentifier> token, Configuration conf)
++        throws IOException {
++      URI uri = HAUtil.getServiceUriFromToken(token);
++      if (HAUtil.isTokenForLogicalUri(token) &&
++          !HAUtil.isLogicalUri(conf, uri)) {
++        // If the token is for a logical nameservice, but the configuration
++        // we have disagrees about that, we can't actually renew it.
++        // This can be the case in MR, for example, if the RM doesn't
++        // have all of the HA clusters configured in its configuration.
++        throw new IOException("Unable to map logical nameservice URI '" +
++            uri + "' to a NameNode. Local configuration does not have " +
++            "a failover proxy provider configured.");
++      }
++      
++      NameNodeProxies.ProxyAndInfo<ClientProtocol> info =
++        NameNodeProxies.createProxy(conf, uri, ClientProtocol.class);
++      assert info.getDelegationTokenService().equals(token.getService()) :
++        "Returned service '" + info.getDelegationTokenService().toString() +
++        "' doesn't match expected service '" +
++        token.getService().toString() + "'";
++        
++      return info.getProxy();
++    }

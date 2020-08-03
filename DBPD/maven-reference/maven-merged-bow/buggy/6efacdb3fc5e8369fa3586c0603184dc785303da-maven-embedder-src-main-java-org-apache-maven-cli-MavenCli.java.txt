@@ -1,0 +1,267 @@
+MNG-5771 user-defined core extensions
+
+read ${maven.projectBasedir}/.mvn/extensions.xml and create core
+extensions realms during maven runtime bootstrap. this required
+short-lived bootstrap plexus container to resolve extensions.
+
+individual extensions realms are wired to maven.ext realm according
+to META-INF/maven/extension.xml exported packages specification
+
+Signed-off-by: Igor Fedorenko <ifedorenko@apache.org>
+
++import java.io.BufferedInputStream;
++import java.io.FileInputStream;
++import java.io.InputStream;
++import org.apache.maven.cli.internal.BootstrapCoreExtensionManager;
++import org.apache.maven.cli.internal.extension.model.CoreExtension;
++import org.apache.maven.cli.internal.extension.model.io.xpp3.CoreExtensionsXpp3Reader;
++import org.apache.maven.extension.internal.CoreExports;
++import org.apache.maven.extension.internal.CoreExtensionEntry;
++import org.codehaus.plexus.util.IOUtil;
++import org.codehaus.plexus.util.xml.pull.XmlPullParserException;
++    private static final String EXTENSIONS_FILENAME = ".mvn/extensions.xml";
++
+-        DefaultPlexusContainer container;
++        ClassRealm coreRealm = cliRequest.classWorld.getClassRealm( "plexus.core" );
++        if ( coreRealm == null )
++        {
++            coreRealm = cliRequest.classWorld.getRealms().iterator().next();
++        }
++
++        List<File> extClassPath = parseExtClasspath( cliRequest );
++
++        CoreExtensionEntry coreEntry = CoreExtensionEntry.discoverFrom( coreRealm );
++        List<CoreExtensionEntry> extensions =
++            loadCoreExtensions( cliRequest, coreRealm, coreEntry.getExportedArtifacts() );
++
++        ClassRealm containerRealm = setupContainerRealm( cliRequest.classWorld, coreRealm, extClassPath, extensions );
+-            .setRealm( setupContainerRealm( cliRequest ) )
++            .setRealm( containerRealm )
+-        container = new DefaultPlexusContainer( cc, new AbstractModule()
++        Set<String> exportedArtifacts = new HashSet<String>( coreEntry.getExportedArtifacts() );
++        Set<String> exportedPackages = new HashSet<String>( coreEntry.getExportedPackages() );
++        for ( CoreExtensionEntry extension : extensions )
++        {
++            exportedArtifacts.addAll( extension.getExportedArtifacts() );
++            exportedPackages.addAll( extension.getExportedPackages() );
++        }
++
++        final CoreExports exports = new CoreExports( containerRealm, exportedArtifacts, exportedPackages );
++
++        DefaultPlexusContainer container = new DefaultPlexusContainer( cc, new AbstractModule()
++                bind( CoreExports.class ).toInstance( exports );
++        for ( CoreExtensionEntry extension : extensions )
++        {
++            container.discoverComponents( extension.getClassRealm() );
++        }
++
+-    private ClassRealm setupContainerRealm( CliRequest cliRequest )
++    private List<CoreExtensionEntry> loadCoreExtensions( CliRequest cliRequest, ClassRealm containerRealm,
++                                                         Set<String> providedArtifacts )
++    {
++        if ( cliRequest.projectBaseDirectory == null )
++        {
++            return Collections.emptyList();
++        }
++
++        File extensionsFile = new File( cliRequest.projectBaseDirectory, EXTENSIONS_FILENAME );
++        if ( !extensionsFile.isFile() )
++        {
++            return Collections.emptyList();
++        }
++
++        try
++        {
++            List<CoreExtension> extensions = readCoreExtensionsDescriptor( extensionsFile );
++            if ( extensions.isEmpty() )
++            {
++                return Collections.emptyList();
++            }
++
++            ContainerConfiguration cc = new DefaultContainerConfiguration() //
++                .setClassWorld( cliRequest.classWorld ) //
++                .setRealm( containerRealm ) //
++                .setClassPathScanning( PlexusConstants.SCANNING_INDEX ) //
++                .setAutoWiring( true ) //
++                .setName( "maven" );
++
++            DefaultPlexusContainer container = new DefaultPlexusContainer( cc, new AbstractModule()
++            {
++                @Override
++                protected void configure()
++                {
++                    bind( ILoggerFactory.class ).toInstance( slf4jLoggerFactory );
++                }
++            } );
++
++            try
++            {
++                container.setLookupRealm( null );
++
++                container.setLoggerManager( plexusLoggerManager );
++
++                container.getLoggerManager().setThresholds( cliRequest.request.getLoggingLevel() );
++
++                Thread.currentThread().setContextClassLoader( container.getContainerRealm() );
++
++                executionRequestPopulator = container.lookup( MavenExecutionRequestPopulator.class );
++                settingsBuilder = container.lookup( SettingsBuilder.class );
++
++                MavenExecutionRequest request = DefaultMavenExecutionRequest.copy( cliRequest.request );
++                settings( cliRequest, request );
++                request = populateRequest( cliRequest, request );
++                request = executionRequestPopulator.populateDefaults( request );
++
++                BootstrapCoreExtensionManager resolver = container.lookup( BootstrapCoreExtensionManager.class );
++                return resolver.loadCoreExtensions( request, providedArtifacts, extensions );
++            }
++            finally
++            {
++                executionRequestPopulator = null;
++                settingsBuilder = null;
++                container.dispose();
++            }
++        }
++        catch ( RuntimeException e )
++        {
++            // runtime exceptions are most likely bugs in maven, let them bubble up to the user
++            throw e;
++        }
++        catch ( Exception e )
++        {
++            slf4jLogger.warn( "Failed to read extensions descriptor " + extensionsFile + ": " + e.getMessage() );
++        }
++        return Collections.emptyList();
++    }
++
++    private List<CoreExtension> readCoreExtensionsDescriptor( File extensionsFile )
++        throws IOException, XmlPullParserException
++    {
++        CoreExtensionsXpp3Reader parser = new CoreExtensionsXpp3Reader();
++        InputStream is = null;
++        try
++        {
++            is = new BufferedInputStream( new FileInputStream( extensionsFile ) );
++            return parser.read( is ).getExtensions();
++        }
++        finally
++        {
++            IOUtil.close( is );
++        }
++    }
++
++    private ClassRealm setupContainerRealm( ClassWorld classWorld, ClassRealm coreRealm, List<File> extClassPath,
++                                            List<CoreExtensionEntry> extensions )
+-        ClassRealm containerRealm = null;
++        if ( !extClassPath.isEmpty() || !extensions.isEmpty() )
++        {
++            ClassRealm extRealm = classWorld.newRealm( "maven.ext", null );
++            extRealm.setParentRealm( coreRealm );
++
++            slf4jLogger.debug( "Populating class realm " + extRealm.getId() );
++
++            for ( File file : extClassPath )
++            {
++                slf4jLogger.debug( "  Included " + file );
++
++                extRealm.addURL( file.toURI().toURL() );
++            }
++
++            for ( CoreExtensionEntry entry : reverse( extensions ) )
++            {
++                Set<String> exportedPackages = entry.getExportedPackages();
++                ClassRealm realm = entry.getClassRealm();
++                for ( String exportedPackage : exportedPackages )
++                {
++                    extRealm.importFrom( realm, exportedPackage );
++                }
++                if ( exportedPackages.isEmpty() )
++                {
++                    // sisu uses realm imports to establish component visibility
++                    extRealm.importFrom( realm, realm.getId() );
++                }
++            }
++
++            return extRealm;
++        }
++
++        return coreRealm;
++    }
++
++    private static <T> List<T> reverse( List<T> list )
++    {
++        List<T> copy = new ArrayList<T>( list );
++        Collections.reverse( copy );
++        return copy;
++    }
++
++    private List<File> parseExtClasspath( CliRequest cliRequest )
++    {
++        List<File> jars = new ArrayList<File>();
++
+-            String[] jars = StringUtils.split( extClassPath, File.pathSeparator );
+-
+-            if ( jars.length > 0 )
++            for ( String jar : StringUtils.split( extClassPath, File.pathSeparator ) )
+-                ClassRealm coreRealm = cliRequest.classWorld.getClassRealm( "plexus.core" );
+-                if ( coreRealm == null )
+-                {
+-                    coreRealm = cliRequest.classWorld.getRealms().iterator().next();
+-                }
++                File file = resolveFile( new File( jar ), cliRequest.workingDirectory );
+-                ClassRealm extRealm = cliRequest.classWorld.newRealm( "maven.ext", null );
++                slf4jLogger.debug( "  Included " + file );
+-                slf4jLogger.debug( "Populating class realm " + extRealm.getId() );
+-
+-                for ( String jar : jars )
+-                {
+-                    File file = resolveFile( new File( jar ), cliRequest.workingDirectory );
+-
+-                    slf4jLogger.debug( "  Included " + file );
+-
+-                    extRealm.addURL( file.toURI().toURL() );
+-                }
+-
+-                extRealm.setParentRealm( coreRealm );
+-
+-                containerRealm = extRealm;
++                jars.add( file );
+-        return containerRealm;
++        return jars;
++        settings( cliRequest, cliRequest.request );
++    }
++
++    private void settings( CliRequest cliRequest, MavenExecutionRequest request )
++        throws Exception
++    {
+-        cliRequest.request.setGlobalSettingsFile( globalSettingsFile );
+-        cliRequest.request.setUserSettingsFile( userSettingsFile );
++        request.setGlobalSettingsFile( globalSettingsFile );
++        request.setUserSettingsFile( userSettingsFile );
+-        eventSpyDispatcher.onEvent( settingsRequest );
++        if ( eventSpyDispatcher != null )
++        {
++            eventSpyDispatcher.onEvent( settingsRequest );
++        }
+-        eventSpyDispatcher.onEvent( settingsResult );
++        if ( eventSpyDispatcher != null )
++        {
++            eventSpyDispatcher.onEvent( settingsResult );
++        }
+-        executionRequestPopulator.populateFromSettings( cliRequest.request, settingsResult.getEffectiveSettings() );
++        executionRequestPopulator.populateFromSettings( request, settingsResult.getEffectiveSettings() );
+-        MavenExecutionRequest request = cliRequest.request;
++        return populateRequest( cliRequest, cliRequest.request );
++    }
++
++    private MavenExecutionRequest populateRequest( CliRequest cliRequest, MavenExecutionRequest request )
++    {
+-        executionListener = eventSpyDispatcher.chainListener( executionListener );
++        if ( eventSpyDispatcher != null )
++        {
++            executionListener = eventSpyDispatcher.chainListener( executionListener );
++        }
+-        else
++        else if ( modelProcessor != null )
+
+INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS23 INS31 INS31 INS31 INS31 INS31 INS31 INS83 INS83 INS83 INS43 INS59 INS83 INS74 INS42 INS44 INS44 INS44 INS8 INS83 INS74 INS42 INS44 INS43 INS43 INS8 INS83 MOV43 INS42 INS44 INS44 INS44 INS44 MOV43 INS8 INS83 INS83 INS73 INS74 INS42 INS44 INS8 INS74 INS42 MOV79 INS83 INS39 INS42 INS44 INS43 INS8 INS44 INS83 INS43 INS42 INS44 INS8 INS44 INS42 INS42 INS45 INS25 INS60 INS60 INS60 INS60 INS60 INS60 INS70 INS60 INS60 INS70 INS43 INS43 INS43 INS42 MOV43 INS42 INS74 INS42 INS25 INS60 INS25 INS54 INS41 INS43 INS43 INS43 INS42 INS42 INS42 INS60 INS60 INS54 INS43 INS42 INS43 INS42 INS74 INS42 INS74 INS42 INS25 INS41 INS42 INS43 INS43 INS74 INS42 INS60 INS21 INS41 INS43 INS43 INS60 MOV25 INS43 INS42 INS42 INS21 MOV43 INS42 INS25 INS25 INS42 INS43 INS42 INS41 INS43 INS42 INS25 MOV43 MOV27 INS8 INS74 INS59 INS43 INS59 INS74 INS59 MOV43 INS59 INS74 INS59 INS74 INS59 INS44 INS42 INS8 INS83 INS43 INS59 MOV43 INS59 INS44 INS42 INS8 INS42 INS42 INS42 INS43 INS43 INS27 INS8 INS43 INS59 INS38 INS8 INS8 INS12 INS12 INS32 INS42 INS42 INS42 INS43 INS59 INS43 INS59 INS8 INS8 INS42 INS42 INS43 INS43 INS43 INS43 INS27 INS8 INS42 INS42 INS42 INS43 INS43 INS74 INS59 INS32 INS42 INS42 INS42 INS74 INS59 MOV32 UPD42 INS42 INS32 INS27 INS8 INS27 INS8 INS42 INS32 INS42 INS27 INS8 INS25 INS42 UPD42 MOV32 MOV21 INS43 INS43 INS42 INS32 INS42 INS42 INS32 INS43 INS43 INS42 INS32 INS42 INS42 INS32 INS43 INS43 INS42 INS14 INS43 INS43 INS42 INS14 INS43 INS42 INS21 INS21 INS42 INS42 INS14 INS42 INS14 INS43 INS42 INS21 INS42 INS42 INS40 INS33 INS41 INS42 INS42 INS14 INS32 INS41 INS60 INS25 INS60 INS60 INS54 INS44 INS8 INS44 INS8 INS42 INS42 INS42 INS42 INS14 INS42 INS42 INS33 INS21 INS41 INS21 INS42 INS42 INS42 INS42 INS38 INS38 INS60 MOV21 MOV21 INS70 INS70 INS41 INS42 INS42 INS43 INS43 INS42 INS14 INS42 INS42 INS42 INS43 INS43 MOV42 INS14 MOV70 INS42 INS42 INS40 INS42 INS42 INS42 INS33 MOV21 INS42 INS33 MOV21 INS42 INS42 INS42 INS40 INS42 INS33 MOV21 INS27 MOV8 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS40 INS42 INS42 INS42 INS42 INS42 INS74 INS32 INS42 INS42 INS74 INS32 INS42 INS32 INS32 INS43 INS42 INS42 INS42 INS43 INS42 INS14 INS42 INS32 INS32 INS43 INS40 INS42 INS42 INS42 INS32 INS74 INS59 INS32 INS8 INS43 INS59 INS43 INS59 INS8 INS8 INS43 INS42 INS53 INS43 INS42 INS21 INS43 INS7 INS32 INS32 INS32 INS32 INS43 INS59 INS44 INS42 INS8 INS44 INS32 INS8 INS42 INS42 INS42 INS74 INS42 UPD42 MOV42 INS42 INS74 MOV32 INS42 INS33 UPD42 MOV32 INS42 INS42 INS43 INS43 INS42 INS42 INS43 INS43 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS43 INS1 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS43 INS43 INS42 INS32 INS42 INS42 INS41 INS42 INS42 INS32 INS42 INS42 MOV14 INS21 INS21 INS21 INS21 INS21 INS21 INS60 INS21 INS21 INS21 INS60 INS41 INS21 INS21 INS21 INS42 INS42 INS42 INS32 INS42 INS42 INS14 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS43 INS42 INS21 MOV21 INS43 INS42 INS42 INS42 INS60 INS60 INS70 INS25 INS43 INS43 INS43 INS43 INS21 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS31 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS32 INS42 INS45 INS32 INS32 INS32 INS32 INS7 INS7 INS43 INS59 INS32 INS7 INS7 INS43 INS59 INS32 INS7 INS7 INS32 INS42 INS42 INS27 INS43 INS14 INS42 INS42 INS42 INS42 INS42 INS45 INS33 INS42 INS32 INS42 INS74 INS59 INS43 INS59 INS44 INS42 INS8 INS32 INS8 INS42 INS42 UPD42 MOV42 INS42 INS32 UPD42 MOV42 INS78 INS83 INS39 INS42 INS8 INS42 INS42 INS32 INS42 INS9 INS42 INS42 INS33 INS42 INS42 INS42 INS32 INS42 INS32 INS32 INS42 INS32 INS42 INS32 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS32 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS33 INS42 INS33 INS42 INS42 INS45 INS42 INS45 INS32 INS42 INS43 INS42 INS42 INS42 INS27 INS43 INS43 INS42 INS32 INS42 INS42 INS32 MOV43 INS42 INS21 INS42 INS42 INS21 INS42 INS42 INS42 INS42 INS21 INS21 INS32 INS42 INS40 INS42 INS42 INS40 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS57 INS42 INS42 INS57 INS42 INS42 INS40 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS57 INS42 INS42 INS42 INS45 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS32 INS32 INS32 INS32 INS42 INS42 INS43 INS43 INS43 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS32 INS42 INS42 INS32 INS42 INS42 INS14 INS42 INS40 INS42 INS42 INS42 INS42 INS42 INS42 INS57 INS42 INS57 INS43 INS43 INS43 INS42 INS42 INS42 DEL42 DEL32 DEL42 DEL42 DEL33 DEL59 DEL60 DEL42 DEL85 DEL5 DEL59 DEL60 DEL40 DEL34 DEL27 DEL42 DEL40 DEL42 DEL45 DEL33 DEL32 DEL59 DEL60 DEL42 DEL42 DEL7 DEL21 DEL8 DEL25 DEL8 DEL25 DEL40 DEL40 DEL40 DEL42 DEL40 DEL59 DEL60

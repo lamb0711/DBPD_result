@@ -1,0 +1,193 @@
+Resolving issue: MNG-339
+
+o Added checksumPolicy to artifact repository construction, which meant changing all the places where the factory was called.
+
+o Added two command-line switches (-C=strict-checksum-checking, -c=lax-checksum-checking, or warning)
+
+o Added checksum policy to all repository definitions (profiles.mdo, settings.mdo, maven.mdo)
+
+o Changed the maven-artifact-ant stuff to use a Repository definition with checksumPolicy added to it
+
+NOTE: I just realized that I haven't touched the inheritance/conversion of repository stuff from profiles/settings.xml to the model. I'll do this, and commit the additional changes.
+
+Currently, the default checksum policy is to warn, since there are still bad checksums out there that prevent bootstrapping. Once we chase these down, we can change to default-strict checking. When verifying checksums, SHA-1 is attempted first, with MD5 acting as a backup verification method. If the checksum verification fails legitimately (not related to the process of retrieving/reading the checksum file), then the verification process is repeated ONCE ONLY.
+
+
+
+git-svn-id: https://svn.apache.org/repos/asf/maven/components/trunk@191536 13f79535-47bb-0310-9956-ffa450edef68
+
++import org.apache.maven.wagon.WagonException;
+-            throw new UnsupportedProtocolException( "Cannot find wagon which supports the requested protocol: " +
+-                                                    protocol, e );
++            throw new UnsupportedProtocolException( "Cannot find wagon which supports the requested protocol: "
++                + protocol, e );
+-                                TransferListener downloadMonitor )
++                               TransferListener downloadMonitor )
+-                                TransferListener downloadMonitor )
++                               TransferListener downloadMonitor )
+-        ChecksumObserver checksumObserver;
++        ChecksumObserver md5ChecksumObserver;
++        ChecksumObserver sha1ChecksumObserver;
+-            checksumObserver = new ChecksumObserver( "MD5" );
+-            wagon.addTransferListener( checksumObserver );
++            md5ChecksumObserver = new ChecksumObserver( "MD5" );
++            wagon.addTransferListener( md5ChecksumObserver );
++
++            sha1ChecksumObserver = new ChecksumObserver( "SHA-1" );
++            wagon.addTransferListener( sha1ChecksumObserver );
+-            // This should take care of creating destination directory now on
+-            wagon.get( remotePath, temp );
+-
+-            try
++            boolean firstRun = true;
++            boolean retry = false;
++            
++            // this will run at most twice. The first time, the firstRun flag is turned off, and if the retry flag
++            // is set on the first run, it will be turned off and not re-set on the second try. This is because the
++            // only way the retry flag can be set is if ( firstRun == true ).
++            while( firstRun || retry )
+-                // grab it first, because it's about to change...
+-                String actualChecksum = checksumObserver.getActualChecksum();
+-
+-                File checksumFile = new File( destination + ".md5" );
+-                wagon.get( remotePath + ".md5", checksumFile );
+-
+-                String expectedChecksum = FileUtils.fileRead( checksumFile );
+-                if ( !expectedChecksum.equals( actualChecksum ) )
++                // reset the retry flag.
++                retry = false;
++                
++                // This should take care of creating destination directory now on
++                wagon.get( remotePath, temp );
++                
++                // keep the checksum files from showing up on the download monitor...
++                if ( downloadMonitor != null )
+-                    getLogger().warn(
+-                        "*** CHECKSUM MISMATCH - currently disabled fail due to bad repository checksums ***" );
+-
+-                    // TODO: optionally retry?
+-                    /*                   throw new ChecksumFailedException( "Checksum failed on download: local = '" + actualChecksum +
+-                     "'; remote = '" + expectedChecksum + "'" );
+-                     */
++                    wagon.removeTransferListener( downloadMonitor );
+-            }
+-            catch ( ResourceDoesNotExistException e )
+-            {
+-                getLogger().warn( "No checksum exists - assuming a valid download" );
+-            }
+-            catch ( IOException e )
+-            {
+-                getLogger().error( "Unable to read checksum - assuming a valid download", e );
++
++                // try to verify the SHA-1 checksum for this file.
++                try
++                {
++                    verifyChecksum( sha1ChecksumObserver, destination, remotePath, ".sha1", wagon );
++                }
++                catch ( WagonException sha1TryException )
++                {
++                    // if we catch a ChecksumFailedException, it means the transfer/read succeeded, but the checksum
++                    // doesn't match. This could be a problem with the server (ibiblio HTTP-200 error page), so we'll
++                    // try this up to two times. On the second try, we'll handle it as a bona-fide error, based on the
++                    // repository's checksum checking policy.
++                    if ( sha1TryException instanceof ChecksumFailedException )
++                    {
++                        // if this is the second try, handle the problem...otherwise, let it try again.
++                        if( firstRun )
++                        {
++                            retry = true;
++                        }
++                        else
++                        {
++                            handleChecksumFailure( repository, sha1TryException.getMessage(), sha1TryException.getCause() );
++                        }
++                    }
++                    // if this IS NOT a ChecksumFailedException, it was a problem with transfer/read of the checksum
++                    // file...we'll try again with the MD5 checksum.
++                    else
++                    {
++                        try
++                        {
++                            verifyChecksum( md5ChecksumObserver, destination, remotePath, ".md5", wagon );
++                        }
++                        catch ( WagonException md5TryException )
++                        {
++                            // if we also fail to verify based on the MD5 checksum, and the checksum transfer/read
++                            // succeeded, then we need to determine whether to retry or handle it as a failure.
++                            if( md5TryException instanceof ChecksumFailedException )
++                            {
++                                // only retry once.
++                                if( firstRun )
++                                {
++                                    retry = true;
++                                }
++                                else
++                                {
++                                    handleChecksumFailure( repository, md5TryException.getMessage(), md5TryException.getCause() );
++                                }
++                            }
++                            // otherwise, this was a failed transfer, and we don't want to retry.
++                            else
++                            {
++                                handleChecksumFailure( repository, "Error retrieving checksum file for " + destination, md5TryException );
++                            }
++                        }
++                    }
++                }
++                finally
++                {
++                    // reinstate the download monitor...
++                    if ( downloadMonitor != null )
++                    {
++                        wagon.addTransferListener( downloadMonitor );
++                    }
++                    
++                    // unset the firstRun flag, so we don't get caught in an infinite loop...
++                    firstRun = false;
++                }
++    private void handleChecksumFailure( ArtifactRepository repository, String message, Throwable cause )
++        throws ChecksumFailedException
++    {
++        if( ArtifactRepository.CHECKSUM_POLICY_FAIL.equals( repository.getChecksumPolicy() ) )
++        {
++            throw new ChecksumFailedException( message, cause );
++        }
++        else
++        {
++            getLogger().warn( "*** CHECKSUM FAILED - " + message + " - IGNORING" );
++        }
++    }
++
++    private void verifyChecksum( ChecksumObserver checksumObserver, File destination, String remotePath,
++                                String checksumFileExtension, Wagon wagon )
++        throws WagonException
++    {
++        try
++        {
++            // grab it first, because it's about to change...
++            String actualChecksum = checksumObserver.getActualChecksum();
++
++            File checksumFile = new File( destination + ".sha1" );
++            wagon.get( remotePath + ".sha1", checksumFile );
++
++            String expectedChecksum = FileUtils.fileRead( checksumFile );
++            if ( !expectedChecksum.equals( actualChecksum ) )
++            {
++                //                getLogger().warn(
++                //                    "*** CHECKSUM MISMATCH - currently disabled fail due to bad repository checksums ***" );
++
++                throw new ChecksumFailedException( "Checksum failed on download: local = '" + actualChecksum
++                    + "'; remote = '" + expectedChecksum + "'" );
++            }
++        }
++        catch ( IOException e )
++        {
++            throw new TransferFailedException( "Invalid SHA-1 checksum file", e );
++        }
++    }
++
+-    public void addProxy( String protocol, String host, int port, String username, String password,
+-                          String nonProxyHosts )
++    public void addProxy( String protocol, String host, int port, String username, String password, String nonProxyHosts )
+-                                       String passphrase )
++                                      String passphrase )

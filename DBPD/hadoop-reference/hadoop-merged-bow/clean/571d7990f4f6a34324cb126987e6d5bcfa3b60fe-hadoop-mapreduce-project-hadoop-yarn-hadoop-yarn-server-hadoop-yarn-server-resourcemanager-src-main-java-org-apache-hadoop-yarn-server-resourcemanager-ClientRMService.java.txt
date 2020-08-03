@@ -1,0 +1,158 @@
+Merge trunk into HA branch
+
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/branches/HDFS-1623@1196458 13f79535-47bb-0310-9956-ffa450edef68
+
+-import java.util.Map;
+-import org.apache.avro.ipc.Server;
++import org.apache.hadoop.fs.CommonConfigurationKeysPublic;
++import org.apache.hadoop.ipc.Server;
+-import org.apache.hadoop.security.SecurityInfo;
+-import org.apache.hadoop.security.authorize.AccessControlList;
++import org.apache.hadoop.security.authorize.PolicyProvider;
+-import org.apache.hadoop.yarn.api.protocolrecords.KillApplicationRequest;
+-import org.apache.hadoop.yarn.api.protocolrecords.KillApplicationResponse;
++import org.apache.hadoop.yarn.api.protocolrecords.KillApplicationRequest;
++import org.apache.hadoop.yarn.api.protocolrecords.KillApplicationResponse;
++import org.apache.hadoop.yarn.api.records.ApplicationAccessType;
++import org.apache.hadoop.yarn.api.records.Resource;
+-import org.apache.hadoop.yarn.security.client.ClientRMSecurityInfo;
++import org.apache.hadoop.yarn.server.resourcemanager.resource.Resources;
++import org.apache.hadoop.yarn.server.resourcemanager.scheduler.SchedulerNodeReport;
++import org.apache.hadoop.yarn.server.resourcemanager.security.authorize.RMPolicyProvider;
++import org.apache.hadoop.yarn.server.security.ApplicationACLsManager;
+-  private  ApplicationACLsManager aclsManager;
+-  private Map<ApplicationACL, AccessControlList> applicationACLs;
++  private final ApplicationACLsManager applicationsACLsManager;
+-      RMAppManager rmAppManager) {
++      RMAppManager rmAppManager, ApplicationACLsManager applicationACLsManager) {
++    this.applicationsACLsManager = applicationACLsManager;
+-      NetUtils.createSocketAddr(clientServiceBindAddress);
+-
+-    this.aclsManager = new ApplicationACLsManager(conf);
+-    this.applicationACLs = aclsManager.constructApplicationACLs(conf);
+-
++      NetUtils.createSocketAddr(clientServiceBindAddress,
++        YarnConfiguration.DEFAULT_RM_PORT,
++        YarnConfiguration.RM_ADDRESS);
++    
++    // Enable service authorization?
++    if (conf.getBoolean(
++        CommonConfigurationKeysPublic.HADOOP_SECURITY_AUTHORIZATION, 
++        false)) {
++      refreshServiceAcls(conf, new RMPolicyProvider());
++    }
++    
+-   * @param appAttemptId
+-   * @param appACL
++   * @param operationPerformed
++   * @param applicationId
+-  private boolean checkAccess(UserGroupInformation callerUGI, String owner, ApplicationACL appACL) {
+-      if (!UserGroupInformation.isSecurityEnabled()) {
+-        return true;
+-      }
+-      AccessControlList applicationACL = applicationACLs.get(appACL);
+-      return aclsManager.checkAccess(callerUGI, appACL, owner, applicationACL);
++  private boolean checkAccess(UserGroupInformation callerUGI, String owner,
++      ApplicationAccessType operationPerformed, ApplicationId applicationId) {
++    return applicationsACLsManager.checkAccess(callerUGI, operationPerformed,
++        owner, applicationId);
+-  public ApplicationId getNewApplicationId() {
++  ApplicationId getNewApplicationId() {
+-    RMApp application = rmContext.getRMApps().get(applicationId);
+-    ApplicationReport report = (application == null) ? null : application
+-        .createAndGetApplicationReport();
++
++    UserGroupInformation callerUGI;
++    try {
++      callerUGI = UserGroupInformation.getCurrentUser();
++    } catch (IOException ie) {
++      LOG.info("Error getting UGI ", ie);
++      throw RPCUtil.getRemoteException(ie);
++    }
++
++    RMApp application = this.rmContext.getRMApps().get(applicationId);
++    if (application == null) {
++      throw RPCUtil.getRemoteException("Trying to get information for an "
++          + "absent application " + applicationId);
++    }
++
++    if (!checkAccess(callerUGI, application.getUser(),
++        ApplicationAccessType.VIEW_APP, applicationId)) {
++      throw RPCUtil.getRemoteException(new AccessControlException("User "
++          + callerUGI.getShortUserName() + " cannot perform operation "
++          + ApplicationAccessType.VIEW_APP.name() + " on " + applicationId));
++    }
++
++    ApplicationReport report = application.createAndGetApplicationReport();
+-      
++
+-      
++
+-      rmAppManager.handle(new RMAppManagerSubmitEvent(submissionContext));
++      rmAppManager.handle(new RMAppManagerSubmitEvent(submissionContext, System
++          .currentTimeMillis()));
+-    // TODO: What if null
++    if (application == null) {
++      RMAuditLogger.logFailure(callerUGI.getUserName(),
++          AuditConstants.KILL_APP_REQUEST, "UNKNOWN", "ClientRMService",
++          "Trying to kill an absent application", applicationId);
++      throw RPCUtil
++          .getRemoteException("Trying to kill an absent application "
++              + applicationId);
++    }
++
+-        ApplicationACL.MODIFY_APP)) {
+-      RMAuditLogger.logFailure(callerUGI.getShortUserName(), 
+-          AuditConstants.KILL_APP_REQUEST, 
+-          "User doesn't have MODIFY_APP permissions", "ClientRMService",
++        ApplicationAccessType.MODIFY_APP, applicationId)) {
++      RMAuditLogger.logFailure(callerUGI.getShortUserName(),
++          AuditConstants.KILL_APP_REQUEST,
++          "User doesn't have permissions to "
++              + ApplicationAccessType.MODIFY_APP.toString(), "ClientRMService",
+-          + ApplicationACL.MODIFY_APP.name() + " on " + applicationId));
++          + ApplicationAccessType.MODIFY_APP.name() + " on " + applicationId));
++    UserGroupInformation callerUGI;
++    try {
++      callerUGI = UserGroupInformation.getCurrentUser();
++    } catch (IOException ie) {
++      LOG.info("Error getting UGI ", ie);
++      throw RPCUtil.getRemoteException(ie);
++    }
++
+-      reports.add(application.createAndGetApplicationReport());
++      // Only give out the applications viewable by the user as
++      // ApplicationReport has confidential information like client-token, ACLs
++      // etc. Web UI displays all applications though as we filter and print
++      // only public information there.
++      if (checkAccess(callerUGI, application.getUser(),
++          ApplicationAccessType.VIEW_APP, application.getApplicationId())) {
++        reports.add(application.createAndGetApplicationReport());
++      }
+-    org.apache.hadoop.yarn.server.resourcemanager.scheduler.SchedulerNodeReport schedulerNodeReport = scheduler
+-        .getNodeReport(rmNode.getNodeID());
+-    report.setUsed(schedulerNodeReport.getUsedResource());
+-    report.setNumContainers(schedulerNodeReport.getNumContainers());
++    
++    SchedulerNodeReport schedulerNodeReport = 
++        scheduler.getNodeReport(rmNode.getNodeID());
++    Resource used = Resources.none();
++    int numContainers = 0;
++    if (schedulerNodeReport != null) {
++      used = schedulerNodeReport.getUsedResource();
++      numContainers = schedulerNodeReport.getNumContainers();
++    } 
++    report.setUsed(used);
++    report.setNumContainers(numContainers);
++
++  void refreshServiceAcls(Configuration configuration, 
++      PolicyProvider policyProvider) {
++    this.server.refreshServiceAcl(configuration, policyProvider);
++  }
++  
+-        this.server.close();
++        this.server.stop();
++  
+
+MOV26 MOV26 MOV26 MOV26 MOV26 MOV26 MOV26 INS26 INS26 INS26 INS26 UPD40 UPD40 UPD40 INS40 INS40 INS40 INS40 UPD40 UPD40 INS23 INS31 MOV83 UPD83 MOV83 MOV43 MOV59 INS44 MOV65 INS44 INS8 INS39 INS42 INS44 INS44 MOV8 UPD42 MOV43 INS42 INS21 INS25 UPD43 UPD42 INS43 INS42 MOV41 INS60 INS54 INS25 INS25 INS25 INS60 INS54 INS60 INS60 INS25 INS21 INS21 INS43 INS42 INS43 INS42 INS7 INS32 INS8 UPD42 UPD42 UPD42 UPD42 MOV42 INS43 INS59 INS8 INS12 MOV27 INS8 INS38 INS8 INS27 INS8 INS43 INS59 INS8 INS12 INS8 UPD43 INS43 INS59 INS39 INS59 INS27 INS8 INS32 INS32 INS42 INS42 INS8 INS22 INS42 INS42 INS42 INS40 INS9 INS21 UPD42 UPD42 UPD42 INS42 INS42 INS21 INS44 INS8 INS53 INS32 INS53 MOV32 INS42 INS33 INS21 INS53 INS42 INS42 INS21 INS44 INS8 INS25 INS42 INS42 INS42 INS32 INS42 INS34 INS42 INS33 MOV21 MOV21 INS42 INS42 INS42 INS42 INS42 INS42 INS42 UPD42 INS42 INS21 INS52 INS42 INS40 INS40 INS32 INS7 INS43 INS42 INS21 INS53 INS32 INS42 INS42 INS32 INS40 INS42 INS32 INS32 INS32 UPD40 INS42 INS7 INS43 INS42 INS21 INS53 INS32 MOV8 INS42 INS42 INS7 INS7 INS32 INS42 INS42 INS14 INS42 INS32 INS42 INS32 INS32 INS22 INS42 INS42 INS27 INS42 INS42 INS42 INS42 INS14 INS42 INS42 INS32 INS40 INS45 INS45 INS45 INS42 INS42 INS42 INS27 INS27 INS42 INS32 INS42 INS32 INS32 INS42 INS42 INS32 INS40 INS32 INS42 MOV32 INS42 MOV32 INS22 INS42 INS43 INS42 INS42 INS42 INS42 INS45 INS42 INS42 INS42 INS42 INS52 INS42 INS45 INS45 INS42 INS43 INS27 INS32 INS42 INS42 INS45 INS42 INS45 INS32 INS42 INS42 INS42 INS42 INS45 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS52 INS42 INS42 INS42 INS45 INS32 INS45 INS32 INS45 INS42 INS42 INS42 INS40 INS42 INS42 INS42 INS40 INS42 UPD40 DEL42 DEL59 DEL23 DEL42 DEL43 DEL42 DEL43 DEL42 DEL43 DEL74 DEL23 DEL52 DEL42 DEL22 DEL42 DEL14 DEL7 DEL21 DEL52 DEL42 DEL22 DEL42 DEL42 DEL42 DEL32 DEL7 DEL21 DEL42 DEL42 DEL32 DEL38 DEL9 DEL41 DEL8 DEL25 DEL43 DEL42 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL8 DEL83 DEL42 DEL36 DEL33 DEL16 DEL45 DEL40 DEL42 DEL42 DEL32 DEL42 DEL42 DEL32

@@ -1,0 +1,241 @@
+HDFS-9733. Refactor DFSClient#getFileChecksum and DataXceiver#blockChecksum. Contributed by Kai Zheng
+
+-import java.io.BufferedOutputStream;
+-import java.io.DataInputStream;
+-import java.io.InputStream;
+-import org.apache.hadoop.fs.MD5MD5CRC32CastagnoliFileChecksum;
+-import org.apache.hadoop.fs.MD5MD5CRC32GzipFileChecksum;
+-import org.apache.hadoop.hdfs.protocol.datatransfer.Op;
+-import org.apache.hadoop.hdfs.protocol.proto.DataTransferProtos.OpBlockChecksumResponseProto;
+-import org.apache.hadoop.hdfs.security.token.block.InvalidBlockTokenException;
+-import org.apache.hadoop.io.DataOutputBuffer;
+-import org.apache.hadoop.io.MD5Hash;
+-   * It retries in case of {@link BlockNotYetCompleteException}.
++   * It retries in case of some {@link RetriableException}.
+-   * Get the checksum of the whole file of a range of the file. Note that the
++   * Get the checksum of the whole file or a range of the file. Note that the
++
++    LocatedBlocks blockLocations = getBlockLocations(src, length);
++
++    FileChecksumHelper.FileChecksumComputer maker =
++        new FileChecksumHelper.ReplicatedFileChecksumComputer(src, length,
++            blockLocations, namenode, this);
++
++    maker.compute();
++
++    return maker.getFileChecksum();
++  }
++
++  protected LocatedBlocks getBlockLocations(String src,
++                                            long length) throws IOException {
+-    LocatedBlocks blockLocations = callGetBlockLocations(namenode, src, 0,
+-        length);
++    LocatedBlocks blockLocations = callGetBlockLocations(namenode,
++        src, 0, length);
+-    List<LocatedBlock> locatedblocks = blockLocations.getLocatedBlocks();
+-    final DataOutputBuffer md5out = new DataOutputBuffer();
+-    int bytesPerCRC = -1;
+-    DataChecksum.Type crcType = DataChecksum.Type.DEFAULT;
+-    long crcPerBlock = 0;
+-    boolean refetchBlocks = false;
+-    int lastRetriedIndex = -1;
+-    // get block checksum for each block
+-    long remaining = length;
+-    if (src.contains(HdfsConstants.SEPARATOR_DOT_SNAPSHOT_DIR_SEPARATOR)) {
+-      remaining = Math.min(length, blockLocations.getFileLength());
+-    }
+-    for(int i = 0; i < locatedblocks.size() && remaining > 0; i++) {
+-      if (refetchBlocks) {  // refetch to get fresh tokens
+-        blockLocations = callGetBlockLocations(namenode, src, 0, length);
+-        if (null == blockLocations) {
+-          throw new FileNotFoundException("File does not exist: " + src);
+-        }
+-        if (blockLocations.isUnderConstruction()) {
+-          throw new IOException("Fail to get checksum, since file " + src
+-              + " is under construction.");
+-        }
+-        locatedblocks = blockLocations.getLocatedBlocks();
+-        refetchBlocks = false;
+-      }
+-      LocatedBlock lb = locatedblocks.get(i);
+-      final ExtendedBlock block = lb.getBlock();
+-      if (remaining < block.getNumBytes()) {
+-        block.setNumBytes(remaining);
+-      }
+-      remaining -= block.getNumBytes();
+-      final DatanodeInfo[] datanodes = lb.getLocations();
+-
+-      //try each datanode location of the block
+-      final int timeout = 3000 * datanodes.length +
+-          dfsClientConf.getSocketTimeout();
+-      boolean done = false;
+-      for(int j = 0; !done && j < datanodes.length; j++) {
+-        DataOutputStream out = null;
+-        DataInputStream in = null;
+-
+-        try {
+-          //connect to a datanode
+-          IOStreamPair pair = connectToDN(datanodes[j], timeout, lb);
+-          out = new DataOutputStream(new BufferedOutputStream(pair.out,
+-              smallBufferSize));
+-          in = new DataInputStream(pair.in);
+-
+-          LOG.debug("write to {}: {}, block={}",
+-              datanodes[j], Op.BLOCK_CHECKSUM, block);
+-          // get block MD5
+-          new Sender(out).blockChecksum(block, lb.getBlockToken());
+-
+-          final BlockOpResponseProto reply =
+-              BlockOpResponseProto.parseFrom(PBHelperClient.vintPrefixed(in));
+-
+-          String logInfo = "for block " + block + " from datanode " +
+-              datanodes[j];
+-          DataTransferProtoUtil.checkBlockOpStatus(reply, logInfo);
+-
+-          OpBlockChecksumResponseProto checksumData =
+-              reply.getChecksumResponse();
+-
+-          //read byte-per-checksum
+-          final int bpc = checksumData.getBytesPerCrc();
+-          if (i == 0) { //first block
+-            bytesPerCRC = bpc;
+-          }
+-          else if (bpc != bytesPerCRC) {
+-            throw new IOException("Byte-per-checksum not matched: bpc=" + bpc
+-                + " but bytesPerCRC=" + bytesPerCRC);
+-          }
+-
+-          //read crc-per-block
+-          final long cpb = checksumData.getCrcPerBlock();
+-          if (locatedblocks.size() > 1 && i == 0) {
+-            crcPerBlock = cpb;
+-          }
+-
+-          //read md5
+-          final MD5Hash md5 = new MD5Hash(
+-              checksumData.getMd5().toByteArray());
+-          md5.write(md5out);
+-
+-          // read crc-type
+-          final DataChecksum.Type ct;
+-          if (checksumData.hasCrcType()) {
+-            ct = PBHelperClient.convert(checksumData
+-                .getCrcType());
+-          } else {
+-            LOG.debug("Retrieving checksum from an earlier-version DataNode: " +
+-                "inferring checksum by reading first byte");
+-            ct = inferChecksumTypeByReading(lb, datanodes[j]);
+-          }
+-
+-          if (i == 0) { // first block
+-            crcType = ct;
+-          } else if (crcType != DataChecksum.Type.MIXED
+-              && crcType != ct) {
+-            // if crc types are mixed in a file
+-            crcType = DataChecksum.Type.MIXED;
+-          }
+-
+-          done = true;
+-
+-          if (LOG.isDebugEnabled()) {
+-            if (i == 0) {
+-              LOG.debug("set bytesPerCRC=" + bytesPerCRC
+-                  + ", crcPerBlock=" + crcPerBlock);
+-            }
+-            LOG.debug("got reply from " + datanodes[j] + ": md5=" + md5);
+-          }
+-        } catch (InvalidBlockTokenException ibte) {
+-          if (i > lastRetriedIndex) {
+-            LOG.debug("Got access token error in response to OP_BLOCK_CHECKSUM "
+-                    + "for file {} for block {} from datanode {}. Will retry "
+-                    + "the block once.",
+-                src, block, datanodes[j]);
+-            lastRetriedIndex = i;
+-            done = true; // actually it's not done; but we'll retry
+-            i--; // repeat at i-th block
+-            refetchBlocks = true;
+-            break;
+-          }
+-        } catch (IOException ie) {
+-          LOG.warn("src=" + src + ", datanodes["+j+"]=" + datanodes[j], ie);
+-        } finally {
+-          IOUtils.closeStream(in);
+-          IOUtils.closeStream(out);
+-        }
+-      }
+-
+-      if (!done) {
+-        throw new IOException("Fail to get block MD5 for " + block);
+-      }
+-    }
+-
+-    //compute file MD5
+-    final MD5Hash fileMD5 = MD5Hash.digest(md5out.getData());
+-    switch (crcType) {
+-    case CRC32:
+-      return new MD5MD5CRC32GzipFileChecksum(bytesPerCRC,
+-          crcPerBlock, fileMD5);
+-    case CRC32C:
+-      return new MD5MD5CRC32CastagnoliFileChecksum(bytesPerCRC,
+-          crcPerBlock, fileMD5);
+-    default:
+-      // If there is no block allocated for the file,
+-      // return one with the magic entry that matches what previous
+-      // hdfs versions return.
+-      if (locatedblocks.size() == 0) {
+-        return new MD5MD5CRC32GzipFileChecksum(0, 0, fileMD5);
+-      }
+-
+-      // we should never get here since the validity was checked
+-      // when getCrcType() was called above.
+-      return null;
+-    }
++    return blockLocations;
+-  /**
+-   * Connect to the given datanode's datantrasfer port, and return
+-   * the resulting IOStreamPair. This includes encryption wrapping, etc.
+-   */
+-  private IOStreamPair connectToDN(DatanodeInfo dn, int timeout,
+-      LocatedBlock lb) throws IOException {
+-    boolean success = false;
+-    Socket sock = null;
+-    try {
+-      sock = socketFactory.createSocket();
+-      String dnAddr = dn.getXferAddr(getConf().isConnectToDnViaHostname());
+-      LOG.debug("Connecting to datanode {}", dnAddr);
+-      NetUtils.connect(sock, NetUtils.createSocketAddr(dnAddr), timeout);
+-      sock.setTcpNoDelay(dfsClientConf.getDataTransferTcpNoDelay());
+-      sock.setSoTimeout(timeout);
+-
+-      OutputStream unbufOut = NetUtils.getOutputStream(sock);
+-      InputStream unbufIn = NetUtils.getInputStream(sock);
+-      IOStreamPair ret = saslClient.newSocketSend(sock, unbufOut, unbufIn, this,
+-          lb.getBlockToken(), dn);
+-      success = true;
+-      return ret;
+-    } finally {
+-      if (!success) {
+-        IOUtils.closeSocket(sock);
+-      }
+-    }
++  protected IOStreamPair connectToDN(DatanodeInfo dn, int timeout,
++                                     Token<BlockTokenIdentifier> blockToken)
++      throws IOException {
++    return DFSUtilClient.connectToDN(dn, timeout, conf, saslClient,
++        socketFactory, getConf().isConnectToDnViaHostname(), this, blockToken);
+-  private Type inferChecksumTypeByReading(LocatedBlock lb, DatanodeInfo dn)
++  protected Type inferChecksumTypeByReading(LocatedBlock lb, DatanodeInfo dn)
+-    IOStreamPair pair = connectToDN(dn, dfsClientConf.getSocketTimeout(), lb);
++    IOStreamPair pair = connectToDN(dn, dfsClientConf.getSocketTimeout(),
++        lb.getBlockToken());
+-      DataOutputStream out = new DataOutputStream(
+-          new BufferedOutputStream(pair.out, smallBufferSize));
+-      DataInputStream in = new DataInputStream(pair.in);
+-
+-      new Sender(out).readBlock(lb.getBlock(), lb.getBlockToken(), clientName,
++      new Sender((DataOutputStream) pair.out).readBlock(lb.getBlock(),
++          lb.getBlockToken(), clientName,
+-          BlockOpResponseProto.parseFrom(PBHelperClient.vintPrefixed(in));
++          BlockOpResponseProto.parseFrom(PBHelperClient.vintPrefixed(pair.in));
+
+INS31 INS31 MOV29 MOV83 MOV43 MOV42 MOV44 MOV44 MOV43 INS8 INS83 INS43 INS42 INS44 INS44 MOV43 INS8 UPD83 INS44 INS8 UPD83 MOV21 MOV21 MOV60 INS60 MOV21 INS41 UPD42 MOV42 INS43 INS42 INS39 INS42 MOV60 MOV25 MOV25 MOV41 INS74 INS42 INS41 UPD66 UPD66 INS43 UPD43 MOV43 INS59 INS32 INS32 MOV42 INS42 INS43 INS43 INS32 MOV43 UPD42 UPD42 MOV42 UPD42 INS40 INS42 INS14 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 MOV42 UPD42 MOV42 MOV42 UPD42 MOV42 MOV32 MOV52 UPD42 MOV42 UPD42 UPD42 INS42 INS43 INS42 INS42 INS42 INS42 INS52 MOV32 MOV43 UPD40 MOV40 MOV43 INS11 MOV43 INS40 INS40 DEL40 DEL26 DEL40 DEL26 DEL40 DEL26 DEL40 DEL26 DEL40 DEL26 DEL40 DEL26 DEL40 DEL26 DEL40 DEL26 DEL40 DEL26 DEL40 DEL26 DEL42 DEL43 DEL43 DEL74 DEL42 DEL42 DEL32 DEL7 DEL42 DEL43 DEL34 DEL34 DEL42 DEL14 DEL83 DEL42 DEL42 DEL43 DEL14 DEL59 DEL60 DEL39 DEL42 DEL34 DEL38 DEL59 DEL60 DEL43 DEL42 DEL40 DEL59 DEL60 DEL39 DEL42 DEL34 DEL59 DEL60 DEL39 DEL42 DEL9 DEL59 DEL60 DEL39 DEL42 DEL34 DEL38 DEL59 DEL60 DEL39 DEL42 DEL42 DEL59 DEL60 DEL42 DEL42 DEL40 DEL32 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL32 DEL7 DEL21 DEL8 DEL25 DEL39 DEL42 DEL34 DEL59 DEL58 DEL42 DEL42 DEL42 DEL32 DEL27 DEL42 DEL34 DEL27 DEL27 DEL42 DEL37 DEL42 DEL42 DEL42 DEL42 DEL42 DEL34 DEL42 DEL32 DEL7 DEL21 DEL33 DEL42 DEL27 DEL42 DEL43 DEL45 DEL42 DEL27 DEL14 DEL53 DEL8 DEL25 DEL42 DEL42 DEL32 DEL42 DEL43 DEL45 DEL42 DEL45 DEL27 DEL14 DEL53 DEL8 DEL25 DEL42 DEL9 DEL7 DEL21 DEL8 DEL25 DEL42 DEL43 DEL42 DEL42 DEL32 DEL59 DEL60 DEL83 DEL43 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL42 DEL42 DEL32 DEL27 DEL42 DEL42 DEL42 DEL32 DEL21 DEL8 DEL25 DEL42 DEL42 DEL42 DEL32 DEL7 DEL21 DEL83 DEL42 DEL43 DEL85 DEL5 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL83 DEL39 DEL42 DEL34 DEL40 DEL27 DEL42 DEL42 DEL32 DEL27 DEL59 DEL60 DEL39 DEL42 DEL9 DEL59 DEL60 DEL39 DEL42 DEL34 DEL59 DEL58 DEL42 DEL38 DEL42 DEL40 DEL27 DEL27 DEL42 DEL37 DEL42 DEL33 DEL59 DEL60 DEL42 DEL43 DEL42 DEL33 DEL59 DEL60 DEL42 DEL42 DEL42 DEL42 DEL2 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL42 DEL43 DEL42 DEL43 DEL40 DEL42 DEL14 DEL14 DEL7 DEL21 DEL42 DEL42 DEL43 DEL40 DEL14 DEL7 DEL21 DEL42 DEL42 DEL45 DEL42 DEL42 DEL2 DEL40 DEL42 DEL32 DEL21 DEL42 DEL14 DEL42 DEL42 DEL32 DEL21 DEL83 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL32 DEL59 DEL60 DEL43 DEL42 DEL45 DEL42 DEL45 DEL42 DEL42 DEL2 DEL27 DEL59 DEL60 DEL42 DEL42 DEL42 DEL42 DEL32 DEL21 DEL42 DEL43 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL83 DEL39 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL34 DEL27 DEL42 DEL42 DEL7 DEL21 DEL8 DEL42 DEL42 DEL27 DEL45 DEL42 DEL45 DEL42 DEL27 DEL14 DEL53 DEL8 DEL25 DEL25 DEL83 DEL39 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL42 DEL32 DEL34 DEL27 DEL42 DEL34 DEL27 DEL27 DEL42 DEL42 DEL7 DEL21 DEL8 DEL25 DEL83 DEL42 DEL43 DEL42 DEL42 DEL43 DEL42 DEL42 DEL32 DEL42 DEL32 DEL14 DEL59 DEL60 DEL42 DEL42 DEL42 DEL32 DEL21 DEL83 DEL40 DEL43 DEL42 DEL59 DEL60 DEL42 DEL42 DEL32 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL32 DEL7 DEL21 DEL8 DEL42 DEL42 DEL45 DEL45 DEL27 DEL32 DEL21 DEL42 DEL42 DEL42 DEL42 DEL42 DEL2 DEL32 DEL7 DEL21 DEL8 DEL25 DEL42 DEL34 DEL27 DEL42 DEL42 DEL7 DEL21 DEL8 DEL42 DEL40 DEL27 DEL42 DEL42 DEL27 DEL27 DEL42 DEL40 DEL7 DEL21 DEL8 DEL25 DEL25 DEL42 DEL9 DEL7 DEL21 DEL42 DEL42 DEL32 DEL42 DEL34 DEL27 DEL42 DEL42 DEL45 DEL42 DEL45 DEL42 DEL27 DEL32 DEL21 DEL8 DEL25 DEL42 DEL42 DEL45 DEL42 DEL42 DEL2 DEL45 DEL42 DEL27 DEL32 DEL21 DEL8 DEL25 DEL8 DEL42 DEL43 DEL42 DEL44 DEL42 DEL42 DEL27 DEL42 DEL42 DEL45 DEL45 DEL45 DEL27 DEL42 DEL42 DEL42 DEL42 DEL2 DEL32 DEL21 DEL42 DEL42 DEL7 DEL21 DEL42 DEL9 DEL7 DEL21 DEL42 DEL37 DEL21 DEL42 DEL9 DEL7 DEL21 DEL10 DEL8 DEL25 DEL8 DEL12 DEL42 DEL43 DEL42 DEL44 DEL42 DEL42 DEL45 DEL42 DEL45 DEL42 DEL45 DEL42 DEL42 DEL2 DEL27 DEL42 DEL32 DEL21 DEL8 DEL12 DEL42 DEL42 DEL42 DEL32 DEL21 DEL42 DEL42 DEL42 DEL32 DEL21 DEL8 DEL54 DEL8 DEL24 DEL42 DEL38 DEL42 DEL43 DEL45 DEL42 DEL27 DEL14 DEL53 DEL8 DEL25 DEL8 DEL24 DEL83 DEL42 DEL43 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL32 DEL59 DEL60 DEL42 DEL42 DEL49 DEL42 DEL43 DEL42 DEL42 DEL42 DEL14 DEL41 DEL42 DEL49 DEL42 DEL43 DEL42 DEL42 DEL42 DEL14 DEL41 DEL49 DEL42 DEL42 DEL32 DEL34 DEL27 DEL8 DEL25 DEL33 DEL41 DEL50 DEL8 DEL31 DEL66 DEL66 DEL65 DEL29 DEL43 DEL42 DEL44 DEL39 DEL42 DEL9 DEL59 DEL60 DEL43 DEL42 DEL33 DEL59 DEL60 DEL42 DEL42 DEL42 DEL32 DEL7 DEL21 DEL42 DEL43 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL42 DEL45 DEL42 DEL32 DEL21 DEL42 DEL42 DEL42 DEL32 DEL32 DEL21 DEL42 DEL42 DEL42 DEL32 DEL32 DEL21 DEL42 DEL42 DEL42 DEL32 DEL21 DEL42 DEL43 DEL42 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL43 DEL42 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL43 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL42 DEL32 DEL59 DEL60 DEL42 DEL9 DEL7 DEL21 DEL42 DEL41 DEL8 DEL42 DEL38 DEL42 DEL42 DEL42 DEL32 DEL21 DEL8 DEL25 DEL8 DEL54 DEL8 DEL42 DEL43 DEL42 DEL42 DEL43 DEL42 DEL42 DEL43 DEL42 DEL43 DEL40 DEL42 DEL14 DEL14 DEL59 DEL60 DEL42 DEL43 DEL42 DEL42 DEL43 DEL40 DEL14 DEL59 DEL60 DEL42 DEL43 DEL42 DEL42 DEL43 DEL42

@@ -1,0 +1,931 @@
+HADOOP-13786 Add S3A committer for zero-rename commits to S3 endpoints.
+Contributed by Steve Loughran and Ryan Blue.
+
++import java.nio.file.AccessDeniedException;
++import java.text.DateFormat;
++import java.text.SimpleDateFormat;
++import java.util.Locale;
+-import com.amazonaws.services.s3.model.AmazonS3Exception;
+-import com.amazonaws.services.s3.model.CompleteMultipartUploadRequest;
+-import com.amazonaws.services.s3.model.CompleteMultipartUploadResult;
++import com.amazonaws.services.s3.model.InitiateMultipartUploadResult;
++import com.amazonaws.services.s3.model.ListMultipartUploadsRequest;
++import com.amazonaws.services.s3.model.MultipartUpload;
+-import com.amazonaws.services.s3.model.PartETag;
++import com.amazonaws.services.s3.transfer.model.UploadResult;
+-import org.apache.hadoop.fs.StorageStatistics;
++import org.apache.hadoop.fs.StreamCapabilities;
++import org.apache.hadoop.fs.s3a.commit.CommitConstants;
++import org.apache.hadoop.fs.s3a.commit.PutTracker;
++import org.apache.hadoop.fs.s3a.commit.MagicCommitIntegration;
++import org.apache.hadoop.io.retry.RetryPolicies;
+-import static org.apache.hadoop.fs.s3a.Listing.ACCEPT_ALL;
++import static org.apache.hadoop.fs.s3a.Invoker.*;
+-public class S3AFileSystem extends FileSystem {
++public class S3AFileSystem extends FileSystem implements StreamCapabilities {
++
++  /**
++   * This declared delete as idempotent.
++   * This is an "interesting" topic in past Hadoop FS work.
++   * Essentially: with a single caller, DELETE is idempotent
++   * but in a shared filesystem, it is is very much not so.
++   * Here, on the basis that isn't a filesystem with consistency guarantees,
++   * retryable results in files being deleted.
++  */
++  public static final boolean DELETE_CONSIDERED_IDEMPOTENT = true;
++  // initial callback policy is fail-once; it's there just to assist
++  // some mock tests and other codepaths trying to call the low level
++  // APIs on an uninitialized filesystem.
++  private Invoker invoker = new Invoker(RetryPolicies.TRY_ONCE_THEN_FAIL,
++      Invoker.LOG_EVENT);
++  private final Retried onRetry = this::operationRetried;
+-  private S3AStorageStatistics storageStatistics;
++  private final S3AStorageStatistics storageStatistics =
++      createStorageStatistics();
++  private MagicCommitIntegration committerIntegration;
+-    uri = S3xLoginHelper.buildFSURI(name);
++    setUri(name);
++    LOG.debug("Initializing S3AFileSystem for {}", bucket);
++      invoker = new Invoker(new S3ARetryPolicy(getConf()), onRetry);
+-      storageStatistics = (S3AStorageStatistics)
+-          GlobalStorageStatistics.INSTANCE
+-              .put(S3AStorageStatistics.NAME,
+-                  new GlobalStorageStatistics.StorageStatisticsProvider() {
+-                    @Override
+-                    public StorageStatistics provide() {
+-                      return new S3AStorageStatistics();
+-                    }
+-                  });
+-      initMultipartUploads(conf);
+-
++      LOG.debug("Input fadvise policy = {}", inputPolicy);
++      boolean magicCommitterEnabled = conf.getBoolean(
++          CommitConstants.MAGIC_COMMITTER_ENABLED,
++          CommitConstants.DEFAULT_MAGIC_COMMITTER_ENABLED);
++      LOG.debug("Filesystem support for magic committers {} enabled",
++          magicCommitterEnabled ? "is" : "is not");
++      committerIntegration = new MagicCommitIntegration(
++          this, magicCommitterEnabled);
+-      metadataStore = S3Guard.getMetadataStore(this);
++      setMetadataStore(S3Guard.getMetadataStore(this));
++      initMultipartUploads(conf);
++   * Create the storage statistics or bind to an existing one.
++   * @return a storage statistics instance.
++   */
++  protected static S3AStorageStatistics createStorageStatistics() {
++    return (S3AStorageStatistics)
++        GlobalStorageStatistics.INSTANCE
++            .put(S3AStorageStatistics.NAME,
++                () -> new S3AStorageStatistics());
++  }
++
++  /**
++   * Retry policy: retrying, translated.
++  @Retries.RetryTranslated
+-    try {
+-      if (!s3.doesBucketExist(bucket)) {
+-        throw new FileNotFoundException("Bucket " + bucket + " does not exist");
+-      }
+-    } catch (AmazonS3Exception e) {
+-      // this is a sign of a serious startup problem so do dump everything
+-      LOG.warn(stringify(e), e);
+-      throw translateException("doesBucketExist", bucket, e);
+-    } catch (AmazonServiceException e) {
+-      // this is a sign of a serious startup problem so do dump everything
+-      LOG.warn(stringify(e), e);
+-      throw translateException("doesBucketExist", bucket, e);
+-    } catch (AmazonClientException e) {
+-      throw translateException("doesBucketExist", bucket, e);
++    if (!invoker.retry("doesBucketExist", bucket, true,
++        () -> s3.doesBucketExist(bucket))) {
++      throw new FileNotFoundException("Bucket " + bucket + " does not exist");
++  @Retries.RetryTranslated
+-      Date purgeBefore =
+-          new Date(new Date().getTime() - purgeExistingMultipartAge * 1000);
+-
+-        transfers.abortMultipartUploads(bucket, purgeBefore);
+-      } catch (AmazonServiceException e) {
+-        if (e.getStatusCode() == 403) {
+-          instrumentation.errorIgnored();
+-          LOG.debug("Failed to purging multipart uploads against {}," +
+-              " FS may be read only", bucket, e);
+-        } else {
+-          throw translateException("purging multipart uploads", bucket, e);
+-        }
++        abortOutstandingMultipartUploads(purgeExistingMultipartAge);
++      } catch (AccessDeniedException e) {
++        instrumentation.errorIgnored();
++        LOG.debug("Failed to purge multipart uploads against {}," +
++            " FS may be read only", bucket);
++   * Abort all outstanding MPUs older than a given age.
++   * @param seconds time in seconds
++   * @throws IOException on any failure, other than 403 "permission denied"
++   */
++  @Retries.RetryTranslated
++  public void abortOutstandingMultipartUploads(long seconds)
++      throws IOException {
++    Preconditions.checkArgument(seconds >= 0);
++    Date purgeBefore =
++        new Date(new Date().getTime() - seconds * 1000);
++    LOG.debug("Purging outstanding multipart uploads older than {}",
++        purgeBefore);
++    invoker.retry("Purging multipart uploads", bucket, true,
++        () -> transfers.abortMultipartUploads(bucket, purgeBefore));
++  }
++
++  /**
++  /**
++   * Set the URI field through {@link S3xLoginHelper}.
++   * Exported for testing.
++   * @param uri filesystem URI.
++   */
++  @VisibleForTesting
++  protected void setUri(URI uri) {
++    this.uri = S3xLoginHelper.buildFSURI(uri);
++  }
++
++   * This is for internal use within the S3A code itself.
++   * Returns the S3 client used by this filesystem.
++   * <i>Warning: this must only be used for testing, as it bypasses core
++   * S3A operations. </i>
++   * @param reason a justification for requesting access.
++   * @return AmazonS3Client
++   */
++  @VisibleForTesting
++  public AmazonS3 getAmazonS3ClientForTesting(String reason) {
++    LOG.warn("Access to S3A client requested, reason {}", reason);
++    return s3;
++  }
++
++  /**
++   * Set the client -used in mocking tests to force in a different client.
++   * @param client client.
++   */
++  protected void setAmazonS3Client(AmazonS3 client) {
++    Preconditions.checkNotNull(client, "client");
++    LOG.debug("Setting S3 client to {}", client);
++    s3 = client;
++  }
++
++  /**
++  @Retries.RetryTranslated
++   * Retry policy: retrying, translated.
++  @Retries.RetryTranslated
+-    try {
+-      return s3.getBucketLocation(bucketName);
+-    } catch (AmazonClientException e) {
+-      throw translateException("getBucketLocation()",
+-          bucketName, e);
+-    }
++    return invoker.retry("getBucketLocation()", bucketName, true,
++        ()-> s3.getBucketLocation(bucketName));
+-   * Returns the read ahead range value used by this filesystem
+-   * @return
++   * Returns the read ahead range value used by this filesystem.
++   * @return the readahead range
+-
+-          ? BUFFER_DIR : "hadoop.tmp.dir";
++          ? BUFFER_DIR : HADOOP_TMP_DIR;
++   * Set the bucket.
++   * @param bucket the bucket
++   */
++  @VisibleForTesting
++  protected void setBucket(String bucket) {
++    this.bucket = bucket;
++  }
++
++  /**
++   * Get the canned ACL of this FS.
++   * @return an ACL, if any
++   */
++  CannedAccessControlList getCannedACL() {
++    return cannedACL;
++  }
++
++  /**
+-  private Path keyToPath(String key) {
++  Path keyToPath(String key) {
+-  Path keyToQualifiedPath(String key) {
++  public Path keyToQualifiedPath(String key) {
+-    LOG.debug("Opening '{}' for reading.", f);
++    LOG.debug("Opening '{}' for reading; input policy = {}", f, inputPolicy);
+-            inputPolicy));
++            inputPolicy,
++            invoker));
++   * Retry policy: retrying, translated on the getFileStatus() probe.
++   * No data is uploaded to S3 in this call, so retry issues related to that.
+-    String key = pathToKey(f);
++    final Path path = qualify(f);
++    String key = pathToKey(path);
+-      status = getFileStatus(f);
++      status = getFileStatus(path);
+-        throw new FileAlreadyExistsException(f + " is a directory");
++        throw new FileAlreadyExistsException(path + " is a directory");
+-        throw new FileAlreadyExistsException(f + " already exists");
++        throw new FileAlreadyExistsException(path + " already exists");
+-      LOG.debug("Overwriting file {}", f);
++      LOG.debug("Overwriting file {}", path);
++    PutTracker putTracker =
++        committerIntegration.createTracker(path, key);
++    String destKey = putTracker.getDestKey();
+-            key,
++            destKey,
+-            new WriteOperationHelper(key)
+-        ),
++            createWriteOperationHelper(),
++            putTracker),
++   * Create a new {@code WriteOperationHelper} instance.
++   *
++   * This class permits other low-level operations against the store.
++   * It is unstable and
++   * only intended for code with intimate knowledge of the object store.
++   * If using this, be prepared for changes even on minor point releases.
++   * @return a new helper.
++   */
++  @InterfaceAudience.Private
++  public WriteOperationHelper createWriteOperationHelper() {
++    return new WriteOperationHelper(this);
++  }
++
++  /**
+-      Path parentPath = keyToPath(srcKey);
++      Path parentPath = keyToQualifiedPath(srcKey);
+-      createFakeDirectoryIfNecessary(src.getParent());
++      maybeCreateFakeParentDirectory(src);
++    Preconditions.checkNotNull(ms);
++   * Callback when an operation was retried.
++   * Increments the statistics of ignored errors or throttled requests,
++   * depending up on the exception class.
++   * @param ex exception.
++   */
++  public void operationRetried(Exception ex) {
++    Statistic stat = isThrottleException(ex)
++        ? STORE_IO_THROTTLED
++        : IGNORED_ERRORS;
++    instrumentation.incrementCounter(stat, 1);
++    storageStatistics.incrementCounter(stat, 1);
++  }
++
++  /**
++   * Callback from {@link Invoker} when an operation is retried.
++   * @param text text of the operation
++   * @param ex exception
++   * @param retries number of retries
++   * @param idempotent is the method idempotent
++   */
++  public void operationRetried(
++      String text,
++      Exception ex,
++      int retries,
++      boolean idempotent) {
++    operationRetried(ex);
++  }
++
++  /**
++   * Callback from {@link Invoker} when an operation against a metastore
++   * is retried.
++   * @param ex exception
++   * @param retries number of retries
++   * @param idempotent is the method idempotent
++   */
++  public void metastoreOperationRetried(Exception ex,
++      int retries,
++      boolean idempotent) {
++    operationRetried(ex);
++  }
++
++  /**
++   * Retry policy: retry untranslated.
++   * @throws IOException if the retry invocation raises one (it shouldn't).
+-  protected ObjectMetadata getObjectMetadata(String key) {
+-    incrementStatistic(OBJECT_METADATA_REQUESTS);
++  @Retries.RetryRaw
++  protected ObjectMetadata getObjectMetadata(String key) throws IOException {
+-    ObjectMetadata meta = s3.getObjectMetadata(request);
++    ObjectMetadata meta = invoker.retryUntranslated("GET " + key, true,
++        () -> {
++          incrementStatistic(OBJECT_METADATA_REQUESTS);
++          return s3.getObjectMetadata(request);
++        });
++   *
++   * Retry policy: retry untranslated.
++   * @throws IOException if the retry invocation raises one (it shouldn't).
+-  protected S3ListResult listObjects(S3ListRequest request) {
+-    incrementStatistic(OBJECT_LIST_REQUESTS);
++  @Retries.RetryRaw
++  protected S3ListResult listObjects(S3ListRequest request) throws IOException {
++    incrementStatistic(OBJECT_LIST_REQUESTS);
++    validateListArguments(request);
++    return invoker.retryUntranslated(
++        request.toString(),
++        true,
++        () -> {
++          if (useListV1) {
++            return S3ListResult.v1(s3.listObjects(request.getV1()));
++          } else {
++            return S3ListResult.v2(s3.listObjectsV2(request.getV2()));
++          }
++        });
++  }
++
++  /**
++   * Validate the list arguments with this bucket's settings.
++   * @param request the request to validate
++   */
++  private void validateListArguments(S3ListRequest request) {
+-      return S3ListResult.v1(s3.listObjects(request.getV1()));
+-      return S3ListResult.v2(s3.listObjectsV2(request.getV2()));
++   * Retry policy: retry untranslated.
++   * @throws IOException: none, just there for retryUntranslated.
++  @Retries.RetryRaw
+-      S3ListResult prevResult) {
+-    incrementStatistic(OBJECT_CONTINUE_LIST_REQUESTS);
++      S3ListResult prevResult) throws IOException {
+-    if (useListV1) {
+-      Preconditions.checkArgument(request.isV1());
+-      return S3ListResult.v1(s3.listNextBatchOfObjects(prevResult.getV1()));
+-    } else {
+-      Preconditions.checkArgument(!request.isV1());
+-      request.getV2().setContinuationToken(prevResult.getV2()
+-          .getNextContinuationToken());
+-      return S3ListResult.v2(s3.listObjectsV2(request.getV2()));
+-    }
++    validateListArguments(request);
++    return invoker.retryUntranslated(
++        request.toString(),
++        true,
++        () -> {
++          incrementStatistic(OBJECT_CONTINUE_LIST_REQUESTS);
++          if (useListV1) {
++            return S3ListResult.v1(
++                s3.listNextBatchOfObjects(prevResult.getV1()));
++          } else {
++            request.getV2().setContinuationToken(prevResult.getV2()
++                .getNextContinuationToken());
++            return S3ListResult.v2(s3.listObjectsV2(request.getV2()));
++          }
++        });
+-   * Delete an object.
++   * Delete an object. This is the low-level internal call which
++   * <i>does not</i> update the metastore.
++   *
++   * Retry policy: retry untranslated; delete considered idempotent.
++   * @throws AmazonClientException problems working with S3
++   * @throws InvalidRequestException if the request was rejected due to
++   * a mistaken attempt to delete the root directory.
+-  private void deleteObject(String key) throws InvalidRequestException {
++  @VisibleForTesting
++  @Retries.RetryRaw
++  protected void deleteObject(String key)
++      throws AmazonClientException, IOException {
+-    incrementStatistic(OBJECT_DELETE_REQUESTS);
+-    s3.deleteObject(bucket, key);
++    invoker.retryUntranslated("Delete "+ bucket + ":/" + key,
++        DELETE_CONSIDERED_IDEMPOTENT,
++        ()-> {
++          incrementStatistic(OBJECT_DELETE_REQUESTS);
++          s3.deleteObject(bucket, key);
++          return null;
++        });
++  }
++
++  /**
++   * Delete an object, also updating the metastore.
++   * This call does <i>not</i> create any mock parent entries.
++   * Retry policy: retry untranslated; delete considered idempotent.
++   * @param f path path to delete
++   * @param key key of entry
++   * @param isFile is the path a file (used for instrumentation only)
++   * @throws AmazonClientException problems working with S3
++   * @throws IOException IO failure
++   */
++  @Retries.RetryRaw
++  void deleteObjectAtPath(Path f, String key, boolean isFile)
++      throws AmazonClientException, IOException {
++    if (isFile) {
++      instrumentation.fileDeleted(1);
++    } else {
++      instrumentation.directoryDeleted();
++    }
++    deleteObject(key);
++    metadataStore.delete(f);
++   * Retry policy: retry untranslated; delete considered idempotent.
++  @Retries.RetryRaw
+-      throws MultiObjectDeleteException, AmazonClientException {
++      throws MultiObjectDeleteException, AmazonClientException, IOException {
+-    incrementStatistic(OBJECT_DELETE_REQUESTS, 1);
+-      s3.deleteObjects(deleteRequest);
++      invoker.retryUntranslated("delete",
++          DELETE_CONSIDERED_IDEMPOTENT,
++          () -> {
++            incrementStatistic(OBJECT_DELETE_REQUESTS, 1);
++            return s3.deleteObjects(deleteRequest);
++          });
++    Preconditions.checkArgument(StringUtils.isNotEmpty(key), "Null/empty key");
++   * Retry policy: N/A: the transfer manager is performing the upload.
++  @Retries.OnceRaw
+-    long len;
+-    if (putObjectRequest.getFile() != null) {
+-      len = putObjectRequest.getFile().length();
+-    } else {
+-      len = putObjectRequest.getMetadata().getContentLength();
+-    }
++    long len = getPutRequestLength(putObjectRequest);
++    LOG.debug("PUT {} bytes to {} via transfer manager ",
++        len, putObjectRequest.getKey());
+-    try {
+-      Upload upload = transfers.upload(putObjectRequest);
+-      incrementPutCompletedStatistics(true, len);
+-      return new UploadInfo(upload, len);
+-    } catch (AmazonClientException e) {
+-      incrementPutCompletedStatistics(false, len);
+-      throw e;
+-    }
++    Upload upload = transfers.upload(putObjectRequest);
++    return new UploadInfo(upload, len);
++   *
++   * Retry Policy: none.
++  @Retries.OnceRaw
++      // update metadata
++      finishedWrite(putObjectRequest.getKey(), len);
++   *
++   * Retry Policy: none.
+-  public UploadPartResult uploadPart(UploadPartRequest request)
++  @Retries.OnceRaw
++  UploadPartResult uploadPart(UploadPartRequest request)
+-   *
++   * Retry policy: retry untranslated; delete considered idempotent.
++  @Retries.RetryRaw
+-      InvalidRequestException {
++      IOException {
+-   * @return  true if delete is successful else false.
++   * @return true if the path existed and then was deleted; false if there
++   * was no path in the first place, or the corner cases of root path deletion
++   * have surfaced.
++  @Retries.RetryTranslated
+-   * @return  true if delete is successful else false.
++   * @return true, except in the corner cases of root directory deletion
++  @Retries.RetryMixed
+-    LOG.debug("Delete path {} - recursive {}", f , recursive);
++    LOG.debug("Delete path {} - recursive {}", f, recursive);
+-        // HADOOP-13761 S3Guard: retries here
+-        deleteObject(key);
+-        metadataStore.delete(f);
+-        instrumentation.directoryDeleted();
++        // HADOOP-13761 s3guard: retries here
++        deleteObjectAtPath(f, key, false);
+-              // TODO: HADOOP-13761 S3Guard: retries
+-      instrumentation.fileDeleted(1);
+-      deleteObject(key);
+-      metadataStore.delete(f);
++      deleteObjectAtPath(f, key, true);
+-    Path parent = f.getParent();
+-    if (parent != null) {
+-      createFakeDirectoryIfNecessary(parent);
+-    }
++    maybeCreateFakeParentDirectory(f);
++  /**
++   * Create a fake directory if required.
++   * That is: it is not the root path and the path does not exist.
++   * Retry policy: retrying; untranslated.
++   * @param f path to create
++   * @throws IOException IO problem
++   * @throws AmazonClientException untranslated AWS client problem
++   */
++  @Retries.RetryTranslated
++   * Create a fake parent directory if required.
++   * That is: it parent is not the root path and does not yet exist.
++   * @param path whose parent is created if needed.
++   * @throws IOException IO problem
++   * @throws AmazonClientException untranslated AWS client problem
++   */
++  void maybeCreateFakeParentDirectory(Path path)
++      throws IOException, AmazonClientException {
++    Path parent = path.getParent();
++    if (parent != null) {
++      createFakeDirectoryIfNecessary(parent);
++    }
++  }
++
++  /**
+-    try {
+-      return innerListStatus(f);
+-    } catch (AmazonClientException e) {
+-      throw translateException("listStatus", f, e);
+-    }
++    return once("listStatus", f.toString(), () -> innerListStatus(f));
+-   * @return true if a directory was created
++   * @return true if a directory was created or already existed
++  @Retries.RetryTranslated
++  @Retries.RetryTranslated
++   * Retry policy: retry translated.
++  @Retries.RetryTranslated
++   * Retry policy: retrying; translated.
++   * @throws IOException IO failure
++  @Retries.RetryTranslated
+-    try {
+-      innerCopyFromLocalFile(delSrc, overwrite, src, dst);
+-    } catch (AmazonClientException e) {
+-      throw translateException("copyFromLocalFile(" + src + ", " + dst + ")",
+-          src, e);
+-    }
++    innerCopyFromLocalFile(delSrc, overwrite, src, dst);
++  @Retries.RetryTranslated
++    Progressable progress = null;
++    invoker.retry("copyFromLocalFile(" + src + ")", dst.toString(), true,
++        () -> executePut(putObjectRequest, progress));
++    if (delSrc) {
++      local.delete(src, false);
++    }
++  }
++
++  /**
++   * Execute a PUT via the transfer manager, blocking for completion,
++   * updating the metastore afterwards.
++   * If the waiting for completion is interrupted, the upload will be
++   * aborted before an {@code InterruptedIOException} is thrown.
++   * @param putObjectRequest request
++   * @param progress optional progress callback
++   * @return the upload result
++   * @throws InterruptedIOException if the blocking was interrupted.
++   */
++  @Retries.OnceRaw
++  UploadResult executePut(PutObjectRequest putObjectRequest,
++      Progressable progress)
++      throws InterruptedIOException {
++    String key = putObjectRequest.getKey();
+-        this, key, upload, null);
++        this, key, upload, progress);
+-    try {
+-      upload.waitForUploadResult();
+-    } catch (InterruptedException e) {
+-      throw new InterruptedIOException("Interrupted copying " + src
+-          + " to "  + dst + ", cancelling");
+-    }
++    UploadResult result = waitForUploadCompletion(key, info);
+-
+-    // This will delete unnecessary fake parent directories
++    // post-write actions
++    return result;
++  }
+-    if (delSrc) {
+-      local.delete(src, false);
++  /**
++   * Wait for an upload to complete.
++   * If the waiting for completion is interrupted, the upload will be
++   * aborted before an {@code InterruptedIOException} is thrown.
++   * @param upload upload to wait for
++   * @param key destination key
++   * @return the upload result
++   * @throws InterruptedIOException if the blocking was interrupted.
++   */
++  UploadResult waitForUploadCompletion(String key, UploadInfo uploadInfo)
++      throws InterruptedIOException {
++    Upload upload = uploadInfo.getUpload();
++    try {
++      UploadResult result = upload.waitForUploadResult();
++      incrementPutCompletedStatistics(true, uploadInfo.getLength());
++      return result;
++    } catch (InterruptedException e) {
++      LOG.info("Interrupted: aborting upload");
++      incrementPutCompletedStatistics(false, uploadInfo.getLength());
++      upload.abort();
++      throw (InterruptedIOException)
++          new InterruptedIOException("Interrupted in PUT to "
++              + keyToQualifiedPath(key))
++          .initCause(e);
++  /**
++   * Initiate a multipart upload from the preconfigured request.
++   * Retry policy: none + untranslated.
++   * @param request request to initiate
++   * @return the result of the call
++   * @throws AmazonClientException on failures inside the AWS SDK
++   * @throws IOException Other IO problems
++   */
++  @Retries.OnceRaw
++  InitiateMultipartUploadResult initiateMultipartUpload(
++      InitiateMultipartUploadRequest request) throws IOException {
++    LOG.debug("Initiate multipart upload to {}", request.getKey());
++    incrementStatistic(OBJECT_MULTIPART_UPLOAD_INITIATED);
++    return getAmazonS3Client().initiateMultipartUpload(request);
++  }
++  @Retries.RetryTranslated("Exceptions are swallowed")
+-   * This code swallows IO exceptions encountered
++   * Retry policy: retrying; exceptions swallowed.
++  @Retries.RetryRaw("Exceptions are swallowed")
+-    } catch(AmazonClientException | InvalidRequestException e) {
++    } catch(AmazonClientException | IOException e) {
++  /**
++   * Create a fake directory, always ending in "/".
++   * Retry policy: retrying; translated.
++   * @param objectName name of directory object.
++   * @throws IOException IO failure
++   */
++  @Retries.RetryTranslated
+-      throws AmazonClientException, AmazonServiceException,
+-      InterruptedIOException {
++      throws IOException {
+-  // Used to create an empty file that represents an empty directory
++  /**
++   * Used to create an empty file that represents an empty directory.
++   * Retry policy: retrying; translated.
++   * @param objectName object to create
++   * @throws IOException IO failure
++   */
++  @Retries.RetryTranslated
+-      throws AmazonClientException, AmazonServiceException,
+-      InterruptedIOException {
++      throws IOException {
+-    UploadInfo info = putObject(putObjectRequest);
+-    try {
+-      info.getUpload().waitForUploadResult();
+-    } catch (InterruptedException e) {
+-      throw new InterruptedIOException("Interrupted creating " + objectName);
+-    }
++    invoker.retry("PUT 0-byte object ", objectName,
++         true,
++        () -> putObjectDirect(putObjectRequest));
++    sb.append(", magicCommitter=").append(isMagicCommitEnabled());
++   * Is magic commit enabled?
++   * @return true if magic commit support is turned on.
++   */
++  public boolean isMagicCommitEnabled() {
++    return committerIntegration.isMagicCommitEnabled();
++  }
++
++  /**
++   * Predicate: is a path a magic commit path?
++   * True if magic commit is enabled and the path qualifies as special.
++   * @param path path to examine
++   * @return true if the path is or is under a magic directory
++   */
++  public boolean isMagicCommitPath(Path path) {
++    return committerIntegration.isMagicCommitPath(path);
++  }
++
++  /**
++  @Retries.OnceTranslated
+-   * Helper for an ongoing write operation.
+-   * <p>
+-   * It hides direct access to the S3 API from the output stream,
+-   * and is a location where the object upload process can be evolved/enhanced.
+-   * <p>
+-   * Features
+-   * <ul>
+-   *   <li>Methods to create and submit requests to S3, so avoiding
+-   *   all direct interaction with the AWS APIs.</li>
+-   *   <li>Some extra preflight checks of arguments, so failing fast on
+-   *   errors.</li>
+-   *   <li>Callbacks to let the FS know of events in the output stream
+-   *   upload process.</li>
+-   * </ul>
+-   *
+-   * Each instance of this state is unique to a single output stream.
++   * Listing all multipart uploads; limited to the first few hundred.
++   * Retry policy: retry, translated.
++   * @return a listing of multipart uploads.
++   * @param prefix prefix to scan for, "" for none
++   * @throws IOException IO failure, including any uprated AmazonClientException
+-  final class WriteOperationHelper {
+-    private final String key;
+-
+-    private WriteOperationHelper(String key) {
+-      this.key = key;
+-    }
+-
+-    /**
+-     * Create a {@link PutObjectRequest} request.
+-     * If {@code length} is set, the metadata is configured with the size of
+-     * the upload.
+-     * @param inputStream source data.
+-     * @param length size, if known. Use -1 for not known
+-     * @return the request
+-     */
+-    PutObjectRequest newPutRequest(InputStream inputStream, long length) {
+-      PutObjectRequest request = newPutObjectRequest(key,
+-          newObjectMetadata(length), inputStream);
+-      return request;
+-    }
+-
+-    /**
+-     * Create a {@link PutObjectRequest} request to upload a file.
+-     * @param sourceFile source file
+-     * @return the request
+-     */
+-    PutObjectRequest newPutRequest(File sourceFile) {
+-      int length = (int) sourceFile.length();
+-      PutObjectRequest request = newPutObjectRequest(key,
+-          newObjectMetadata(length), sourceFile);
+-      return request;
+-    }
+-
+-    /**
+-     * Callback on a successful write.
+-     */
+-    void writeSuccessful(long length) {
+-      finishedWrite(key, length);
+-    }
+-
+-    /**
+-     * Callback on a write failure.
+-     * @param e Any exception raised which triggered the failure.
+-     */
+-    void writeFailed(Exception e) {
+-      LOG.debug("Write to {} failed", this, e);
+-    }
+-
+-    /**
+-     * Create a new object metadata instance.
+-     * Any standard metadata headers are added here, for example:
+-     * encryption.
+-     * @param length size, if known. Use -1 for not known
+-     * @return a new metadata instance
+-     */
+-    public ObjectMetadata newObjectMetadata(long length) {
+-      return S3AFileSystem.this.newObjectMetadata(length);
+-    }
+-
+-    /**
+-     * Start the multipart upload process.
+-     * @return the upload result containing the ID
+-     * @throws IOException IO problem
+-     */
+-    String initiateMultiPartUpload() throws IOException {
+-      LOG.debug("Initiating Multipart upload");
+-      final InitiateMultipartUploadRequest initiateMPURequest =
+-          new InitiateMultipartUploadRequest(bucket,
+-              key,
+-              newObjectMetadata(-1));
+-      initiateMPURequest.setCannedACL(cannedACL);
+-      setOptionalMultipartUploadRequestParameters(initiateMPURequest);
+-      try {
+-        return s3.initiateMultipartUpload(initiateMPURequest)
+-            .getUploadId();
+-      } catch (AmazonClientException ace) {
+-        throw translateException("initiate MultiPartUpload", key, ace);
++  @InterfaceAudience.Private
++  @Retries.RetryTranslated
++  public List<MultipartUpload> listMultipartUploads(String prefix)
++      throws IOException {
++    ListMultipartUploadsRequest request = new ListMultipartUploadsRequest(
++        bucket);
++    if (!prefix.isEmpty()) {
++      if (!prefix.endsWith("/")) {
++        prefix = prefix + "/";
++      request.setPrefix(prefix);
+-    /**
+-     * Complete a multipart upload operation.
+-     * @param uploadId multipart operation Id
+-     * @param partETags list of partial uploads
+-     * @return the result
+-     * @throws AmazonClientException on problems.
+-     */
+-    CompleteMultipartUploadResult completeMultipartUpload(String uploadId,
+-        List<PartETag> partETags) throws AmazonClientException {
+-      Preconditions.checkNotNull(uploadId);
+-      Preconditions.checkNotNull(partETags);
+-      Preconditions.checkArgument(!partETags.isEmpty(),
+-          "No partitions have been uploaded");
+-      LOG.debug("Completing multipart upload {} with {} parts",
+-          uploadId, partETags.size());
+-      // a copy of the list is required, so that the AWS SDK doesn't
+-      // attempt to sort an unmodifiable list.
+-      return s3.completeMultipartUpload(
+-          new CompleteMultipartUploadRequest(bucket,
+-              key,
+-              uploadId,
+-              new ArrayList<>(partETags)));
++    return invoker.retry("listMultipartUploads", prefix, true,
++        () -> s3.listMultipartUploads(request).getMultipartUploads());
++  }
++
++  /**
++   * Abort a multipart upload.
++   * Retry policy: none.
++   * @param destKey destination key
++   * @param uploadId Upload ID
++   */
++  @Retries.OnceRaw
++  void abortMultipartUpload(String destKey, String uploadId) {
++    LOG.info("Aborting multipart upload {} to {}", uploadId, destKey);
++    getAmazonS3Client().abortMultipartUpload(
++        new AbortMultipartUploadRequest(getBucket(),
++            destKey,
++            uploadId));
++  }
++
++  /**
++   * Abort a multipart upload.
++   * Retry policy: none.
++   * @param upload the listed upload to abort.
++   */
++  @Retries.OnceRaw
++  void abortMultipartUpload(MultipartUpload upload) {
++    String destKey;
++    String uploadId;
++    destKey = upload.getKey();
++    uploadId = upload.getUploadId();
++    if (LOG.isInfoEnabled()) {
++      DateFormat df = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss");
++      LOG.info("Aborting multipart upload {} to {} initiated by {} on {}",
++          uploadId, destKey, upload.getInitiator(),
++          df.format(upload.getInitiated()));
++    getAmazonS3Client().abortMultipartUpload(
++        new AbortMultipartUploadRequest(getBucket(),
++            destKey,
++            uploadId));
++  }
+-    /**
+-     * Abort a multipart upload operation.
+-     * @param uploadId multipart operation Id
+-     * @throws AmazonClientException on problems.
+-     */
+-    void abortMultipartUpload(String uploadId) throws AmazonClientException {
+-      LOG.debug("Aborting multipart upload {}", uploadId);
+-      s3.abortMultipartUpload(
+-          new AbortMultipartUploadRequest(bucket, key, uploadId));
+-    }
++  /**
++   * Create a new instance of the committer statistics.
++   * @return a new committer statistics instance
++   */
++  public S3AInstrumentation.CommitterStatistics newCommitterStatistics() {
++    return instrumentation.newCommitterStatistics();
++  }
+-    /**
+-     * Create and initialize a part request of a multipart upload.
+-     * Exactly one of: {@code uploadStream} or {@code sourceFile}
+-     * must be specified.
+-     * @param uploadId ID of ongoing upload
+-     * @param partNumber current part number of the upload
+-     * @param size amount of data
+-     * @param uploadStream source of data to upload
+-     * @param sourceFile optional source file.
+-     * @return the request.
+-     */
+-    UploadPartRequest newUploadPartRequest(String uploadId,
+-        int partNumber, int size, InputStream uploadStream, File sourceFile) {
+-      Preconditions.checkNotNull(uploadId);
+-      // exactly one source must be set; xor verifies this
+-      Preconditions.checkArgument((uploadStream != null) ^ (sourceFile != null),
+-          "Data source");
+-      Preconditions.checkArgument(size > 0, "Invalid partition size %s", size);
+-      Preconditions.checkArgument(partNumber > 0 && partNumber <= 10000,
+-          "partNumber must be between 1 and 10000 inclusive, but is %s",
+-          partNumber);
++  /**
++   * Return the capabilities of this filesystem instance.
++   * @param capability string to query the stream support for.
++   * @return whether the FS instance has the capability.
++   */
++  @Override
++  public boolean hasCapability(String capability) {
+-      LOG.debug("Creating part upload request for {} #{} size {}",
+-          uploadId, partNumber, size);
+-      UploadPartRequest request = new UploadPartRequest()
+-          .withBucketName(bucket)
+-          .withKey(key)
+-          .withUploadId(uploadId)
+-          .withPartNumber(partNumber)
+-          .withPartSize(size);
+-      if (uploadStream != null) {
+-        // there's an upload stream. Bind to it.
+-        request.setInputStream(uploadStream);
+-      } else {
+-        request.setFile(sourceFile);
+-      }
+-      return request;
+-    }
++    switch (capability.toLowerCase(Locale.ENGLISH)) {
+-    /**
+-     * The toString method is intended to be used in logging/toString calls.
+-     * @return a string description.
+-     */
+-    @Override
+-    public String toString() {
+-      final StringBuilder sb = new StringBuilder(
+-          "{bucket=").append(bucket);
+-      sb.append(", key='").append(key).append('\'');
+-      sb.append('}');
+-      return sb.toString();
+-    }
++    case CommitConstants.STORE_CAPABILITY_MAGIC_COMMITTER:
++      // capability depends on FS configuration
++      return isMagicCommitEnabled();
+-    /**
+-     * PUT an object directly (i.e. not via the transfer manager).
+-     * @param putObjectRequest the request
+-     * @return the upload initiated
+-     * @throws IOException on problems
+-     */
+-    PutObjectResult putObject(PutObjectRequest putObjectRequest)
+-        throws IOException {
+-      try {
+-        return putObjectDirect(putObjectRequest);
+-      } catch (AmazonClientException e) {
+-        throw translateException("put", putObjectRequest.getKey(), e);
+-      }
++    default:
++      return false;
+
+MOV26 MOV26 MOV26 MOV26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 MOV31 INS40 INS40 INS40 INS40 UPD40 UPD40 UPD40 UPD40 UPD40 INS40 INS40 INS40 INS40 UPD40 INS43 INS23 INS23 INS23 INS23 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS31 MOV31 MOV31 MOV31 INS31 INS31 INS31 MOV31 MOV31 MOV31 INS31 INS31 INS31 INS31 INS31 INS31 MOV31 INS42 INS29 INS83 INS83 INS83 INS39 INS59 INS83 INS43 INS59 INS83 INS83 INS43 INS59 INS83 INS83 INS43 INS59 INS29 INS83 INS83 INS43 INS42 INS8 INS78 MOV8 INS78 INS78 INS83 INS39 INS42 INS44 INS43 INS8 MOV29 INS78 UPD83 MOV83 INS39 INS42 INS44 INS8 INS29 INS78 INS83 INS43 INS42 INS44 INS8 INS29 INS83 INS39 INS42 INS44 INS8 INS78 INS78 MOV8 INS29 MOV78 INS39 INS42 MOV8 INS29 INS78 INS83 INS39 INS42 INS44 MOV8 INS29 INS43 INS42 INS8 INS83 INS29 INS78 INS83 INS43 INS42 INS8 INS29 INS83 INS39 UPD42 MOV42 MOV44 MOV8 INS83 INS39 INS42 INS44 INS44 INS44 INS8 INS83 UPD42 MOV44 INS44 INS78 INS43 INS78 INS43 INS8 INS83 UPD42 INS44 INS8 INS78 INS43 INS8 INS78 INS78 UPD83 INS43 UPD43 MOV29 INS78 INS39 INS42 INS44 INS44 INS44 MOV43 INS43 MOV8 INS78 INS43 INS29 INS78 MOV83 MOV43 INS42 MOV44 MOV8 MOV60 INS78 INS78 INS78 UPD43 INS78 INS78 INS29 INS78 INS29 INS39 UPD42 MOV42 MOV44 MOV43 MOV43 MOV8 MOV8 INS78 INS78 INS78 INS78 MOV8 INS78 MOV60 INS78 INS43 INS42 MOV44 INS44 MOV43 INS8 UPD43 UPD42 MOV44 MOV43 INS78 INS43 UPD42 UPD43 INS79 INS79 INS29 INS78 UPD43 INS29 INS78 UPD43 INS29 INS83 INS39 INS42 INS8 INS29 INS83 INS39 INS42 INS44 INS8 INS78 INS29 INS78 INS78 INS83 UPD74 MOV74 INS42 MOV44 INS43 INS8 INS29 INS78 INS39 INS42 INS44 MOV44 INS8 INS29 INS78 INS39 INS42 INS44 INS8 INS29 INS83 INS43 INS42 INS8 MOV78 INS83 INS39 INS42 INS44 INS8 INS65 INS42 INS9 INS42 INS42 INS14 INS42 INS42 INS90 INS32 INS42 INS42 INS21 INS21 INS65 INS65 INS42 INS41 INS40 INS40 UPD65 INS65 INS40 INS39 INS42 INS42 INS21 MOV60 INS21 MOV21 INS65 INS65 INS42 INS43 INS42 MOV21 INS65 INS65 INS65 INS42 INS42 INS43 INS42 MOV21 INS41 INS65 INS65 UPD43 MOV43 UPD42 MOV42 MOV21 INS21 INS21 INS40 INS40 INS65 INS65 INS65 INS65 INS42 INS43 INS42 INS65 INS65 INS42 INS41 INS60 INS60 INS60 MOV65 UPD65 MOV65 INS40 INS42 INS41 INS21 INS65 INS65 UPD43 UPD42 INS60 INS21 INS21 INS65 INS65 UPD65 INS43 INS42 UPD43 UPD42 INS39 INS42 INS39 INS42 INS21 INS65 INS65 INS65 UPD42 UPD39 UPD42 INS39 INS42 INS65 INS40 INS42 INS65 INS40 INS42 MOV21 MOV21 INS21 INS41 INS43 INS42 INS25 INS65 INS40 INS42 MOV21 INS21 INS41 INS65 INS65 INS42 INS40 INS42 UPD42 INS21 INS65 INS65 INS65 UPD65 INS40 INS43 INS42 INS43 INS42 INS39 INS42 INS42 INS25 INS40 INS42 INS21 INS65 MOV65 MOV65 INS40 INS60 MOV21 MOV65 MOV65 INS40 INS40 INS40 UPD42 INS40 INS40 INS21 INS65 INS65 INS65 INS65 INS40 INS65 INS65 MOV65 INS65 INS43 INS42 INS60 MOV25 INS40 INS40 INS40 INS65 INS40 INS40 INS21 INS65 INS65 INS65 INS40 INS42 INS43 INS42 MOV60 MOV60 MOV60 INS60 MOV21 INS60 MOV21 MOV21 INS41 UPD42 UPD43 UPD42 INS60 INS54 INS65 INS65 INS40 INS42 MOV43 INS42 UPD42 INS21 INS41 INS40 INS45 INS40 INS45 INS65 INS65 INS65 INS40 UPD42 INS65 INS65 INS65 INS40 MOV42 INS21 INS21 INS65 INS65 INS41 INS65 MOV65 UPD65 MOV65 INS43 INS42 INS41 INS40 INS65 UPD65 MOV65 MOV65 UPD65 MOV65 INS40 INS40 UPD43 MOV43 UPD42 INS42 INS60 INS25 INS41 INS65 INS65 INS65 INS40 MOV43 INS42 MOV21 INS21 INS65 INS65 INS40 INS43 INS42 INS60 INS60 MOV21 MOV21 INS25 MOV21 INS65 INS65 INS40 MOV41 UPD43 MOV43 UPD42 MOV42 INS50 INS66 INS66 INS66 INS66 INS66 INS66 INS43 INS40 INS40 INS52 INS42 INS42 INS32 INS32 MOV21 MOV21 INS66 INS66 INS11 INS66 UPD66 INS42 INS66 INS42 INS66 INS32 INS32 INS32 UPD66 MOV66 INS65 UPD66 MOV66 UPD66 MOV66 INS42 UPD66 MOV66 INS42 INS66 INS66 INS66 INS66 INS42 INS66 INS66 INS42 INS32 INS42 INS66 INS42 INS66 UPD42 INS32 INS7 INS66 INS32 UPD66 MOV66 UPD66 MOV66 UPD66 MOV66 INS42 UPD66 MOV66 INS42 INS66 INS66 INS42 INS66 INS66 INS83 INS43 INS59 INS43 INS59 INS43 INS59 UPD66 UPD65 UPD66 UPD66 UPD66 MOV66 UPD66 UPD66 UPD66 MOV14 INS32 UPD66 MOV66 UPD66 MOV66 INS66 INS42 INS66 UPD42 UPD43 MOV43 INS59 INS32 INS32 UPD66 UPD66 INS42 INS66 UPD42 UPD66 INS42 INS66 INS42 UPD66 UPD42 MOV42 UPD42 INS32 UPD66 INS65 INS66 INS66 INS42 INS66 INS42 INS66 INS42 INS66 INS66 INS42 INS66 INS66 INS42 INS66 INS32 INS32 UPD66 UPD42 UPD66 INS42 INS42 INS8 INS8 INS66 INS42 INS66 INS32 INS32 UPD66 INS66 INS66 INS42 INS66 INS42 INS66 INS66 INS32 UPD66 UPD66 UPD66 INS42 INS66 INS42 INS66 UPD42 UPD66 INS42 INS66 INS42 UPD66 INS42 INS42 INS42 INS8 INS8 INS66 INS8 INS32 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS39 INS59 INS66 INS66 INS66 UPD66 INS66 INS66 UPD66 INS8 INS32 INS66 INS66 INS66 INS42 INS66 INS42 INS66 INS42 INS66 INS66 INS66 INS42 INS66 INS42 INS66 INS42 MOV43 INS59 INS32 UPD66 INS66 INS66 INS42 INS66 INS43 INS59 INS32 INS66 INS66 UPD66 INS66 INS65 INS66 INS42 INS66 INS42 INS66 UPD66 INS42 INS66 INS42 UPD43 MOV43 INS59 INS43 INS59 INS42 UPD66 INS66 INS66 INS65 INS66 UPD42 UPD66 UPD42 UPD66 UPD66 UPD42 UPD66 UPD42 INS43 INS59 INS8 INS12 UPD66 INS66 UPD42 UPD66 INS66 UPD66 INS42 INS66 INS32 INS32 UPD66 INS66 INS66 INS42 INS66 INS42 INS66 INS66 INS66 INS42 INS66 INS42 INS66 INS32 INS32 UPD66 MOV66 UPD66 MOV66 INS32 INS66 UPD66 MOV66 UPD42 UPD66 UPD66 INS42 INS32 UPD66 MOV66 INS66 UPD66 UPD42 UPD66 INS42 UPD66 UPD42 INS43 INS59 INS38 INS8 INS32 INS66 INS66 INS42 INS66 INS42 INS66 INS32 INS66 INS66 INS42 INS66 INS42 MOV43 INS59 INS43 INS59 INS7 INS7 INS32 INS8 INS66 INS66 UPD66 UPD42 UPD66 UPD66 UPD42 INS32 INS49 INS41 INS49 INS41 INS42 INS42 INS42 UPD42 MOV42 UPD42 MOV42 INS45 UPD42 MOV42 INS21 INS60 INS21 INS21 MOV43 INS32 INS32 INS42 INS42 INS27 INS42 INS42 INS45 INS42 INS42 INS42 INS45 INS42 INS9 INS86 INS42 INS22 UPD42 MOV42 UPD42 MOV42 INS45 UPD42 MOV42 UPD42 UPD42 INS42 INS45 INS42 INS42 INS45 INS42 INS42 INS42 INS42 INS42 INS45 INS42 INS9 INS86 UPD42 UPD45 INS42 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS32 INS66 INS52 INS42 INS42 INS42 UPD42 UPD42 MOV42 INS16 UPD42 MOV42 UPD42 MOV42 INS42 INS34 INS42 UPD42 MOV42 INS42 INS34 UPD42 UPD42 MOV42 UPD42 MOV42 INS42 UPD42 UPD42 INS32 INS42 INS42 INS42 INS42 INS32 INS9 INS86 MOV21 MOV21 INS42 INS42 INS42 INS42 INS32 INS9 INS86 INS42 INS42 INS27 INS42 INS86 MOV21 MOV21 INS21 INS42 INS42 INS32 INS45 INS42 INS32 UPD42 INS42 INS45 INS32 INS21 MOV21 INS21 INS42 MOV42 INS42 INS32 INS42 INS45 INS32 INS86 INS42 INS42 INS33 INS42 INS42 INS27 INS32 INS9 INS86 INS66 UPD42 INS42 MOV32 INS42 INS14 UPD42 MOV42 INS42 INS32 INS66 INS42 INS42 INS32 INS60 MOV21 INS41 MOV44 INS8 UPD45 INS32 UPD42 MOV42 UPD42 MOV42 INS32 INS42 INS42 INS42 INS42 INS45 INS42 INS9 INS86 INS32 INS42 INS32 INS42 INS42 INS42 INS42 INS42 UPD42 MOV42 INS42 INS14 INS32 INS25 MOV21 UPD42 MOV42 UPD42 MOV42 INS45 INS42 INS9 INS86 UPD42 UPD45 UPD42 INS32 INS42 INS14 INS42 INS42 INS42 INS42 INS32 INS42 INS32 INS42 INS42 MOV60 MOV21 INS32 UPD42 INS14 UPD42 UPD42 UPD42 MOV42 UPD42 MOV42 INS40 INS40 INS32 INS9 INS32 INS39 INS59 INS32 INS7 INS32 INS40 INS42 INS40 INS86 INS42 INS42 INS45 INS42 INS9 INS86 INS42 INS34 MOV32 INS52 INS42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV32 UPD42 INS42 INS42 INS42 UPD42 INS42 INS42 INS42 INS42 INS42 INS42 UPD42 INS32 INS42 INS32 INS42 INS42 INS42 INS42 INS27 INS9 INS86 INS42 INS42 MOV8 INS42 INS42 MOV8 INS45 INS42 INS45 INS42 INS8 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS32 UPD42 MOV42 UPD42 MOV42 INS42 INS42 MOV32 UPD45 MOV45 MOV42 UPD45 MOV45 INS42 INS42 INS32 MOV43 INS52 INS42 INS42 INS42 UPD42 MOV42 MOV42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 INS43 INS59 INS42 INS21 INS21 INS21 INS53 UPD42 MOV42 INS42 INS42 UPD84 MOV32 INS42 INS42 INS45 INS42 INS43 INS42 UPD42 MOV42 UPD42 MOV42 INS38 INS8 INS32 INS42 MOV43 INS32 INS42 INS42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 UPD43 UPD42 MOV42 INS43 INS32 INS42 INS42 INS42 UPD42 INS14 INS42 INS42 INS45 INS42 INS42 INS32 INS42 INS42 INS45 INS16 INS42 INS14 INS42 MOV32 MOV14 MOV32 INS21 INS8 UPD42 INS42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 INS45 INS42 INS8 MOV21 MOV21 INS41 INS42 INS42 INS45 INS42 INS86 INS42 INS32 INS42 INS42 INS42 INS42 INS9 INS42 INS42 INS42 INS42 INS42 MOV32 UPD42 INS9 INS32 INS32 INS32 INS32 INS11 UPD43 UPD42 MOV42 INS32 INS21 UPD42 INS42 UPD42 INS32 UPD42 MOV42 UPD42 MOV42 UPD42 UPD42 INS14 UPD42 MOV42 UPD42 MOV42 UPD45 MOV45 UPD42 MOV42 UPD42 MOV42 INS32 INS32 INS42 INS42 UPD43 MOV43 INS14 INS42 INS42 INS42 INS40 INS40 INS42 INS45 INS45 INS43 INS52 INS42 INS32 UPD43 MOV21 MOV21 UPD42 INS42 UPD42 UPD42 MOV21 INS41 INS33 MOV8 INS42 INS42 UPD42 MOV42 UPD42 MOV42 MOV42 UPD42 MOV42 UPD45 MOV45 UPD42 MOV42 INS9 MOV32 UPD42 MOV42 INS42 MOV43 INS32 UPD42 UPD42 MOV42 UPD42 MOV42 INS45 INS7 INS42 INS42 INS42 UPD43 MOV43 UPD45 MOV45 UPD42 MOV42 INS42 INS42 INS42 INS32 INS42 INS43 INS32 INS42 INS42 INS42 UPD42 MOV43 MOV43 MOV32 MOV21 INS41 UPD42 INS42 INS9 UPD42 UPD42 INS14 INS42 INS42 INS42 INS27 UPD42 INS42 INS42 UPD42 MOV42 INS42 UPD42 UPD42 MOV32 MOV43 INS27 UPD42 MOV42 INS45 UPD45 INS45 INS32 INS42 INS42 DEL42 DEL32 DEL7 DEL21 DEL40 DEL40 DEL42 DEL40 DEL42 DEL78 DEL83 DEL43 DEL42 DEL41 DEL8 DEL31 DEL1 DEL14 DEL32 DEL11 DEL42 DEL7 DEL42 DEL43 DEL42 DEL44 DEL42 DEL42 DEL42 DEL42 DEL32 DEL42 DEL32 DEL21 DEL42 DEL45 DEL42 DEL42 DEL32 DEL53 DEL8 DEL12 DEL42 DEL43 DEL42 DEL44 DEL42 DEL42 DEL42 DEL42 DEL32 DEL42 DEL32 DEL21 DEL42 DEL45 DEL42 DEL42 DEL32 DEL53 DEL8 DEL12 DEL42 DEL43 DEL42 DEL44 DEL42 DEL45 DEL42 DEL42 DEL32 DEL53 DEL8 DEL12 DEL54 DEL8 DEL42 DEL42 DEL42 DEL32 DEL34 DEL27 DEL8 DEL42 DEL45 DEL42 DEL42 DEL32 DEL53 DEL8 DEL25 DEL8 DEL39 DEL42 DEL66 DEL66 DEL66 DEL66 DEL66 DEL66 DEL65 DEL42 DEL32 DEL42 DEL32 DEL32 DEL7 DEL9 DEL42 DEL43 DEL42 DEL44 DEL42 DEL45 DEL42 DEL42 DEL32 DEL53 DEL8 DEL12 DEL54 DEL8 DEL45 DEL83 DEL42 DEL65 DEL42 DEL42 DEL42 DEL32 DEL32 DEL32 DEL59 DEL60 DEL42 DEL41 DEL43 DEL42 DEL39 DEL42 DEL39 DEL42 DEL42 DEL32 DEL11 DEL59 DEL60 DEL42 DEL43 DEL42 DEL42 DEL42 DEL32 DEL42 DEL32 DEL59 DEL60 DEL42 DEL41 DEL8 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL32 DEL21 DEL42 DEL42 DEL42 DEL42 DEL32 DEL38 DEL32 DEL21 DEL42 DEL42 DEL45 DEL52 DEL42 DEL32 DEL21 DEL8 DEL21 DEL9 DEL42 DEL39 DEL42 DEL59 DEL60 DEL42 DEL42 DEL32 DEL33 DEL27 DEL8 DEL8 DEL25 DEL44 DEL42 DEL53 DEL8 DEL12 DEL54 DEL8 DEL31 DEL83 DEL42 DEL42 DEL42 DEL32 DEL21 DEL42 DEL42 DEL32 DEL59 DEL60 DEL39 DEL42 DEL42 DEL52 DEL32 DEL41 DEL42 DEL43 DEL42 DEL44 DEL42 DEL45 DEL42 DEL42 DEL32 DEL53 DEL8 DEL12 DEL54 DEL8 DEL42 DEL43 DEL42 DEL44 DEL42 DEL45 DEL42 DEL45 DEL42 DEL45 DEL27 DEL42 DEL42 DEL32 DEL53 DEL8 DEL12 DEL54 DEL8 DEL42 DEL52 DEL42 DEL42 DEL33 DEL14 DEL59 DEL21 DEL8 DEL42 DEL43 DEL42 DEL44 DEL42 DEL45 DEL27 DEL14 DEL53 DEL8 DEL12 DEL54 DEL83 DEL42 DEL42 DEL42 DEL42 DEL34 DEL38 DEL32 DEL14 DEL42 DEL42 DEL42 DEL45 DEL32 DEL21 DEL42 DEL42 DEL42 DEL32 DEL21 DEL42 DEL42 DEL32 DEL21 DEL42 DEL42 DEL42 DEL32 DEL42 DEL32 DEL41 DEL8 DEL43 DEL42 DEL44 DEL45 DEL32 DEL53 DEL8 DEL12 DEL54 DEL8 DEL42 DEL44 DEL42 DEL32 DEL38 DEL45 DEL42 DEL42 DEL32 DEL21 DEL42 DEL42 DEL32 DEL21 DEL32 DEL21 DEL42 DEL42 DEL43 DEL42 DEL42 DEL42 DEL42 DEL43 DEL74 DEL42 DEL14 DEL14 DEL32 DEL41 DEL39 DEL42 DEL43 DEL42 DEL42 DEL42 DEL42 DEL14 DEL32 DEL21 DEL42 DEL43 DEL42 DEL43 DEL42 DEL32 DEL59 DEL60 DEL42 DEL42 DEL32 DEL42 DEL32 DEL21 DEL8 DEL45 DEL42 DEL27 DEL14 DEL53 DEL8 DEL12 DEL54 DEL42 DEL42 DEL39 DEL42 DEL42 DEL34 DEL27 DEL45 DEL42 DEL42 DEL32 DEL42 DEL32 DEL83 DEL14 DEL42 DEL42 DEL32 DEL32 DEL32 DEL13 DEL13 DEL42 DEL66 DEL65 DEL42 DEL43 DEL42 DEL41 DEL8 DEL44 DEL45 DEL32 DEL53 DEL8 DEL12 DEL54 DEL8 DEL66 DEL66 DEL66 DEL66 DEL66 DEL66 DEL66 DEL66 DEL66 DEL66 DEL66 DEL65 DEL29 DEL83 DEL42 DEL83 DEL83 DEL42 DEL59 DEL23 DEL83 DEL42 DEL31 DEL42 DEL65 DEL65 DEL29 DEL42 DEL43 DEL39 DEL42 DEL44 DEL31 DEL42 DEL43 DEL31 DEL66 DEL66 DEL65 DEL66 DEL65 DEL65 DEL42 DEL65 DEL29 DEL42 DEL43 DEL42 DEL39 DEL42 DEL44 DEL43 DEL42 DEL44 DEL43 DEL42 DEL44 DEL42 DEL32 DEL21 DEL42 DEL33 DEL27 DEL36 DEL33 DEL27 DEL36 DEL27 DEL45 DEL32 DEL21 DEL42 DEL34 DEL27 DEL42 DEL34 DEL27 DEL27 DEL45 DEL32 DEL21 DEL42 DEL43 DEL42 DEL42 DEL43 DEL14 DEL42 DEL32 DEL42 DEL42 DEL32 DEL42 DEL42 DEL32 DEL42 DEL42 DEL32 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL33 DEL27 DEL8 DEL8 DEL25 DEL42 DEL41 DEL8 DEL31 DEL66 DEL65 DEL66 DEL65 DEL29 DEL83 DEL42 DEL8 DEL31 DEL55

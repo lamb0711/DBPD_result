@@ -1,0 +1,398 @@
+YARN-2496. Enhanced Capacity Scheduler to have basic support for allocating resources based on node-labels. Contributed by Wangda Tan.
+YARN-2500. Ehnaced ResourceManager to support schedulers allocating resources based on node-labels. Contributed by Wangda Tan.
+
++import java.util.HashSet;
++import org.apache.commons.lang.StringUtils;
++import org.apache.hadoop.yarn.nodelabels.CommonNodeLabelsManager;
++import org.apache.hadoop.yarn.server.resourcemanager.nodelabels.RMNodeLabelsManager;
+-import org.apache.hadoop.yarn.server.resourcemanager.scheduler.QueueMetrics;
++import org.apache.hadoop.yarn.server.resourcemanager.scheduler.SchedulerUtils;
+-import org.apache.hadoop.yarn.util.resource.ResourceCalculator;
++import com.google.common.collect.Sets;
++
+-public class ParentQueue implements CSQueue {
++public class ParentQueue extends AbstractCSQueue {
+-  private CSQueue parent;
+-  private final String queueName;
+-  
+-  private float capacity;
+-  private float maximumCapacity;
+-  private float absoluteCapacity;
+-  private float absoluteMaxCapacity;
+-  private float absoluteUsedCapacity = 0.0f;
+-
+-  private float usedCapacity = 0.0f;
+-
+-  protected final Set<CSQueue> childQueues;
+-  private final Comparator<CSQueue> queueComparator;
+-  
+-  private Resource usedResources = Resources.createResource(0, 0);
+-  
++  protected final Set<CSQueue> childQueues;  
+-  
+-  private final Resource minimumAllocation;
+-
+-  private volatile int numApplications;
+-  private volatile int numContainers;
+-
+-  private QueueState state;
+-
+-  private final QueueMetrics metrics;
+-
+-  private QueueInfo queueInfo; 
+-
+-  private Map<QueueACL, AccessControlList> acls = 
+-    new HashMap<QueueACL, AccessControlList>();
++  final Comparator<CSQueue> queueComparator;
++  volatile int numApplications;
+-  private final ResourceCalculator resourceCalculator;
+-
+-  private boolean reservationsContinueLooking;
+-  
+-      String queueName, CSQueue parent, CSQueue old) {
+-    minimumAllocation = cs.getMinimumResourceCapability();
++      String queueName, CSQueue parent, CSQueue old) throws IOException {
++    super(cs, queueName, parent, old);
+-    this.parent = parent;
+-    this.queueName = queueName;
+-    this.rootQueue = (parent == null);
+-    this.resourceCalculator = cs.getResourceCalculator();
++    this.queueComparator = cs.getQueueComparator();
+-    // must be called after parent and queueName is set
+-    this.metrics = old != null ? old.getMetrics() :
+-        QueueMetrics.forQueue(getQueuePath(), parent,
+-			      cs.getConfiguration().getEnableUserMetrics(),
+-			      cs.getConf());
++    this.rootQueue = (parent == null);
+-    
+-    this.queueInfo = recordFactory.newRecordInstance(QueueInfo.class);
+-    this.queueInfo.setQueueName(queueName);
++
+-    setupQueueConfigs(cs.getClusterResource(),
+-        capacity, absoluteCapacity, 
+-        maximumCapacity, absoluteMaxCapacity, state, acls,
++    setupQueueConfigs(cs.getClusterResource(), capacity, absoluteCapacity,
++        maximumCapacity, absoluteMaxCapacity, state, acls, accessibleLabels,
++        defaultLabelExpression, capacitiyByNodeLabels, maxCapacityByNodeLabels, 
+-    this.queueComparator = cs.getQueueComparator();
+-  protected synchronized void setupQueueConfigs(
+-      Resource clusterResource,
+-      float capacity, float absoluteCapacity, 
+-      float maximumCapacity, float absoluteMaxCapacity,
++  synchronized void setupQueueConfigs(Resource clusterResource, float capacity,
++      float absoluteCapacity, float maximumCapacity, float absoluteMaxCapacity,
+-      boolean continueLooking
+-  ) {
+-    // Sanity check
+-    CSQueueUtils.checkMaxCapacity(getQueueName(), capacity, maximumCapacity);
+-    CSQueueUtils.checkAbsoluteCapacities(getQueueName(), absoluteCapacity, absoluteMaxCapacity);
+-
+-    this.capacity = capacity;
+-    this.absoluteCapacity = absoluteCapacity;
+-
+-    this.maximumCapacity = maximumCapacity;
+-    this.absoluteMaxCapacity = absoluteMaxCapacity;
+-
+-    this.state = state;
+-
+-    this.acls = acls;
+-    
+-    this.queueInfo.setCapacity(this.capacity);
+-    this.queueInfo.setMaximumCapacity(this.maximumCapacity);
+-    this.queueInfo.setQueueState(this.state);
+-
+-    this.reservationsContinueLooking = continueLooking;
+-
+-    StringBuilder aclsString = new StringBuilder();
++      Set<String> accessibleLabels, String defaultLabelExpression,
++      Map<String, Float> nodeLabelCapacities,
++      Map<String, Float> maximumCapacitiesByLabel, 
++      boolean reservationContinueLooking) throws IOException {
++    super.setupQueueConfigs(clusterResource, capacity, absoluteCapacity,
++        maximumCapacity, absoluteMaxCapacity, state, acls, accessibleLabels,
++        defaultLabelExpression, nodeLabelCapacities, maximumCapacitiesByLabel,
++        reservationContinueLooking);
++   StringBuilder aclsString = new StringBuilder();
+-    // Update metrics
+-    CSQueueUtils.updateQueueStatistics(
+-        resourceCalculator, this, parent, clusterResource, minimumAllocation);
++    StringBuilder labelStrBuilder = new StringBuilder(); 
++    if (accessibleLabels != null) {
++      for (String s : accessibleLabels) {
++        labelStrBuilder.append(s);
++        labelStrBuilder.append(",");
++      }
++    }
+-        ", acls=" + aclsString +
++        ", acls=" + aclsString + 
++        ", labels=" + labelStrBuilder.toString() + "\n" +
+-    
++    // check label capacities
++    for (String nodeLabel : labelManager.getClusterNodeLabels()) {
++      float capacityByLabel = getCapacityByNodeLabel(nodeLabel);
++      // check children's labels
++      float sum = 0;
++      for (CSQueue queue : childQueues) {
++        sum += queue.getCapacityByNodeLabel(nodeLabel);
++      }
++      if ((capacityByLabel > 0 && Math.abs(1.0f - sum) > PRECISION)
++          || (capacityByLabel == 0) && (sum > 0)) {
++        throw new IllegalArgumentException("Illegal" + " capacity of "
++            + sum + " for children of queue " + queueName
++            + " for label=" + nodeLabel);
++      }
++    }
+-  
+-  @Override
+-  public synchronized CSQueue getParent() {
+-    return parent;
+-  }
+-
+-  @Override
+-  public synchronized void setParent(CSQueue newParentQueue) {
+-    this.parent = (ParentQueue)newParentQueue;
+-  }
+-  
+-  @Override
+-  public String getQueueName() {
+-    return queueName;
+-  }
+-  public synchronized float getCapacity() {
+-    return capacity;
+-  }
+-
+-  @Override
+-  public synchronized float getAbsoluteCapacity() {
+-    return absoluteCapacity;
+-  }
+-
+-  @Override
+-  public float getAbsoluteMaximumCapacity() {
+-    return absoluteMaxCapacity;
+-  }
+-
+-  @Override
+-  public synchronized float getAbsoluteUsedCapacity() {
+-    return absoluteUsedCapacity;
+-  }
+-
+-  @Override
+-  public float getMaximumCapacity() {
+-    return maximumCapacity;
+-  }
+-
+-  @Override
+-  public ActiveUsersManager getActiveUsersManager() {
+-    // Should never be called since all applications are submitted to LeafQueues
+-    return null;
+-  }
+-
+-  @Override
+-  public synchronized float getUsedCapacity() {
+-    return usedCapacity;
+-  }
+-
+-  @Override
+-  public synchronized Resource getUsedResources() {
+-    return usedResources;
+-  }
+-  
+-  @Override
+-  public synchronized List<CSQueue> getChildQueues() {
+-    return new ArrayList<CSQueue>(childQueues);
+-  }
+-
+-  public synchronized int getNumContainers() {
+-    return numContainers;
+-  }
+-  
+-  public synchronized int getNumApplications() {
+-    return numApplications;
+-  }
+-
+-  @Override
+-  public synchronized QueueState getState() {
+-    return state;
+-  }
+-
+-  @Override
++        newlyParsedParentQueue.accessibleLabels,
++        newlyParsedParentQueue.defaultLabelExpression,
++        newlyParsedParentQueue.capacitiyByNodeLabels,
++        newlyParsedParentQueue.maxCapacityByNodeLabels,
+-  
+-  @Override
+-  public boolean hasAccess(QueueACL acl, UserGroupInformation user) {
+-    synchronized (this) {
+-      if (acls.get(acl).isUserAllowed(user)) {
+-        return true;
+-      }
+-    }
+-    
+-    if (parent != null) {
+-      return parent.hasAccess(acl, user);
+-    }
+-    
+-    return false;
+-  }
+-  public synchronized void removeApplication(ApplicationId applicationId, 
++  private synchronized void removeApplication(ApplicationId applicationId, 
+-  
+-  @Override
+-  public synchronized void setUsedCapacity(float usedCapacity) {
+-    this.usedCapacity = usedCapacity;
+-  }
+-  
+-  @Override
+-  public synchronized void setAbsoluteUsedCapacity(float absUsedCapacity) {
+-    this.absoluteUsedCapacity = absUsedCapacity;
+-  }
+-
+-  /**
+-   * Set maximum capacity - used only for testing.
+-   * @param maximumCapacity new max capacity
+-   */
+-  synchronized void setMaxCapacity(float maximumCapacity) {
+-    // Sanity check
+-    CSQueueUtils.checkMaxCapacity(getQueueName(), capacity, maximumCapacity);
+-    float absMaxCapacity = CSQueueUtils.computeAbsoluteMaximumCapacity(maximumCapacity, parent);
+-    CSQueueUtils.checkAbsoluteCapacities(getQueueName(), absoluteCapacity, absMaxCapacity);
+-    
+-    this.maximumCapacity = maximumCapacity;
+-    this.absoluteMaxCapacity = absMaxCapacity;
+-  }
++    // if our queue cannot access this node, just return
++    if (!SchedulerUtils.checkQueueAccessToNode(accessibleLabels,
++        labelManager.getLabelsOnNode(node.getNodeID()))) {
++      return assignment;
++    }
++    
++      Set<String> nodeLabels = labelManager.getLabelsOnNode(node.getNodeID()); 
++      
+-      if (!assignToQueue(clusterResource)) {
++      if (!canAssignToThisQueue(clusterResource, nodeLabels)) {
+-        allocateResource(clusterResource, assignedToChild.getResource());
++        super.allocateResource(clusterResource, assignedToChild.getResource(),
++            nodeLabels);
+-  private synchronized boolean assignToQueue(Resource clusterResource) {
+-    // Check how of the cluster's absolute capacity we are currently using...
+-    float currentCapacity =
+-        Resources.divide(
+-            resourceCalculator, clusterResource, 
+-            usedResources, clusterResource);
+-    
+-    if (currentCapacity >= absoluteMaxCapacity) {
+-      LOG.info(getQueueName() + 
+-          " used=" + usedResources + 
+-          " current-capacity (" + currentCapacity + ") " +
+-          " >= max-capacity (" + absoluteMaxCapacity + ")");
+-      return false;
++  private synchronized boolean canAssignToThisQueue(Resource clusterResource,
++      Set<String> nodeLabels) {
++    Set<String> labelCanAccess =
++        new HashSet<String>(
++            accessibleLabels.contains(CommonNodeLabelsManager.ANY) ? nodeLabels
++                : Sets.intersection(accessibleLabels, nodeLabels));
++    if (nodeLabels.isEmpty()) {
++      // Any queue can always access any node without label
++      labelCanAccess.add(RMNodeLabelsManager.NO_LABEL);
+-    return true;
+-
++    
++    boolean canAssign = true;
++    for (String label : labelCanAccess) {
++      if (!usedResourcesByNodeLabels.containsKey(label)) {
++        usedResourcesByNodeLabels.put(label, Resources.createResource(0));
++      }
++      float currentAbsoluteLabelUsedCapacity =
++          Resources.divide(resourceCalculator, clusterResource,
++              usedResourcesByNodeLabels.get(label),
++              labelManager.getResourceByLabel(label, clusterResource));
++      // if any of the label doesn't beyond limit, we can allocate on this node
++      if (currentAbsoluteLabelUsedCapacity >= 
++            getAbsoluteMaximumCapacityByNodeLabel(label)) {
++        if (LOG.isDebugEnabled()) {
++          LOG.debug(getQueueName() + " used=" + usedResources
++              + " current-capacity (" + usedResourcesByNodeLabels.get(label) + ") "
++              + " >= max-capacity ("
++              + labelManager.getResourceByLabel(label, clusterResource) + ")");
++        }
++        canAssign = false;
++        break;
++      }
++    }
++    
++    return canAssign;
+-  synchronized CSAssignment assignContainersToChildQueues(Resource cluster, 
++  private synchronized CSAssignment assignContainersToChildQueues(Resource cluster, 
+-      sb.append(q.getQueuePath() + "(" + q.getUsedCapacity() + "), ");
++      sb.append(q.getQueuePath() + 
++          "usedCapacity=(" + q.getUsedCapacity() + "), " + 
++          " label=("
++          + StringUtils.join(q.getAccessibleNodeLabels().iterator(), ",") 
++          + ")");
+-  void printChildQueues() {
++
++  private void printChildQueues() {
+-        releaseResource(clusterResource, 
+-            rmContainer.getContainer().getResource());
++        super.releaseResource(clusterResource, rmContainer.getContainer()
++            .getResource(), labelManager.getLabelsOnNode(node.getNodeID()));
+-  @Private
+-  boolean getReservationContinueLooking() {
+-    return reservationsContinueLooking;
+-  }
+-  
+-  synchronized void allocateResource(Resource clusterResource, 
+-      Resource resource) {
+-    Resources.addTo(usedResources, resource);
+-    CSQueueUtils.updateQueueStatistics(
+-        resourceCalculator, this, parent, clusterResource, minimumAllocation);
+-    ++numContainers;
+-  }
+-  
+-  synchronized void releaseResource(Resource clusterResource, 
+-      Resource resource) {
+-    Resources.subtractFrom(usedResources, resource);
+-    CSQueueUtils.updateQueueStatistics(
+-        resourceCalculator, this, parent, clusterResource, minimumAllocation);
+-    --numContainers;
+-  }
+-
+-  public QueueMetrics getMetrics() {
+-    return metrics;
++  public synchronized List<CSQueue> getChildQueues() {
++    return new ArrayList<CSQueue>(childQueues);
+-
+-      allocateResource(clusterResource,rmContainer.getContainer().getResource());
++      super.allocateResource(clusterResource, rmContainer.getContainer()
++          .getResource(), labelManager.getLabelsOnNode(rmContainer
++          .getContainer().getNodeId()));
++  
++  @Override
++  public ActiveUsersManager getActiveUsersManager() {
++    // Should never be called since all applications are submitted to LeafQueues
++    return null;
++  }
+-      allocateResource(clusterResource, rmContainer.getContainer()
+-          .getResource());
++      super.allocateResource(clusterResource, rmContainer.getContainer()
++          .getResource(), labelManager.getLabelsOnNode(rmContainer
++          .getContainer().getNodeId()));
+-      releaseResource(clusterResource, rmContainer.getContainer().getResource());
++      super.releaseResource(clusterResource,
++          rmContainer.getContainer().getResource(),
++          labelManager.getLabelsOnNode(rmContainer.getContainer().getNodeId()));
+-  public Map<QueueACL, AccessControlList> getACLs() {
+-    return acls;
++  @Override
++  public float getAbsActualCapacity() {
++    // for now, simply return actual capacity = guaranteed capacity for parent
++    // queue
++    return absoluteCapacity;
++  }
++  
++  public synchronized int getNumApplications() {
++    return numApplications;
+
+MOV26 MOV26 INS26 INS26 INS26 INS26 MOV23 MOV31 MOV31 MOV31 MOV31 INS40 INS40 INS40 UPD40 UPD40 INS40 UPD43 INS31 INS31 UPD42 INS43 MOV21 INS83 INS39 INS42 MOV44 MOV44 MOV44 MOV44 MOV44 MOV44 MOV44 INS44 INS44 INS44 INS44 INS44 INS43 MOV8 UPD83 UPD83 MOV83 MOV83 UPD39 MOV39 UPD42 MOV42 MOV44 INS44 INS8 INS83 INS83 UPD42 INS42 INS46 INS74 INS42 INS43 INS42 INS74 INS42 INS74 INS42 INS39 INS42 INS42 INS21 INS60 INS25 INS70 INS25 INS74 INS42 INS60 INS25 INS60 INS70 MOV41 INS42 INS42 INS42 INS42 INS43 MOV43 UPD42 MOV42 MOV43 UPD43 MOV43 UPD43 MOV43 MOV43 MOV43 UPD43 MOV43 INS48 INS43 INS59 INS27 INS8 INS44 INS32 INS8 INS38 INS8 INS43 INS43 INS74 INS59 INS32 INS8 INS39 INS59 INS44 INS42 INS8 UPD42 INS42 INS42 INS42 INS42 UPD42 MOV42 UPD42 UPD42 UPD42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS14 INS42 INS33 INS70 INS43 INS42 INS42 INS42 INS60 INS60 INS70 INS25 INS40 INS40 INS40 INS40 INS32 INS41 INS60 UPD42 MOV42 UPD42 MOV42 INS43 INS43 INS42 INS14 INS42 INS42 MOV21 INS42 INS9 INS43 INS42 INS25 MOV60 MOV25 INS43 INS44 INS42 INS8 INS45 INS32 INS45 INS42 INS39 INS59 INS39 INS59 INS44 INS42 INS8 INS27 INS8 INS42 INS42 INS42 INS32 INS42 INS74 INS59 UPD42 MOV42 UPD42 MOV42 INS74 INS16 INS32 INS42 INS38 INS8 INS48 INS48 INS48 INS42 INS43 INS42 MOV21 MOV21 INS42 INS42 INS42 INS32 INS42 INS34 MOV43 INS42 INS21 INS36 INS27 INS53 INS42 INS42 INS32 INS43 INS43 INS42 INS32 INS43 INS43 INS32 INS42 INS32 INS42 INS42 INS40 INS32 MOV21 UPD42 UPD42 INS32 INS25 INS21 INS10 INS42 INS42 INS32 INS32 INS42 INS42 MOV32 INS32 INS42 INS42 MOV32 INS32 INS42 INS42 INS42 INS42 INS7 INS27 INS36 INS36 INS14 INS42 INS42 INS42 INS42 INS42 INS42 INS32 UPD42 INS42 INS48 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 INS40 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 INS32 INS32 INS42 INS42 INS32 INS8 INS7 UPD45 INS45 INS32 INS45 INS48 INS32 INS42 INS42 INS42 INS32 INS42 INS42 MOV32 INS42 INS42 MOV32 INS42 UPD42 INS42 UPD42 UPD42 INS45 INS42 INS32 INS27 INS27 INS27 INS27 INS43 INS27 INS42 INS42 INS42 INS42 MOV32 INS42 UPD42 UPD42 UPD42 MOV42 INS32 UPD42 MOV42 INS42 INS42 INS42 INS42 INS42 MOV42 INS42 INS42 MOV21 INS42 INS9 INS42 INS42 INS32 INS45 INS42 INS42 INS32 INS32 INS42 INS42 INS32 INS42 UPD42 UPD42 INS42 INS42 INS42 INS42 INS34 INS32 INS42 INS42 INS34 INS42 INS34 INS42 INS27 INS42 INS45 INS42 INS45 INS42 UPD42 MOV42 UPD42 MOV42 INS34 INS32 INS42 INS32 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS27 INS45 INS45 UPD42 INS42 INS42 INS42 INS42 INS42 INS42 INS34 INS42 INS32 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 DEL83 DEL42 DEL43 DEL42 DEL59 DEL23 DEL83 DEL83 DEL42 DEL59 DEL23 DEL83 DEL39 DEL42 DEL59 DEL23 DEL83 DEL39 DEL42 DEL59 DEL23 DEL83 DEL39 DEL42 DEL59 DEL23 DEL83 DEL39 DEL42 DEL59 DEL23 DEL83 DEL39 DEL42 DEL34 DEL59 DEL23 DEL83 DEL39 DEL42 DEL34 DEL59 DEL23 DEL83 DEL42 DEL43 DEL42 DEL42 DEL42 DEL34 DEL34 DEL32 DEL59 DEL23 DEL83 DEL83 DEL83 DEL42 DEL43 DEL42 DEL59 DEL23 DEL83 DEL83 DEL83 DEL39 DEL42 DEL59 DEL23 DEL83 DEL43 DEL42 DEL59 DEL23 DEL83 DEL83 DEL43 DEL42 DEL59 DEL23 DEL83 DEL42 DEL43 DEL42 DEL59 DEL23 DEL83 DEL74 DEL42 DEL42 DEL43 DEL42 DEL43 DEL74 DEL14 DEL59 DEL23 DEL83 DEL83 DEL42 DEL43 DEL42 DEL59 DEL23 DEL83 DEL39 DEL42 DEL59 DEL23 DEL42 DEL42 DEL42 DEL32 DEL7 DEL21 DEL52 DEL42 DEL22 DEL42 DEL7 DEL21 DEL52 DEL42 DEL22 DEL42 DEL7 DEL21 DEL52 DEL42 DEL22 DEL42 DEL42 DEL32 DEL7 DEL21 DEL52 DEL42 DEL22 DEL42 DEL33 DEL27 DEL42 DEL42 DEL32 DEL42 DEL42 DEL42 DEL32 DEL42 DEL42 DEL42 DEL32 DEL42 DEL32 DEL42 DEL42 DEL32 DEL32 DEL16 DEL7 DEL21 DEL52 DEL42 DEL22 DEL42 DEL42 DEL42 DEL43 DEL57 DEL32 DEL7 DEL21 DEL52 DEL42 DEL22 DEL42 DEL42 DEL32 DEL21 DEL42 DEL42 DEL42 DEL32 DEL42 DEL42 DEL32 DEL21 DEL42 DEL42 DEL42 DEL32 DEL42 DEL42 DEL32 DEL21 DEL52 DEL42 DEL22 DEL42 DEL7 DEL21 DEL52 DEL42 DEL22 DEL42 DEL7 DEL21 DEL52 DEL42 DEL22 DEL42 DEL7 DEL21 DEL52 DEL42 DEL22 DEL42 DEL7 DEL21 DEL52 DEL42 DEL22 DEL42 DEL7 DEL21 DEL52 DEL42 DEL22 DEL42 DEL7 DEL21 DEL52 DEL42 DEL22 DEL42 DEL52 DEL42 DEL22 DEL32 DEL21 DEL52 DEL42 DEL22 DEL42 DEL52 DEL42 DEL22 DEL32 DEL21 DEL52 DEL42 DEL22 DEL42 DEL7 DEL21 DEL52 DEL42 DEL22 DEL52 DEL42 DEL22 DEL42 DEL42 DEL52 DEL42 DEL42 DEL83 DEL83 DEL39 DEL42 DEL39 DEL42 DEL44 DEL31 DEL42 DEL78 DEL42 DEL43 DEL42 DEL42 DEL41 DEL8 DEL31 DEL42 DEL78 DEL83 DEL83 DEL42 DEL44 DEL52 DEL42 DEL22 DEL43 DEL42 DEL11 DEL7 DEL21 DEL8 DEL31 DEL42 DEL78 DEL83 DEL42 DEL42 DEL41 DEL8 DEL31 DEL42 DEL78 DEL83 DEL83 DEL39 DEL42 DEL42 DEL41 DEL8 DEL31 DEL42 DEL78 DEL83 DEL39 DEL42 DEL42 DEL41 DEL8 DEL31 DEL42 DEL78 DEL83 DEL83 DEL39 DEL42 DEL42 DEL41 DEL8 DEL31 DEL42 DEL78 DEL83 DEL39 DEL42 DEL42 DEL41 DEL8 DEL31 DEL42 DEL78 DEL83 DEL83 DEL39 DEL42 DEL42 DEL41 DEL8 DEL31 DEL42 DEL78 DEL83 DEL83 DEL43 DEL42 DEL42 DEL41 DEL8 DEL31 DEL83 DEL83 DEL39 DEL42 DEL42 DEL41 DEL8 DEL31 DEL42 DEL78 DEL83 DEL83 DEL43 DEL42 DEL42 DEL41 DEL8 DEL31 DEL42 DEL78 DEL83 DEL39 DEL42 DEL43 DEL42 DEL44 DEL43 DEL42 DEL44 DEL52 DEL42 DEL32 DEL42 DEL42 DEL32 DEL9 DEL41 DEL8 DEL25 DEL8 DEL51 DEL42 DEL33 DEL27 DEL32 DEL41 DEL8 DEL25 DEL9 DEL41 DEL8 DEL31 DEL42 DEL78 DEL83 DEL83 DEL39 DEL42 DEL39 DEL42 DEL44 DEL52 DEL42 DEL22 DEL42 DEL7 DEL21 DEL8 DEL31 DEL42 DEL78 DEL83 DEL83 DEL39 DEL42 DEL39 DEL42 DEL44 DEL8 DEL31 DEL66 DEL65 DEL42 DEL66 DEL65 DEL29 DEL83 DEL39 DEL42 DEL39 DEL42 DEL44 DEL42 DEL42 DEL42 DEL32 DEL42 DEL42 DEL32 DEL21 DEL39 DEL42 DEL42 DEL32 DEL59 DEL60 DEL52 DEL42 DEL22 DEL42 DEL7 DEL21 DEL52 DEL42 DEL22 DEL42 DEL7 DEL21 DEL8 DEL31 DEL42 DEL42 DEL32 DEL52 DEL42 DEL22 DEL42 DEL7 DEL32 DEL42 DEL42 DEL42 DEL9 DEL41 DEL83 DEL83 DEL39 DEL42 DEL9 DEL41 DEL8 DEL31 DEL42 DEL42 DEL32 DEL42 DEL78 DEL39 DEL42 DEL8 DEL31 DEL83 DEL39 DEL42 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL44 DEL42 DEL42 DEL42 DEL42 DEL32 DEL21 DEL42 DEL42 DEL42 DEL52 DEL42 DEL42 DEL42 DEL32 DEL21 DEL42 DEL38 DEL21 DEL8 DEL31 DEL83 DEL39 DEL42 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL44 DEL42 DEL42 DEL42 DEL42 DEL32 DEL21 DEL42 DEL42 DEL42 DEL52 DEL42 DEL42 DEL42 DEL32 DEL21 DEL42 DEL38 DEL21 DEL8 DEL31 DEL42 DEL78 DEL83 DEL42 DEL43 DEL42 DEL42 DEL41 DEL8 DEL31 DEL42 DEL42 DEL32 DEL42 DEL42 DEL32 DEL42 DEL42 DEL32 DEL83 DEL83 DEL42 DEL43 DEL42 DEL43 DEL74 DEL42 DEL42 DEL41 DEL8 DEL31

@@ -1,0 +1,134 @@
+Merge r1550130 through r1555020 from trunk.
+
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/branches/HDFS-5535@1555021 13f79535-47bb-0310-9956-ffa450edef68
+
++import org.apache.hadoop.yarn.server.resourcemanager.scheduler.event.AppAddedSchedulerEvent;
++import org.apache.hadoop.yarn.server.resourcemanager.scheduler.event.AppRemovedSchedulerEvent;
++
++  // These states stored are only valid when app is at killing or final_saving.
++  private RMAppState stateBeforeKilling;
++
+-            RMAppState.RUNNING, RMAppState.FINISHED, RMAppState.FAILED,
++            RMAppState.ACCEPTED, RMAppState.FINISHED, RMAppState.FAILED,
+-        RMAppEventType.APP_NEW_SAVED, new StartAppAttemptTransition())
++        RMAppEventType.APP_NEW_SAVED, new AddApplicationToSchedulerTransition())
+-        RMAppEventType.APP_ACCEPTED)
++        RMAppEventType.APP_ACCEPTED, new StartAppAttemptTransition())
+-          new KillAppAndAttemptTransition(), RMAppState.KILLED))
++          new AppKilledTransition(), RMAppState.KILLED))
++
+-        EnumSet.of(RMAppState.SUBMITTED, RMAppState.FINAL_SAVING),
++        EnumSet.of(RMAppState.ACCEPTED, RMAppState.FINAL_SAVING),
++        // ACCEPTED state is possible to receive ATTEMPT_FAILED event because
++        // RMAppRecoveredTransition is returning ACCEPTED state directly and
++        // waiting for the previous AM to exit.
+-        new AttemptFailedTransition(RMAppState.SUBMITTED))
++        new AttemptFailedTransition(RMAppState.ACCEPTED))
+-          new KillAppAndAttemptTransition(), RMAppState.KILLED))
++          new AppKilledTransition(), RMAppState.KILLED))
++    // ACCECPTED state can once again receive APP_ACCEPTED event, because on
++    // recovery the app returns ACCEPTED state and the app once again go
++    // through the scheduler and triggers one more APP_ACCEPTED event at
++    // ACCEPTED state.
++    .addTransition(RMAppState.ACCEPTED, RMAppState.ACCEPTED,
++        RMAppEventType.APP_ACCEPTED)
+-        EnumSet.of(RMAppState.SUBMITTED, RMAppState.FINAL_SAVING),
++        EnumSet.of(RMAppState.ACCEPTED, RMAppState.FINAL_SAVING),
+-        new AttemptFailedTransition(RMAppState.SUBMITTED))
+-    .addTransition(RMAppState.RUNNING, RMAppState.FINAL_SAVING,
+-        RMAppEventType.KILL,
+-        new FinalSavingTransition(
+-          new KillAppAndAttemptTransition(), RMAppState.KILLED))
++        new AttemptFailedTransition(RMAppState.ACCEPTED))
++    .addTransition(RMAppState.RUNNING, RMAppState.KILLING,
++        RMAppEventType.KILL, new KillAttemptTransition())
+-    .addTransition(RMAppState.FINISHING, RMAppState.FINISHED,
+-        RMAppEventType.KILL, new KillAppAndAttemptTransition())
+-      EnumSet.of(RMAppEventType.NODE_UPDATE))
++      EnumSet.of(RMAppEventType.NODE_UPDATE,
++        // ignore Kill as we have already saved the final Finished state in
++        // state store.
++        RMAppEventType.KILL))
++
++     // Transitions from KILLING state
++    .addTransition(RMAppState.KILLING, RMAppState.FINAL_SAVING,
++        RMAppEventType.ATTEMPT_KILLED,
++        new FinalSavingTransition(
++          new AppKilledTransition(), RMAppState.KILLED))
++    .addTransition(RMAppState.KILLING, RMAppState.KILLING,
++        EnumSet.of(
++            RMAppEventType.NODE_UPDATE,
++            RMAppEventType.ATTEMPT_REGISTERED,
++            RMAppEventType.ATTEMPT_UNREGISTERED,
++            RMAppEventType.ATTEMPT_FINISHED,
++            RMAppEventType.ATTEMPT_FAILED,
++            RMAppEventType.APP_UPDATE_SAVED,
++            RMAppEventType.KILL))
+-            RMAppEventType.ATTEMPT_KILLED, RMAppEventType.NODE_UPDATE))
++            RMAppEventType.NODE_UPDATE))
++    case KILLING:
+-          submissionContext, conf, user);
++          submissionContext, conf);
++      // Notify scheduler about the app on recovery
++      new AddApplicationToSchedulerTransition().transition(app, event);
++
+-      // started or started but not yet saved。
++      // started or started but not yet saved.
+-        app.createNewAttempt(true);
+-      return RMAppState.RUNNING;
++      // YARN-1507 is saving the application state after the application is
++      // accepted. So after YARN-1507, an app is saved meaning it is accepted.
++      // Thus we return ACCECPTED state on recovery.
++      return RMAppState.ACCEPTED;
++    }
++  }
++
++  private static final class AddApplicationToSchedulerTransition extends
++      RMAppTransition {
++    @SuppressWarnings("unchecked")
++    @Override
++    public void transition(RMAppImpl app, RMAppEvent event) {
++      if (event instanceof RMAppNewSavedEvent) {
++        RMAppNewSavedEvent storeEvent = (RMAppNewSavedEvent) event;
++        // For HA this exception needs to be handled by giving up
++        // master status if we got fenced
++        if (((RMAppNewSavedEvent) event).getStoredException() != null) {
++          LOG.error(
++            "Failed to store application: " + storeEvent.getApplicationId(),
++            storeEvent.getStoredException());
++          ExitUtil.terminate(1, storeEvent.getStoredException());
++        }
++      }
++      app.handler.handle(new AppAddedSchedulerEvent(app.applicationId,
++        app.submissionContext.getQueue(), app.user));
+-      RMAppNewSavedEvent storeEvent = (RMAppNewSavedEvent) event;
+-      if (storeEvent.getStoredException() != null) {
+-        // For HA this exception needs to be handled by giving up
+-        // master status if we got fenced
+-        LOG.error(
+-          "Failed to store application: " + storeEvent.getApplicationId(),
+-          storeEvent.getStoredException());
+-        ExitUtil.terminate(1, storeEvent.getStoredException());
+-      }
+-    case KILL:
++    case ATTEMPT_KILLED:
+-      app.diagnostics.append("Application killed by user.");
++      app.diagnostics.append(getAppKilledDiagnostics());
+-  private static class KillAppAndAttemptTransition extends AppKilledTransition {
++  private static class KillAttemptTransition extends RMAppTransition {
+-      app.handler.handle(new RMAppAttemptEvent(app.currentAttempt.getAppAttemptId(),
+-          RMAppAttemptEventType.KILL));
+-      super.transition(app, event);
++      app.stateBeforeKilling = app.getState();
++      app.handler.handle(new RMAppAttemptEvent(app.currentAttempt
++        .getAppAttemptId(), RMAppAttemptEventType.KILL));
++
++      app.handler.handle(new AppRemovedSchedulerEvent(app.applicationId, app
++        .getState()));
+-
+-  public boolean isAppSafeToUnregister() {
++  public boolean isAppSafeToTerminate() {
++    if (rmAppState.equals(RMAppState.KILLING)) {
++      rmAppState = stateBeforeKilling;
++    }

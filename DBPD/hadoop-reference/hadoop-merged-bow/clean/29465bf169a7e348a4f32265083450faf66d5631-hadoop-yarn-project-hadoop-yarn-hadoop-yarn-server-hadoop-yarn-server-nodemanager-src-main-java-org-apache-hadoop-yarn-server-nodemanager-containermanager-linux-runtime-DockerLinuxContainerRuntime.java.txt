@@ -1,0 +1,356 @@
+YARN-9560. Restructure DockerLinuxContainerRuntime to extend OCIContainerRuntime.
+           Contributed by Eric Badger, Jim Brennan, Craig Condit
+
++import org.apache.hadoop.security.authorize.AccessControlList;
+-import org.apache.hadoop.yarn.api.CsiAdaptorProtocol;
+-import org.apache.hadoop.yarn.api.impl.pb.client.CsiAdaptorProtocolPBClientImpl;
+-import org.apache.hadoop.yarn.util.csi.CsiConfigUtils;
+-import org.apache.hadoop.security.UserGroupInformation;
+-import org.apache.hadoop.security.authorize.AccessControlList;
+-import org.apache.hadoop.util.Shell;
+-import org.apache.hadoop.yarn.server.nodemanager.containermanager.runtime.ContainerRuntime;
+-import java.net.InetSocketAddress;
+-import java.nio.file.Files;
+-import java.nio.file.Paths;
+-import java.util.HashMap;
+-import java.util.Map.Entry;
+- * <p>This class is a {@link ContainerRuntime} implementation that uses the
++ * <p>This class is an extension of {@link OCIContainerRuntime} that uses the
+- +     additional volume mounts for the Docker container. The value of the
++ *     additional volume mounts for the Docker container. The value of the
+- *     when this feature is set, app.json will be available in
++ *     When this feature is set, app.json will be available in
+-public class DockerLinuxContainerRuntime implements LinuxContainerRuntime {
++public class DockerLinuxContainerRuntime extends OCIContainerRuntime {
+-       LoggerFactory.getLogger(DockerLinuxContainerRuntime.class);
++      LoggerFactory.getLogger(DockerLinuxContainerRuntime.class);
+-  public static final String HOSTNAME_PATTERN =
+-      "^[a-zA-Z0-9][a-zA-Z0-9_.-]+$";
+-  private static final Pattern hostnamePattern = Pattern.compile(
+-      HOSTNAME_PATTERN);
+-  private static final Pattern USER_MOUNT_PATTERN = Pattern.compile(
+-      "(?<=^|,)([^:\\x00]+):([^:\\x00]+)" +
+-          "(:(r[ow]|(r[ow][+])?(r?shared|r?slave|r?private)))?(?:,|$)");
+-  private static final Pattern TMPFS_MOUNT_PATTERN = Pattern.compile(
+-      "^/[^:\\x00]+$");
+-  public static final String PORTS_MAPPING_PATTERN =
+-      "^:[0-9]+|^[0-9]+:[0-9]+|^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]" +
+-          "|25[0-5])\\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])" +
+-          ":[0-9]+:[0-9]+$";
+-  private static final int HOST_NAME_LENGTH = 64;
++
+-  public static final String ENV_DOCKER_CONTAINER_RUN_OVERRIDE_DISABLE =
+-      "YARN_CONTAINER_RUNTIME_DOCKER_RUN_OVERRIDE_DISABLE";
+-  @InterfaceAudience.Private
+-  public static final String ENV_DOCKER_CONTAINER_PID_NAMESPACE =
+-      "YARN_CONTAINER_RUNTIME_DOCKER_CONTAINER_PID_NAMESPACE";
+-  @InterfaceAudience.Private
+-  public static final String ENV_DOCKER_CONTAINER_RUN_PRIVILEGED_CONTAINER =
+-      "YARN_CONTAINER_RUNTIME_DOCKER_RUN_PRIVILEGED_CONTAINER";
+-  @InterfaceAudience.Private
+-          "YARN_CONTAINER_RUNTIME_DOCKER_PORTS_MAPPING";
++      "YARN_CONTAINER_RUNTIME_DOCKER_PORTS_MAPPING";
+-  public static final String YARN_SYSFS_PATH =
+-      "/hadoop/yarn/sysfs";
++
++  @InterfaceAudience.Private
++  private static final String RUNTIME_TYPE = "DOCKER";
++  @InterfaceAudience.Private
++  private final static String ENV_OCI_CONTAINER_PID_NAMESPACE =
++      formatOciEnvKey(RUNTIME_TYPE, CONTAINER_PID_NAMESPACE_SUFFIX);
++  @InterfaceAudience.Private
++  private final static String ENV_OCI_CONTAINER_RUN_PRIVILEGED_CONTAINER =
++      formatOciEnvKey(RUNTIME_TYPE, RUN_PRIVILEGED_CONTAINER_SUFFIX);
++
+-  private Map<String, CsiAdaptorProtocol> csiClients = new HashMap<>();
+-  private String defaultRuntime;
++    super(privilegedOperationExecutor, cGroupsHandler);
++
++    super.initialize(conf, nmContext);
++
+-  public Map<String, CsiAdaptorProtocol> getCsiClients() {
+-    return csiClients;
+-  }
+-
+-
+-  }
+-
+-  @Override
+-  public void prepareContainer(ContainerRuntimeContext ctx)
+-      throws ContainerExecutionException {
+-  private void validateContainerNetworkType(String network)
+-      throws ContainerExecutionException {
+-    if (allowedNetworks.contains(network)) {
+-      return;
+-    }
+-
+-    String msg = "Disallowed network:  '" + network
+-        + "' specified. Allowed networks: are " + allowedNetworks
+-        .toString();
+-    throw new ContainerExecutionException(msg);
+-  }
+-
+-  private void validateContainerRuntimeType(String runtime)
+-          throws ContainerExecutionException {
+-    if (runtime == null || runtime.isEmpty()
+-        || allowedRuntimes.contains(runtime)) {
+-      return;
+-    }
+-
+-    String msg = "Disallowed runtime:  '" + runtime
+-            + "' specified. Allowed networks: are " + allowedRuntimes
+-            .toString();
+-    throw new ContainerExecutionException(msg);
+-  }
+-
+-  /**
+-   * Return whether the YARN container is allowed to run using the host's PID
+-   * namespace for the Docker container. For this to be allowed, the submitting
+-   * user must request the feature and the feature must be enabled on the
+-   * cluster.
+-   *
+-   * @param container the target YARN container
+-   * @return whether host pid namespace is requested and allowed
+-   * @throws ContainerExecutionException if host pid namespace is requested
+-   * but is not allowed
+-   */
+-  private boolean allowHostPidNamespace(Container container)
+-      throws ContainerExecutionException {
+-    Map<String, String> environment = container.getLaunchContext()
+-        .getEnvironment();
+-    String pidNamespace = environment.get(ENV_DOCKER_CONTAINER_PID_NAMESPACE);
+-
+-    if (pidNamespace == null) {
+-      return false;
+-    }
+-
+-    if (!pidNamespace.equalsIgnoreCase("host")) {
+-      LOG.warn("NOT requesting PID namespace. Value of " +
+-          ENV_DOCKER_CONTAINER_PID_NAMESPACE + "is invalid: " + pidNamespace);
+-      return false;
+-    }
+-
+-    boolean hostPidNamespaceEnabled = conf.getBoolean(
+-        YarnConfiguration.NM_DOCKER_ALLOW_HOST_PID_NAMESPACE,
+-        YarnConfiguration.DEFAULT_NM_DOCKER_ALLOW_HOST_PID_NAMESPACE);
+-
+-    if (!hostPidNamespaceEnabled) {
+-      String message = "Host pid namespace being requested but this is not "
+-          + "enabled on this cluster";
+-      LOG.warn(message);
+-      throw new ContainerExecutionException(message);
+-    }
+-
+-    return true;
+-  }
+-
+-  public static void validateHostname(String hostname) throws
+-      ContainerExecutionException {
+-    if (hostname != null && !hostname.isEmpty()) {
+-      if (!hostnamePattern.matcher(hostname).matches()) {
+-        throw new ContainerExecutionException("Hostname '" + hostname
+-            + "' doesn't match docker hostname pattern");
+-      }
+-      if (hostname.length() > HOST_NAME_LENGTH) {
+-        throw new ContainerExecutionException(
+-            "Hostname can not be greater than " + HOST_NAME_LENGTH
+-                + " characters: " + hostname);
+-      }
+-    }
+-  }
+-
+-   * Return whether the YARN container is allowed to run in a privileged
+-   * Docker container. For a privileged container to be allowed all of the
+-   * following three conditions must be satisfied:
+-   *
+-   * <ol>
+-   *   <li>Submitting user must request for a privileged container</li>
+-   *   <li>Privileged containers must be enabled on the cluster</li>
+-   *   <li>Submitting user must be white-listed to run a privileged
+-   *   container</li>
+-   * </ol>
+-   *
+-   * @param container the target YARN container
+-   * @return whether privileged container execution is allowed
+-   * @throws ContainerExecutionException if privileged container execution
+-   * is requested but is not allowed
+-   */
+-  private boolean allowPrivilegedContainerExecution(Container container)
+-      throws ContainerExecutionException {
+-
+-    if(!isContainerRequestedAsPrivileged(container)) {
+-      return false;
+-    }
+-
+-    LOG.info("Privileged container requested for : " + container
+-        .getContainerId().toString());
+-
+-    //Ok, so we have been asked to run a privileged container. Security
+-    // checks need to be run. Each violation is an error.
+-
+-    //check if privileged containers are enabled.
+-    boolean privilegedContainersEnabledOnCluster = conf.getBoolean(
+-        YarnConfiguration.NM_DOCKER_ALLOW_PRIVILEGED_CONTAINERS,
+-            YarnConfiguration.DEFAULT_NM_DOCKER_ALLOW_PRIVILEGED_CONTAINERS);
+-
+-    if (!privilegedContainersEnabledOnCluster) {
+-      String message = "Privileged container being requested but privileged "
+-          + "containers are not enabled on this cluster";
+-      LOG.warn(message);
+-      throw new ContainerExecutionException(message);
+-    }
+-
+-    //check if submitting user is in the whitelist.
+-    String submittingUser = container.getUser();
+-    UserGroupInformation submitterUgi = UserGroupInformation
+-        .createRemoteUser(submittingUser);
+-
+-    if (!privilegedContainersAcl.isUserAllowed(submitterUgi)) {
+-      String message = "Cannot launch privileged container. Submitting user ("
+-          + submittingUser + ") fails ACL check.";
+-      LOG.warn(message);
+-      throw new ContainerExecutionException(message);
+-    }
+-
+-    LOG.info("All checks pass. Launching privileged container for : "
+-        + container.getContainerId().toString());
+-
+-    return true;
+-  }
+-
+-  /**
+-   * This function only returns whether a privileged container was requested,
+-   * not whether the container was or will be launched as privileged.
+-   * @param container
+-   * @return
+-   */
+-  private boolean isContainerRequestedAsPrivileged(
+-      Container container) {
+-    String runPrivilegedContainerEnvVar = container.getLaunchContext()
+-        .getEnvironment().get(ENV_DOCKER_CONTAINER_RUN_PRIVILEGED_CONTAINER);
+-    return Boolean.parseBoolean(runPrivilegedContainerEnvVar);
+-  }
+-
+-  @VisibleForTesting
+-  private String mountReadOnlyPath(String mount,
+-      Map<Path, List<String>> localizedResources)
+-      throws ContainerExecutionException {
+-    for (Entry<Path, List<String>> resource : localizedResources.entrySet()) {
+-      if (resource.getValue().contains(mount)) {
+-        java.nio.file.Path path = Paths.get(resource.getKey().toString());
+-        if (!path.isAbsolute()) {
+-          throw new ContainerExecutionException("Mount must be absolute: " +
+-              mount);
+-        }
+-        if (Files.isSymbolicLink(path)) {
+-          throw new ContainerExecutionException("Mount cannot be a symlink: " +
+-              mount);
+-        }
+-        return path.toString();
+-      }
+-    }
+-    throw new ContainerExecutionException("Mount must be a localized " +
+-        "resource: " + mount);
+-  }
+-
+-  private String getUserIdInfo(String userName)
+-      throws ContainerExecutionException {
+-    String id = "";
+-    Shell.ShellCommandExecutor shexec = new Shell.ShellCommandExecutor(
+-        new String[]{"id", "-u", userName});
+-    try {
+-      shexec.execute();
+-      id = shexec.getOutput().replaceAll("[^0-9]", "");
+-    } catch (Exception e) {
+-      throw new ContainerExecutionException(e);
+-    }
+-    return id;
+-  }
+-
+-  private String[] getGroupIdInfo(String userName)
+-      throws ContainerExecutionException {
+-    String[] id = null;
+-    Shell.ShellCommandExecutor shexec = new Shell.ShellCommandExecutor(
+-        new String[]{"id", "-G", userName});
+-    try {
+-      shexec.execute();
+-      id = shexec.getOutput().replace("\n", "").split(" ");
+-    } catch (Exception e) {
+-      throw new ContainerExecutionException(e);
+-    }
+-    return id;
+-  }
+-
+-  /**
+-
+-   * Perform docker exec command into running container
++   * Perform docker exec command into running container.
+-
+-              .get("YARN_CONTAINER_RUNTIME_DOCKER_CONTAINER_NETWORK");
++              .get(ENV_DOCKER_CONTAINER_NETWORK);
+-  public String getExposedPorts(Container container)
+-      throws ContainerExecutionException {
++  public String getExposedPorts(Container container) {
+-
++
+-  /**
+-   * Initiate CSI clients to talk to the CSI adaptors on this node and
+-   * cache the clients for easier fetch.
+-   * @param config configuration
+-   * @throws ContainerExecutionException
+-   */
+-  private void initiateCsiClients(Configuration config)
+-      throws ContainerExecutionException {
+-    String[] driverNames = CsiConfigUtils.getCsiDriverNames(config);
+-    if (driverNames != null && driverNames.length > 0) {
+-      for (String driverName : driverNames) {
+-        try {
+-          // find out the adaptors service address
+-          InetSocketAddress adaptorServiceAddress =
+-              CsiConfigUtils.getCsiAdaptorAddressForDriver(driverName, config);
+-          LOG.info("Initializing a csi-adaptor-client for csi-adaptor {},"
+-              + " csi-driver {}", adaptorServiceAddress.toString(), driverName);
+-          CsiAdaptorProtocolPBClientImpl client =
+-              new CsiAdaptorProtocolPBClientImpl(1L, adaptorServiceAddress,
+-                  config);
+-          csiClients.put(driverName, client);
+-        } catch (IOException e1) {
+-          throw new ContainerExecutionException(e1.getMessage());
+-        } catch (YarnException e2) {
+-          throw new ContainerExecutionException(e2.getMessage());
+-        }
+-      }
+-    }
++  boolean getHostPidNamespaceEnabled() {
++    return conf.getBoolean(
++      YarnConfiguration.NM_DOCKER_ALLOW_HOST_PID_NAMESPACE,
++      YarnConfiguration.DEFAULT_NM_DOCKER_ALLOW_HOST_PID_NAMESPACE);
++
++  boolean getPrivilegedContainersEnabledOnCluster() {
++    return conf.getBoolean(
++        YarnConfiguration.NM_DOCKER_ALLOW_PRIVILEGED_CONTAINERS,
++        YarnConfiguration.DEFAULT_NM_DOCKER_ALLOW_PRIVILEGED_CONTAINERS);
++  }
++
++  Set<String> getAllowedNetworks() {
++    return allowedNetworks;
++  }
++
++  Set<String> getAllowedRuntimes() {
++    return allowedRuntimes;
++  }
++
++  AccessControlList getPrivilegedContainersAcl() {
++    return privilegedContainersAcl;
++  }
++
++  String getEnvOciContainerPidNamespace() {
++    return ENV_OCI_CONTAINER_PID_NAMESPACE;
++  }
++
++  String getEnvOciContainerRunPrivilegedContainer() {
++    return ENV_OCI_CONTAINER_RUN_PRIVILEGED_CONTAINER;
++  }
++
+
+MOV26 MOV23 MOV23 MOV31 MOV31 MOV31 MOV31 MOV31 MOV31 UPD43 INS23 UPD42 MOV78 UPD83 MOV43 MOV78 INS83 MOV43 MOV78 MOV83 MOV83 MOV83 MOV43 INS59 UPD42 INS8 UPD42 INS8 INS74 INS42 UPD74 MOV74 INS42 INS8 INS43 INS42 MOV43 INS42 MOV43 INS42 INS8 UPD66 UPD66 UPD66 UPD66 UPD42 UPD45 UPD42 UPD42 MOV42 INS32 INS46 INS21 MOV41 MOV41 INS43 MOV43 UPD43 MOV41 UPD42 MOV42 INS41 UPD42 UPD42 UPD42 UPD42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 INS42 INS42 INS48 UPD66 MOV32 MOV32 UPD42 MOV42 INS42 UPD42 INS42 UPD42 UPD42 INS42 INS42 INS42 INS42 INS42 DEL40 DEL26 DEL40 DEL26 DEL40 DEL26 DEL40 DEL26 DEL40 DEL26 DEL40 DEL26 DEL40 DEL26 DEL40 DEL26 DEL40 DEL26 DEL40 DEL26 DEL40 DEL26 DEL83 DEL42 DEL43 DEL42 DEL42 DEL42 DEL45 DEL45 DEL27 DEL32 DEL59 DEL23 DEL83 DEL83 DEL42 DEL43 DEL42 DEL42 DEL42 DEL45 DEL32 DEL59 DEL23 DEL83 DEL83 DEL83 DEL42 DEL43 DEL42 DEL45 DEL45 DEL45 DEL27 DEL59 DEL23 DEL83 DEL83 DEL83 DEL39 DEL42 DEL34 DEL59 DEL23 DEL83 DEL83 DEL83 DEL42 DEL45 DEL59 DEL23 DEL83 DEL83 DEL83 DEL42 DEL45 DEL59 DEL23 DEL83 DEL83 DEL83 DEL45 DEL59 DEL23 DEL42 DEL43 DEL83 DEL42 DEL43 DEL83 DEL83 DEL83 DEL42 DEL43 DEL42 DEL45 DEL59 DEL23 DEL83 DEL42 DEL43 DEL42 DEL43 DEL42 DEL43 DEL74 DEL42 DEL42 DEL43 DEL74 DEL14 DEL59 DEL23 DEL83 DEL42 DEL43 DEL42 DEL59 DEL23 DEL83 DEL42 DEL43 DEL42 DEL43 DEL42 DEL43 DEL74 DEL42 DEL42 DEL41 DEL8 DEL31 DEL42 DEL78 DEL83 DEL39 DEL42 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL8 DEL31 DEL83 DEL39 DEL42 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL32 DEL41 DEL8 DEL25 DEL42 DEL43 DEL42 DEL45 DEL42 DEL45 DEL42 DEL42 DEL32 DEL27 DEL59 DEL60 DEL42 DEL43 DEL42 DEL14 DEL53 DEL8 DEL31 DEL83 DEL39 DEL42 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL33 DEL27 DEL42 DEL42 DEL32 DEL27 DEL42 DEL42 DEL42 DEL32 DEL27 DEL41 DEL8 DEL25 DEL42 DEL43 DEL42 DEL45 DEL42 DEL45 DEL42 DEL42 DEL32 DEL27 DEL59 DEL60 DEL42 DEL43 DEL42 DEL14 DEL53 DEL8 DEL31 DEL83 DEL83 DEL39 DEL42 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL33 DEL27 DEL42 DEL42 DEL32 DEL38 DEL27 DEL42 DEL42 DEL42 DEL32 DEL42 DEL32 DEL38 DEL42 DEL43 DEL45 DEL42 DEL45 DEL27 DEL14 DEL53 DEL8 DEL25 DEL42 DEL42 DEL32 DEL42 DEL27 DEL42 DEL43 DEL45 DEL42 DEL45 DEL42 DEL27 DEL14 DEL53 DEL8 DEL25 DEL8 DEL25 DEL8 DEL31 DEL45 DEL42 DEL43 DEL66 DEL66 DEL66 DEL66 DEL65 DEL42 DEL66 DEL65 DEL66 DEL65 DEL42 DEL66 DEL66 DEL65 DEL29 DEL83 DEL9 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL43 DEL42 DEL43 DEL42 DEL43 DEL74 DEL42 DEL42 DEL42 DEL32 DEL42 DEL32 DEL59 DEL60 DEL42 DEL43 DEL42 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL33 DEL27 DEL8 DEL25 DEL42 DEL42 DEL45 DEL32 DEL38 DEL42 DEL42 DEL45 DEL42 DEL45 DEL42 DEL27 DEL32 DEL21 DEL9 DEL41 DEL8 DEL25 DEL39 DEL42 DEL59 DEL60 DEL42 DEL38 DEL42 DEL43 DEL42 DEL45 DEL45 DEL27 DEL59 DEL60 DEL42 DEL42 DEL42 DEL32 DEL21 DEL42 DEL43 DEL42 DEL14 DEL53 DEL8 DEL25 DEL9 DEL41 DEL8 DEL66 DEL66 DEL66 DEL66 DEL66 DEL66 DEL66 DEL66 DEL66 DEL65 DEL42 DEL66 DEL65 DEL66 DEL65 DEL42 DEL66 DEL66 DEL65 DEL29 DEL83 DEL9 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL42 DEL32 DEL38 DEL8 DEL25 DEL42 DEL42 DEL45 DEL42 DEL42 DEL32 DEL42 DEL32 DEL27 DEL32 DEL21 DEL39 DEL42 DEL59 DEL60 DEL42 DEL38 DEL42 DEL43 DEL42 DEL45 DEL45 DEL27 DEL59 DEL60 DEL42 DEL42 DEL42 DEL32 DEL21 DEL42 DEL43 DEL42 DEL14 DEL53 DEL8 DEL25 DEL42 DEL43 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL43 DEL42 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL42 DEL42 DEL32 DEL38 DEL42 DEL43 DEL42 DEL45 DEL42 DEL45 DEL27 DEL59 DEL60 DEL42 DEL42 DEL42 DEL32 DEL21 DEL42 DEL43 DEL42 DEL14 DEL53 DEL8 DEL25 DEL42 DEL42 DEL45 DEL42 DEL42 DEL32 DEL42 DEL32 DEL27 DEL32 DEL21 DEL9 DEL41 DEL8 DEL66 DEL66 DEL65 DEL42 DEL65 DEL65 DEL29 DEL83 DEL39 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL42 DEL42 DEL32 DEL42 DEL32 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL42 DEL42 DEL32 DEL42 DEL42 DEL32 DEL42 DEL78 DEL83 DEL42 DEL43 DEL42 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL43 DEL42 DEL43 DEL42 DEL43 DEL74 DEL74 DEL42 DEL44 DEL42 DEL43 DEL42 DEL43 DEL42 DEL43 DEL74 DEL42 DEL44 DEL42 DEL42 DEL32 DEL42 DEL42 DEL32 DEL42 DEL42 DEL32 DEL40 DEL43 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL42 DEL32 DEL32 DEL59 DEL60 DEL42 DEL42 DEL32 DEL38 DEL42 DEL43 DEL45 DEL42 DEL27 DEL14 DEL53 DEL8 DEL25 DEL42 DEL42 DEL42 DEL32 DEL42 DEL43 DEL45 DEL42 DEL27 DEL14 DEL53 DEL8 DEL25 DEL8 DEL25 DEL8 DEL70 DEL42 DEL43 DEL45 DEL45 DEL42 DEL27 DEL14 DEL53 DEL8 DEL83 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL43 DEL42 DEL45 DEL59 DEL60 DEL40 DEL43 DEL42 DEL40 DEL43 DEL42 DEL43 DEL85 DEL5 DEL45 DEL45 DEL42 DEL4 DEL3 DEL14 DEL59 DEL60 DEL42 DEL42 DEL32 DEL21 DEL42 DEL42 DEL42 DEL32 DEL42 DEL45 DEL45 DEL32 DEL7 DEL21 DEL8 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL14 DEL53 DEL8 DEL12 DEL54 DEL83 DEL42 DEL43 DEL85 DEL5 DEL42 DEL42 DEL44 DEL42 DEL43 DEL42 DEL43 DEL85 DEL5 DEL42 DEL33 DEL59 DEL60 DEL40 DEL43 DEL42 DEL40 DEL43 DEL42 DEL43 DEL85 DEL5 DEL45 DEL45 DEL42 DEL4 DEL3 DEL14 DEL59 DEL60 DEL42 DEL42 DEL32 DEL21 DEL42 DEL42 DEL42 DEL32 DEL42 DEL45 DEL45 DEL32 DEL42 DEL45 DEL32 DEL7 DEL21 DEL8 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL14 DEL53 DEL8 DEL12 DEL54 DEL66 DEL66 DEL65 DEL42 DEL66 DEL65 DEL42 DEL65 DEL29 DEL83 DEL39 DEL42 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL43 DEL85 DEL5 DEL42 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL33 DEL27 DEL40 DEL34 DEL27 DEL27 DEL42 DEL44 DEL42 DEL42 DEL43 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL42 DEL45 DEL45 DEL27 DEL42 DEL42 DEL32 DEL42 DEL32 DEL21 DEL42 DEL43 DEL42 DEL42 DEL43 DEL34 DEL42 DEL42 DEL14 DEL59 DEL60 DEL42 DEL42 DEL42 DEL42 DEL32 DEL21 DEL8 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL42 DEL32 DEL14 DEL53 DEL8 DEL12 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL42 DEL32 DEL14 DEL53 DEL8 DEL12 DEL54 DEL8 DEL70 DEL8 DEL25 DEL8

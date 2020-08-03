@@ -1,0 +1,387 @@
+HDFS-4126. Add reading/writing snapshot information to FSImage. Contributed by Jing Zhao.
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/branches/HDFS-2802@1437256 13f79535-47bb-0310-9956-ffa450edef68
+
++import java.util.HashMap;
++import java.util.List;
++import java.util.Map;
++import org.apache.hadoop.hdfs.server.namenode.snapshot.INodeDirectorySnapshottable;
++import org.apache.hadoop.hdfs.server.namenode.snapshot.INodeDirectoryWithSnapshot;
++import org.apache.hadoop.hdfs.server.namenode.snapshot.Snapshot;
++import org.apache.hadoop.hdfs.server.namenode.snapshot.SnapshotFSImageFormat;
+- *   LayoutVersion: int, NamespaceID: int, NumberItemsInFSDirectoryTree: long,
+- *   NamesystemGenerationStamp: long, TransactionID: long
++ *   layoutVersion: int, namespaceID: int, numberItemsInFSDirectoryTree: long,
++ *   namesystemGenerationStamp: long, transactionID: long, 
++ *   snapshotCounter: int, numberOfSnapshots: int, numOfSnapshottableDirs: int,
+- *   INodeInfo of root, NumberOfChildren of root: int
++ *   INodeInfo of root, numberOfChildren of root: int
+- *     LocalName: short + byte[]
++ *     localName: short + byte[]
+- *     FullPath: byte[]
++ *     fullPath: byte[]
+- *   ReplicationFactor: short, ModificationTime: long,
+- *   AccessTime: long, PreferredBlockSize: long,
+- *   NumberOfBlocks: int (-1 for INodeDirectory, -2 for INodeSymLink),
++ *   replicationFactor: short, modificationTime: long,
++ *   accessTime: long, preferredBlockSize: long,
++ *   numberOfBlocks: int (-1 for INodeDirectory, -2 for INodeSymLink),
+- *     NsQuota: long, DsQuota: long, FsPermission: short, PermissionStatus
++ *     nsQuota: long, dsQuota: long, 
++ *     {
++ *       isINodeSnapshottable: byte,
++ *       isINodeWithSnapshot: byte (if isINodeSnapshottable is false)
++ *     } (when {@link Feature#SNAPSHOT} is supported), 
++ *     fsPermission: short, PermissionStatus
+- *     SymlinkString, FsPermission: short, PermissionStatus
++ *     symlinkString, fsPermission: short, PermissionStatus
+- *     [list of BlockInfo], FsPermission: short, PermissionStatus
++ *     containsBlock: byte (when {@link Feature#SNAPSHOT} is supported),
++ *     [list of BlockInfo] (when {@link Feature#SNAPSHOT} is not supported or 
++ *     containsBlock is true),
++ *     {
++ *       snapshotFileSize: long,
++ *       isINodeFileWithLink: byte (if ComputedFileSize is negative),
++ *     } (when {@link Feature#SNAPSHOT} is supported), 
++ *     fsPermission: short, PermissionStatus
+- *   FullPath of the directory: short + byte[],
+- *   NumberOfChildren: int, [list of INodeInfo of children INode]
+- *   [list of INodeDirectoryInfo of the directory children]
++ *   fullPath of the directory: short + byte[],
++ *   numberOfChildren: int, [list of INodeInfo of children INode],
++ *   {
++ *     numberOfSnapshots: int,
++ *     [list of Snapshot] (when NumberOfSnapshots is positive),
++ *     numberOfSnapshotDiffs: int,
++ *     [list of SnapshotDiff] (NumberOfSnapshotDiffs is positive),
++ *     number of children that are directories,
++ *     [list of INodeDirectoryInfo of the directory children] (includes
++ *     snapshot copies of deleted sub-directories)
++ *   } (when {@link Feature#SNAPSHOT} is supported), 
++ * }
++ * 
++ * Snapshot {
++ *   snapshotID: int, root of Snapshot: INodeDirectoryInfo (its local name is 
++ *   the name of the snapshot)
++ * }
++ * 
++ * SnapshotDiff {
++ *   childrenSize: int, 
++ *   full path of the root of the associated Snapshot: short + byte[], 
++ *   isSnapshotRoot: byte, 
++ *   snapshotINodeIsNotNull: byte (when isSnapshotRoot is false),
++ *   snapshotINode: INodeDirectory (when SnapshotINodeIsNotNull is true), Diff 
++ * }
++ * 
++ * Diff {
++ *   createdListSize: int, [Local name of INode in created list],
++ *   deletedListSize: int, [INode in deleted list: INodeInfo]
+-class FSImageFormat {
++public class FSImageFormat {
+-  static class Loader {
++  public static class Loader {
+-    void load(File curFile)
+-      throws IOException
+-    {
++    void load(File curFile) throws IOException {
++        
++        if (LayoutVersion.supports(Feature.SNAPSHOT, imgVersion)) {
++          namesystem.getSnapshotManager().read(in);
++        }
+-          loadLocalNameINodes(numFiles, in);
++          if (LayoutVersion.supports(Feature.SNAPSHOT, imgVersion)) {
++            loadLocalNameINodesWithSnapshot(in);
++          } else {
++            loadLocalNameINodes(numFiles, in);
++          }
+-
++  
++    /**
++     * Load fsimage files when 1) only local names are stored, 
++     * and 2) snapshot is supported.
++     * 
++     * @param in Image input stream
++     */
++    private void loadLocalNameINodesWithSnapshot(DataInputStream in)
++        throws IOException {
++      assert LayoutVersion.supports(Feature.FSIMAGE_NAME_OPTIMIZATION,
++          getLayoutVersion());
++      assert LayoutVersion.supports(Feature.SNAPSHOT, getLayoutVersion());
++      
++      // load root
++      loadRoot(in);
++      // load rest of the nodes recursively
++      loadDirectoryWithSnapshot(in);
++    }
++    
+-     if( in.readShort() != 0) {
+-       throw new IOException("First node is not root");
+-     }   
+-     INode root = loadINode(in);
+-     // update the root's attributes
+-     updateRootAttr(root);
+-     numFiles--;
++     loadRoot(in);
++     // have loaded the first file (the root)
++     numFiles--; 
++    /**
++     * Load information about root, and use the information to update the root
++     * directory of NameSystem.
++     * @param in The {@link DataInputStream} instance to read.
++     */
++    private void loadRoot(DataInputStream in) throws IOException {
++      // load root
++      if (in.readShort() != 0) {
++        throw new IOException("First node is not root");
++      }
++      INode root = loadINode(in);
++      // update the root's attributes
++      updateRootAttr(root);
++    }
++   
++    /** Load children nodes for the parent directory. */
++    private void loadChildren(INodeDirectory parent, DataInputStream in)
++        throws IOException {
++      int numChildren = in.readInt();
++      for (int i = 0; i < numChildren; i++) {
++        // load single inode
++        byte[] localName = new byte[in.readShort()];
++        in.readFully(localName); // read local name
++        INode newNode = loadINode(in); // read rest of inode
++        newNode.setLocalName(localName);
++        addToParent(parent, newNode);
++      }
++    }
++    
++    /**
++     * Load a directory when snapshot is supported.
++     * @param in The {@link DataInputStream} instance to read.
++     */
++    private void loadDirectoryWithSnapshot(DataInputStream in)
++        throws IOException {
++      // Step 1. Identify the parent INode
++      String parentPath = FSImageSerialization.readString(in);
++      final INodeDirectory parent = INodeDirectory.valueOf(
++          namesystem.dir.rootDir.getNode(parentPath, false), parentPath);
++      
++      // Step 2. Load children nodes under parent
++      loadChildren(parent, in);
++      
++      // Step 3. Load snapshots if parent is snapshottable
++      int numSnapshots = in.readInt();
++      INodeDirectorySnapshottable snapshottableParent = null;
++      if (numSnapshots >= 0) {
++        snapshottableParent = (INodeDirectorySnapshottable) parent;
++        // load snapshots and snapshotQuota
++        SnapshotFSImageFormat.loadSnapshotList(snapshottableParent,
++            numSnapshots, in, this);
++      }
++      
++      // Step 4. load SnapshotDiff list
++      int numSnapshotDiffs = in.readInt();
++      if (numSnapshotDiffs >= 0) {
++        INodeDirectoryWithSnapshot parentWithSnapshot = 
++            (INodeDirectoryWithSnapshot) parent;
++        // load SnapshotDiff list
++        SnapshotFSImageFormat.loadSnapshotDiffList(parentWithSnapshot,
++            numSnapshotDiffs, in, this);
++      }
++      
++      // Recursively load sub-directories, including snapshot copies of deleted
++      // directories
++      int numSubTree = in.readInt();
++      for (int i = 0; i < numSubTree; i++) {
++        loadDirectoryWithSnapshot(in);
++      }
++    }
++    
++    /** @return The FSDirectory of the namesystem where the fsimage is loaded */
++    public FSDirectory getFSDirectoryInLoading() {
++      return namesystem.dir;
++    }
++  
+-  private INode loadINode(DataInputStream in)
+-      throws IOException {
++  public INode loadINode(DataInputStream in) throws IOException {
++    long computeFileSize = -1;
++    boolean snapshottable = false;
++    boolean withSnapshot = false;
++    boolean withLink = false;
+-      blocks = new BlockInfo[numBlocks];
++      // to indicate INodeFileWithLink, blocks may be set as null while
++      // numBlocks is set to 0
++      blocks = LayoutVersion.supports(Feature.SNAPSHOT, imgVersion) ? (in
++            .readBoolean() ? new BlockInfo[numBlocks] : null)
++            : new BlockInfo[numBlocks];
++      
++      if (LayoutVersion.supports(Feature.SNAPSHOT, imgVersion)) {
++        computeFileSize = in.readLong();
++        if (computeFileSize < 0) {
++          withLink = in.readBoolean();
++        }
++      }
+-
++    if (LayoutVersion.supports(Feature.SNAPSHOT, imgVersion)
++        && blocks == null && numBlocks == -1) {
++      snapshottable = in.readBoolean();
++      if (!snapshottable) {
++        withSnapshot = in.readBoolean();
++      }
++    }
++    
+-        modificationTime, atime, nsQuota, dsQuota, blockSize);
++        modificationTime, atime, nsQuota, dsQuota, blockSize, numBlocks,
++        withLink, computeFileSize, snapshottable, withSnapshot);
+-    void save(File newFile,
+-              FSImageCompression compression)
+-      throws IOException {
++    void save(File newFile, FSImageCompression compression) throws IOException {
+-
++        sourceNamesystem.getSnapshotManager().write(out);
++        
+-
+-        saveImage(strbuf, fsDir.rootDir, out);
++        saveImage(strbuf, fsDir.rootDir, out, null);
+-     * Save file tree image starting from the given root.
+-     * This is a recursive procedure, which first saves all children of
+-     * a current directory and then moves inside the sub-directories.
++     * Save children INodes.
++     * @param children The list of children INodes
++     * @param out The DataOutputStream to write
++     * @return Number of children that are directory
+-    private void saveImage(ByteBuffer currentDirName,
+-                                  INodeDirectory current,
+-                                  DataOutputStream out) throws IOException {
+-      final ReadOnlyList<INode> children = current.getChildrenList(null);
+-      if (children.isEmpty()) {
+-        return;
+-      }
+-      // print prefix (parent directory name)
+-      int prefixLen = currentDirName.position();
+-      if (prefixLen == 0) {  // root
+-        out.writeShort(PATH_SEPARATOR.length);
+-        out.write(PATH_SEPARATOR);
+-      } else {  // non-root directories
+-        out.writeShort(prefixLen);
+-        out.write(currentDirName.array(), 0, prefixLen);
+-      }
++    private int saveChildren(ReadOnlyList<INode> children, DataOutputStream out)
++        throws IOException {
++      // Write normal children INode. 
++      int dirNum = 0;
++        if (child.isDirectory()) {
++          dirNum++;
++        }
++      return dirNum;
++    }
++    
++    /**
++     * The nonSnapshotPath is a path without snapshot in order to enable buffer
++     * reuse. If the snapshot is not null, we need to compute a snapshot path.
++     * E.g., when nonSnapshotPath is "/test/foo/bar/" and the snapshot is s1 of
++     * /test, we actually want to save image for directory /test/foo/bar/ under
++     * snapshot s1 of /test, and the path to save thus should be
++     * "/test/.snapshot/s1/foo/bar/".
++     * 
++     * @param nonSnapshotPath The path without snapshot related information.
++     * @param snapshot The snapshot associated with the inode that the path 
++     *                 actually leads to.
++     * @return The snapshot path.                
++     */
++    private String computeSnapshotPath(String nonSnapshotPath, 
++        Snapshot snapshot) {
++      String snapshotParentFullPath = snapshot.getRoot().getParent()
++          .getFullPathName();
++      String snapshotName = snapshot.getRoot().getLocalName();
++      String relativePath = nonSnapshotPath.equals(snapshotParentFullPath) ? 
++          Path.SEPARATOR : nonSnapshotPath.substring(
++               snapshotParentFullPath.length());
++      String snapshotFullPath = snapshotParentFullPath + Path.SEPARATOR
++          + HdfsConstants.DOT_SNAPSHOT_DIR + Path.SEPARATOR + snapshotName
++          + relativePath;
++      return snapshotFullPath;
++    }
++    
++    /**
++     * Save file tree image starting from the given root.
++     * This is a recursive procedure, which first saves all children and 
++     * snapshot diffs of a current directory and then moves inside the 
++     * sub-directories.
++     * 
++     * @param currentDirName A ByteBuffer storing the path leading to the 
++     *                       current node. For a snapshot node, the path is
++     *                       (the snapshot path - ".snapshot/snapshot_name")
++     * @param current The current node
++     * @param out The DataoutputStream to write the image
++     * @param snapshot The possible snapshot associated with the current node
++     */
++    private void saveImage(ByteBuffer currentDirName, INodeDirectory current,
++        DataOutputStream out, Snapshot snapshot)
++        throws IOException {
++      final ReadOnlyList<INode> children = current.getChildrenList(null);
++      int dirNum = 0;
++      Map<Snapshot, List<INodeDirectory>> snapshotDirMap = null;
++      if (current instanceof INodeDirectoryWithSnapshot) {
++        snapshotDirMap = new HashMap<Snapshot, List<INodeDirectory>>();
++        dirNum += ((INodeDirectoryWithSnapshot) current).
++            getSnapshotDirectory(snapshotDirMap);
++      }
++      
++      // 1. Print prefix (parent directory name)
++      int prefixLen = currentDirName.position();
++      if (snapshot == null) {
++        if (prefixLen == 0) {  // root
++          out.writeShort(PATH_SEPARATOR.length);
++          out.write(PATH_SEPARATOR);
++        } else {  // non-root directories
++          out.writeShort(prefixLen);
++          out.write(currentDirName.array(), 0, prefixLen);
++        }
++      } else {
++        String nonSnapshotPath = prefixLen == 0 ? Path.SEPARATOR : DFSUtil
++            .bytes2String(currentDirName.array(), 0, prefixLen);
++        String snapshotFullPath = computeSnapshotPath(nonSnapshotPath, 
++            snapshot);
++        byte[] snapshotFullPathBytes = DFSUtil.string2Bytes(snapshotFullPath);
++        out.writeShort(snapshotFullPathBytes.length);
++        out.write(snapshotFullPathBytes);
++      }
++      
++      // 2. Write children INode 
++      dirNum += saveChildren(children, out);
++      
++      // 3. Write INodeDirectorySnapshottable#snapshotsByNames to record all
++      // Snapshots
++      if (current instanceof INodeDirectorySnapshottable) {
++        INodeDirectorySnapshottable snapshottableNode = 
++            (INodeDirectorySnapshottable) current;
++        SnapshotFSImageFormat.saveSnapshots(snapshottableNode, out);
++      } else {
++        out.writeInt(-1); // # of snapshots
++      }
++      
++      // 4. Write SnapshotDiff lists.
++      if (current instanceof INodeDirectoryWithSnapshot) {
++        INodeDirectoryWithSnapshot sNode = (INodeDirectoryWithSnapshot) current;
++        SnapshotFSImageFormat.saveSnapshotDiffs(sNode, out);
++      } else {
++        out.writeInt(-1); // # of SnapshotDiffs
++      }
++      
++      // Write sub-tree of sub-directories, including possible snapshots of 
++      // deleted sub-directories
++      out.writeInt(dirNum); // the number of sub-directories
+-        saveImage(currentDirName, (INodeDirectory)child, out);
++        saveImage(currentDirName, (INodeDirectory)child, out, snapshot);
++      if (snapshotDirMap != null) {
++        for (Snapshot ss : snapshotDirMap.keySet()) {
++          List<INodeDirectory> snapshotSubDirs = snapshotDirMap.get(ss);
++          for (INodeDirectory subDir : snapshotSubDirs) {
++            currentDirName.put(PATH_SEPARATOR).put(subDir.getLocalNameBytes());
++            saveImage(currentDirName, subDir, out, ss);
++            currentDirName.position(prefixLen);
++          }
++        }
++      }
+
+INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS83 INS83 INS31 INS31 INS31 INS31 INS31 INS31 INS31 UPD66 UPD66 INS66 UPD66 UPD66 UPD66 UPD66 UPD66 UPD66 INS66 INS66 INS66 INS66 INS66 INS65 INS66 UPD66 UPD66 INS66 INS65 INS66 INS66 INS65 INS66 INS66 INS66 INS66 INS66 INS66 INS65 INS66 UPD66 UPD66 UPD66 INS66 INS66 INS66 INS66 INS66 INS66 UPD66 INS66 INS66 INS65 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS29 INS83 INS39 INS42 INS44 INS43 INS8 INS29 INS83 INS39 INS42 INS44 INS43 INS8 INS29 INS83 INS39 INS42 INS44 INS44 INS43 INS8 INS29 INS83 INS39 INS42 INS44 INS43 INS8 INS29 INS83 INS43 INS42 INS8 UPD83 INS29 INS83 INS39 INS42 INS44 INS44 INS43 INS8 INS29 INS83 INS43 INS42 INS44 INS44 INS8 INS44 INS67 INS67 INS67 INS67 INS67 INS65 INS65 INS43 INS42 INS42 INS6 INS6 INS21 INS21 INS21 INS65 INS65 INS43 INS42 INS42 MOV25 MOV60 MOV21 INS65 INS43 INS42 INS43 INS42 INS42 INS60 INS24 INS65 INS65 INS43 INS42 INS42 INS60 INS60 INS21 INS60 INS60 INS25 INS60 INS25 INS60 INS24 INS65 INS42 INS41 INS60 INS60 INS60 INS60 INS25 INS65 INS65 INS65 INS65 INS74 INS42 INS43 INS42 INS42 MOV21 INS60 MOV60 MOV70 INS41 INS65 INS65 INS65 INS65 INS42 INS43 INS42 INS43 INS42 INS60 INS60 INS60 INS60 INS41 INS65 INS65 INS65 INS65 INS43 INS42 INS60 INS60 INS25 INS25 INS21 INS25 INS25 INS21 INS25 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS66 INS66 INS42 INS66 INS42 INS32 INS32 INS32 INS32 INS32 INS66 INS66 INS42 INS66 INS65 INS66 INS42 INS66 INS42 INS42 INS39 INS59 INS58 INS27 INS37 INS8 INS66 INS42 INS66 INS65 INS66 INS42 INS43 INS59 INS83 INS43 INS59 INS32 INS39 INS59 INS43 INS59 INS27 INS8 INS39 INS59 INS27 INS8 INS39 INS59 INS58 INS27 INS37 INS8 INS66 INS40 INS39 INS59 INS39 INS59 INS39 INS59 INS39 INS59 INS27 INS8 MOV21 MOV21 INS66 INS42 INS66 INS42 INS66 INS66 INS43 INS43 INS42 INS39 INS59 INS42 INS66 INS66 INS66 INS66 INS66 INS66 INS42 INS66 INS42 INS66 INS66 INS66 INS42 INS42 INS43 INS59 INS43 INS59 INS43 INS59 INS43 INS59 INS42 UPD66 UPD66 INS66 INS42 INS66 INS66 INS66 INS42 INS66 INS42 INS66 INS42 INS66 INS42 INS39 INS59 INS74 INS59 INS62 INS8 INS27 INS8 INS8 INS7 INS62 MOV8 INS8 INS62 INS8 INS8 INS32 INS27 INS8 INS25 INS42 INS42 INS40 INS32 INS42 INS42 INS40 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS39 INS59 INS42 INS42 INS42 INS60 INS21 INS60 INS21 INS21 INS42 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS33 INS42 INS34 INS21 INS21 INS42 INS32 INS42 INS34 INS60 INS21 INS42 INS32 INS39 INS59 INS42 INS42 INS42 INS21 INS42 INS38 INS42 INS9 INS42 INS9 INS42 INS9 INS25 INS27 INS27 INS21 INS25 INS42 INS42 INS42 INS42 INS42 INS21 INS42 INS42 INS42 INS34 INS25 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS16 INS42 INS42 INS27 INS42 INS34 INS43 INS43 INS74 INS42 INS33 INS42 INS43 INS21 INS21 INS42 INS33 MOV25 INS60 INS60 INS60 INS21 INS21 INS42 INS32 INS42 INS43 INS60 INS21 INS21 INS42 INS43 INS60 INS21 INS21 INS42 INS42 INS42 INS42 INS33 INS70 INS32 INS8 INS8 INS42 INS42 INS42 INS42 INS42 INS34 INS5 INS59 INS32 INS43 INS59 INS32 INS32 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS7 INS32 INS42 INS42 INS43 INS59 INS32 INS42 INS42 INS42 INS34 INS32 INS34 INS32 INS8 INS32 INS27 INS42 INS38 INS7 INS38 INS8 INS32 INS32 INS8 INS32 INS42 INS32 INS42 INS32 INS40 INS32 INS42 INS40 INS40 INS40 INS42 INS42 INS42 INS42 INS43 INS43 INS42 INS7 INS7 INS43 INS59 INS43 INS59 INS5 INS59 INS32 INS32 INS42 MOV42 UPD42 MOV42 INS42 INS43 INS59 INS32 INS32 INS42 INS43 INS59 INS32 INS32 INS44 INS32 INS8 INS42 INS42 INS40 INS42 INS21 INS25 INS39 INS85 INS42 INS3 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS40 INS42 INS42 INS9 INS42 INS11 INS42 INS42 INS42 INS42 INS42 INS52 INS42 INS42 INS11 INS42 INS42 INS42 INS42 INS42 INS52 INS42 INS42 INS16 INS42 INS42 INS40 INS42 INS21 INS25 INS42 INS42 INS40 INS42 INS42 INS33 INS34 INS42 INS32 INS42 INS21 INS32 INS42 INS42 INS33 INS42 INS42 INS21 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS14 INS42 INS32 INS42 INS42 INS16 INS42 INS42 INS32 INS39 INS85 INS42 INS32 INS42 INS42 INS40 INS42 INS42 INS42 INS42 INS42 INS11 INS42 INS42 INS42 INS42 INS42 INS42 INS38 INS42 INS42 INS11 INS42 INS42 INS42 INS42 INS42 INS42 INS38 INS42 INS43 INS42 INS42 INS42 INS60 INS70 INS32 INS32 INS8 MOV8 INS5 INS32 INS42 INS42 INS43 INS42 INS43 INS42 INS32 INS36 INS3 INS7 INS27 INS8 INS42 INS42 INS7 INS42 INS42 INS37 INS42 INS42 INS42 INS42 INS74 INS36 INS42 INS42 INS27 INS40 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS43 INS42 INS34 INS43 INS42 INS34 INS42 INS74 INS59 INS44 INS42 INS8 INS32 INS42 INS42 INS42 INS42 INS40 INS42 INS21 INS39 INS85 INS42 INS42 INS42 INS42 INS42 INS42 INS40 INS42 INS16 INS5 INS42 INS42 INS32 INS42 INS34 INS21 INS42 INS32 INS42 INS43 INS43 INS74 INS11 INS42 INS34 INS42 INS42 INS32 INS34 INS42 INS42 INS42 INS43 INS43 INS42 INS32 INS43 INS42 INS21 INS21 INS21 INS42 INS42 INS32 INS32 MOV3 INS33 INS43 INS85 INS42 INS42 INS7 INS42 INS42 INS42 INS42 INS43 INS43 INS43 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS32 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS32 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 DEL32 DEL25 DEL41

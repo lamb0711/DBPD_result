@@ -1,0 +1,283 @@
+HADOOP-12759. RollingFileSystemSink should eagerly rotate directories. Contributed by Daniel Templeton.
+
++import com.google.common.annotations.VisibleForTesting;
++import java.util.Calendar;
++import java.util.Timer;
++import java.util.TimerTask;
++import org.apache.hadoop.fs.LocatedFileStatus;
++import org.apache.hadoop.fs.RemoteIterator;
+- * This class is a metrics sink that uses
++ * <p>This class is a metrics sink that uses
+- * system is configured for the cluster.
++ * system is configured for the cluster.</p>
+- * The <code>&lt;prefix&gt;.sink.&lt;instance&gt;.ignore-error</code> property
+- * controls whether an exception is thrown when an error is encountered writing
+- * a log file.  The default value is <code>true</code>.  When set to
+- * <code>false</code>, file errors are quietly swallowed.
++ * <p>The <code>&lt;prefix&gt;.sink.&lt;instance&gt;.ignore-error</code>
++ * property controls whether an exception is thrown when an error is encountered
++ * writing a log file.  The default value is <code>true</code>.  When set to
++ * <code>false</code>, file errors are quietly swallowed.</p>
+- * The primary use of this class is for logging to HDFS.  As it uses
++ * <p>The primary use of this class is for logging to HDFS.  As it uses
+- * set by the configuration.
++ * set by the configuration.</p>
+- * Not all file systems support the ability to append to files.  In file systems
+- * without the ability to append to files, only one writer can write to a file
+- * at a time.  To allow for concurrent writes from multiple daemons on a single
+- * host, the <code>source</code> property should be set to the name of the
+- * source daemon, e.g. <i>namenode</i>.  The value of the <code>source</code>
+- * property should typically be the same as the property's prefix.  If this
+- * property is not set, the source is taken to be <i>unknown</i>.
++ * <p>Not all file systems support the ability to append to files.  In file
++ * systems without the ability to append to files, only one writer can write to
++ * a file at a time.  To allow for concurrent writes from multiple daemons on a
++ * single host, the <code>source</code> property should be set to the name of
++ * the source daemon, e.g. <i>namenode</i>.  The value of the
++ * <code>source</code> property should typically be the same as the property's
++ * prefix.  If this property is not set, the source is taken to be
++ * <i>unknown</i>.</p>
+- * Instead of appending to an existing file, by default the sink
++ * <p>Instead of appending to an existing file, by default the sink
+- * sequence number is the <b>newest</b> file, unlike the Hadoop daemon logs.
++ * sequence number is the <b>newest</b> file, unlike the Hadoop daemon logs.</p>
+- * For file systems that allow append, the sink supports appending to the
++ * <p>For file systems that allow append, the sink supports appending to the
+- * false.
++ * false.</p>
+- * Note that when writing to HDFS with <code>allow-append</code> set to true,
++ * <p>Note that when writing to HDFS with <code>allow-append</code> set to true,
+- * number of data nodes required for a successful append is generally 2 or 3.
++ * number of data nodes required for a successful append is generally 2 or
++ * 3.</p>
+- * Note also that when writing to HDFS, the file size information is not updated
+- * until the file is closed (e.g. at the top of the hour) even though the data
+- * is being written successfully. This is a known HDFS limitation that exists
+- * because of the performance cost of updating the metadata.  See
+- * <a href="https://issues.apache.org/jira/browse/HDFS-5478">HDFS-5478</a>.
++ * <p>Note also that when writing to HDFS, the file size information is not
++ * updated until the file is closed (e.g. at the top of the hour) even though
++ * the data is being written successfully. This is a known HDFS limitation that
++ * exists because of the performance cost of updating the metadata.  See
++ * <a href="https://issues.apache.org/jira/browse/HDFS-5478">HDFS-5478</a>.</p>
++  private final Object lock = new Object();
++  private Timer flushTimer;
++  @VisibleForTesting
++  protected static boolean isTest = false;
++  @VisibleForTesting
++  protected static volatile boolean hasFlushed = false;
++
++    flushTimer = new Timer("RollingFileSystemSink Flusher", true);
+-    String currentDir = DATE_FORMAT.format(new Date());
++    Date now = new Date();
++    String currentDir = DATE_FORMAT.format(now);
+-      currentDirPath = path;
+-
++      // Close the stream. This step could have been handled already by the
++      // flusher thread, but if it has, the PrintStream will just swallow the
++      // exception, which is fine.
++      currentDirPath = path;
++
+-        throwMetricsException("Failed to creating new log file", ex);
++        throwMetricsException("Failed to create new log file", ex);
++
++      scheduleFlush(now);
++   * Schedule the current hour's directory to be flushed at the top of the next
++   * hour. If this ends up running after the top of the next hour, it will
++   * execute immediately.
++   *
++   * @param now the current time
++   */
++  private void scheduleFlush(Date now) {
++    // Store the current currentDirPath to close later
++    final PrintStream toClose = currentOutStream;
++    Calendar next = Calendar.getInstance();
++
++    next.setTime(now);
++
++    if (isTest) {
++      // If we're running unit tests, flush after a short pause
++      next.add(Calendar.MILLISECOND, 400);
++    } else {
++      // Otherwise flush at the top of the hour
++      next.set(Calendar.SECOND, 0);
++      next.set(Calendar.MINUTE, 0);
++      next.add(Calendar.HOUR, 1);
++    }
++
++    flushTimer.schedule(new TimerTask() {
++      @Override
++      public void run() {
++        synchronized (lock) {
++          // This close may have already been done by a putMetrics() call. If it
++          // has, the PrintStream will swallow the exception, which is fine.
++          toClose.close();
++        }
++
++        hasFlushed = true;
++      }
++    }, next.getTime());
++  }
++
++  /**
+-    int id = 1;
++    // Start at 0 so that if the base filname exists, we start with the suffix
++    // ".1".
++    int id = 0;
++          id = getNextIdToTry(initial, id);
+-          id += 1;
++   * Return the next ID suffix to use when creating the log file. This method
++   * will look at the files in the directory, find the one with the highest
++   * ID suffix, and 1 to that suffix, and return it. This approach saves a full
++   * linear probe, which matters in the case where there are a large number of
++   * log files.
++   *
++   * @param initial the base file path
++   * @param lastId the last ID value that was used
++   * @return the next ID to try
++   * @throws IOException thrown if there's an issue querying the files in the
++   * directory
++   */
++  private int getNextIdToTry(Path initial, int lastId)
++      throws IOException {
++    RemoteIterator<LocatedFileStatus> files =
++        fileSystem.listFiles(currentDirPath, true);
++    String base = initial.toString();
++    int id = lastId;
++
++    while (files.hasNext()) {
++      String file = files.next().getPath().getName();
++
++      if (file.startsWith(base)) {
++        int fileId = extractId(file);
++
++        if (fileId > id) {
++          id = fileId;
++        }
++      }
++    }
++
++    // Return either 1 more than the highest we found or 1 more than the last
++    // ID used (if no ID was found).
++    return id + 1;
++  }
++
++  /**
++   * Extract the ID from the suffix of the given file name.
++   *
++   * @param file the file name
++   * @return the ID or -1 if no ID could be extracted
++   */
++  private int extractId(String file) {
++    int index = file.lastIndexOf(".");
++    int id = -1;
++
++    // A hostname has to have at least 1 character
++    if (index > 0) {
++      try {
++        id = Integer.parseInt(file.substring(index + 1));
++      } catch (NumberFormatException ex) {
++        // This can happen if there's no suffix, but there is a dot in the
++        // hostname.  Just ignore it.
++      }
++    }
++
++    return id;
++  }
++
++  /**
+-    rollLogDirIfNeeded();
++    synchronized (lock) {
++      rollLogDirIfNeeded();
+-    if (currentOutStream != null) {
+-      currentOutStream.printf("%d %s.%s", record.timestamp(),
+-          record.context(), record.name());
++      if (currentOutStream != null) {
++        currentOutStream.printf("%d %s.%s", record.timestamp(),
++            record.context(), record.name());
+-      String separator = ": ";
++        String separator = ": ";
+-      for (MetricsTag tag : record.tags()) {
+-        currentOutStream.printf("%s%s=%s", separator, tag.name(), tag.value());
+-        separator = ", ";
++        for (MetricsTag tag : record.tags()) {
++          currentOutStream.printf("%s%s=%s", separator, tag.name(),
++              tag.value());
++          separator = ", ";
++        }
++
++        for (AbstractMetric metric : record.metrics()) {
++          currentOutStream.printf("%s%s=%s", separator, metric.name(),
++              metric.value());
++        }
++
++        currentOutStream.println();
++
++        // If we don't hflush(), the data may not be written until the file is
++        // closed. The file won't be closed until the top of the hour *AND*
++        // another record is received. Calling hflush() makes sure that the data
++        // is complete at the top of the hour.
++        try {
++          currentFSOutStream.hflush();
++        } catch (IOException ex) {
++          throwMetricsException("Failed flushing the stream", ex);
++        }
++
++        checkForErrors("Unable to write to log file");
++      } else if (!ignoreError) {
++        throwMetricsException("Unable to write to log file");
+-
+-      for (AbstractMetric metric : record.metrics()) {
+-        currentOutStream.printf("%s%s=%s", separator, metric.name(),
+-            metric.value());
+-      }
+-
+-      currentOutStream.println();
+-
+-      // If we don't hflush(), the data may not be written until the file is
+-      // closed. The file won't be closed until the top of the hour *AND*
+-      // another record is received. Calling hflush() makes sure that the data
+-      // is complete at the top of the hour.
+-      try {
+-        currentFSOutStream.hflush();
+-      } catch (IOException ex) {
+-        throwMetricsException("Failed flushing the stream", ex);
+-      }
+-
+-      checkForErrors("Unable to write to log file");
+-    } else if (!ignoreError) {
+-      throwMetricsException("Unable to write to log file");
+-    // currentOutStream is null if currentFSOutStream is null
+-    if (currentFSOutStream != null) {
+-      try {
+-        currentFSOutStream.hflush();
+-      } catch (IOException ex) {
+-        throwMetricsException("Unable to flush log file", ex);
++    synchronized (lock) {
++      // currentOutStream is null if currentFSOutStream is null
++      if (currentFSOutStream != null) {
++        try {
++          currentFSOutStream.hflush();
++        } catch (IOException ex) {
++          throwMetricsException("Unable to flush log file", ex);
++        }
+-  public void close() throws IOException {
+-    if (currentOutStream != null) {
+-      currentOutStream.close();
++  public void close() {
++    synchronized (lock) {
++      if (currentOutStream != null) {
++        currentOutStream.close();
+-      try {
+-        checkForErrors("Unable to close log file");
+-      } finally {
+-        // Null out the streams just in case someone tries to reuse us.
+-        currentOutStream = null;
+-        currentFSOutStream = null;
++        try {
++          checkForErrors("Unable to close log file");
++        } finally {
++          // Null out the streams just in case someone tries to reuse us.
++          currentOutStream = null;
++          currentFSOutStream = null;
++        }

@@ -1,0 +1,102 @@
+YARN-1368. Added core functionality of recovering container state into schedulers after ResourceManager Restart so as to preserve running work in the cluster. Contributed by Jian He.
+
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/trunk@1601303 13f79535-47bb-0310-9956-ffa450edef68
+
++import org.apache.hadoop.yarn.api.records.ContainerState;
++import org.apache.hadoop.yarn.server.api.protocolrecords.NMContainerStatus;
++import org.apache.hadoop.yarn.server.resourcemanager.rmcontainer.RMContainerImpl;
++import org.apache.hadoop.yarn.server.resourcemanager.rmcontainer.RMContainerRecoverEvent;
++import org.apache.hadoop.yarn.server.resourcemanager.rmnode.RMNode;
++import org.apache.hadoop.yarn.server.resourcemanager.rmnode.RMNodeCleanContainerEvent;
++@SuppressWarnings("unchecked")
+-  protected Map<NodeId, N> nodes =
+-      new ConcurrentHashMap<NodeId, N>();
++  protected Map<NodeId, N> nodes = new ConcurrentHashMap<NodeId, N>();
++
++
++  private void killOrphanContainerOnNode(RMNode node,
++      NMContainerStatus container) {
++    if (!container.getContainerState().equals(ContainerState.COMPLETE)) {
++      this.rmContext.getDispatcher().getEventHandler().handle(
++        new RMNodeCleanContainerEvent(node.getNodeID(),
++          container.getContainerId()));
++    }
++  }
++
++  public synchronized void recoverContainersOnNode(
++      List<NMContainerStatus> containerReports, RMNode nm) {
++    if (!rmContext.isWorkPreservingRecoveryEnabled()
++        || containerReports == null
++        || (containerReports != null && containerReports.isEmpty())) {
++      return;
++    }
++
++    for (NMContainerStatus container : containerReports) {
++      ApplicationId appId =
++          container.getContainerId().getApplicationAttemptId().getApplicationId();
++      RMApp rmApp = rmContext.getRMApps().get(appId);
++      if (rmApp == null) {
++        LOG.error("Skip recovering container " + container
++            + " for unknown application.");
++        killOrphanContainerOnNode(nm, container);
++        continue;
++      }
++
++      // Unmanaged AM recovery is addressed in YARN-1815
++      if (rmApp.getApplicationSubmissionContext().getUnmanagedAM()) {
++        LOG.info("Skip recovering container " + container + " for unmanaged AM."
++            + rmApp.getApplicationId());
++        killOrphanContainerOnNode(nm, container);
++        continue;
++      }
++
++      SchedulerApplication<T> schedulerApp = applications.get(appId);
++      if (schedulerApp == null) {
++        LOG.info("Skip recovering container  " + container
++            + " for unknown SchedulerApplication. Application current state is "
++            + rmApp.getState());
++        killOrphanContainerOnNode(nm, container);
++        continue;
++      }
++
++      LOG.info("Recovering container " + container);
++      SchedulerApplicationAttempt schedulerAttempt =
++          schedulerApp.getCurrentAppAttempt();
++
++      // create container
++      RMContainer rmContainer = recoverAndCreateContainer(container, nm);
++
++      // recover RMContainer
++      rmContainer.handle(new RMContainerRecoverEvent(container.getContainerId(),
++        container));
++
++      // recover scheduler node
++      nodes.get(nm.getNodeID()).recoverContainer(rmContainer);
++
++      // recover queue: update headroom etc.
++      Queue queue = schedulerAttempt.getQueue();
++      queue.recoverContainer(clusterResource, schedulerAttempt, rmContainer);
++
++      // recover scheduler attempt
++      schedulerAttempt.recoverContainer(rmContainer);
++    }
++  }
++
++  private RMContainer recoverAndCreateContainer(NMContainerStatus report,
++      RMNode node) {
++    Container container =
++        Container.newInstance(report.getContainerId(), node.getNodeID(),
++          node.getHttpAddress(), report.getAllocatedResource(),
++          report.getPriority(), null);
++    ApplicationAttemptId attemptId =
++        container.getId().getApplicationAttemptId();
++    RMContainer rmContainer =
++        new RMContainerImpl(container, attemptId, node.getNodeID(),
++          applications.get(attemptId.getApplicationId()).getUser(), rmContext);
++    return rmContainer;
++  }
++
++  public SchedulerNode getSchedulerNode(NodeId nodeId) {
++    return nodes.get(nodeId);
++  }

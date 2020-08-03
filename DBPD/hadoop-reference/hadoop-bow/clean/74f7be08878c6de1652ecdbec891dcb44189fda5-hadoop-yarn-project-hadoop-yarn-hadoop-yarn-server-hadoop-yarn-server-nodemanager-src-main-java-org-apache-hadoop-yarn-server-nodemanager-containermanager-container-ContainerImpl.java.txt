@@ -1,0 +1,169 @@
+merge from trunk r1617527
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/branches/fs-encryption@1617532 13f79535-47bb-0310-9956-ffa450edef68
+
++import java.io.IOException;
++import org.apache.hadoop.yarn.server.nodemanager.recovery.NMStateStoreService;
++import org.apache.hadoop.yarn.server.nodemanager.recovery.NMStateStoreService.RecoveredContainerStatus;
++  private final NMStateStoreService stateStore;
++  // whether container has been recovered after a restart
++  private RecoveredContainerStatus recoveredStatus =
++      RecoveredContainerStatus.REQUESTED;
++  // whether container was marked as killed after recovery
++  private boolean recoveredAsKilled = false;
++
+-      ContainerLaunchContext launchContext, Credentials creds,
+-      NodeManagerMetrics metrics,
++      NMStateStoreService stateStore, ContainerLaunchContext launchContext,
++      Credentials creds, NodeManagerMetrics metrics,
++    this.stateStore = stateStore;
++  // constructor for a recovered container
++  public ContainerImpl(Configuration conf, Dispatcher dispatcher,
++      NMStateStoreService stateStore, ContainerLaunchContext launchContext,
++      Credentials creds, NodeManagerMetrics metrics,
++      ContainerTokenIdentifier containerTokenIdentifier,
++      RecoveredContainerStatus recoveredStatus, int exitCode,
++      String diagnostics, boolean wasKilled) {
++    this(conf, dispatcher, stateStore, launchContext, creds, metrics,
++        containerTokenIdentifier);
++    this.recoveredStatus = recoveredStatus;
++    this.exitCode = exitCode;
++    this.recoveredAsKilled = wasKilled;
++    this.diagnostics.append(diagnostics);
++  }
++
+-        EnumSet.of(ContainerState.LOCALIZING, ContainerState.LOCALIZED,
+-            ContainerState.LOCALIZATION_FAILED),
++        EnumSet.of(ContainerState.LOCALIZING,
++            ContainerState.LOCALIZED,
++            ContainerState.LOCALIZATION_FAILED,
++            ContainerState.DONE),
+-        ContainerEventType.KILL_CONTAINER)
++        EnumSet.of(ContainerEventType.KILL_CONTAINER,
++            ContainerEventType.CONTAINER_EXITED_WITH_SUCCESS,
++            ContainerEventType.CONTAINER_EXITED_WITH_FAILURE))
+-        ContainerEventType.RESOURCE_FAILED)
++        EnumSet.of(ContainerEventType.RESOURCE_FAILED,
++            ContainerEventType.CONTAINER_EXITED_WITH_SUCCESS,
++            ContainerEventType.CONTAINER_EXITED_WITH_FAILURE))
+-  @SuppressWarnings({"fallthrough", "unchecked"})
++  @SuppressWarnings("fallthrough")
++    sendFinishedEvents();
++  }
++  @SuppressWarnings("unchecked")
++  private void sendFinishedEvents() {
++  private void sendLaunchEvent() {
++    ContainersLauncherEventType launcherEvent =
++        ContainersLauncherEventType.LAUNCH_CONTAINER;
++    if (recoveredStatus == RecoveredContainerStatus.LAUNCHED) {
++      // try to recover a container that was previously launched
++      launcherEvent = ContainersLauncherEventType.RECOVER_CONTAINER;
++    }
++    dispatcher.getEventHandler().handle(
++        new ContainersLauncherEvent(this, launcherEvent));
++  }
++
++  // Inform the ContainersMonitor to start monitoring the container's
++  // resource usage.
++  @SuppressWarnings("unchecked") // dispatcher not typed
++  private void sendContainerMonitorStartEvent() {
++      long pmemBytes = getResource().getMemory() * 1024 * 1024L;
++      float pmemRatio = daemonConf.getFloat(
++          YarnConfiguration.NM_VMEM_PMEM_RATIO,
++          YarnConfiguration.DEFAULT_NM_VMEM_PMEM_RATIO);
++      long vmemBytes = (long) (pmemRatio * pmemBytes);
++
++      dispatcher.getEventHandler().handle(
++          new ContainerStartMonitoringEvent(containerId,
++              vmemBytes, pmemBytes));
++  }
++
++  private void addDiagnostics(String... diags) {
++    for (String s : diags) {
++      this.diagnostics.append(s);
++    }
++    try {
++      stateStore.storeContainerDiagnostics(containerId, diagnostics);
++    } catch (IOException e) {
++      LOG.warn("Unable to update diagnostics in state store for "
++          + containerId, e);
++    }
++  }
++
++  @SuppressWarnings("unchecked") // dispatcher not typed
++      if (container.recoveredStatus == RecoveredContainerStatus.COMPLETED) {
++        container.sendFinishedEvents();
++        return ContainerState.DONE;
++      } else if (container.recoveredAsKilled &&
++          container.recoveredStatus == RecoveredContainerStatus.REQUESTED) {
++        // container was killed but never launched
++        container.finished();
++        return ContainerState.DONE;
++      }
++
+-        container.dispatcher.getEventHandler().handle(
+-            new ContainersLauncherEvent(container,
+-                ContainersLauncherEventType.LAUNCH_CONTAINER));
++        container.sendLaunchEvent();
+-  @SuppressWarnings("unchecked") // dispatcher not typed
+-      container.dispatcher.getEventHandler().handle(
+-          new ContainersLauncherEvent(container,
+-              ContainersLauncherEventType.LAUNCH_CONTAINER));
++
++      container.sendLaunchEvent();
+-  @SuppressWarnings("unchecked") // dispatcher not typed
++    @SuppressWarnings("unchecked")
+-      // Inform the ContainersMonitor to start monitoring the container's
+-      // resource usage.
+-      long pmemBytes =
+-          container.getResource().getMemory() * 1024 * 1024L;
+-      float pmemRatio = container.daemonConf.getFloat(
+-          YarnConfiguration.NM_VMEM_PMEM_RATIO,
+-          YarnConfiguration.DEFAULT_NM_VMEM_PMEM_RATIO);
+-      long vmemBytes = (long) (pmemRatio * pmemBytes);
+-      
+-      container.dispatcher.getEventHandler().handle(
+-          new ContainerStartMonitoringEvent(container.containerId,
+-              vmemBytes, pmemBytes));
++      container.sendContainerMonitorStartEvent();
++
++      if (container.recoveredAsKilled) {
++        LOG.info("Killing " + container.containerId
++            + " due to recovered as killed");
++        container.addDiagnostics("Container recovered as killed.\n");
++        container.dispatcher.getEventHandler().handle(
++            new ContainersLauncherEvent(container,
++                ContainersLauncherEventType.CLEANUP_CONTAINER));
++      }
+-        container.diagnostics.append(exitEvent.getDiagnosticInfo())
+-          .append('\n');
++        container.addDiagnostics(exitEvent.getDiagnosticInfo(), "\n");
+-      container.diagnostics.append("Killed by external signal\n");
++      container.addDiagnostics("Killed by external signal\n");
+-      container.diagnostics.append(rsrcFailedEvent.getDiagnosticMessage()
+-          + "\n");
+-          
++      container.addDiagnostics(rsrcFailedEvent.getDiagnosticMessage(), "\n");
+-      container.diagnostics.append(killEvent.getDiagnostic()).append("\n");
+-      container.diagnostics.append("Container is killed before being launched.\n");
++      container.addDiagnostics(killEvent.getDiagnostic(), "\n");
++      container.addDiagnostics("Container is killed before being launched.\n");
+-      container.diagnostics.append(killEvent.getDiagnostic()).append("\n");
++      container.addDiagnostics(killEvent.getDiagnostic(), "\n");
+-        container.diagnostics.append(exitEvent.getDiagnosticInfo())
+-          .append('\n');
++        container.addDiagnostics(exitEvent.getDiagnosticInfo(), "\n");
+-      container.diagnostics.append(killEvent.getDiagnostic()).append("\n");
+-      container.diagnostics.append("Container is killed before being launched.\n");
++      container.addDiagnostics(killEvent.getDiagnostic(), "\n");
++      container.addDiagnostics("Container is killed before being launched.\n");
+-      container.diagnostics.append(updateEvent.getDiagnosticsUpdate())
+-          .append("\n");
++      container.addDiagnostics(updateEvent.getDiagnosticsUpdate(), "\n");
++      try {
++        container.stateStore.storeContainerDiagnostics(container.containerId,
++            container.diagnostics);
++      } catch (IOException e) {
++        LOG.warn("Unable to update state store diagnostics for "
++            + container.containerId, e);
++      }

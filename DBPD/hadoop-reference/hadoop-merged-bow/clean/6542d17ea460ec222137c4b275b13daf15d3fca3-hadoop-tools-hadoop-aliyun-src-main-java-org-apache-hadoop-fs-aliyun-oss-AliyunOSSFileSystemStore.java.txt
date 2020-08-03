@@ -1,0 +1,177 @@
+HADOOP-14999. AliyunOSS: provide one asynchronous multi-part based uploading mechanism. Contributed by Genmao Yu.
+
++
++import java.io.Serializable;
++import java.util.Collections;
++import java.util.Comparator;
+-  private long partSize;
+-        "null or empty. Please set proper endpoint with 'fs.oss.endpoint'.");
++          "null or empty. Please set proper endpoint with 'fs.oss.endpoint'.");
+-    uploadPartSize = conf.getLong(MULTIPART_UPLOAD_SIZE_KEY,
+-        MULTIPART_UPLOAD_SIZE_DEFAULT);
++    uploadPartSize = AliyunOSSUtils.getMultipartSizeProperty(conf,
++        MULTIPART_UPLOAD_PART_SIZE_KEY, MULTIPART_UPLOAD_PART_SIZE_DEFAULT);
+-    partSize = conf.getLong(MULTIPART_UPLOAD_SIZE_KEY,
+-        MULTIPART_UPLOAD_SIZE_DEFAULT);
+-    if (partSize < MIN_MULTIPART_UPLOAD_PART_SIZE) {
+-      partSize = MIN_MULTIPART_UPLOAD_PART_SIZE;
+-    }
+-    if (uploadPartSize < 5 * 1024 * 1024) {
+-      LOG.warn(MULTIPART_UPLOAD_SIZE_KEY + " must be at least 5 MB");
+-      uploadPartSize = 5 * 1024 * 1024;
+-    }
+-
+-   * Upload a file as an OSS object, using multipart upload.
+-   *
+-   * @param key object key.
+-   * @param file local file to upload.
+-   * @throws IOException if failed to upload object.
+-   */
+-  public void multipartUploadObject(String key, File file) throws IOException {
+-    File object = file.getAbsoluteFile();
+-    long dataLen = object.length();
+-    long realPartSize = AliyunOSSUtils.calculatePartSize(dataLen, partSize);
+-    int partNum = (int) (dataLen / realPartSize);
+-    if (dataLen % realPartSize != 0) {
+-      partNum += 1;
+-    }
+-
+-    InitiateMultipartUploadRequest initiateMultipartUploadRequest =
+-        new InitiateMultipartUploadRequest(bucketName, key);
+-    ObjectMetadata meta = new ObjectMetadata();
+-    if (StringUtils.isNotEmpty(serverSideEncryptionAlgorithm)) {
+-      meta.setServerSideEncryption(serverSideEncryptionAlgorithm);
+-    }
+-    initiateMultipartUploadRequest.setObjectMetadata(meta);
+-    InitiateMultipartUploadResult initiateMultipartUploadResult =
+-        ossClient.initiateMultipartUpload(initiateMultipartUploadRequest);
+-    List<PartETag> partETags = new ArrayList<PartETag>();
+-    String uploadId = initiateMultipartUploadResult.getUploadId();
+-
+-    try {
+-      for (int i = 0; i < partNum; i++) {
+-        // TODO: Optimize this, avoid opening the object multiple times
+-        FileInputStream fis = new FileInputStream(object);
+-        try {
+-          long skipBytes = realPartSize * i;
+-          AliyunOSSUtils.skipFully(fis, skipBytes);
+-          long size = (realPartSize < dataLen - skipBytes) ?
+-              realPartSize : dataLen - skipBytes;
+-          UploadPartRequest uploadPartRequest = new UploadPartRequest();
+-          uploadPartRequest.setBucketName(bucketName);
+-          uploadPartRequest.setKey(key);
+-          uploadPartRequest.setUploadId(uploadId);
+-          uploadPartRequest.setInputStream(fis);
+-          uploadPartRequest.setPartSize(size);
+-          uploadPartRequest.setPartNumber(i + 1);
+-          UploadPartResult uploadPartResult =
+-              ossClient.uploadPart(uploadPartRequest);
+-          statistics.incrementWriteOps(1);
+-          partETags.add(uploadPartResult.getPartETag());
+-        } finally {
+-          fis.close();
+-        }
+-      }
+-      CompleteMultipartUploadRequest completeMultipartUploadRequest =
+-          new CompleteMultipartUploadRequest(bucketName, key,
+-              uploadId, partETags);
+-      CompleteMultipartUploadResult completeMultipartUploadResult =
+-          ossClient.completeMultipartUpload(completeMultipartUploadRequest);
+-      LOG.debug(completeMultipartUploadResult.getETag());
+-    } catch (OSSException | ClientException e) {
+-      AbortMultipartUploadRequest abortMultipartUploadRequest =
+-          new AbortMultipartUploadRequest(bucketName, key, uploadId);
+-      ossClient.abortMultipartUpload(abortMultipartUploadRequest);
+-    }
+-  }
+-
+-  /**
+-                                   String marker, boolean recursive) {
++      String marker, boolean recursive) {
+-            0, status.getLen());
++              0, status.getLen());
+-        for(OSSObjectSummary summary: listing.getObjectSummaries()) {
++        for (OSSObjectSummary summary : listing.getObjectSummaries()) {
+-        for(String commonPrefix: listing.getCommonPrefixes()) {
++        for (String commonPrefix : listing.getCommonPrefixes()) {
++
++  public PartETag uploadPart(File file, String key, String uploadId, int idx)
++      throws IOException {
++    InputStream instream = null;
++    Exception caught = null;
++    int tries = 3;
++    while (tries > 0) {
++      try {
++        instream = new FileInputStream(file);
++        UploadPartRequest uploadRequest = new UploadPartRequest();
++        uploadRequest.setBucketName(bucketName);
++        uploadRequest.setKey(key);
++        uploadRequest.setUploadId(uploadId);
++        uploadRequest.setInputStream(instream);
++        uploadRequest.setPartSize(file.length());
++        uploadRequest.setPartNumber(idx);
++        UploadPartResult uploadResult = ossClient.uploadPart(uploadRequest);
++        return uploadResult.getPartETag();
++      } catch (Exception e) {
++        LOG.debug("Failed to upload "+ file.getPath() +", " +
++            "try again.", e);
++        caught = e;
++      } finally {
++        if (instream != null) {
++          instream.close();
++          instream = null;
++        }
++      }
++      tries--;
++    }
++
++    assert (caught != null);
++    throw new IOException("Failed to upload " + file.getPath() +
++        " for 3 times.", caught);
++  }
++
++  /**
++   * Initiate multipart upload.
++   */
++  public String getUploadId(String key) {
++    InitiateMultipartUploadRequest initiateMultipartUploadRequest =
++        new InitiateMultipartUploadRequest(bucketName, key);
++    InitiateMultipartUploadResult initiateMultipartUploadResult =
++        ossClient.initiateMultipartUpload(initiateMultipartUploadRequest);
++    return initiateMultipartUploadResult.getUploadId();
++  }
++
++  /**
++   * Complete the specific multipart upload.
++   */
++  public CompleteMultipartUploadResult completeMultipartUpload(String key,
++      String uploadId, List<PartETag> partETags) {
++    Collections.sort(partETags, new PartNumberAscendComparator());
++    CompleteMultipartUploadRequest completeMultipartUploadRequest =
++        new CompleteMultipartUploadRequest(bucketName, key, uploadId,
++            partETags);
++    return ossClient.completeMultipartUpload(completeMultipartUploadRequest);
++  }
++
++  /**
++   * Abort the specific multipart upload.
++   */
++  public void abortMultipartUpload(String key, String uploadId) {
++    AbortMultipartUploadRequest request = new AbortMultipartUploadRequest(
++        bucketName, key, uploadId);
++    ossClient.abortMultipartUpload(request);
++  }
++
++  private static class PartNumberAscendComparator
++      implements Comparator<PartETag>, Serializable {
++    @Override
++    public int compare(PartETag o1, PartETag o2) {
++      if (o1.getPartNumber() > o2.getPartNumber()) {
++        return 1;
++      } else {
++        return -1;
++      }
++    }
++  }
+
+INS26 INS26 INS26 INS40 INS40 INS40 INS31 INS31 INS31 INS31 INS55 MOV83 MOV43 UPD42 MOV42 MOV44 INS44 INS44 INS44 MOV43 INS8 INS29 INS83 MOV43 INS42 INS44 INS8 INS29 INS83 MOV43 INS42 MOV44 INS44 INS44 INS8 INS29 INS83 INS39 INS42 INS44 INS44 MOV8 INS83 INS83 INS42 INS74 INS43 INS31 INS43 INS42 INS43 INS42 INS39 INS42 MOV60 INS60 INS60 INS61 INS6 INS53 INS65 INS43 INS42 MOV60 MOV60 INS41 INS65 INS43 INS42 MOV74 INS42 MOV21 MOV60 INS41 INS65 INS43 INS42 INS43 INS42 INS43 INS43 INS42 INS78 INS83 INS39 INS42 INS44 INS44 INS8 UPD42 MOV42 INS42 UPD43 INS43 MOV59 INS39 INS59 INS27 INS8 INS36 INS14 INS66 INS42 MOV32 INS66 INS42 MOV32 INS66 UPD42 MOV42 INS42 UPD42 MOV42 INS42 INS42 INS43 INS42 INS43 INS42 INS25 UPD42 UPD42 INS33 UPD42 MOV42 UPD42 INS33 UPD42 MOV42 UPD34 MOV34 UPD42 MOV42 INS34 MOV54 INS21 INS27 INS43 INS27 INS42 UPD42 UPD42 UPD42 MOV42 INS14 UPD42 UPD42 INS42 INS42 INS27 INS8 INS8 UPD42 UPD42 INS42 UPD42 UPD42 INS8 INS12 INS8 INS37 INS42 INS33 INS42 INS45 INS32 INS45 INS43 INS32 INS32 INS41 INS41 MOV21 MOV60 MOV21 MOV21 MOV21 MOV21 MOV21 MOV21 MOV60 INS41 INS44 INS8 INS25 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS34 INS38 INS7 INS32 INS43 INS42 MOV21 INS21 INS27 INS8 INS34 INS42 MOV14 UPD42 UPD42 UPD42 UPD42 UPD42 UPD42 UPD42 INS32 UPD42 INS42 UPD42 UPD42 MOV42 UPD42 MOV42 INS42 INS7 INS42 INS33 MOV21 INS21 UPD42 UPD42 MOV42 INS42 UPD42 UPD42 UPD42 INS27 INS42 INS42 INS42 INS7 INS45 INS32 INS45 INS45 UPD42 INS42 INS33 UPD42 MOV42 UPD42 MOV42 DEL83 DEL39 DEL42 DEL59 DEL23 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL7 DEL21 DEL42 DEL42 DEL27 DEL42 DEL42 DEL7 DEL21 DEL8 DEL25 DEL42 DEL34 DEL34 DEL34 DEL27 DEL27 DEL42 DEL42 DEL42 DEL45 DEL27 DEL32 DEL21 DEL42 DEL34 DEL34 DEL34 DEL27 DEL7 DEL21 DEL8 DEL25 DEL66 DEL65 DEL42 DEL66 DEL65 DEL42 DEL66 DEL65 DEL42 DEL66 DEL65 DEL29 DEL39 DEL43 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL39 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL39 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL39 DEL42 DEL39 DEL42 DEL42 DEL27 DEL36 DEL11 DEL59 DEL60 DEL42 DEL42 DEL27 DEL34 DEL27 DEL42 DEL34 DEL7 DEL21 DEL8 DEL25 DEL42 DEL42 DEL42 DEL32 DEL42 DEL42 DEL42 DEL32 DEL21 DEL8 DEL25 DEL42 DEL42 DEL42 DEL32 DEL21 DEL42 DEL43 DEL74 DEL14 DEL59 DEL60 DEL60 DEL39 DEL59 DEL58 DEL42 DEL27 DEL42 DEL37 DEL42 DEL43 DEL42 DEL59 DEL60 DEL8 DEL24 DEL42 DEL59 DEL60 DEL8 DEL43 DEL43 DEL84 DEL42 DEL44 DEL12 DEL54 DEL8 DEL31 DEL42 DEL43 DEL14 DEL42 DEL42 DEL42 DEL42 DEL32 DEL42 DEL34 DEL27 DEL32 DEL39 DEL42 DEL42 DEL42 DEL27 DEL59 DEL60 DEL39 DEL42 DEL42 DEL42 DEL42 DEL27 DEL27 DEL36 DEL42 DEL42 DEL42 DEL27 DEL16 DEL59 DEL60 DEL34 DEL32 DEL21 DEL8 DEL8 DEL42 DEL32

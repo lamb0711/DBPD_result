@@ -1,0 +1,181 @@
+HADOOP-14556. S3A to support Delegation Tokens.
+
+Contributed by Steve Loughran and Daryn Sharp.
+
++import java.io.Closeable;
++import java.util.concurrent.TimeUnit;
++import com.amazonaws.services.securitytoken.AWSSecurityTokenService;
++import com.amazonaws.services.securitytoken.model.AssumeRoleRequest;
++import com.amazonaws.services.securitytoken.model.Credentials;
++import com.amazonaws.services.securitytoken.model.GetSessionTokenRequest;
+-import org.apache.commons.lang3.StringUtils;
++import org.apache.hadoop.fs.s3a.Invoker;
++import org.apache.hadoop.fs.s3a.Retries;
++import static org.apache.commons.lang3.StringUtils.isEmpty;
++import static org.apache.commons.lang3.StringUtils.isNotEmpty;
++import static org.apache.hadoop.fs.s3a.auth.delegation.DelegationConstants.*;
++
++   * The endpoint comes from the configuration options
++   * {@link org.apache.hadoop.fs.s3a.auth.delegation.DelegationConstants#DELEGATION_TOKEN_ENDPOINT}
++   * and
++   * {@link org.apache.hadoop.fs.s3a.auth.delegation.DelegationConstants#DELEGATION_TOKEN_REGION}
+-   * @param stsEndpoint optional endpoint "https://sns.us-west-1.amazonaws.com"
+-   * @param stsRegion the region, e.g "us-west-1"
+-      final AWSCredentialsProvider credentials, final String stsEndpoint,
++      final AWSCredentialsProvider credentials) throws IOException {
++    final ClientConfiguration awsConf = S3AUtils.createAwsConf(conf, bucket);
++    String endpoint = conf.getTrimmed(DELEGATION_TOKEN_ENDPOINT,
++        DEFAULT_DELEGATION_TOKEN_ENDPOINT);
++    String region = conf.getTrimmed(DELEGATION_TOKEN_REGION,
++        DEFAULT_DELEGATION_TOKEN_REGION);
++    return builder(credentials, awsConf, endpoint, region);
++  }
++
++  /**
++   * Create the builder ready for any final configuration options.
++   * Picks up connection settings from the Hadoop configuration, including
++   * proxy secrets.
++   * @param conf Configuration to act as source of options.
++   * @param bucket Optional bucket to use to look up per-bucket proxy secrets
++   * @param credentials AWS credential chain to use
++   * @param stsEndpoint optional endpoint "https://sns.us-west-1.amazonaws.com"
++   * @param stsRegion AWS recommend setting the endpoint instead.
++   * @return the builder to call {@code build()}
++   * @throws IOException problem reading proxy secrets
++   */
++  public static AWSSecurityTokenServiceClientBuilder builder(
++      final Configuration conf,
++      final String bucket,
++      final AWSCredentialsProvider credentials,
++      final String stsEndpoint,
+-    Preconditions.checkArgument(credentials != null, "No credentials");
++    final ClientConfiguration awsConf = S3AUtils.createAwsConf(conf, bucket);
++    return builder(credentials, awsConf, stsEndpoint, stsRegion);
++  }
++
++  /**
++   * Create the builder ready for any final configuration options.
++   * Picks up connection settings from the Hadoop configuration, including
++   * proxy secrets.
++   * @param awsConf AWS configuration.
++   * @param credentials AWS credential chain to use
++   * @param stsEndpoint optional endpoint "https://sns.us-west-1.amazonaws.com"
++   * @param stsRegion the region, e.g "us-west-1". Must be set if endpoint is.
++   * @return the builder to call {@code build()}
++   */
++  public static AWSSecurityTokenServiceClientBuilder builder(
++      final AWSCredentialsProvider credentials,
++      final ClientConfiguration awsConf,
++      final String stsEndpoint,
++      final String stsRegion) {
+-    final ClientConfiguration awsConf = S3AUtils.createAwsConf(conf, bucket);
++    Preconditions.checkArgument(credentials != null, "No credentials");
+-    if (StringUtils.isNotEmpty(stsEndpoint)) {
+-      LOG.debug("STS Endpoint ={}", stsEndpoint);
++    boolean destIsStandardEndpoint = STS_STANDARD.equals(stsEndpoint);
++    if (isNotEmpty(stsEndpoint) && !destIsStandardEndpoint) {
++      Preconditions.checkArgument(
++          isNotEmpty(stsRegion),
++          "STS endpoint is set to %s but no signing region was provided",
++          stsEndpoint);
++      LOG.debug("STS Endpoint={}; region='{}'", stsEndpoint, stsRegion);
++    } else {
++      Preconditions.checkArgument(isEmpty(stsRegion),
++          "STS signing region set set to %s but no STS endpoint specified",
++          stsRegion);
++  /**
++   * Create an STS Client instance.
++   * @param tokenService STS instance
++   * @param invoker invoker to use
++   * @return an STS client bonded to that interface.
++   * @throws IOException on any failure
++   */
++  public static STSClient createClientConnection(
++      final AWSSecurityTokenService tokenService,
++      final Invoker invoker)
++      throws IOException {
++    return new STSClient(tokenService, invoker);
++  }
++
++  /**
++   * STS client connection with retries.
++   */
++  public static final class STSClient implements Closeable {
++
++    private final AWSSecurityTokenService tokenService;
++
++    private final Invoker invoker;
++
++    private STSClient(final AWSSecurityTokenService tokenService,
++        final Invoker invoker) {
++      this.tokenService = tokenService;
++      this.invoker = invoker;
++    }
++
++    @Override
++    public void close() throws IOException {
++      try {
++        tokenService.shutdown();
++      } catch (UnsupportedOperationException ignored) {
++        // ignore this, as it is what the STS client currently
++        // does.
++      }
++    }
++
++    /**
++     * Request a set of session credentials.
++     *
++     * @param duration duration of the credentials
++     * @param timeUnit time unit of duration
++     * @return the role result
++     * @throws IOException on a failure of the request
++     */
++    @Retries.RetryTranslated
++    public Credentials requestSessionCredentials(
++        final long duration,
++        final TimeUnit timeUnit) throws IOException {
++      int durationSeconds = (int) timeUnit.toSeconds(duration);
++      LOG.debug("Requesting session token of duration {}", duration);
++      final GetSessionTokenRequest request = new GetSessionTokenRequest();
++      request.setDurationSeconds(durationSeconds);
++      return invoker.retry("request session credentials", "",
++          true,
++          () ->{
++            LOG.info("Requesting Amazon STS Session credentials");
++            return tokenService.getSessionToken(request).getCredentials();
++          });
++    }
++
++    /**
++     * Request a set of role credentials.
++     *
++     * @param roleARN ARN to request
++     * @param sessionName name of the session
++     * @param policy optional policy; "" is treated as "none"
++     * @param duration duration of the credentials
++     * @param timeUnit time unit of duration
++     * @return the role result
++     * @throws IOException on a failure of the request
++     */
++    @Retries.RetryTranslated
++    public Credentials requestRole(
++        final String roleARN,
++        final String sessionName,
++        final String policy,
++        final long duration,
++        final TimeUnit timeUnit) throws IOException {
++      LOG.debug("Requesting role {} with duration {}; policy = {}",
++          roleARN, duration, policy);
++      AssumeRoleRequest request = new AssumeRoleRequest();
++      request.setDurationSeconds((int) timeUnit.toSeconds(duration));
++      request.setRoleArn(roleARN);
++      request.setRoleSessionName(sessionName);
++      if (isNotEmpty(policy)) {
++        request.setPolicy(policy);
++      }
++      return invoker.retry("request role credentials", "", true,
++          () -> tokenService.assumeRole(request).getCredentials());
++    }
++  }
+
+MOV26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 UPD40 INS40 INS40 INS31 INS31 INS31 INS55 INS29 INS83 INS83 INS43 INS42 MOV44 MOV44 INS44 INS43 INS8 MOV29 INS83 INS83 INS43 INS42 INS44 INS44 INS44 INS44 INS44 MOV43 INS8 INS29 INS44 MOV21 INS29 INS83 INS83 INS43 INS42 INS44 INS44 INS43 INS8 INS29 INS83 INS83 INS83 INS42 INS43 INS23 INS23 INS31 INS31 INS31 INS31 INS65 MOV65 MOV65 MOV65 INS65 INS65 INS42 INS83 INS43 INS42 INS42 MOV60 INS60 INS60 INS41 INS65 INS65 INS65 INS42 INS83 INS43 INS42 INS83 INS43 INS42 INS83 INS43 INS42 INS83 INS43 INS42 INS83 INS43 INS42 INS60 INS41 INS65 INS65 INS65 INS65 INS65 INS65 INS83 INS43 INS42 INS60 INS65 INS65 INS65 INS65 INS65 INS42 INS83 INS43 INS42 INS83 INS43 INS42 INS42 INS41 INS65 INS42 INS83 INS83 INS43 INS59 INS83 INS83 INS43 INS59 INS83 INS42 INS44 INS44 INS8 INS78 INS83 INS39 INS42 INS43 INS8 INS29 INS78 INS83 INS43 INS42 INS44 INS44 INS43 INS8 INS29 INS78 INS83 INS43 INS42 INS44 INS44 INS44 INS44 INS44 INS43 INS8 INS66 INS66 INS66 INS66 INS65 INS66 INS65 INS66 INS65 INS42 INS66 INS42 INS43 INS59 INS43 INS59 INS32 INS42 INS66 INS42 INS66 INS42 INS66 UPD66 INS42 INS42 INS42 INS42 INS42 INS83 INS43 INS59 INS32 INS66 INS66 INS66 INS42 INS66 INS42 INS66 INS42 INS66 INS42 INS66 INS66 INS65 INS42 INS39 INS59 INS27 INS8 INS8 INS66 INS42 INS66 INS42 INS66 INS66 INS42 INS66 INS42 INS42 INS14 INS66 INS42 INS42 INS42 INS42 INS83 INS43 INS42 INS83 INS43 INS42 INS21 INS21 INS42 INS42 INS54 INS65 INS65 INS65 INS65 INS65 INS40 INS42 INS83 INS39 INS42 INS83 INS43 INS42 INS42 INS60 INS21 INS60 INS21 INS41 INS65 INS65 INS65 INS65 INS65 INS65 INS65 INS65 INS40 INS42 INS83 INS43 INS42 INS83 INS43 INS42 INS83 INS43 INS42 INS83 INS39 INS42 INS83 INS43 INS42 INS42 INS21 INS60 INS21 INS21 INS21 INS25 INS41 INS67 INS67 INS66 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS66 INS42 INS32 INS32 INS38 INS21 MOV21 MOV21 INS21 INS43 INS42 INS42 INS42 INS42 INS7 INS7 INS8 INS12 INS66 INS42 INS66 INS42 INS66 INS66 INS42 INS66 INS42 INS39 INS59 INS32 INS83 INS43 INS59 INS32 INS32 INS66 INS42 INS66 INS42 INS66 INS42 INS66 INS42 INS66 INS42 INS66 INS66 INS42 INS66 INS42 INS42 INS42 INS42 INS32 INS43 INS59 INS32 INS32 INS32 INS32 INS8 INS32 INS40 INS42 INS40 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS32 INS42 INS22 INS42 INS22 INS42 INS21 INS44 INS8 INS42 INS11 INS42 INS42 INS45 INS42 INS42 INS42 INS14 INS42 INS42 INS42 INS42 INS42 INS45 INS45 INS9 INS86 INS42 INS42 INS45 INS42 INS42 INS42 INS42 INS42 INS14 INS42 INS42 INS11 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS21 INS42 INS42 INS45 INS45 INS9 INS86 UPD42 MOV42 INS42 INS32 INS45 MOV42 UPD45 INS42 INS42 INS42 INS32 INS45 INS42 INS52 INS42 INS52 INS42 INS32 INS43 INS42 INS39 INS32 INS43 INS8 INS43 INS39 INS32 INS32 INS32 MOV42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS21 INS41 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS32 INS32 INS42 INS42 INS42 INS42 INS42 INS45 INS32 INS42 INS42 INS42 INS42 DEL32 DEL8

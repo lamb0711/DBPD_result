@@ -1,0 +1,150 @@
+HDFS-8578. On upgrade, Datanode should process all storage/data dirs in parallel.  Contributed by vinayakumarb and szetszwo
+
++import java.util.concurrent.ExecutionException;
++import org.apache.hadoop.HadoopIllegalArgumentException;
++import org.apache.hadoop.hdfs.DFSUtilClient;
+-      NamespaceInfo nsInfo, File dataDir, StartupOption startOpt)
+-          throws IOException {
++      NamespaceInfo nsInfo, File dataDir, StartupOption startOpt,
++      List<Callable<StorageDirectory>> callables) throws IOException {
+-      if (doTransition(sd, nsInfo, startOpt, datanode.getConf())) {
+-        return sd;
+-      }
++      if (!doTransition(sd, nsInfo, startOpt, callables, datanode.getConf())) {
+-      // 3. Update successfully loaded storage.
+-      setServiceLayoutVersion(getServiceLayoutVersion());
+-      writeProperties(sd);
++        // 3. Update successfully loaded storage.
++        setServiceLayoutVersion(getServiceLayoutVersion());
++        writeProperties(sd);
++      }
+-        datanode, nsInfos.get(0), volume, StartupOption.HOTSWAP);
++        datanode, nsInfos.get(0), volume, StartupOption.HOTSWAP, null);
+-          nsInfo, bpDataDirs, StartupOption.HOTSWAP, datanode.getConf());
++          nsInfo, bpDataDirs, StartupOption.HOTSWAP, null, datanode.getConf());
++  static int getParallelVolumeLoadThreadsNum(int dataDirs, Configuration conf) {
++    final String key
++        = DFSConfigKeys.DFS_DATANODE_PARALLEL_VOLUME_LOAD_THREADS_NUM_KEY;
++    final int n = conf.getInt(key, dataDirs);
++    if (n < 1) {
++      throw new HadoopIllegalArgumentException(key + " = " + n + " < 1");
++    }
++    final int min = Math.min(n, dataDirs);
++    LOG.info("Using " + min + " threads to upgrade data directories ("
++        + key + "=" + n + ", dataDirs=" + dataDirs + ")");
++    return min;
++  }
++
++  static class UpgradeTask {
++    private final StorageLocation dataDir;
++    private final Future<StorageDirectory> future;
++
++    UpgradeTask(StorageLocation dataDir, Future<StorageDirectory> future) {
++      this.dataDir = dataDir;
++      this.future = future;
++    }
++  }
++
+-    final List<StorageLocation> successLocations = loadDataStorage(
+-        datanode, nsInfo, dataDirs, startOpt);
+-    return loadBlockPoolSliceStorage(
+-        datanode, nsInfo, successLocations, startOpt);
++    final int numThreads = getParallelVolumeLoadThreadsNum(
++        dataDirs.size(), datanode.getConf());
++    final ExecutorService executor = Executors.newFixedThreadPool(numThreads);
++    try {
++      final List<StorageLocation> successLocations = loadDataStorage(
++          datanode, nsInfo, dataDirs, startOpt, executor);
++      return loadBlockPoolSliceStorage(
++          datanode, nsInfo, successLocations, startOpt, executor);
++    } finally {
++      executor.shutdown();
++    }
+-      StartupOption startOpt) throws IOException {
++      StartupOption startOpt, ExecutorService executor) throws IOException {
++    final List<UpgradeTask> tasks = Lists.newArrayList();
++          final List<Callable<StorageDirectory>> callables
++              = Lists.newArrayList();
+-              datanode, nsInfo, root, startOpt);
+-          addStorageDir(sd);
++              datanode, nsInfo, root, startOpt, callables);
++          if (callables.isEmpty()) {
++            addStorageDir(sd);
++            success.add(dataDir);
++          } else {
++            for(Callable<StorageDirectory> c : callables) {
++              tasks.add(new UpgradeTask(dataDir, executor.submit(c)));
++            }
++          }
+-          continue;
++        success.add(dataDir);
+-      success.add(dataDir);
++    }
++
++    if (!tasks.isEmpty()) {
++      LOG.info("loadDataStorage: " + tasks.size() + " upgrade tasks");
++      for(UpgradeTask t : tasks) {
++        try {
++          addStorageDir(t.future.get());
++          success.add(t.dataDir);
++        } catch (ExecutionException e) {
++          LOG.warn("Failed to upgrade storage directory " + t.dataDir, e);
++        } catch (InterruptedException e) {
++          throw DFSUtilClient.toInterruptedIOException("Task interrupted", e);
++        }
++      }
+-      StartupOption startOpt) throws IOException {
++      StartupOption startOpt, ExecutorService executor) throws IOException {
++    final List<UpgradeTask> tasks = Lists.newArrayList();
++        final List<Callable<StorageDirectory>> callables = Lists.newArrayList();
+-            nsInfo, bpDataDirs, startOpt, datanode.getConf());
+-        for(StorageDirectory sd : dirs) {
+-          success.add(sd);
++            nsInfo, bpDataDirs, startOpt, callables, datanode.getConf());
++        if (callables.isEmpty()) {
++          for(StorageDirectory sd : dirs) {
++            success.add(sd);
++          }
++        } else {
++          for(Callable<StorageDirectory> c : callables) {
++            tasks.add(new UpgradeTask(dataDir, executor.submit(c)));
++          }
++    if (!tasks.isEmpty()) {
++      LOG.info("loadBlockPoolSliceStorage: " + tasks.size() + " upgrade tasks");
++      for(UpgradeTask t : tasks) {
++        try {
++          success.add(t.future.get());
++        } catch (ExecutionException e) {
++          LOG.warn("Failed to upgrade storage directory " + t.dataDir
++              + " for block pool " + bpid, e);
++        } catch (InterruptedException e) {
++          throw DFSUtilClient.toInterruptedIOException("Task interrupted", e);
++        }
++      }
++    }
++
+-      StartupOption startOpt, Configuration conf) throws IOException {
++      StartupOption startOpt, List<Callable<StorageDirectory>> callables,
++      Configuration conf) throws IOException {
+-        doUpgradePreFederation(sd, nsInfo, conf);
++        doUpgradePreFederation(sd, nsInfo, callables, conf);
+-      final NamespaceInfo nsInfo, final Configuration conf) throws IOException {
++      final NamespaceInfo nsInfo,
++      final List<Callable<StorageDirectory>> callables,
++      final Configuration conf) throws IOException {
+-    doUgrade(sd, nsInfo, prevDir, tmpDir, bbwDir, toDir, oldLV, conf);
++    if (callables == null) {
++      doUpgrade(sd, nsInfo, prevDir, tmpDir, bbwDir, toDir, oldLV, conf);
++    } else {
++      callables.add(new Callable<StorageDirectory>() {
++        @Override
++        public StorageDirectory call() throws Exception {
++          doUpgrade(sd, nsInfo, prevDir, tmpDir, bbwDir, toDir, oldLV, conf);
++          return sd;
++        }
++      });
++    }
+-  private void doUgrade(final StorageDirectory sd,
++  private void doUpgrade(final StorageDirectory sd,
+
+INS26 INS26 INS26 INS40 INS40 INS40 INS31 INS55 INS44 INS83 INS39 INS42 INS44 INS44 INS8 INS83 INS42 INS23 INS23 INS31 INS8 INS44 INS44 INS44 INS44 UPD42 INS74 INS42 INS39 INS42 INS43 INS42 INS60 INS60 INS25 INS60 INS21 INS41 INS83 INS83 INS43 INS59 INS83 INS83 INS74 INS59 INS42 INS44 INS44 INS8 INS60 INS60 INS54 INS43 INS42 INS60 INS25 INS43 INS42 INS60 INS25 INS74 INS42 INS83 INS74 INS42 INS25 INS43 INS74 INS42 INS83 INS43 INS59 INS83 INS39 INS59 INS27 INS8 INS83 INS39 INS59 INS32 INS42 INS42 INS42 INS43 INS43 INS42 INS43 INS42 INS74 INS42 INS21 INS21 INS83 INS39 INS59 INS83 INS43 INS59 INS8 INS8 INS42 INS83 INS74 INS59 INS38 INS8 INS42 INS83 INS74 INS59 INS38 INS8 INS43 INS74 INS43 INS74 INS27 INS8 INS8 INS42 INS43 INS43 INS42 INS42 INS40 INS42 INS32 INS42 INS34 INS53 INS42 INS32 INS42 INS42 INS27 INS42 INS42 INS42 INS43 MOV43 INS7 INS7 INS42 INS32 INS42 INS42 INS32 MOV60 MOV41 INS21 INS43 INS43 INS42 INS32 INS25 INS32 INS21 INS70 INS43 INS43 INS42 INS32 INS32 INS21 INS70 INS42 INS43 INS43 INS42 INS43 INS43 INS42 INS33 MOV21 INS21 INS42 INS42 INS38 INS33 INS42 INS42 INS42 INS42 INS14 INS42 INS42 INS42 INS42 INS45 INS42 INS45 INS42 INS45 INS42 INS45 INS42 INS45 INS42 INS22 INS42 INS22 INS42 INS42 INS32 INS32 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS42 MOV38 INS8 MOV8 INS42 INS42 INS32 INS44 INS42 INS8 INS42 INS42 INS42 INS42 INS8 INS42 INS42 INS32 INS44 INS42 INS8 INS42 INS42 INS42 INS42 INS32 INS32 MOV21 MOV21 INS43 INS27 INS52 INS42 INS52 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS54 INS21 INS42 INS42 INS27 INS43 INS42 INS54 MOV21 INS60 INS60 INS25 INS42 INS42 INS27 INS43 INS42 INS54 UPD42 INS42 INS42 INS14 MOV42 MOV42 MOV42 MOV42 INS42 INS32 INS33 INS42 INS42 INS45 INS42 INS45 INS42 INS8 MOV12 INS32 INS45 INS32 INS45 INS42 INS8 INS12 INS12 INS83 INS74 INS59 INS83 MOV74 INS59 INS32 MOV8 INS8 INS45 INS32 INS45 INS42 INS8 INS12 INS12 INS74 INS1 INS42 INS42 INS60 MOV60 INS25 INS42 INS42 INS42 INS42 INS42 INS21 INS21 INS44 INS8 INS44 INS8 INS43 INS74 INS42 INS32 INS42 INS32 INS42 INS42 INS70 INS42 INS42 INS21 INS44 INS8 INS44 INS8 INS42 INS43 INS43 INS31 INS83 INS74 INS59 INS43 INS32 INS8 INS8 INS32 INS32 INS43 INS42 INS21 INS43 INS42 INS53 INS42 INS43 INS43 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 MOV32 INS44 INS42 INS8 INS32 INS43 INS42 INS21 INS43 INS42 INS53 INS42 INS42 INS78 INS83 INS43 INS42 INS43 INS8 INS43 INS74 INS42 INS32 INS42 INS42 INS42 MOV21 MOV21 INS70 INS42 INS32 INS42 INS42 INS40 INS42 INS32 INS42 INS32 INS42 INS42 INS74 INS42 INS21 INS42 INS42 INS32 INS42 INS32 INS42 INS32 INS42 INS42 INS42 INS21 MOV41 INS42 INS43 INS43 INS42 INS42 INS42 INS44 INS42 INS8 INS40 INS42 INS42 INS42 INS27 INS42 INS42 INS42 INS45 INS42 INS43 INS43 INS32 INS40 INS42 INS42 INS42 INS27 INS42 INS42 INS42 INS45 INS42 INS32 INS42 INS42 INS74 INS42 INS21 INS45 INS40 INS42 INS42 INS42 INS42 INS14 INS45 INS40 INS45 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS43 INS43 INS32 INS43 INS42 INS32 INS42 INS42 INS42 INS42 INS14 INS42 INS42 INS42 INS42 INS43 INS42 INS32 INS42 INS42 INS42 INS42 DEL32 DEL8 DEL18 DEL8 DEL54 DEL8 DEL25 DEL83 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60

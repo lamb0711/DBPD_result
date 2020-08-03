@@ -1,0 +1,224 @@
+HADOOP-15229. Add FileSystem builder-based openFile() API to match createFile();
+S3A to implement S3 Select through this API.
+
+The new openFile() API is asynchronous, and implemented across FileSystem and FileContext.
+
+The MapReduce V2 inputs are moved to this API, and you can actually set must/may
+options to pass in.
+
+This is more useful for setting things like s3a seek policy than for S3 select,
+as the existing input format/record readers can't handle S3 select output where
+the stream is shorter than the file length, and splitting plain text is suboptimal.
+Future work is needed there.
+
+In the meantime, any/all filesystem connectors are now free to add their own filesystem-specific
+configuration parameters which can be set in jobs and used to set filesystem input stream
+options (seek policy, retry, encryption secrets, etc).
+
+Contributed by Steve Loughran
+
++import java.util.concurrent.CompletableFuture;
++import org.apache.hadoop.fs.s3a.select.InternalSelectConstants;
++import org.apache.hadoop.util.LambdaUtils;
++import org.apache.hadoop.fs.s3a.select.SelectBinding;
++import org.apache.hadoop.fs.s3a.select.SelectConstants;
++import static org.apache.hadoop.fs.impl.AbstractFSBuilderImpl.rejectUnknownMandatoryKeys;
++
++  private SelectBinding selectBinding;
++      // instantiate S3 Select support
++      selectBinding = new SelectBinding(writeHelper);
++
++  @Retries.RetryTranslated
++    return open(f, Optional.empty());
++  }
++
++  /**
++   * Opens an FSDataInputStream at the indicated Path.
++   * @param path the file to open
++   * @param options configuration options if opened with the builder API.
++   * @throws IOException IO failure.
++   */
++  @Retries.RetryTranslated
++  private FSDataInputStream open(
++      final Path path,
++      final Optional<Configuration> options)
++      throws IOException {
++
+-    LOG.debug("Opening '{}' for reading; input policy = {}", f, inputPolicy);
+-    final FileStatus fileStatus = getFileStatus(f);
++    final FileStatus fileStatus = getFileStatus(path);
+-      throw new FileNotFoundException("Can't open " + f
++      throw new FileNotFoundException("Can't open " + path
++    S3AReadOpContext readContext;
++    if (options.isPresent()) {
++      Configuration o = options.get();
++      // normal path. Open the file with the chosen seek policy, if different
++      // from the normal one.
++      // and readahead.
++      S3AInputPolicy policy = S3AInputPolicy.getPolicy(
++          o.get(INPUT_FADVISE, inputPolicy.toString()));
++      long readAheadRange2 = o.getLong(READAHEAD_RANGE, readAhead);
++      readContext = createReadContext(fileStatus, policy, readAheadRange2);
++    } else {
++      readContext = createReadContext(fileStatus, inputPolicy, readAhead);
++    }
++    LOG.debug("Opening '{}'", readContext);
++
+-        new S3AInputStream(new S3AReadOpContext(hasMetadataStore(),
+-            invoker,
+-            s3guardInvoker,
+-            statistics,
+-            instrumentation,
+-            fileStatus),
+-            new S3ObjectAttributes(bucket,
+-                pathToKey(f),
+-                getServerSideEncryptionAlgorithm(),
+-                encryptionSecrets.getEncryptionKey()),
++        new S3AInputStream(
++            readContext,
++            createObjectAttributes(path),
+-            s3,
+-            readAhead,
+-            inputPolicy));
++            s3));
++  }
++
++  /**
++   * Create the read context for reading from the referenced file,
++   * using FS state as well as the status.
++   * @param fileStatus file status.
++   * @param seekPolicy input policy for this operation
++   * @param readAheadRange readahead value.
++   * @return a context for read and select operations.
++   */
++  private S3AReadOpContext createReadContext(
++      final FileStatus fileStatus,
++      final S3AInputPolicy seekPolicy,
++      final long readAheadRange) {
++    return new S3AReadOpContext(fileStatus.getPath(),
++        hasMetadataStore(),
++        invoker,
++        s3guardInvoker,
++        statistics,
++        instrumentation,
++        fileStatus,
++        seekPolicy,
++        readAheadRange);
++  }
++
++  /**
++   * Create the attributes of an object for a get/select request.
++   * @param f path path of the request.
++   * @return attributes to use when building the query.
++   */
++  private S3ObjectAttributes createObjectAttributes(final Path f) {
++    return new S3ObjectAttributes(bucket,
++        pathToKey(f),
++        getServerSideEncryptionAlgorithm(),
++        encryptionSecrets.getEncryptionKey());
++    case SelectConstants.S3_SELECT_CAPABILITY:
++      // select is only supported if enabled
++      return selectBinding.isEnabled();
++
++
++  /**
++   * This is a proof of concept of a select API.
++   * Once a proper factory mechanism for opening files is added to the
++   * FileSystem APIs, this will be deleted <i>without any warning</i>.
++   * @param source path to source data
++   * @param expression select expression
++   * @param options request configuration from the builder.
++   * @return the stream of the results
++   * @throws IOException IO failure
++   */
++  @Retries.RetryTranslated
++  private FSDataInputStream select(final Path source,
++      final String expression,
++      final Configuration options)
++      throws IOException {
++    entryPoint(OBJECT_SELECT_REQUESTS);
++    requireSelectSupport(source);
++    final Path path = makeQualified(source);
++    // call getFileStatus(), which will look at S3Guard first,
++    // so the operation will fail if it is not there or S3Guard believes it has
++    // been deleted.
++    // validation of the file status are delegated to the binding.
++    final FileStatus fileStatus = getFileStatus(path);
++
++    // readahead range can be dynamically set
++    long ra = options.getLong(READAHEAD_RANGE, readAhead);
++    // build and execute the request
++    return selectBinding.select(
++        createReadContext(fileStatus, inputPolicy, ra),
++        expression,
++        options,
++        generateSSECustomerKey(),
++        createObjectAttributes(path));
++  }
++
++  /**
++   * Verify the FS supports S3 Select.
++   * @param source source file.
++   * @throws UnsupportedOperationException if not.
++   */
++  private void requireSelectSupport(final Path source) throws
++      UnsupportedOperationException {
++    if (!selectBinding.isEnabled()) {
++      throw new UnsupportedOperationException(
++          SelectConstants.SELECT_UNSUPPORTED);
++    }
++  }
++
++  /**
++   * Initiate the open or select operation.
++   * This is invoked from both the FileSystem and FileContext APIs
++   * @param path path to the file
++   * @param mandatoryKeys set of options declared as mandatory.
++   * @param options options set during the build sequence.
++   * @return a future which will evaluate to the opened/selected file.
++   * @throws IOException failure to resolve the link.
++   * @throws PathIOException operation is a select request but S3 select is
++   * disabled
++   * @throws IllegalArgumentException unknown mandatory key
++   */
++  @Override
++  @Retries.RetryTranslated
++  public CompletableFuture<FSDataInputStream> openFileWithOptions(
++      final Path path,
++      final Set<String> mandatoryKeys,
++      final Configuration options,
++      final int bufferSize) throws IOException {
++    String sql = options.get(SelectConstants.SELECT_SQL, null);
++    boolean isSelect = sql != null;
++    // choice of keys depends on open type
++    if (isSelect) {
++      rejectUnknownMandatoryKeys(
++          mandatoryKeys,
++          InternalSelectConstants.SELECT_OPTIONS,
++          "for " + path + " in S3 Select operation");
++    } else {
++      rejectUnknownMandatoryKeys(
++          mandatoryKeys,
++          InternalConstants.STANDARD_OPENFILE_KEYS,
++          "for " + path + " in non-select file I/O");
++    }
++    CompletableFuture<FSDataInputStream> result = new CompletableFuture<>();
++    if (!isSelect) {
++      // normal path.
++      unboundedThreadPool.submit(() ->
++          LambdaUtils.eval(result,
++              () -> open(path, Optional.of(options))));
++    } else {
++      // it is a select statement.
++      // fail fast if the method is not present
++      requireSelectSupport(path);
++      // submit the query
++      unboundedThreadPool.submit(() ->
++          LambdaUtils.eval(result,
++              () -> select(path, sql, options)));
++    }
++    return result;
++  }
++
+
+INS26 INS26 INS26 INS26 INS26 INS26 INS40 INS40 INS40 INS40 INS40 INS40 INS23 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS83 INS43 INS59 MOV29 INS78 MOV83 MOV43 MOV42 MOV44 MOV44 MOV43 INS8 INS29 INS78 INS83 INS43 INS42 INS44 INS44 INS43 INS8 INS29 INS83 INS43 INS42 INS44 INS44 INS44 INS8 INS29 INS83 INS43 INS42 INS44 INS8 INS29 INS78 INS83 INS43 INS42 INS44 INS44 INS44 INS43 INS8 INS29 INS83 INS39 INS42 INS44 INS43 INS8 INS29 INS78 INS78 INS83 INS74 INS42 INS44 INS44 INS44 INS44 INS43 INS8 INS42 INS42 INS40 INS41 INS65 INS65 INS65 INS65 INS40 INS42 INS83 INS43 INS42 INS83 INS74 INS42 INS42 MOV21 MOV60 MOV25 INS60 INS25 INS21 INS41 INS65 INS65 INS65 INS65 INS65 INS42 INS83 INS43 INS42 INS83 INS43 INS42 INS83 INS39 INS42 INS41 INS65 INS65 INS65 INS42 INS83 INS43 INS42 MOV41 INS65 INS65 INS65 INS65 INS65 INS65 INS40 INS42 INS83 INS43 INS42 INS83 INS43 INS42 INS83 INS43 INS42 INS42 INS21 INS21 INS60 INS60 INS60 INS41 INS65 INS65 INS65 INS83 INS43 INS42 INS42 INS25 INS65 INS65 INS65 INS65 INS65 INS65 INS65 INS65 INS42 INS40 INS43 INS43 INS83 INS43 INS42 INS83 INS74 INS42 INS83 INS43 INS42 INS83 INS39 INS42 INS42 INS60 INS60 INS25 INS60 INS25 INS41 INS32 INS66 INS42 INS66 INS42 INS66 INS42 INS66 INS42 INS43 INS43 INS43 INS59 INS32 INS8 INS8 INS32 INS14 INS66 INS66 INS42 INS66 INS42 INS66 INS42 INS66 INS66 INS42 INS42 INS14 INS66 INS42 INS66 INS66 INS42 MOV14 INS41 INS49 INS66 INS66 INS66 INS42 INS66 INS42 INS66 INS42 INS66 INS66 INS42 INS66 INS42 INS42 INS42 INS32 INS32 INS83 INS43 INS59 INS83 INS43 INS59 INS39 INS59 INS32 INS66 INS42 INS66 INS42 INS66 INS42 INS38 INS8 INS66 INS66 INS42 INS66 INS42 INS66 INS42 INS66 INS66 INS42 INS66 INS42 INS66 INS66 INS42 INS66 INS42 INS42 INS42 INS43 INS43 INS42 INS43 INS59 INS39 INS59 INS42 INS8 INS8 INS74 INS59 INS38 INS8 INS8 INS42 INS21 UPD42 MOV42 MOV42 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS60 INS60 INS60 INS21 INS21 INS42 INS42 INS45 INS42 MOV43 INS14 MOV43 INS32 MOV32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS40 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS32 INS32 INS32 INS53 INS42 INS42 INS42 INS42 INS32 INS42 INS27 INS21 INS21 INS43 INS43 INS42 INS14 INS42 INS21 INS21 INS21 INS7 INS42 UPD42 MOV42 UPD42 INS43 INS59 INS43 INS59 INS39 INS59 INS7 INS7 MOV43 INS42 INS32 MOV32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS14 INS42 INS42 INS40 INS33 INS42 INS33 INS32 INS32 INS42 INS42 INS74 INS32 INS32 INS32 INS42 INS14 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS32 INS42 INS32 INS42 INS32 INS42 INS42 INS43 INS40 INS42 INS42 INS40 INS27 INS42 INS42 INS40 INS27 INS43 INS42 INS42 INS86 INS42 INS42 INS42 INS42 INS86 INS43 INS42 UPD42 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS45 INS42 INS45 INS45 INS42 INS45 INS42 INS32 INS32 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS86 INS42 INS42 INS42 INS86 INS42 INS42 INS32 INS32 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL14 DEL42 DEL42 DEL42 DEL14 DEL14 DEL42 DEL45 DEL32 DEL21 DEL8 DEL31

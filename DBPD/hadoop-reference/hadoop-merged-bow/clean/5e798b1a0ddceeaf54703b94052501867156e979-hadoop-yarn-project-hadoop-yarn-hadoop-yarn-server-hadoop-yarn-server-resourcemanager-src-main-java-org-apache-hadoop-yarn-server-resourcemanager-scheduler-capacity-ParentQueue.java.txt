@@ -1,0 +1,207 @@
+YARN-6471. Support to add min/max resource configuration for a queue. (Sunil G via wangda)
+
+Change-Id: I9213f5297a6841fab5c573e85ee4c4e5f4a0b7ff
+
++import java.util.Set;
++import org.apache.hadoop.yarn.util.resource.ResourceCalculator;
++      Resource minResDefaultLabel = Resources.createResource(0, 0);
++        Resources.addTo(minResDefaultLabel, queue.getQueueResourceQuotas()
++            .getConfiguredMinResource());
++
++        // If any child queue is using percentage based capacity model vs parent
++        // queues' absolute configuration or vice versa, throw back an
++        // exception.
++        if (!queueName.equals("root") && getCapacity() != 0f
++            && !queue.getQueueResourceQuotas().getConfiguredMinResource()
++                .equals(Resources.none())) {
++          throw new IllegalArgumentException("Parent queue '" + getQueueName()
++              + "' and child queue '" + queue.getQueueName()
++              + "' should use either percentage based capacity"
++              + " configuration or absolute resource together.");
++        }
++
+-      if (((queueCapacities.getCapacity() > 0) && (delta > PRECISION)) || (
+-          (queueCapacities.getCapacity() == 0) && (childCapacities > 0))) {
+-        throw new IllegalArgumentException(
+-            "Illegal" + " capacity of " + childCapacities
+-                + " for children of queue " + queueName);
++      if ((minResDefaultLabel.equals(Resources.none())
++          && (queueCapacities.getCapacity() > 0) && (delta > PRECISION))
++          || ((queueCapacities.getCapacity() == 0) && (childCapacities > 0))) {
++        throw new IllegalArgumentException("Illegal" + " capacity of "
++            + childCapacities + " for children of queue " + queueName);
++        Resource minRes = Resources.createResource(0, 0);
++        Resource resourceByLabel = labelManager.getResourceByLabel(nodeLabel,
++            scheduler.getClusterResource());
++
++          // If any child queue of a label is using percentage based capacity
++          // model vs parent queues' absolute configuration or vice versa, throw
++          // back an exception
++          if (!queueName.equals("root") && !this.capacityConfigType
++              .equals(queue.getCapacityConfigType())) {
++            throw new IllegalArgumentException("Parent queue '" + getQueueName()
++                + "' and child queue '" + queue.getQueueName()
++                + "' should use either percentage based capacity"
++                + "configuration or absolute resource together for label:"
++                + nodeLabel);
++          }
++
++          // Accumulate all min/max resource configured for all child queues.
++          Resources.addTo(minRes, queue.getQueueResourceQuotas()
++              .getConfiguredMinResource(nodeLabel));
+-        if ((capacityByLabel > 0 && Math.abs(1.0f - sum) > PRECISION)
++        if ((minResDefaultLabel.equals(Resources.none()) && capacityByLabel > 0
++            && Math.abs(1.0f - sum) > PRECISION)
++
++        // Ensure that for each parent queue: parent.min-resource >=
++        // Σ(child.min-resource).
++        Resource parentMinResource = queueResourceQuotas
++            .getConfiguredMinResource(nodeLabel);
++        if (!parentMinResource.equals(Resources.none()) && Resources.lessThan(
++            resourceCalculator, resourceByLabel, parentMinResource, minRes)) {
++          throw new IllegalArgumentException("Parent Queues" + " capacity: "
++              + parentMinResource + " is less than" + " to its children:"
++              + minRes + " for queue:" + queueName);
++        }
+-    Resource childConfiguredMaxResource = Resources.multiplyAndNormalizeDown(
+-        resourceCalculator,
+-        labelManager.getResourceByLabel(nodePartition, clusterResource),
+-        child.getQueueCapacities().getAbsoluteMaximumCapacity(nodePartition),
+-        minimumAllocation);
++    Resource childConfiguredMaxResource = getEffectiveMaxCapacityDown(
++        nodePartition, minimumAllocation);
++
++      // Update effective capacity in all parent queue.
++      Set<String> configuredNodelabels = csContext.getConfiguration()
++          .getConfiguredNodeLabels(getQueuePath());
++      for (String label : configuredNodelabels) {
++        calculateEffectiveResourcesAndCapacity(label, clusterResource);
++      }
++
++  private void calculateEffectiveResourcesAndCapacity(String label,
++      Resource clusterResource) {
++
++    // For root queue, ensure that max/min resource is updated to latest
++    // cluster resource.
++    Resource resourceByLabel = labelManager.getResourceByLabel(label,
++        clusterResource);
++    if (getQueueName().equals("root")) {
++      queueResourceQuotas.setConfiguredMinResource(label, resourceByLabel);
++      queueResourceQuotas.setConfiguredMaxResource(label, resourceByLabel);
++      queueResourceQuotas.setEffectiveMinResource(label, resourceByLabel);
++      queueResourceQuotas.setEffectiveMaxResource(label, resourceByLabel);
++    }
++
++    // Total configured min resources of direct children of queue
++    Resource configuredMinResources = Resource.newInstance(0L, 0);
++    for (CSQueue childQueue : getChildQueues()) {
++      Resources.addTo(configuredMinResources,
++          childQueue.getQueueResourceQuotas().getConfiguredMinResource(label));
++    }
++
++    // Factor to scale down effective resource: When cluster has sufficient
++    // resources, effective_min_resources will be same as configured
++    // min_resources.
++    float effectiveMinRatio = 1;
++    ResourceCalculator rc = this.csContext.getResourceCalculator();
++    if (getQueueName().equals("root")) {
++      if (!resourceByLabel.equals(Resources.none()) && Resources.lessThan(rc,
++          clusterResource, resourceByLabel, configuredMinResources)) {
++        effectiveMinRatio = Resources.divide(rc, clusterResource,
++            resourceByLabel, configuredMinResources);
++      }
++    } else {
++      if (Resources.lessThan(rc, clusterResource,
++          queueResourceQuotas.getEffectiveMinResource(label),
++          configuredMinResources)) {
++        effectiveMinRatio = Resources.divide(rc, clusterResource,
++            queueResourceQuotas.getEffectiveMinResource(label),
++            configuredMinResources);
++      }
++    }
++
++    // loop and do this for all child queues
++    for (CSQueue childQueue : getChildQueues()) {
++      Resource minResource = childQueue.getQueueResourceQuotas()
++          .getConfiguredMinResource(label);
++
++      // Update effective resource (min/max) to each child queue.
++      if (childQueue.getCapacityConfigType()
++          .equals(CapacityConfigType.ABSOLUTE_RESOURCE)) {
++        childQueue.getQueueResourceQuotas().setEffectiveMinResource(label,
++            Resources.multiply(minResource, effectiveMinRatio));
++
++        // Max resource of a queue should be a minimum of {configuredMaxRes,
++        // parentMaxRes}. parentMaxRes could be configured value. But if not
++        // present could also be taken from effective max resource of parent.
++        Resource parentMaxRes = queueResourceQuotas
++            .getConfiguredMaxResource(label);
++        if (parentMaxRes.equals(Resources.none())) {
++          parentMaxRes = parent.getQueueResourceQuotas()
++              .getEffectiveMaxResource(label);
++        }
++
++        // Minimum of {childMaxResource, parentMaxRes}. However if
++        // childMaxResource is empty, consider parent's max resource alone.
++        Resource childMaxResource = childQueue.getQueueResourceQuotas()
++            .getConfiguredMaxResource(label);
++        Resource effMaxResource = Resources.min(resourceCalculator,
++            resourceByLabel, childMaxResource.equals(Resources.none())
++                ? parentMaxRes
++                : childMaxResource,
++            parentMaxRes);
++        childQueue.getQueueResourceQuotas().setEffectiveMaxResource(label,
++            Resources.clone(effMaxResource));
++      } else {
++        childQueue.getQueueResourceQuotas().setEffectiveMinResource(label,
++            Resources.multiply(resourceByLabel,
++                childQueue.getQueueCapacities().getAbsoluteCapacity(label)));
++        childQueue.getQueueResourceQuotas().setEffectiveMaxResource(label,
++            Resources.multiply(resourceByLabel, childQueue.getQueueCapacities()
++                .getAbsoluteMaximumCapacity(label)));
++
++        childQueue.getQueueResourceQuotas().setEffectiveMinResourceUp(label,
++            Resources.multiplyAndNormalizeUp(rc, resourceByLabel,
++                childQueue.getQueueCapacities().getAbsoluteCapacity(label),
++                minimumAllocation));
++        childQueue.getQueueResourceQuotas().setEffectiveMaxResourceUp(label,
++            Resources.multiplyAndNormalizeUp(rc,
++                resourceByLabel, childQueue.getQueueCapacities()
++                    .getAbsoluteMaximumCapacity(label),
++                    minimumAllocation));
++      }
++
++      if (LOG.isDebugEnabled()) {
++        LOG.debug("Updating effective min resource for queue:"
++            + childQueue.getQueueName() + " as effMinResource="
++            + childQueue.getQueueResourceQuotas().getEffectiveMinResource(label)
++            + "and Updating effective max resource as effMaxResource="
++            + childQueue.getQueueResourceQuotas()
++                .getEffectiveMaxResource(label));
++      }
++    }
++  }
++
+-      if (getQueueCapacities().getAbsoluteMaximumCapacity(nodePartition)
+-          < getQueueCapacities().getAbsoluteUsedCapacity(nodePartition)) {
+-        killContainersToEnforceMaxQueueCapacity(nodePartition, clusterResource);
++      if (!queueResourceQuotas.getEffectiveMaxResource(nodePartition)
++          .equals(Resources.none())) {
++        if (Resources.lessThan(resourceCalculator, clusterResource,
++            queueResourceQuotas.getEffectiveMaxResource(nodePartition),
++            queueUsage.getUsed(nodePartition))) {
++          killContainersToEnforceMaxQueueCapacity(nodePartition,
++              clusterResource);
++        }
++      } else {
++        if (getQueueCapacities()
++            .getAbsoluteMaximumCapacity(nodePartition) < getQueueCapacities()
++                .getAbsoluteUsedCapacity(nodePartition)) {
++          killContainersToEnforceMaxQueueCapacity(nodePartition,
++              clusterResource);
++        }
+-    Resource maxResource = Resources.multiply(partitionResource,
+-        getQueueCapacities().getAbsoluteMaximumCapacity(partition));
++    Resource maxResource = getEffectiveMaxCapacity(partition);
+
+INS26 INS26 INS40 INS40 INS31 INS83 INS39 INS42 INS44 INS44 INS8 INS43 INS42 INS43 INS42 INS60 INS25 INS60 INS70 INS60 INS60 INS25 INS70 INS42 INS42 INS43 INS59 INS32 INS8 INS43 INS59 INS44 INS32 INS8 INS39 INS59 INS43 INS59 INS32 INS8 INS8 INS44 INS32 INS8 INS8 INS43 INS59 INS60 INS60 INS70 INS42 INS42 INS32 INS32 INS42 INS45 INS21 INS21 INS21 INS21 INS42 INS42 INS32 INS43 INS42 INS42 INS21 INS42 INS34 INS42 INS42 INS32 INS32 INS42 INS45 INS25 INS25 INS43 INS42 INS42 INS60 INS25 INS25 MOV21 MOV21 INS25 INS42 INS42 INS32 INS43 INS59 INS8 UPD42 MOV42 MOV42 INS74 INS59 INS44 INS42 INS8 INS42 INS42 INS42 INS42 INS42 INS32 INS32 INS32 INS32 INS42 INS42 INS34 INS34 INS42 INS32 INS22 INS42 INS42 INS27 INS8 INS32 INS8 INS42 INS43 INS59 INS32 INS8 INS8 INS32 INS8 INS38 INS8 MOV8 UPD42 MOV42 MOV42 INS42 INS42 INS32 MOV21 INS21 INS25 INS60 INS60 INS60 INS25 INS43 INS43 INS42 INS32 INS43 INS42 INS21 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS52 INS42 INS38 INS32 INS21 INS42 INS42 INS42 INS42 INS32 INS42 INS21 INS42 INS42 INS32 INS32 INS42 INS40 INS21 INS60 INS25 INS60 INS60 INS21 INS21 INS21 INS21 INS21 INS42 INS42 INS21 INS32 INS25 INS42 INS42 INS34 INS34 INS32 INS27 INS8 INS43 INS59 INS43 INS59 INS8 INS43 INS59 INS27 INS8 INS42 INS42 INS32 INS42 INS32 INS42 INS32 INS32 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS7 INS42 INS42 INS42 INS7 INS32 INS42 INS42 INS42 INS42 INS32 INS43 INS59 INS32 INS8 INS43 INS59 MOV43 INS59 INS32 INS32 INS32 INS32 INS32 INS32 INS32 INS42 INS32 INS32 INS8 INS42 INS42 INS42 INS32 INS27 INS38 INS53 INS32 INS42 INS42 INS32 INS42 INS42 INS32 MOV21 INS25 INS21 INS42 INS42 INS32 INS38 INS32 INS53 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS32 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS32 INS21 INS42 INS42 INS32 INS42 INS32 INS32 INS42 INS42 INS32 INS32 INS42 INS42 INS32 INS32 INS42 INS42 INS32 INS32 INS42 INS42 INS32 INS32 INS42 INS42 INS32 INS42 INS42 INS27 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS32 INS21 INS32 INS42 INS38 INS27 INS32 INS14 INS42 INS42 INS32 INS42 INS42 INS34 INS34 INS42 INS42 INS42 INS32 INS27 INS8 INS32 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS14 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS7 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS16 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS45 INS32 INS45 INS32 INS45 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS32 INS32 INS34 INS32 INS42 INS32 INS43 INS27 INS42 INS42 INS42 INS42 INS38 INS38 INS53 INS42 INS42 INS42 INS32 INS27 INS42 INS42 INS32 INS43 INS27 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS45 INS42 INS32 INS42 INS42 INS42 INS42 INS45 INS32 INS45 INS32 INS45 INS45 INS32 INS32 INS14 INS32 INS42 INS42 INS32 MOV27 INS42 INS42 INS42 INS27 INS42 INS45 INS45 INS42 INS45 INS42 INS32 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS45 INS22 INS42 INS32 INS43 INS27 INS42 INS42 INS42 INS42 INS32 INS45 INS45 INS42 INS42 INS42 INS42 INS52 INS42 INS42 INS42 INS42 INS45 INS32 INS45 INS32 INS45 INS45 INS42 INS42 INS42 INS42 INS42 INS42 DEL8 DEL8 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL42 DEL42 DEL32 DEL32 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL32 DEL32 DEL59

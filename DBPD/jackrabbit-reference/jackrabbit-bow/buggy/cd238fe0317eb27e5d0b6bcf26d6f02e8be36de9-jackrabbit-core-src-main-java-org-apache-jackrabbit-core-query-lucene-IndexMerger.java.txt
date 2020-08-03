@@ -1,0 +1,249 @@
+JCR-2387: Use executor service from repository for index merging
+
+git-svn-id: https://svn.apache.org/repos/asf/jackrabbit/trunk@834039 13f79535-47bb-0310-9956-ffa450edef68
+
+-import org.apache.lucene.index.Term;
++import java.io.IOException;
++import java.util.ArrayList;
++import java.util.Collections;
++import java.util.Iterator;
++import java.util.List;
++import java.util.concurrent.CountDownLatch;
++import java.util.concurrent.Executor;
++import java.util.concurrent.atomic.AtomicBoolean;
++import java.util.concurrent.locks.Lock;
++import java.util.concurrent.locks.ReadWriteLock;
++import java.util.concurrent.locks.ReentrantReadWriteLock;
++
++import org.apache.lucene.index.Term;
+-import java.util.List;
+-import java.util.Collections;
+-import java.util.ArrayList;
+-import java.util.Iterator;
+-import java.util.concurrent.LinkedBlockingQueue;
+-import java.util.concurrent.BlockingQueue;
+-import java.util.concurrent.Semaphore;
+-import java.io.IOException;
+-
+-     * Marker task to signal the background thread to quit.
+-     */
+-    private static final Merge QUIT = new Merge(new Index[0]);
+-
+-    /**
+-     * Queue of merge Tasks
+-     */
+-    private final BlockingQueue<Merge> mergeTasks = new LinkedBlockingQueue<Merge>();
+-
+-    /**
++     * The executor of the repository.
++     */
++    private final Executor executor;
++
++    /**
++     * Flag that indicates that this index merger is shuting down and should
++     * quit. 
++     */
++    private final AtomicBoolean quit = new AtomicBoolean(false);
++
++    /**
++     * Flag that indicates if this index merger has already been started.
++     * @see #start()
++     */
++    private final AtomicBoolean isStarted = new AtomicBoolean(false);
++
++    /**
+-     * Mutex that is acquired when replacing indexes on MultiIndex.
++     * Read/write lock for index segment replacement. A shared read lock is
++     * aquired for an index replacement. An exclusive write lock is acquired
++     * when this index merger is shuting down, to prevent further index
++     * replacements.
+-    private final Semaphore indexReplacement;
++    private final ReadWriteLock indexReplacement = new ReentrantReadWriteLock();
+-     * List of merger threads.
+-     */
+-    private final List<Worker> workers = new ArrayList<Worker>();
+-
+-    /**
+-     * @param numWorkers the number of worker threads to use.
++     * @param executor   the executor of the repository.
+-    IndexMerger(MultiIndex multiIndex, int numWorkers) {
++    IndexMerger(MultiIndex multiIndex, Executor executor) {
+-        for (int i = 0; i < numWorkers; i++) {
+-            Worker w = new Worker();
+-            workers.add(w);
+-            busyMergers.add(w);
+-        }
+-        this.indexReplacement = new Semaphore(workers.size());
++        this.executor = executor;
+-        for (Thread t : workers) {
+-            t.start();
++        isStarted.set(true);
++        for (Worker worker : busyMergers) {
++            worker.unblock();
+-                        log.debug("merge queue now contains " + mergeTasks.size() + " tasks.");
+-        // get all permits for index replacements
++        // get exclusive lock on index replacements
+-            indexReplacement.acquire(workers.size());
++            indexReplacement.writeLock().lockInterruptibly();
+-            log.warn("Interrupted while acquiring index replacement permits: " + e);
++            log.warn("Interrupted while acquiring index replacement exclusive lock: " + e);
+-        log.debug("merge queue size: " + mergeTasks.size());
+-        // clear task queue
+-        mergeTasks.clear();
+-
+-        // send quit
+-        addMergeTask(QUIT);
+-        log.debug("quit sent");
++        // set quit
++        quit.set(true);
++        log.debug("quit flag set");
+-            for (Thread t : workers) {
+-                t.join(500);
+-                if (t.isAlive()) {
++            Worker[] workers;
++            synchronized (busyMergers) {
++                workers = busyMergers.toArray(new Worker[busyMergers.size()]);
++            }
++            for (Worker w : workers) {
++                w.join(500);
++                if (w.isAlive()) {
+-        for (;;) {
+-            try {
+-                mergeTasks.put(task);
+-                break;
+-            } catch (InterruptedException e) {
+-                // try again
+-                Thread.interrupted();
++        // only enqueue if still running
++        if (!quit.get()) {
++            Worker worker = new Worker(task);
++            if (isStarted.get()) {
++                // immediately unblock if this index merger is already started
++                worker.unblock();
++            synchronized (busyMergers) {
++                busyMergers.add(worker);
++            }
++            executor.execute(worker);
+-    private class Worker extends Thread implements IndexListener {
++    private class Worker implements Runnable, IndexListener {
+-        public Worker() {
+-            setName("IndexMerger.Worker");
+-            setDaemon(true);
++        /**
++         * A latch that is set to zero when this worker is unblocked.
++         */
++        private final CountDownLatch start = new CountDownLatch(1);
++
++        /**
++         * Flat that indicates whether this woker has finished its work.
++         */
++        private final AtomicBoolean terminated = new AtomicBoolean(true);
++
++        /**
++         * The merge task.
++         */
++        private final Merge task;
++
++        /**
++         * Creates a new worker which is initially blocked. Call
++         * {@link #unblock()} to unblock it.
++         *
++         * @param task the merge task.
++         */
++        private Worker(Merge task) {
++            this.task = task;
+-            for (;;) {
+-                boolean isIdle = false;
+-                if (mergeTasks.size() == 0) {
+-                    synchronized (busyMergers) {
+-                        busyMergers.remove(this);
+-                        busyMergers.notifyAll();
++            // worker is initially suspended
++            try {
++                try {
++                    start.await();
++                } catch (InterruptedException e) {
++                    // check if we should quit
++                    if (!quit.get()) {
++                        // enqueue task again and retry with another thread
++                        addMergeTask(task);
+-                    isIdle = true;
+-                }
+-                Merge task;
+-                for (;;) {
+-                    try {
+-                        task = mergeTasks.take();
+-                        break;
+-                    } catch (InterruptedException e) {
+-                        // try again
+-                        Thread.interrupted();
+-                    }
+-                }
+-                if (task == QUIT) {
+-                    synchronized (busyMergers) {
+-                        busyMergers.remove(this);
+-                    }
+-                    // put back QUIT to signal other workers
+-                    addMergeTask(task);
+-                    break;
+-                }
+-                if (isIdle) {
+-                    synchronized (busyMergers) {
+-                        busyMergers.add(this);
+-                    }
++                    return;
+-                // reset deleted documents
+-                deletedDocuments.clear();
+-
+-                        if (!indexReplacement.tryAcquire()) {
++                        Lock shared = indexReplacement.readLock();
++                        if (!shared.tryLock()) {
+-                            break;
++                            return;
+-                            indexReplacement.release();
++                            shared.unlock();
++                            // add task again and retry
++                            addMergeTask(task);
++            } finally {
++                synchronized (terminated) {
++                    terminated.set(true);
++                    terminated.notifyAll();
++                }
++                synchronized (busyMergers) {
++                    busyMergers.remove(this);
++                    busyMergers.notifyAll();
++                }
++                log.debug("Worker finished");
+-            log.info("IndexMerger.Worker terminated");
++
++        /**
++         * Unblocks this worker and allows it to start with the index merging.
++         */
++        void unblock() {
++            start.countDown();
++        }
++
++        /**
++         * Waits until this worker is finished or the specified amount of time
++         * has elapsed.
++         *
++         * @param timeout the timeout in milliseconds.
++         * @throws InterruptedException if the current thread is interrupted
++         *                              while waiting for this worker to
++         *                              terminate.
++         */
++        void join(long timeout) throws InterruptedException {
++            synchronized (terminated) {
++                while (!terminated.get()) {
++                    terminated.wait(timeout);
++                }
++            }
++        }
++
++        /**
++         * @return <code>true</code> if this worker is still alive and not yet
++         *         terminated.
++         */
++        boolean isAlive() {
++            return !terminated.get();
++        }

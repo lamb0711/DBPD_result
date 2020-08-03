@@ -1,0 +1,228 @@
+HDFS-7463. Simplify FSNamesystem#getBlockLocationsUpdateTimes. Contributed by Haohui Mai.
+
++  static class GetBlockLocationsResult {
++    final INodesInPath iip;
++    final LocatedBlocks blocks;
++    boolean updateAccessTime() {
++      return iip != null;
++    }
++    private GetBlockLocationsResult(INodesInPath iip, LocatedBlocks blocks) {
++      this.iip = iip;
++      this.blocks = blocks;
++    }
++  }
++
+-      long offset, long length) throws AccessControlException,
+-      FileNotFoundException, UnresolvedLinkException, IOException {
+-    LocatedBlocks blocks = getBlockLocations(src, offset, length, true, true,
+-        true);
++      long offset, long length) throws IOException {
++    checkOperation(OperationCategory.READ);
++    GetBlockLocationsResult res = null;
++    readLock();
++    try {
++      checkOperation(OperationCategory.READ);
++      res = getBlockLocations(src, offset, length, true, true);
++    } catch (AccessControlException e) {
++      logAuditEvent(false, "open", src);
++      throw e;
++    } finally {
++      readUnlock();
++    }
++
++    logAuditEvent(true, "open", src);
++
++    if (res == null) {
++      return null;
++    }
++
++    if (res.updateAccessTime()) {
++      writeLock();
++      final long now = now();
++      try {
++        checkOperation(OperationCategory.WRITE);
++        INode inode = res.iip.getLastINode();
++        boolean updateAccessTime = now > inode.getAccessTime() +
++            getAccessTimePrecision();
++        if (!isInSafeMode() && updateAccessTime) {
++          boolean changed = dir.setTimes(
++              inode, -1, now, false, res.iip.getLatestSnapshotId());
++          if (changed) {
++            getEditLog().logTimes(src, -1, now);
++          }
++        }
++      } catch (Throwable e) {
++        LOG.warn("Failed to update the access time of " + src, e);
++      } finally {
++        writeUnlock();
++      }
++    }
++
++    LocatedBlocks blocks = res.blocks;
+-      blockManager.getDatanodeManager().sortLocatedBlocks(clientMachine,
+-          blocks.getLocatedBlocks());
++      blockManager.getDatanodeManager().sortLocatedBlocks(
++          clientMachine, blocks.getLocatedBlocks());
+-        ArrayList<LocatedBlock> lastBlockList =
+-            Lists.newArrayListWithCapacity(1);
+-        lastBlockList.add(lastBlock);
+-        blockManager.getDatanodeManager().sortLocatedBlocks(clientMachine,
+-            lastBlockList);
++        ArrayList<LocatedBlock> lastBlockList = Lists.newArrayList(lastBlock);
++        blockManager.getDatanodeManager().sortLocatedBlocks(
++            clientMachine, lastBlockList);
+-   * @throws FileNotFoundException, UnresolvedLinkException, IOException
++   * @throws IOException
+-  LocatedBlocks getBlockLocations(String src, long offset, long length,
+-      boolean doAccessTime, boolean needBlockToken, boolean checkSafeMode)
+-      throws FileNotFoundException, UnresolvedLinkException, IOException {
+-    try {
+-      return getBlockLocationsInt(src, offset, length, doAccessTime,
+-                                  needBlockToken, checkSafeMode);
+-    } catch (AccessControlException e) {
+-      logAuditEvent(false, "open", src);
+-      throw e;
+-    }
+-  }
+-
+-  private LocatedBlocks getBlockLocationsInt(String src, long offset,
+-      long length, boolean doAccessTime, boolean needBlockToken,
+-      boolean checkSafeMode)
+-      throws FileNotFoundException, UnresolvedLinkException, IOException {
++  GetBlockLocationsResult getBlockLocations(
++      String src, long offset, long length, boolean needBlockToken,
++      boolean checkSafeMode) throws IOException {
+-    final LocatedBlocks ret = getBlockLocationsUpdateTimes(src,
+-        offset, length, doAccessTime, needBlockToken);  
+-    logAuditEvent(true, "open", src);
++    final GetBlockLocationsResult ret = getBlockLocationsInt(
++        src, offset, length, needBlockToken);
++
+-      for (LocatedBlock b : ret.getLocatedBlocks()) {
++      for (LocatedBlock b : ret.blocks.getLocatedBlocks()) {
+-          if (haEnabled && haContext != null && 
++          if (haEnabled && haContext != null &&
+-  /*
+-   * Get block locations within the specified range, updating the
+-   * access times if necessary. 
+-   */
+-  private LocatedBlocks getBlockLocationsUpdateTimes(final String srcArg,
+-      long offset, long length, boolean doAccessTime, boolean needBlockToken)
++  private GetBlockLocationsResult getBlockLocationsInt(
++      final String srcArg, long offset, long length, boolean needBlockToken)
+-    for (int attempt = 0; attempt < 2; attempt++) {
+-      boolean isReadOp = (attempt == 0);
+-      if (isReadOp) { // first attempt is with readlock
+-        checkOperation(OperationCategory.READ);
+-        readLock();
+-      }  else { // second attempt is with  write lock
+-        checkOperation(OperationCategory.WRITE);
+-        writeLock(); // writelock is needed to set accesstime
+-      }
+-      try {
+-        if (isReadOp) {
+-          checkOperation(OperationCategory.READ);
+-        } else {
+-          checkOperation(OperationCategory.WRITE);
+-        }
+-        src = dir.resolvePath(pc, src, pathComponents);
+-        final INodesInPath iip = dir.getINodesInPath(src, true);
+-        if (isPermissionEnabled) {
+-          dir.checkPathAccess(pc, iip, FsAction.READ);
+-        }
+-
+-        // if the namenode is in safemode, then do not update access time
+-        if (isInSafeMode()) {
+-          doAccessTime = false;
+-        }
+-
+-        final INodeFile inode = INodeFile.valueOf(iip.getLastINode(), src);
+-        if (isPermissionEnabled) {
+-          checkUnreadableBySuperuser(pc, inode, iip.getPathSnapshotId());
+-        }
+-        if (!iip.isSnapshot() //snapshots are readonly, so don't update atime.
+-            && doAccessTime && isAccessTimeSupported()) {
+-          final long now = now();
+-          if (now > inode.getAccessTime() + getAccessTimePrecision()) {
+-            // if we have to set access time but we only have the readlock, then
+-            // restart this entire operation with the writeLock.
+-            if (isReadOp) {
+-              continue;
+-            }
+-            boolean changed = dir.setTimes(inode, -1, now, false,
+-                    iip.getLatestSnapshotId());
+-            if (changed) {
+-              getEditLog().logTimes(src, -1, now);
+-            }
+-          }
+-        }
+-        final long fileSize = iip.isSnapshot() ?
+-            inode.computeFileSize(iip.getPathSnapshotId())
+-            : inode.computeFileSizeNotIncludingLastUcBlock();
+-        boolean isUc = inode.isUnderConstruction();
+-        if (iip.isSnapshot()) {
+-          // if src indicates a snapshot file, we need to make sure the returned
+-          // blocks do not exceed the size of the snapshot file.
+-          length = Math.min(length, fileSize - offset);
+-          isUc = false;
+-        }
+-
+-        final FileEncryptionInfo feInfo =
+-          FSDirectory.isReservedRawName(srcArg) ?
+-          null : dir.getFileEncryptionInfo(inode, iip.getPathSnapshotId(),
+-              iip);
+-
+-        final LocatedBlocks blocks =
+-          blockManager.createLocatedBlocks(inode.getBlocks(), fileSize,
+-            isUc, offset, length, needBlockToken, iip.isSnapshot(), feInfo);
+-        // Set caching information for the located blocks.
+-        for (LocatedBlock lb: blocks.getLocatedBlocks()) {
+-          cacheManager.setCachedLocations(lb);
+-        }
+-        return blocks;
+-      } finally {
+-        if (isReadOp) {
+-          readUnlock();
+-        } else {
+-          writeUnlock();
+-        }
+-      }
++    src = dir.resolvePath(pc, src, pathComponents);
++    final INodesInPath iip = dir.getINodesInPath(src, true);
++    final INodeFile inode = INodeFile.valueOf(iip.getLastINode(), src);
++    if (isPermissionEnabled) {
++      dir.checkPathAccess(pc, iip, FsAction.READ);
++      checkUnreadableBySuperuser(pc, inode, iip.getPathSnapshotId());
+-    return null; // can never reach here
++
++    final long fileSize = iip.isSnapshot()
++        ? inode.computeFileSize(iip.getPathSnapshotId())
++        : inode.computeFileSizeNotIncludingLastUcBlock();
++    boolean isUc = inode.isUnderConstruction();
++    if (iip.isSnapshot()) {
++      // if src indicates a snapshot file, we need to make sure the returned
++      // blocks do not exceed the size of the snapshot file.
++      length = Math.min(length, fileSize - offset);
++      isUc = false;
++    }
++
++    final FileEncryptionInfo feInfo =
++        FSDirectory.isReservedRawName(srcArg) ? null
++            : dir.getFileEncryptionInfo(inode, iip.getPathSnapshotId(), iip);
++
++    final LocatedBlocks blocks = blockManager.createLocatedBlocks(
++        inode.getBlocks(), fileSize, isUc, offset, length, needBlockToken,
++        iip.isSnapshot(), feInfo);
++
++    // Set caching information for the located blocks.
++    for (LocatedBlock lb : blocks.getLocatedBlocks()) {
++      cacheManager.setCachedLocations(lb);
++    }
++
++    final long now = now();
++    boolean updateAccessTime = isAccessTimeSupported() && !isInSafeMode()
++        && !iip.isSnapshot()
++        && now > inode.getAccessTime() + getAccessTimePrecision();
++    return new GetBlockLocationsResult(updateAccessTime ? iip : null, blocks);
+
+INS55 INS83 INS42 INS23 INS23 INS31 INS31 INS8 MOV29 UPD43 UPD42 UPD43 UPD42 MOV8 MOV25 INS83 INS43 INS59 INS83 MOV43 INS59 INS39 INS42 INS8 INS83 INS42 INS44 INS44 INS8 MOV21 INS60 MOV21 INS54 MOV21 INS25 INS25 INS60 MOV25 MOV41 UPD42 UPD42 MOV60 MOV60 MOV60 MOV60 MOV60 INS41 UPD42 MOV42 INS42 INS42 INS41 INS43 INS42 MOV43 INS42 MOV21 INS21 INS43 INS59 INS8 MOV12 MOV8 INS27 INS8 INS32 INS8 INS43 INS59 UPD42 UPD43 INS14 INS27 UPD42 MOV42 INS7 INS7 UPD42 MOV42 INS42 INS33 MOV21 INS21 INS42 INS33 MOV41 INS42 INS42 MOV21 INS60 INS54 INS42 INS42 INS40 UPD42 MOV21 INS42 MOV27 MOV38 INS43 INS16 INS42 INS42 INS33 INS22 INS42 INS22 INS42 INS7 INS21 INS83 INS39 INS59 INS8 INS12 MOV8 UPD42 INS38 INS27 INS42 INS42 INS42 INS33 INS52 INS42 INS52 INS42 INS42 INS32 MOV32 INS42 INS32 MOV21 INS60 INS60 INS25 INS44 INS8 INS40 MOV32 INS42 INS27 MOV42 MOV42 MOV42 MOV42 MOV9 MOV9 INS42 INS43 INS59 INS39 INS59 INS27 INS8 INS43 INS42 INS21 INS32 INS32 INS42 INS42 INS32 INS42 MOV27 INS38 INS42 INS60 MOV25 INS42 INS32 INS42 INS42 INS42 INS40 INS42 INS32 INS39 INS59 INS42 INS42 INS27 INS42 UPD42 INS42 INS42 INS42 INS32 INS45 INS42 INS42 INS42 INS42 MOV38 INS42 INS9 INS32 INS40 INS42 DEL42 DEL43 DEL43 DEL42 DEL43 DEL34 DEL42 DEL42 DEL42 DEL32 DEL21 DEL42 DEL32 DEL59 DEL60 DEL8 DEL42 DEL43 DEL42 DEL44 DEL39 DEL42 DEL44 DEL39 DEL42 DEL44 DEL39 DEL42 DEL44 DEL39 DEL42 DEL44 DEL39 DEL42 DEL44 DEL42 DEL43 DEL42 DEL43 DEL43 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL41 DEL8 DEL54 DEL8 DEL31 DEL66 DEL83 DEL39 DEL42 DEL44 DEL42 DEL43 DEL42 DEL43 DEL42 DEL42 DEL39 DEL42 DEL44 DEL42 DEL8 DEL42 DEL40 DEL32 DEL21 DEL8 DEL25 DEL42 DEL9 DEL7 DEL21 DEL8 DEL25 DEL42 DEL8 DEL25 DEL42 DEL18 DEL8 DEL25 DEL8 DEL25 DEL8 DEL25 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL9 DEL42 DEL42 DEL32 DEL32 DEL42 DEL41 DEL39 DEL42 DEL34 DEL59 DEL58 DEL42 DEL34 DEL27 DEL42 DEL37 DEL39 DEL42 DEL42 DEL34 DEL27 DEL36 DEL59 DEL60 DEL42 DEL8 DEL8 DEL25 DEL42 DEL25 DEL8 DEL54 DEL8 DEL24 DEL8

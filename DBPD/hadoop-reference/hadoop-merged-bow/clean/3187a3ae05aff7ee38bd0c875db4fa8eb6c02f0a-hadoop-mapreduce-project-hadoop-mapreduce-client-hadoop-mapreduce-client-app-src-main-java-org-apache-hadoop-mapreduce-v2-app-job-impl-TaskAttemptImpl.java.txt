@@ -1,0 +1,179 @@
+Merge trunk into HA branch.
+
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/branches/HDFS-1623@1227775 13f79535-47bb-0310-9956-ffa450edef68
+
++import java.util.Map.Entry;
++import org.apache.hadoop.yarn.api.records.URL;
++  private static Object commonContainerSpecLock = new Object();
++  private static ContainerLaunchContext commonContainerSpec = null;
+-   * TODO: This should pave way for Builder pattern.
+-  private static LocalResource createLocalResource(FileSystem fc,
+-      RecordFactory recordFactory, Path file, LocalResourceType type,
+-      LocalResourceVisibility visibility) throws IOException {
++  private static LocalResource createLocalResource(FileSystem fc, Path file,
++      LocalResourceType type, LocalResourceVisibility visibility)
++      throws IOException {
+-    LocalResource resource =
+-        recordFactory.newRecordInstance(LocalResource.class);
+-    resource.setResource(ConverterUtils.getYarnUrlFromPath(fc.resolvePath(fstat
+-        .getPath())));
+-    resource.setType(type);
+-    resource.setVisibility(visibility);
+-    resource.setSize(fstat.getLen());
+-    resource.setTimestamp(fstat.getModificationTime());
+-    return resource;
++    URL resourceURL = ConverterUtils.getYarnUrlFromPath(fc.resolvePath(fstat
++        .getPath()));
++    long resourceSize = fstat.getLen();
++    long resourceModificationTime = fstat.getModificationTime();
++
++    return BuilderUtils.newLocalResource(resourceURL, type, visibility,
++        resourceSize, resourceModificationTime);
+-   * getting the initial class-path. TODO: This should go away once we construct
+-   * a parent CLC and use it for all the containers.
++   * getting the initial class-path. TODO: We already construct
++   * a parent CLC and use it for all the containers, so this should go away
++   * once the mr-generated-classpath stuff is gone.
+-  private String getInitialClasspath() throws IOException {
++  private static String getInitialClasspath() throws IOException {
+-   * Create the {@link ContainerLaunchContext} for this attempt.
++   * Create the common {@link ContainerLaunchContext} for all attempts.
+-  private ContainerLaunchContext createContainerLaunchContext(
+-      Map<ApplicationAccessType, String> applicationACLs) {
++  private static ContainerLaunchContext createCommonContainerLaunchContext(
++      Map<ApplicationAccessType, String> applicationACLs, Configuration conf,
++      Token<JobTokenIdentifier> jobToken,
++      final org.apache.hadoop.mapred.JobID oldJobId,
++      Collection<Token<? extends TokenIdentifier>> fsTokens) {
+-      if (conf.get(MRJobConfig.JAR) != null) {
+-        Path remoteJobJar = (new Path(remoteTask.getConf().get(
+-              MRJobConfig.JAR))).makeQualified(remoteFS.getUri(), 
+-                                               remoteFS.getWorkingDirectory());
++      String jobJar = conf.get(MRJobConfig.JAR);
++      if (jobJar != null) {
++        Path remoteJobJar = (new Path(jobJar)).makeQualified(remoteFS
++            .getUri(), remoteFS.getWorkingDirectory());
+-            createLocalResource(remoteFS, recordFactory, remoteJobJar,
++            createLocalResource(remoteFS, remoteJobJar,
+-          createLocalResource(remoteFS, recordFactory, remoteJobConfPath,
++          createLocalResource(remoteFS, remoteJobConfPath,
+-    // Setup environment
+-    MapReduceChildJVM.setVMEnv(environment, remoteTask);
++    // Shell
++    environment.put(
++        Environment.SHELL.name(), 
++        conf.get(
++            MRJobConfig.MAPRED_ADMIN_USER_SHELL, 
++            MRJobConfig.DEFAULT_SHELL)
++            );
++
++    // Add pwd to LD_LIBRARY_PATH, add this before adding anything else
++    Apps.addToEnvironment(
++        environment, 
++        Environment.LD_LIBRARY_PATH.name(), 
++        Environment.PWD.$());
++
++    // Add the env variables passed by the admin
++    Apps.setEnvFromInputString(
++        environment, 
++        conf.get(
++            MRJobConfig.MAPRED_ADMIN_USER_ENV, 
++            MRJobConfig.DEFAULT_MAPRED_ADMIN_USER_ENV)
++        );
++
++    // Construct the actual Container
++    // The null fields are per-container and will be constructed for each
++    // container separately.
++    ContainerLaunchContext container = BuilderUtils
++        .newContainerLaunchContext(null, conf
++            .get(MRJobConfig.USER_NAME), null, localResources,
++            environment, null, serviceData, tokens, applicationACLs);
++
++    return container;
++  }
++
++  static ContainerLaunchContext createContainerLaunchContext(
++      Map<ApplicationAccessType, String> applicationACLs,
++      ContainerId containerID, Configuration conf,
++      Token<JobTokenIdentifier> jobToken, Task remoteTask,
++      final org.apache.hadoop.mapred.JobID oldJobId,
++      Resource assignedCapability, WrappedJvmID jvmID,
++      TaskAttemptListener taskAttemptListener,
++      Collection<Token<? extends TokenIdentifier>> fsTokens) {
++
++    synchronized (commonContainerSpecLock) {
++      if (commonContainerSpec == null) {
++        commonContainerSpec = createCommonContainerLaunchContext(
++            applicationACLs, conf, jobToken, oldJobId, fsTokens);
++      }
++    }
++
++    // Fill in the fields needed per-container that are missing in the common
++    // spec.
++
++    // Setup environment by cloning from common env.
++    Map<String, String> env = commonContainerSpec.getEnvironment();
++    Map<String, String> myEnv = new HashMap<String, String>(env.size());
++    myEnv.putAll(env);
++    MapReduceChildJVM.setVMEnv(myEnv, remoteTask);
+-        taskAttemptListener.getAddress(), remoteTask,
+-        jvmID);
+-    
++        taskAttemptListener.getAddress(), remoteTask, jvmID);
++
++    // Duplicate the ByteBuffers for access by multiple containers.
++    Map<String, ByteBuffer> myServiceData = new HashMap<String, ByteBuffer>();
++    for (Entry<String, ByteBuffer> entry : commonContainerSpec
++                .getServiceData().entrySet()) {
++      myServiceData.put(entry.getKey(), entry.getValue().duplicate());
++    }
++
+-    ContainerLaunchContext container = BuilderUtils
+-        .newContainerLaunchContext(containerID, conf
+-            .get(MRJobConfig.USER_NAME), assignedCapability, localResources,
+-            environment, commands, serviceData, tokens, applicationACLs);
++    ContainerLaunchContext container = BuilderUtils.newContainerLaunchContext(
++        containerID, commonContainerSpec.getUser(), assignedCapability,
++        commonContainerSpec.getLocalResources(), myEnv, commands,
++        myServiceData, commonContainerSpec.getContainerTokens().duplicate(),
++        applicationACLs);
+-    @SuppressWarnings({ "unchecked", "deprecation" })
++    @SuppressWarnings({ "unchecked" })
+-      taskAttempt.taskAttemptListener.registerPendingTask(taskAttempt.jvmID);
++      taskAttempt.taskAttemptListener.registerPendingTask(
++          taskAttempt.remoteTask, taskAttempt.jvmID);
+-      taskAttempt.eventHandler.handle(
+-          new ContainerRemoteLaunchEvent(taskAttempt.attemptId, 
+-              taskAttempt.containerID, 
+-              taskAttempt.containerMgrAddress, taskAttempt.containerToken) {
+-        @Override
+-        public ContainerLaunchContext getContainer() {
+-          return taskAttempt.createContainerLaunchContext(cEvent
+-              .getApplicationACLs());
+-        }
+-        @Override
+-        public Task getRemoteTask() {  // classic mapred Task, not YARN version
+-          return taskAttempt.remoteTask;
+-        }
+-      });
++      ContainerLaunchContext launchContext = createContainerLaunchContext(
++          cEvent.getApplicationACLs(), taskAttempt.containerID,
++          taskAttempt.conf, taskAttempt.jobToken, taskAttempt.remoteTask,
++          taskAttempt.oldJobId, taskAttempt.assignedCapability,
++          taskAttempt.jvmID, taskAttempt.taskAttemptListener,
++          taskAttempt.fsTokens);
++      taskAttempt.eventHandler.handle(new ContainerRemoteLaunchEvent(
++          taskAttempt.attemptId, taskAttempt.containerID,
++          taskAttempt.containerMgrAddress, taskAttempt.containerToken,
++          launchContext, taskAttempt.remoteTask));
+-      // register it to TaskAttemptListener so that it start listening
+-      // for it
+-      taskAttempt.taskAttemptListener.registerLaunchedTask(
+-          taskAttempt.attemptId, taskAttempt.remoteTask, taskAttempt.jvmID);
++      // register it to TaskAttemptListener so that it can start monitoring it.
++      taskAttempt.taskAttemptListener
++        .registerLaunchedTask(taskAttempt.attemptId);
+-      @SuppressWarnings("deprecation")
+
+INS26 INS26 INS40 INS40 INS23 INS23 INS31 INS83 INS83 INS43 INS59 INS83 INS83 INS43 INS59 INS83 INS83 UPD42 INS44 INS44 INS44 INS44 INS83 INS43 INS42 INS44 INS44 INS44 INS44 INS44 INS44 INS44 INS44 INS44 INS44 INS8 INS42 INS42 INS14 INS42 INS42 INS33 INS60 INS60 INS41 INS43 INS42 INS74 INS42 INS83 INS43 INS42 INS74 INS42 INS21 INS21 INS42 INS74 INS42 INS43 INS42 INS43 INS42 INS74 INS42 MOV43 INS42 INS83 INS43 INS42 INS43 INS42 INS43 INS42 INS43 INS42 INS74 INS42 INS51 INS60 INS60 INS21 INS21 MOV60 INS60 INS70 INS60 INS41 INS43 UPD43 INS39 INS59 INS39 INS59 INS32 UPD66 UPD66 INS66 UPD66 UPD66 INS42 INS43 INS43 INS40 INS43 INS74 INS32 INS32 INS43 INS43 INS43 INS42 INS42 INS43 INS43 INS40 INS42 INS42 INS42 INS43 INS74 INS42 INS8 INS74 INS59 INS74 INS59 INS32 INS32 INS74 INS59 INS44 INS32 INS8 INS43 INS59 INS42 INS60 INS42 UPD42 UPD42 MOV32 INS42 MOV32 INS42 MOV32 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 MOV42 UPD42 MOV42 UPD42 MOV42 INS42 INS42 INS42 INS43 INS76 INS60 INS42 INS42 INS32 INS32 INS42 INS42 INS42 INS32 INS32 UPD42 UPD42 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS43 INS76 INS25 INS43 INS43 INS43 INS42 INS32 INS43 INS43 INS43 INS42 INS14 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS43 INS43 INS43 INS42 INS14 INS74 INS42 INS32 INS42 INS21 INS42 INS42 INS32 MOV43 INS59 INS42 INS43 INS43 INS59 INS40 INS42 INS42 INS42 INS40 INS40 INS40 INS42 INS40 INS42 UPD42 MOV42 INS42 INS40 INS40 INS33 INS33 INS33 INS42 INS43 INS27 INS8 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS74 INS32 INS42 INS42 INS42 INS74 INS43 INS43 INS43 INS42 INS42 INS32 INS42 INS42 INS42 INS32 INS42 INS32 INS42 INS42 INS42 INS32 INS42 INS40 INS42 INS32 INS42 INS42 INS42 MOV32 INS42 INS42 INS42 INS33 INS21 INS43 INS43 INS43 INS42 INS42 INS43 INS43 INS43 INS42 INS42 INS42 INS42 INS42 INS32 INS32 INS42 INS42 INS42 INS42 INS32 INS42 INS42 MOV32 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS42 INS40 INS7 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 DEL66 DEL42 DEL43 DEL42 DEL44 DEL42 DEL42 DEL42 DEL43 DEL57 DEL32 DEL42 DEL42 DEL32 DEL21 DEL42 DEL32 DEL21 DEL32 DEL21 DEL42 DEL32 DEL21 DEL42 DEL32 DEL21 DEL42 DEL41 DEL42 DEL42 DEL32 DEL42 DEL40 DEL32 DEL42 DEL42 DEL42 DEL42 DEL42 DEL45 DEL42 DEL78 DEL83 DEL42 DEL42 DEL42 DEL32 DEL41 DEL8 DEL31 DEL42 DEL78 DEL83 DEL42 DEL40 DEL41 DEL8 DEL31 DEL1 DEL40 DEL40 DEL42 DEL45 DEL79

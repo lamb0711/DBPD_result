@@ -1,0 +1,211 @@
+HDFS-2742. HA: observed dataloss in replication stress test. Contributed by Todd Lipcon
+
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/branches/HDFS-1623@1238940 13f79535-47bb-0310-9956-ffa450edef68
+
+-import org.apache.hadoop.hdfs.server.namenode.PendingDataNodeMessages.BlockReceivedDeleteMessage;
+-import org.apache.hadoop.hdfs.server.namenode.PendingDataNodeMessages.BlockReportMessage;
+-import org.apache.hadoop.hdfs.server.namenode.PendingDataNodeMessages.CommitBlockSynchronizationMessage;
+-import org.apache.hadoop.hdfs.server.namenode.PendingDataNodeMessages.DataNodeMessage;
+-  private PendingDataNodeMessages pendingDatanodeMessages = new PendingDataNodeMessages();
+-  
+-  
+-  PendingDataNodeMessages getPendingDataNodeMessages() {
+-    return pendingDatanodeMessages;
+-  }
+-  
++    
++      assert safeMode != null &&
++        !safeMode.initializedReplQueues;
++        blockManager.processAllPendingDNMessages();
+-
+-  private boolean isInStandbyState() {
++  
++  @Override
++  public boolean isInStandbyState() {
+-        return prepareFileForWrite(src, myFile, holder, clientMachine, clientNode);
++        return prepareFileForWrite(
++            src, myFile, holder, clientMachine, clientNode, true);
++   * @param writeToEditLog whether to persist this change to the edit log
+-      String leaseHolder, String clientMachine, DatanodeDescriptor clientNode)
++      String leaseHolder, String clientMachine, DatanodeDescriptor clientNode,
++      boolean writeToEditLog)
++    
++    if (writeToEditLog) {
++      getEditLog().logOpenFile(src, cons);
++    }
+-    for(Block b : blocks) {
++    
++    // In the case that we are a Standby tailing edits from the
++    // active while in safe-mode, we need to track the total number
++    // of blocks and safe blocks in the system.
++    boolean trackBlockCounts = isSafeModeTrackingBlocks();
++    int numRemovedComplete = 0, numRemovedSafe = 0;
++
++    for (Block b : blocks) {
++      if (trackBlockCounts) {
++        BlockInfo bi = blockManager.getStoredBlock(b);
++        if (bi.isComplete()) {
++          numRemovedComplete++;
++          if (bi.numNodes() >= blockManager.minReplication) {
++            numRemovedSafe++;
++          }
++        }
++      }
++    if (trackBlockCounts) {
++      if (LOG.isDebugEnabled()) {
++        LOG.debug("Adjusting safe-mode totals for deletion of " + src + ":" +
++            "decreasing safeBlocks by " + numRemovedSafe +
++            ", totalBlocks by " + numRemovedComplete);
++      }
++      adjustSafeModeBlockTotals(-numRemovedSafe, -numRemovedComplete);
++    }
++  }
++
++  /**
++   * @see SafeModeInfo#shouldIncrementallyTrackBlocks
++   */
++  private boolean isSafeModeTrackingBlocks() {
++    if (!haEnabled) {
++      // Never track blocks incrementally in non-HA code.
++      return false;
++    }
++    SafeModeInfo sm = this.safeMode;
++    return sm != null && sm.shouldIncrementallyTrackBlocks();
+-        if (isGenStampInFuture(newgenerationstamp)) {
+-          LOG.info("Required GS=" + newgenerationstamp
+-              + ", Queuing commitBlockSynchronization message");
+-          getPendingDataNodeMessages().queueMessage(
+-              new PendingDataNodeMessages.CommitBlockSynchronizationMessage(
+-                  lastblock, newgenerationstamp, newlength, closeFile, deleteblock,
+-                  newtargets, newgenerationstamp));
+-          return;
+-        }
++        // Need to implement tests, etc, for this - block recovery spanning
++        // failover.
++    /** Should safemode adjust its block totals as blocks come in */
++    private boolean shouldIncrementallyTrackBlocks = false;
++     * In the HA case, the StandbyNode can be in safemode while the namespace
++     * is modified by the edit log tailer. In this case, the number of total
++     * blocks changes as edits are processed (eg blocks are added and deleted).
++     * However, we don't want to do the incremental tracking during the
++     * startup-time loading process -- only once the initial total has been
++     * set after the image has been loaded.
++     */
++    private boolean shouldIncrementallyTrackBlocks() {
++      return shouldIncrementallyTrackBlocks;
++    }
++
++    /**
++      if (haEnabled) {
++        // After we initialize the block count, any further namespace
++        // modifications done while in safe mode need to keep track
++        // of the number of total blocks in the system.
++        this.shouldIncrementallyTrackBlocks = true;
++      }
++      
+-      if (replication == safeReplication)
++      if (replication == safeReplication) {
+-      checkMode();
++        checkMode();
++      }
+-      if (replication == safeReplication-1)
++      if (replication == safeReplication-1) {
+-      checkMode();
++        assert blockSafe >= 0 || isManual();
++        checkMode();
++      }
++
++    private void adjustBlockTotals(int deltaSafe, int deltaTotal) {
++      if (!shouldIncrementallyTrackBlocks) {
++        return;
++      }
++      assert haEnabled;
++      
++      if (LOG.isDebugEnabled()) {
++        LOG.debug("Adjusting block totals from " +
++            blockSafe + "/" + blockTotal + " to " +
++            (blockSafe + deltaSafe) + "/" + (blockTotal + deltaTotal));
++      }
++      assert blockSafe + deltaSafe >= 0 : "Can't reduce blockSafe " +
++        blockSafe + " by " + deltaSafe + ": would be negative";
++      assert blockTotal + deltaTotal >= 0 : "Can't reduce blockTotal " +
++        blockTotal + " by " + deltaTotal + ": would be negative";
++      
++      blockSafe += deltaSafe;
++      setBlockTotal(blockTotal + deltaTotal);
++    }
+-    safeMode.decrementSafeBlockCount((short)blockManager.countNodes(b).liveReplicas());
++    BlockInfo storedBlock = blockManager.getStoredBlock(b);
++    if (storedBlock.isComplete()) {
++      safeMode.decrementSafeBlockCount((short)blockManager.countNodes(b).liveReplicas());
++    }
++  }
++  
++  /**
++   * Adjust the total number of blocks safe and expected during safe mode.
++   * If safe mode is not currently on, this is a no-op.
++   * @param deltaSafe the change in number of safe blocks
++   * @param deltaTotal the change i nnumber of total blocks expected
++   */
++  public void adjustSafeModeBlockTotals(int deltaSafe, int deltaTotal) {
++    // safeMode is volatile, and may be set to null at any time
++    SafeModeInfo safeMode = this.safeMode;
++    if (safeMode == null)
++      return;
++    safeMode.adjustBlockTotals(deltaSafe, deltaTotal);
++  public int getPendingDataNodeMessageCount() {
++    return blockManager.getPendingDataNodeMessageCount();
++  }
++  
++  @Metric
+-  
+-  public void notifyGenStampUpdate(long gs) {
+-    if (LOG.isDebugEnabled()) {
+-      LOG.debug("Generation stamp " + gs + " has been reached. " +
+-          "Processing pending messages from DataNodes...");
+-    }
+-    DataNodeMessage msg = pendingDatanodeMessages.take(gs);
+-    while (msg != null) {
+-      if (LOG.isDebugEnabled()) {
+-        LOG.debug("Processing previously pending message: " + msg);
+-      }
+-      try {
+-        switch (msg.getType()) {
+-        case BLOCK_RECEIVED_DELETE:
+-          BlockReceivedDeleteMessage m = (BlockReceivedDeleteMessage) msg;
+-          if (NameNode.stateChangeLog.isDebugEnabled()) {
+-            NameNode.stateChangeLog
+-                .debug("*BLOCK* NameNode.blockReceivedAndDeleted: " + "from "
+-                    + m.getNodeReg().getName() + " "
+-                    + m.getReceivedAndDeletedBlocks().length + " blocks.");
+-          }
+-          this.getBlockManager().processIncrementalBlockReport(m.getNodeReg(),
+-              m.getPoolId(), m.getReceivedAndDeletedBlocks());
+-          break;
+-        case BLOCK_REPORT:
+-          BlockReportMessage mbr = (BlockReportMessage) msg;
+-          if (NameNode.stateChangeLog.isDebugEnabled()) {
+-            NameNode.stateChangeLog.debug("*BLOCK* NameNode.blockReport: "
+-                + "from " + mbr.getNodeReg().getName() + " "
+-                + mbr.getBlockList().getNumberOfBlocks() + " blocks");
+-          }
+-          this.getBlockManager().processReport(mbr.getNodeReg(),
+-              mbr.getPoolId(), mbr.getBlockList());
+-          break;
+-        case COMMIT_BLOCK_SYNCHRONIZATION:
+-          CommitBlockSynchronizationMessage mcbm = (CommitBlockSynchronizationMessage) msg;
+-          this.commitBlockSynchronization(mcbm.getBlock(),
+-              mcbm.getNewgenerationstamp(), mcbm.getNewlength(),
+-              mcbm.isCloseFile(), mcbm.isDeleteblock(), mcbm.getNewtargets());
+-          break;
+-        }
+-      } catch (IOException ex) {
+-        LOG.warn("Could not process the message " + msg.getType(), ex);
+-      }
+-      msg = pendingDatanodeMessages.take(gs);
+-    }
+-  }
+-  
+
+MOV26 MOV26 INS31 INS31 INS31 INS31 INS78 UPD83 INS44 MOV39 MOV42 MOV44 MOV44 INS8 INS29 INS83 INS39 INS42 INS8 INS23 INS31 INS31 INS29 INS83 INS39 INS42 INS44 INS44 INS8 INS78 INS83 INS39 INS42 INS8 INS42 INS65 INS39 INS42 INS25 MOV6 MOV21 MOV25 INS60 INS60 INS70 INS25 INS65 INS25 INS60 INS41 INS29 INS83 INS39 INS59 INS29 INS83 INS39 INS42 INS8 INS83 INS39 INS42 INS44 INS44 INS8 INS60 INS25 INS65 INS65 INS65 INS39 INS42 INS39 INS42 INS60 INS25 MOV21 INS42 INS41 INS42 INS66 INS42 INS8 INS39 INS59 INS39 INS59 INS59 MOV44 INS42 INS8 INS42 INS8 INS67 INS38 MOV8 UPD43 MOV43 MOV59 INS27 INS65 INS42 INS9 INS65 INS41 INS25 INS39 INS42 INS39 INS42 INS25 INS6 INS25 INS6 INS6 INS21 INS21 INS43 INS59 INS32 INS8 INS66 INS66 INS42 INS66 INS42 INS66 INS43 INS59 INS27 INS41 INS32 INS6 INS21 INS42 INS32 INS42 INS34 INS42 INS34 INS25 MOV21 INS25 INS21 INS42 INS42 INS42 INS41 UPD42 UPD42 INS22 INS27 INS32 MOV25 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS42 INS42 INS8 INS8 INS8 INS38 INS8 INS42 MOV32 INS8 INS27 INS27 INS27 INS27 INS7 INS32 INS42 INS42 INS32 INS42 INS42 MOV21 INS42 INS42 INS22 INS42 INS33 UPD42 UPD42 UPD42 MOV42 UPD42 UPD42 MOV42 UPD42 MOV42 INS27 INS32 UPD42 MOV42 INS42 INS8 MOV32 MOV8 MOV32 INS9 INS52 INS42 INS42 INS33 UPD42 MOV42 UPD42 MOV42 MOV32 INS21 MOV21 MOV21 MOV21 INS6 MOV21 INS42 INS41 INS42 INS21 INS27 INS34 INS45 INS42 INS45 INS42 INS45 INS27 INS34 INS45 INS42 INS45 INS42 INS45 INS42 INS42 INS42 INS27 INS42 INS42 INS42 INS52 INS42 INS27 INS38 INS21 INS32 INS42 INS42 INS42 MOV60 INS25 UPD42 INS38 INS38 INS7 INS27 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS33 INS40 INS32 INS42 UPD43 INS32 INS8 INS42 INS42 INS22 INS9 INS27 INS32 INS42 INS42 INS27 INS42 INS42 INS9 UPD42 UPD42 INS42 UPD42 MOV42 INS21 INS25 INS42 INS52 INS42 INS42 INS34 INS42 INS45 INS42 INS45 INS42 INS45 INS36 INS45 INS36 UPD42 UPD42 UPD42 INS37 INS27 INS8 UPD45 MOV45 INS42 UPD45 MOV45 UPD45 INS42 UPD45 INS42 INS27 INS27 INS42 INS32 INS40 INS21 INS42 INS42 INS42 INS42 UPD42 MOV42 UPD42 MOV42 INS37 INS42 DEL40 DEL26 DEL40 DEL26 DEL40 DEL26 DEL40 DEL26 DEL83 DEL42 DEL43 DEL42 DEL42 DEL43 DEL14 DEL59 DEL23 DEL42 DEL43 DEL42 DEL42 DEL41 DEL8 DEL31 DEL40 DEL27 DEL42 DEL42 DEL32 DEL42 DEL32 DEL42 DEL42 DEL32 DEL42 DEL22 DEL52 DEL42 DEL32 DEL42 DEL42 DEL32 DEL42 DEL42 DEL32 DEL42 DEL42 DEL32 DEL40 DEL42 DEL45 DEL45 DEL27 DEL42 DEL42 DEL32 DEL42 DEL32 DEL45 DEL42 DEL42 DEL32 DEL42 DEL32 DEL45 DEL27 DEL32 DEL21 DEL42 DEL43 DEL42 DEL11 DEL42 DEL8 DEL70 DEL8 DEL31 DEL42 DEL42 DEL32 DEL42 DEL42 DEL45 DEL42 DEL45 DEL27 DEL32 DEL21 DEL42 DEL32 DEL42 DEL40 DEL43 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL14 DEL32 DEL21 DEL41 DEL8 DEL25 DEL45 DEL42 DEL32 DEL27 DEL83 DEL39 DEL42 DEL39 DEL42 DEL44 DEL42 DEL42 DEL45 DEL42 DEL45 DEL45 DEL27 DEL32 DEL21 DEL8 DEL25 DEL42 DEL33 DEL27 DEL42 DEL45 DEL42 DEL27 DEL32 DEL21 DEL8 DEL25 DEL32 DEL42 DEL49 DEL42 DEL43 DEL42 DEL42 DEL43 DEL42 DEL11 DEL59 DEL60 DEL40 DEL42 DEL32 DEL25 DEL21 DEL10 DEL42 DEL49 DEL42 DEL43 DEL42 DEL42 DEL43 DEL42 DEL11 DEL59 DEL60 DEL40 DEL42 DEL32 DEL25 DEL52 DEL42 DEL32 DEL42 DEL42 DEL42 DEL32 DEL42 DEL42 DEL32 DEL42 DEL42 DEL32 DEL32 DEL21 DEL10 DEL42 DEL49 DEL60 DEL52 DEL42 DEL42 DEL42 DEL32 DEL32 DEL42 DEL42 DEL32 DEL42 DEL42 DEL32 DEL42 DEL42 DEL32 DEL42 DEL42 DEL32 DEL32 DEL21 DEL10 DEL50 DEL8 DEL42 DEL43 DEL42 DEL44 DEL8 DEL12 DEL54 DEL42 DEL42 DEL32 DEL7 DEL21 DEL8 DEL61 DEL8 DEL31

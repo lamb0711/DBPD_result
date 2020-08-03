@@ -1,0 +1,659 @@
+JCR-3729 - S3 Datastore optimizations
+
+
+git-svn-id: https://svn.apache.org/repos/asf/jackrabbit/trunk@1577127 13f79535-47bb-0310-9956-ffa450edef68
+
++import java.util.HashSet;
++import java.util.Set;
++import java.util.concurrent.ExecutorService;
++import java.util.concurrent.Executors;
++import java.util.concurrent.TimeUnit;
++import java.util.concurrent.atomic.AtomicBoolean;
++import java.util.concurrent.atomic.AtomicInteger;
++import java.util.concurrent.atomic.AtomicLong;
++import org.apache.jackrabbit.core.data.util.NamedThreadFactory;
++ *     &lt;param name="{@link #setContinueOnAsyncUploadFailure(boolean) continueOnAsyncUploadFailure}" value="false"/>
++ *     &lt;param name="{@link #setConcurrentUploadsThreads(int) concurrentUploadsThreads}" value="10"/>
++ *     &lt;param name="{@link #setAsyncUploadLimit(int) asyncUploadLimit}" value="100"/>
+-        MultiDataStoreAware {
++        MultiDataStoreAware, AsyncUploadCallback {
+-    protected Map<DataIdentifier, WeakReference<DataIdentifier>> inUse =
+-            Collections.synchronizedMap(new WeakHashMap<DataIdentifier,
+-                    WeakReference<DataIdentifier>>());
++    protected Map<DataIdentifier, WeakReference<DataIdentifier>> inUse = Collections.synchronizedMap(new WeakHashMap<DataIdentifier, WeakReference<DataIdentifier>>());
++    /**
++     * Caching holding pending uploads
++     */
++    private AsyncUploadCache asyncWriteCache;
++
++     * In {@link #init(String)},it resumes all incomplete asynchronous upload
++     * from {@link AsyncUploadCache} and uploads them concurrently in multiple
++     * threads. It throws {@link RepositoryException}, if file is not found in
++     * local cache for that asynchronous upload. As far as code is concerned, it
++     * is only possible when somebody has removed files from local cache
++     * manually. If there is an exception and user want to proceed with
++     * inconsistencies, set parameter continueOnAsyncUploadFailure to true in
++     * repository.xml. This will ignore {@link RepositoryException} and log all
++     * missing files and proceed after resetting {@link AsyncUploadCache} .
++     */
++    private boolean continueOnAsyncUploadFailure;
++
++    /**
++     * The {@link #init(String)} methods checks for {@link #getMarkerFile()} and
++     * if it doesn't exists migrates all files from fileystem to {@link Backend}
++     * . This parameter governs number of threads which will upload files
++     * concurrently to {@link Backend}.
++     */
++    private int concurrentUploadsThreads = 10;
++
++    /**
++     * This parameter limits the number of asynchronous uploads slots to
++     * {@link Backend}. Once this limit is reached, further uploads to
++     * {@link Backend} are synchronous, till one of asynchronous uploads
++     * completes and make asynchronous uploads slot available. To disable
++     * asynchronous upload, set {@link #asyncUploadLimit} parameter to 0 in
++     * repository.xml. By default it is 100
++     */
++    private int asyncUploadLimit = 100;
++
++    /**
+-        if (path == null) {
+-            path = homeDir + "/repository/datastore";
+-        }
+-        directory = new File(path);
++            if (path == null) {
++                path = homeDir + "/repository/datastore";
++                tmpDir = new File(homeDir, "/repository/s3tmp");
++            } else {
++                // cache is moved from 'path' to 'path'/repository/datastore
++                tmpDir = new File(path, "/repository/s3tmp");
++                path = path + "/repository/datastore";
++            }
++            LOG.info("path=[" + path + ",] tmpPath= [" + tmpDir.getPath() + "]");
++            directory = new File(path);
+-        } catch (IOException e) {
+-            throw new DataStoreException("Could not create directory "
+-                    + directory.getAbsolutePath(), e);
+-        }
+-        tmpDir = new File(homeDir, "/repository/s3tmp");
+-        try {
+-        } catch (IOException e) {
+-            throw new DataStoreException("Could not create directory "
+-                    + tmpDir.getAbsolutePath(), e);
+-        }
+-        LOG.info("cachePurgeTrigFactor = " + cachePurgeTrigFactor
+-                + ", cachePurgeResizeFactor = " + cachePurgeResizeFactor);
+-        backend = createBackend();
+-        backend.init(this, path, config);
+-        String markerFileName = getMarkerFile();
+-        if (markerFileName != null) {
+-            // create marker file in homeDir to avoid deletion in cache cleanup.
+-            File markerFile = new File(homeDir, markerFileName);
+-            if (!markerFile.exists()) {
+-                LOG.info("load files from local cache");
+-                loadFilesFromCache();
+-                try {
+-                    markerFile.createNewFile();
+-                } catch (IOException e) {
+-                    throw new DataStoreException(
++
++            asyncWriteCache = new AsyncUploadCache();
++            asyncWriteCache.init(homeDir, path, asyncUploadLimit);
++
++            backend = createBackend();
++            backend.init(this, path, config);
++            String markerFileName = getMarkerFile();
++            if (markerFileName != null) {
++                // create marker file in homeDir to avoid deletion in cache
++                // cleanup.
++                File markerFile = new File(homeDir, markerFileName);
++                if (!markerFile.exists()) {
++                    LOG.info("load files from local cache");
++                    uploadFilesFromCache();
++                    try {
++                        markerFile.createNewFile();
++                    } catch (IOException e) {
++                        throw new DataStoreException(
+-                                    + markerFile.getAbsolutePath(), e);
+-                }
+-            } else {
+-                LOG.info("marker file = " + markerFile.getAbsolutePath()
++                                + markerFile.getAbsolutePath(), e);
++                    }
++                } else {
++                    LOG.info("marker file = " + markerFile.getAbsolutePath()
++                }
++            // upload any leftover async uploads to backend during last shutdown
++            Set<String> fileList = asyncWriteCache.getAll();
++            if (fileList != null && !fileList.isEmpty()) {
++                List<String> errorFiles = new ArrayList<String>();
++                LOG.info("Uploading [" + fileList + "]  and size ["
++                    + fileList.size() + "] from AsyncUploadCache.");
++                long totalSize = 0;
++                List<File> files = new ArrayList<File>(fileList.size());
++                for (String fileName : fileList) {
++                    File f = new File(path, fileName);
++                    if (!f.exists()) {
++                        errorFiles.add(fileName);
++                        LOG.error("Cannot upload pending file ["
++                            + f.getAbsolutePath() + "]. File doesn't exist.");
++                    } else {
++                        totalSize += f.length();
++                        files.add(new File(homeDir, fileName));
++                    }
++                }
++                new FilesUploader(files, totalSize, concurrentUploadsThreads,
++                    true).upload();
++                if (!continueOnAsyncUploadFailure && errorFiles.size() > 0) {
++                    LOG.error("Pending uploads of files [" + errorFiles
++                        + "] failed. Files do not exist in Local cache.");
++                    LOG.error("To continue set [continueOnAsyncUploadFailure] to true in Datastore configuration in repository.xml."
++                        + " There would be inconsistent data in repository due the missing files. ");
++                    throw new RepositoryException(
++                        "Cannot upload async uploads from local cache. Files not found.");
++                } else {
++                    if (errorFiles.size() > 0) {
++                        LOG.error("Pending uploads of files ["
++                            + errorFiles
++                            + "] failed. Files do not exist"
++                            + " in Local cache. Continuing as [continueOnAsyncUploadFailure] is set to true.");
++                    }
++                    LOG.info("Reseting AsyncWrite Cache list.");
++                    asyncWriteCache.reset();
++                }
++            }
++            cache = new LocalCache(path, tmpDir.getAbsolutePath(), cacheSize,
++                cachePurgeTrigFactor, cachePurgeResizeFactor, asyncWriteCache);
++        } catch (Exception e) {
++            throw new RepositoryException(e);
+-        cache = new LocalCache(path, tmpDir.getAbsolutePath(), cacheSize,
+-                cachePurgeTrigFactor, cachePurgeResizeFactor);
++        long startTime = System.currentTimeMillis();
++        long length = 0;
+-                    temporary), digest);
++                temporary), digest);
+-                IOUtils.copyLarge(input, output);
++                length = IOUtils.copyLarge(input, output);
++            long currTime = System.currentTimeMillis();
+-                    encodeHexString(digest.digest()));
++                encodeHexString(digest.digest()));
++            if (LOG.isDebugEnabled()) {
++                LOG.debug("getting SHA1 hash  [" + identifier + "] length ["
++                    + length + "],   in [" + (currTime - startTime) + "] ms.");
++            }
++            String fileName = getFileName(identifier);
++            AsyncUploadCacheResult result = null;
+-                backend.write(identifier, temporary);
+-                String fileName = getFileName(identifier);
+-                cache.store(fileName, temporary);
++                // check if async upload is already in progress
++                if (!asyncWriteCache.hasEntry(fileName, true)) {
++                    result = cache.store(fileName, temporary, true);
++                }
++            }
++            if (LOG.isDebugEnabled()) {
++                LOG.debug("storing  [" + identifier + "] in localCache took ["
++                    + (System.currentTimeMillis() - currTime) + "] ms.");
++            }
++            if (result != null) {
++                if (result.canAsyncUpload()) {
++                    backend.writeAsync(identifier, result.getFile(), this);
++                } else {
++                    backend.write(identifier, result.getFile());
++                }
++            if (LOG.isDebugEnabled()) {
++                LOG.debug("write [" + identifier + "] length [" + length
++                    + "],   in [" + (System.currentTimeMillis() - startTime)
++                    + "] ms.");
++            }
++    @Override
++    public DataRecord getRecord(DataIdentifier identifier)
++            throws DataStoreException {
++        String fileName = getFileName(identifier);
++        boolean touch = minModifiedDate > 0 ? true : false;
++        synchronized (this) {
++            try {
++                if (asyncWriteCache.hasEntry(fileName, touch)) {
++                    usesIdentifier(identifier);
++                    return new CachingDataRecord(this, identifier);
++                } else if (cache.getFileIfStored(fileName) != null) {
++                    if (touch) {
++                        backend.exists(identifier, touch);
++                    }
++                    usesIdentifier(identifier);
++                    return new CachingDataRecord(this, identifier);
++                } else if (backend.exists(identifier, touch)) {
++                    usesIdentifier(identifier);
++                    return new CachingDataRecord(this, identifier);
++                }
++
++            } catch (IOException ioe) {
++                throw new DataStoreException("error in getting record ["
++                    + identifier + "]", ioe);
++            }
++        }
++        throw new DataStoreException("Record not found: " + identifier);
++    }
++
++        String fileName = getFileName(identifier);
++        boolean touch = minModifiedDate > 0 ? true : false;
+-            usesIdentifier(identifier);
+-            if (!backend.exists(identifier)) {
+-                return null;
++            try {
++                if (asyncWriteCache.hasEntry(fileName, touch)
++                    || backend.exists(identifier, touch)) {
++                    usesIdentifier(identifier);
++                    return new CachingDataRecord(this, identifier);
++                }
++            } catch (IOException ioe) {
++                throw new DataStoreException(ioe);
+-            backend.touch(identifier, minModifiedDate);
+-            return new CachingDataRecord(this, identifier);
++        return null;
+-        return backend.getAllIdentifiers();
++        Set<DataIdentifier> ids = new HashSet<DataIdentifier>();
++        for (String fileName : asyncWriteCache.getAll()) {
++            ids.add(getIdentifier(fileName));
++        }
++        Iterator<DataIdentifier> itr = backend.getAllIdentifiers();
++        while (itr.hasNext()) {
++            ids.add(itr.next());
++        }
++        return ids.iterator();
+-            backend.deleteRecord(identifier);
+-            cache.delete(fileName);
++            try {
++                // order is important here
++                asyncWriteCache.delete(fileName);
++                backend.deleteRecord(identifier);
++                cache.delete(fileName);
++            } catch (IOException ioe) {
++                throw new DataStoreException(ioe);
++            }
+-        List<DataIdentifier> diList = backend.deleteAllOlderThan(min);
++        Set<DataIdentifier> diSet = backend.deleteAllOlderThan(min);
+-        for (DataIdentifier identifier : diList) {
++        for (DataIdentifier identifier : diSet) {
+-        return diList.size();
++        try {
++            for (String fileName : asyncWriteCache.deleteOlderThan(min)) {
++                diSet.add(getIdentifier(fileName));
++            }
++        } catch (IOException e) {
++            throw new DataStoreException(e);
++        }
++        LOG.info("deleteAllOlderThan  exit. Deleted [" + diSet
++            + "] records. Number of records deleted [" + diSet.size() + "]");
++        return diSet.size();
+-    public long getLastModified(DataIdentifier identifier) throws DataStoreException {
+-        LOG.info("accessed lastModified");
+-        return backend.getLastModified(identifier);
++    public long getLastModified(DataIdentifier identifier)
++            throws DataStoreException {
++        if (LOG.isDebugEnabled()) {
++            LOG.debug("accessed lastModified of identifier:" + identifier);
++        }
++        String fileName = getFileName(identifier);
++        long lastModified = asyncWriteCache.getLastModified(fileName);
++        if (lastModified != 0) {
++            if (LOG.isDebugEnabled()) {
++                LOG.debug("getlastModified of identifier [" + identifier
++                    + "] from AsyncUploadCache = " + lastModified);
++            }
++            return lastModified;
++
++        } else {
++            return backend.getLastModified(identifier);
++        }
++        } else {
++            InputStream in = null;
++            InputStream cachedStream = null;
++            try {
++                in = backend.read(identifier);
++                cachedStream = cache.store(fileName, in);
++            } catch (IOException e) {
++                throw new DataStoreException("IO Exception: " + identifier, e);
++            } finally {
++                IOUtils.closeQuietly(in);
++                IOUtils.closeQuietly(cachedStream);
++            }
++            length = cache.getFileLength(fileName);
++            if (length != null) {
++                return length.longValue();
++            }
++    public Set<String> getPendingUploads() {
++        return asyncWriteCache.getAll();
++    }
++
++    public void call(DataIdentifier identifier, File file,
++            AsyncUploadCallback.RESULT resultCode) {
++        String fileName = getFileName(identifier);
++        if (AsyncUploadCallback.RESULT.SUCCESS.equals(resultCode)) {
++            try {
++                if (LOG.isDebugEnabled()) {
++                    LOG.debug("Upload completed. [" + identifier + "].");
++                }
++                AsyncUploadCacheResult result = asyncWriteCache.remove(fileName);
++                if (result.doRequiresDelete()) {
++                    // added record already marked for delete
++                    deleteRecord(identifier);
++                }
++            } catch (IOException ie) {
++                LOG.warn("Cannot remove pending file upload. Dataidentifer [ "
++                    + identifier + "], file [" + file.getAbsolutePath() + "]",
++                    ie);
++            } catch (DataStoreException dse) {
++                LOG.warn("Cannot remove pending file upload. Dataidentifer [ "
++                    + identifier + "], file [" + file.getAbsolutePath() + "]",
++                    dse);
++            }
++        } else if (AsyncUploadCallback.RESULT.FAILED.equals(resultCode)) {
++            LOG.error("Async Upload failed. Dataidentifer [ " + identifier
++                + "], file [" + file.getAbsolutePath() + "]");
++        } else if (AsyncUploadCallback.RESULT.ABORTED.equals(resultCode)) {
++            if (LOG.isDebugEnabled()) {
++                LOG.debug("Async Upload Aborted. Dataidentifer [ " + identifier
++                    + "], file [" + file.getAbsolutePath() + "]");
++            }
++            try {
++                asyncWriteCache.remove(fileName);
++                LOG.info("Async Upload Aborted. Dataidentifer [ " + identifier
++                    + "], file [" + file.getAbsolutePath() + "] removed.");
++            } catch (IOException ie) {
++                LOG.warn("Cannot remove pending file upload. Dataidentifer [ "
++                    + identifier + "], file [" + file.getAbsolutePath() + "]",
++                    ie);
++            }
++        }
++    }
++
+-    private void loadFilesFromCache() throws RepositoryException {
++    private void uploadFilesFromCache() throws RepositoryException {
++        if (concurrentUploadsThreads > 1) {
++            new FilesUploader(files, totalSize, concurrentUploadsThreads, false).upload();
++        } else {
++            uploadFilesInSingleThread(files, totalSize);
++        }
++    }
++
++    private void uploadFilesInSingleThread(List<File> files, long totalSize)
++            throws RepositoryException {
++        long startTime = System.currentTimeMillis();
++        LOG.info("Upload:  {" + files.size() + "} files in single thread.");
++        long currentCount = 0;
+-                LOG.info("Uploaded {" + currentSize + "}/{" + totalSize + "}");
++                LOG.info("Uploaded:  {" + currentCount + "}/{" + files.size()
++                    + "} files, {" + currentSize + "}/{" + totalSize
++                    + "} size data");
+-            currentSize += f.length();
+-            LOG.debug("upload file = " + name);
+-            if (!name.startsWith(TMP) && !name.endsWith(DS_STORE)
+-                    && f.length() > 0) {
+-                loadFileToBackEnd(f);
++            if (LOG.isDebugEnabled()) {
++                LOG.debug("upload file = " + name);
++            if (!name.startsWith(TMP) && !name.endsWith(DS_STORE)
++                && f.length() > 0) {
++                uploadFileToBackEnd(f, false);
++            }
++            currentSize += f.length();
++            currentCount++;
+-        LOG.info("Uploaded {" + currentSize + "}/{" + totalSize + "}");
++        long endTime = System.currentTimeMillis();
++        LOG.info("Uploaded:  {" + currentCount + "}/{" + files.size()
++            + "} files, {" + currentSize + "}/{" + totalSize
++            + "} size data, time taken {" + ((endTime - startTime) / 1000)
++            + "} sec");
+-    private void listRecursive(List<File> list, File file) {
++    private static void listRecursive(List<File> list, File file) {
+-    private void loadFileToBackEnd(File f) throws DataStoreException {
+-        DataIdentifier identifier = new DataIdentifier(f.getName());
+-        usesIdentifier(identifier);
+-        backend.write(identifier, f);
+-        LOG.debug(f.getName() + "uploaded.");
+-
++    private void uploadFileToBackEnd(File f, boolean updateAsyncUploadCache)
++            throws DataStoreException {
++        try {
++            DataIdentifier identifier = new DataIdentifier(f.getName());
++            usesIdentifier(identifier);
++            backend.write(identifier, f);
++            if (updateAsyncUploadCache) {
++                String fileName = getFileName(identifier);
++                asyncWriteCache.remove(fileName);
++            }
++            if (LOG.isDebugEnabled()) {
++                LOG.debug(f.getName() + "uploaded.");
++            }
++        } catch (IOException ioe) {
++            throw new DataStoreException(ioe);
++        }
+-        name = name.substring(0, 2) + "/" + name.substring(2, 4) + "/"
+-                + name.substring(4, 6) + "/" + name;
+-        return name;
++        return getFileName(name);
++    }
++
++    private static String getFileName(String name) {
++        return name.substring(0, 2) + "/" + name.substring(2, 4) + "/"
++            + name.substring(4, 6) + "/" + name;
++    }
++
++    private static DataIdentifier getIdentifier(String fileName) {
++        return new DataIdentifier(
++            fileName.substring(fileName.lastIndexOf("/") + 1));
+-                        + "because a file exists with the same name: "
+-                        + dir.getAbsolutePath());
++                    + "because a file exists with the same name: "
++                    + dir.getAbsolutePath());
+-                    + dir.getAbsolutePath());
++                + dir.getAbsolutePath());
+-        cache = null;
+-     * 
++    public int getConcurrentUploadsThreads() {
++        return concurrentUploadsThreads;
++    }
++
++    public void setConcurrentUploadsThreads(int concurrentUploadsThreads) {
++        this.concurrentUploadsThreads = concurrentUploadsThreads;
++    }
++
++    public int getAsyncUploadLimit() {
++        return asyncUploadLimit;
++    }
++
++    public void setAsyncUploadLimit(int asyncUploadLimit) {
++        this.asyncUploadLimit = asyncUploadLimit;
++    }
++
++    public boolean isContinueOnAsyncUploadFailure() {
++        return continueOnAsyncUploadFailure;
++    }
++
++    public void setContinueOnAsyncUploadFailure(
++            boolean continueOnAsyncUploadFailure) {
++        this.continueOnAsyncUploadFailure = continueOnAsyncUploadFailure;
++    }
++
++    public Backend getBackend() {
++        return backend;
++    }
++
++    /**
++     * This class initiates files upload in multiple threads to backend.
++     */
++    private class FilesUploader {
++        final List<File> files;
++
++        final long totalSize;
++
++        volatile AtomicInteger currentCount = new AtomicInteger();
++
++        volatile AtomicLong currentSize = new AtomicLong();
++
++        volatile AtomicBoolean exceptionRaised = new AtomicBoolean();
++
++        DataStoreException exception;
++
++        final int threads;
++
++        final boolean updateAsyncCache;
++
++        FilesUploader(List<File> files, long totalSize, int threads,
++                boolean updateAsyncCache) {
++            super();
++            this.files = files;
++            this.threads = threads;
++            this.totalSize = totalSize;
++            this.updateAsyncCache = updateAsyncCache;
++        }
++
++        void addCurrentCount(int delta) {
++            currentCount.addAndGet(delta);
++        }
++
++        void addCurrentSize(long delta) {
++            currentSize.addAndGet(delta);
++        }
++
++        synchronized void setException(DataStoreException exception) {
++            exceptionRaised.getAndSet(true);
++            this.exception = exception;
++        }
++
++        boolean isExceptionRaised() {
++            return exceptionRaised.get();
++        }
++
++        void logProgress() {
++            LOG.info("Uploaded:  {" + currentCount.get() + "}/{" + files.size()
++                + "} files, {" + currentSize.get() + "}/{" + totalSize
++                + "} size data");
++        }
++
++        void upload() throws DataStoreException {
++            long startTime = System.currentTimeMillis();
++            LOG.info(" Uploading " + files.size() + " using " + threads
++                + " threads.");
++            ExecutorService executor = Executors.newFixedThreadPool(threads,
++                new NamedThreadFactory("backend-file-upload-worker"));
++            int partitionSize = files.size() / (threads);
++            int startIndex = 0;
++            int endIndex = partitionSize;
++            for (int i = 1; i <= threads; i++) {
++                List<File> partitionFileList = Collections.unmodifiableList(files.subList(
++                    startIndex, endIndex));
++                FileUploaderThread fut = new FileUploaderThread(
++                    partitionFileList, startIndex, endIndex, this,
++                    updateAsyncCache);
++                executor.execute(fut);
++
++                startIndex = endIndex;
++                if (i == (threads - 1)) {
++                    endIndex = files.size();
++                } else {
++                    endIndex = startIndex + partitionSize;
++                }
++            }
++            // This will make the executor accept no new threads
++            // and finish all existing threads in the queue
++            executor.shutdown();
++
++            try {
++                // Wait until all threads are finish
++                while (!isExceptionRaised()
++                    && !executor.awaitTermination(15, TimeUnit.SECONDS)) {
++                    logProgress();
++                }
++            } catch (InterruptedException ie) {
++
++            }
++            long endTime = System.currentTimeMillis();
++            LOG.info("Uploaded:  {" + currentCount.get() + "}/{" + files.size()
++                + "} files, {" + currentSize.get() + "}/{" + totalSize
++                + "} size data, time taken {" + ((endTime - startTime) / 1000)
++                + "} sec");
++            if (isExceptionRaised()) {
++                executor.shutdownNow(); // Cancel currently executing tasks
++                throw exception;
++            }
++        }
++
++    }
++
++    /**
++     * This class implements {@link Runnable} interface and uploads list of
++     * files from startIndex to endIndex to {@link Backend}
++     */
++    private class FileUploaderThread implements Runnable {
++        final List<File> files;
++
++        final FilesUploader filesUploader;
++
++        final int startIndex;
++
++        final int endIndex;
++
++        final boolean updateAsyncCache;
++
++        FileUploaderThread(List<File> files, int startIndex, int endIndex,
++                FilesUploader controller, boolean updateAsyncCache) {
++            super();
++            this.files = files;
++            this.filesUploader = controller;
++            this.startIndex = startIndex;
++            this.endIndex = endIndex;
++            this.updateAsyncCache = updateAsyncCache;
++        }
++
++        public void run() {
++            long time = System.currentTimeMillis();
++            if (LOG.isDebugEnabled()) {
++                LOG.debug("Thread [ " + Thread.currentThread().getName()
++                    + "]: Uploading files from startIndex[" + startIndex
++                    + "] and endIndex [" + (endIndex - 1)
++                    + "], both inclusive.");
++            }
++            int uploadCount = 0;
++            long uploadSize = 0;
++            try {
++                for (File f : files) {
++
++                    if (filesUploader.isExceptionRaised()) {
++                        break;
++                    }
++                    String name = f.getName();
++                    if (LOG.isDebugEnabled()) {
++                        LOG.debug("upload file = " + name);
++                    }
++                    if (!name.startsWith(TMP) && !name.endsWith(DS_STORE)
++                        && f.length() > 0) {
++                        uploadFileToBackEnd(f, updateAsyncCache);
++                    }
++                    uploadCount++;
++                    uploadSize += f.length();
++                    // update upload status at every 15 seconds.
++                    long now = System.currentTimeMillis();
++                    if (now > time + 15000) {
++                        filesUploader.addCurrentCount(uploadCount);
++                        filesUploader.addCurrentSize(uploadSize);
++                        uploadCount = 0;
++                        uploadSize = 0;
++                        time = now;
++                    }
++                }
++                // update final state.
++                filesUploader.addCurrentCount(uploadCount);
++                filesUploader.addCurrentSize(uploadSize);
++            } catch (DataStoreException e) {
++                if (!filesUploader.isExceptionRaised()) {
++                    filesUploader.setException(e);
++                }
++            }
++
++        }
++    }
++
+
+INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS43 INS23 INS23 INS23 INS23 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS55 INS55 INS42 INS29 INS83 INS43 INS59 INS29 INS83 INS39 INS59 INS29 INS83 INS39 INS59 INS29 INS83 INS39 INS59 INS8 INS78 INS43 UPD42 INS44 INS43 MOV29 MOV78 INS83 MOV43 INS42 MOV44 MOV43 INS8 INS8 INS83 INS74 INS42 INS8 INS83 INS39 INS42 INS44 INS44 INS44 INS8 MOV29 INS83 INS39 INS42 MOV43 INS8 UPD42 INS44 INS44 INS43 INS83 UPD42 INS44 INS8 MOV29 INS83 INS83 INS43 INS42 MOV44 INS8 INS44 INS83 INS83 INS43 INS42 INS44 INS8 INS83 INS39 INS42 INS8 INS83 INS39 INS42 INS44 INS8 INS83 INS39 INS42 INS8 INS83 INS39 INS42 INS44 INS8 INS83 INS39 INS42 INS8 INS83 INS39 INS42 INS44 INS8 INS83 INS43 INS42 INS8 INS29 INS83 INS42 INS23 INS23 INS23 INS23 INS23 INS23 INS23 INS23 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS29 INS83 INS42 INS43 INS23 INS23 INS23 INS23 INS23 INS31 INS31 INS66 INS65 INS66 INS66 INS65 INS66 INS66 INS65 INS66 INS65 INS42 INS42 INS65 INS42 INS65 INS42 INS34 INS65 INS42 INS34 INS54 INS60 INS60 INS42 INS42 INS43 INS42 INS42 INS60 INS60 INS53 INS60 INS60 INS51 MOV41 INS60 INS70 INS60 INS61 INS54 INS21 INS25 MOV60 INS60 INS25 INS25 INS43 INS43 INS41 INS43 INS42 INS43 INS42 INS43 INS42 INS60 INS25 MOV60 MOV21 MOV60 MOV70 INS25 INS74 INS42 INS39 INS42 INS42 INS60 INS21 INS60 INS60 INS39 INS42 INS54 INS42 MOV60 INS41 INS43 INS42 INS42 INS43 INS42 INS41 INS41 INS39 INS42 INS21 INS41 INS39 INS42 INS21 INS41 INS39 INS42 INS21 INS42 INS41 INS65 INS83 INS74 INS59 INS83 INS39 INS59 INS83 INS43 INS59 INS83 INS43 INS59 INS83 INS43 INS59 INS43 INS59 INS83 INS39 INS59 INS83 INS39 INS59 INS42 INS44 INS44 INS44 INS44 INS8 INS39 INS42 INS44 INS8 INS39 INS42 INS44 INS8 INS83 INS39 INS42 INS44 INS8 INS39 INS42 INS8 INS39 INS42 INS8 INS39 INS42 INS43 INS8 INS65 INS42 INS83 INS74 INS59 INS83 INS43 INS59 INS83 INS39 INS59 INS83 INS39 INS59 INS83 INS39 INS59 INS42 INS44 INS44 INS44 INS44 INS44 INS8 INS83 INS39 INS42 INS8 INS68 INS66 INS68 INS66 INS68 INS66 INS66 INS66 INS65 INS66 INS66 INS65 INS66 INS66 INS65 INS66 INS66 INS66 INS66 INS66 INS66 INS65 INS66 INS66 INS65 INS66 INS66 INS65 INS66 INS65 INS66 INS66 INS65 INS66 INS66 INS65 INS66 INS66 INS65 INS66 INS65 INS66 INS66 INS66 INS65 INS66 INS66 MOV8 INS12 INS39 INS59 INS39 INS59 INS42 INS43 INS59 INS39 INS59 INS14 INS43 INS59 INS39 INS59 INS52 INS8 UPD74 MOV74 INS59 INS44 INS32 INS8 INS74 INS59 INS32 INS8 INS32 INS8 INS74 UPD42 INS8 INS12 INS32 INS32 INS8 INS39 INS59 INS27 INS8 MOV8 INS27 INS8 INS8 INS42 INS42 INS32 INS42 INS42 INS40 INS43 INS59 INS32 INS8 INS25 INS27 INS8 INS8 INS43 INS43 INS39 INS59 INS32 INS39 INS59 MOV21 INS39 INS59 MOV8 INS12 INS32 INS42 MOV27 INS42 INS14 INS42 INS7 INS42 INS7 INS42 INS7 INS42 INS66 INS43 INS43 INS42 INS42 INS42 INS42 INS14 INS42 INS42 INS14 INS42 INS42 INS14 INS42 INS42 INS42 INS42 INS74 INS42 INS39 INS42 INS39 INS42 INS39 INS42 INS46 INS21 INS21 INS21 INS21 INS39 INS42 INS21 INS39 INS42 INS21 INS43 INS42 INS21 INS21 INS41 INS21 INS42 INS60 INS21 INS60 INS60 INS60 INS60 INS24 INS21 INS54 INS60 INS21 INS25 INS66 INS65 INS66 INS66 INS65 INS43 INS43 INS42 INS42 INS42 INS42 INS42 INS42 INS74 INS42 INS39 INS42 INS39 INS42 INS43 INS42 INS39 INS42 INS46 INS21 INS21 INS21 INS21 INS21 INS60 INS25 INS60 INS60 INS54 INS42 INS69 INS42 INS69 INS42 INS69 INS68 INS42 INS42 INS42 INS42 INS68 INS68 INS42 INS42 INS42 INS42 INS67 INS21 MOV21 MOV25 INS21 INS21 INS60 INS25 INS44 INS8 INS42 INS32 INS42 INS34 INS60 INS25 INS60 INS60 INS25 INS25 INS25 INS42 INS42 INS32 INS42 INS16 INS54 MOV43 INS27 INS42 INS42 INS32 INS42 INS16 INS54 UPD43 INS42 INS14 INS43 INS42 INS42 INS42 INS21 INS43 INS43 INS42 MOV32 INS42 INS42 INS21 INS42 INS42 INS54 INS43 INS43 UPD42 INS70 MOV44 INS8 INS42 INS42 INS27 UPD42 INS42 INS42 INS21 INS42 INS32 INS42 INS34 INS25 INS41 INS42 INS33 INS41 INS60 INS60 INS54 INS21 MOV25 INS42 INS42 INS42 INS42 INS32 INS40 INS42 INS42 INS54 INS32 INS8 INS25 INS42 INS34 INS21 INS21 INS42 INS42 INS42 INS32 INS42 INS42 INS27 INS42 INS34 INS25 INS21 INS42 INS32 INS25 INS25 INS44 INS8 INS42 INS42 INS43 INS32 INS22 INS42 INS22 INS42 INS22 INS42 INS42 INS42 INS43 INS43 INS43 INS43 INS43 INS7 INS7 INS7 INS7 INS32 INS32 INS42 INS32 INS7 INS32 INS32 INS39 INS59 INS32 INS43 INS59 INS39 INS59 INS39 INS59 INS39 INS59 INS58 INS27 INS37 INS8 INS32 INS8 INS12 INS39 INS59 INS32 INS32 INS8 INS42 INS42 INS42 INS42 INS43 INS43 INS42 INS7 INS7 INS7 INS7 INS7 INS39 INS59 INS32 INS8 INS39 INS59 INS39 INS59 INS8 INS12 INS39 INS39 INS39 INS42 INS69 INS42 INS69 INS42 INS42 INS8 INS32 INS7 INS32 INS74 INS59 INS27 INS8 INS43 INS42 INS53 INS42 INS42 INS39 INS59 INS32 INS8 INS43 INS59 INS43 INS59 INS32 INS8 INS27 INS8 INS32 INS8 INS42 INS42 INS27 INS9 INS9 INS8 INS12 INS45 INS42 INS42 INS42 INS27 INS9 INS9 INS8 INS12 UPD42 INS74 INS42 INS32 INS42 INS42 INS32 MOV8 INS12 INS42 INS42 INS44 INS32 INS8 INS53 INS45 INS42 INS45 INS32 INS45 INS32 INS42 INS42 INS42 INS32 INS8 INS42 INS32 INS43 INS59 INS43 INS59 INS8 INS12 INS8 INS7 INS42 INS42 INS8 INS12 INS12 INS40 INS42 INS42 INS21 INS32 INS8 INS32 INS32 INS42 INS42 INS45 INS32 INS45 INS32 INS8 INS37 INS42 INS42 UPD45 INS42 INS45 INS32 INS45 INS45 INS36 UPD45 INS42 INS8 INS32 INS8 INS43 INS42 INS53 INS42 INS42 INS42 INS27 INS52 INS42 INS52 INS42 INS52 INS42 INS42 INS42 INS42 INS42 INS42 INS22 INS42 INS22 INS42 INS22 INS42 INS22 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS9 INS22 INS42 INS42 INS42 INS42 INS42 INS27 INS42 INS32 INS42 INS42 INS27 INS42 INS42 INS32 INS42 INS27 INS42 INS34 INS42 INS42 INS39 INS59 INS42 INS42 INS42 INS60 INS60 INS21 INS21 INS25 INS42 INS42 INS61 INS44 INS8 INS42 INS32 INS42 INS42 INS27 INS42 INS21 INS53 INS42 INS42 INS22 INS42 INS22 INS42 INS22 INS42 INS22 INS42 INS22 INS42 INS42 INS32 INS42 INS42 INS21 INS42 INS34 INS42 INS34 INS70 INS21 INS21 INS44 INS8 INS43 INS43 MOV21 INS21 INS21 INS42 INS42 INS27 INS42 INS14 INS42 INS42 INS42 INS42 INS42 INS43 INS43 INS42 INS32 INS27 INS38 INS60 INS21 INS60 INS60 INS70 INS21 INS25 INS42 INS14 INS42 INS32 INS42 INS42 INS21 INS42 INS42 INS32 INS42 INS42 INS33 INS25 INS42 INS42 INS21 INS42 INS33 INS25 INS42 INS42 INS21 INS42 INS34 INS25 INS44 INS8 INS42 INS34 INS25 INS44 INS8 INS43 INS43 INS42 INS42 INS32 INS42 INS42 INS32 INS21 INS44 INS8 INS43 INS42 INS42 INS42 INS42 INS21 INS14 INS42 INS42 INS42 INS42 INS27 INS42 INS42 INS21 INS42 INS42 INS42 INS42 INS33 INS42 INS42 INS33 INS21 INS21 MOV44 INS8 INS21 INS21 INS42 INS32 INS25 INS60 INS25 INS44 INS8 INS44 INS8 INS32 INS40 INS42 INS42 INS25 INS54 INS14 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 MOV21 INS42 INS42 INS42 INS27 INS60 INS21 INS42 INS42 MOV21 INS42 INS14 INS32 INS34 INS52 INS42 INS52 INS42 INS52 INS42 INS52 INS42 INS52 INS42 INS45 INS32 INS45 INS32 INS45 INS32 INS45 INS42 INS45 INS42 INS42 INS45 INS32 INS45 INS42 INS45 INS42 INS42 INS42 INS14 INS32 INS36 INS42 INS34 INS74 INS59 INS43 INS59 INS32 INS7 INS27 INS8 INS8 INS27 INS8 INS43 INS42 INS42 INS42 INS45 INS32 INS45 INS32 INS45 INS32 INS45 INS42 INS45 INS36 INS45 INS32 INS42 INS52 INS42 INS52 INS42 INS52 INS42 INS52 INS42 INS52 INS42 INS42 INS42 INS32 INS44 INS42 INS8 INS32 INS32 INS43 INS42 INS25 INS42 INS42 INS7 INS7 UPD45 MOV45 INS42 INS45 MOV32 INS45 INS43 INS42 INS42 INS42 INS42 INS42 INS33 INS32 INS74 INS59 INS32 INS39 INS59 INS74 INS59 INS44 INS42 INS8 INS32 INS27 INS8 INS8 INS42 INS43 INS42 INS7 INS42 INS42 INS32 INS42 INS42 INS38 INS8 INS32 INS32 INS8 INS8 INS32 INS32 INS8 INS25 INS43 INS42 INS53 INS27 INS8 INS43 INS42 INS53 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS43 INS42 INS53 INS42 INS32 INS43 INS42 INS45 INS42 INS32 INS7 INS7 INS53 INS32 INS32 INS42 INS42 INS42 INS32 INS8 INS43 INS59 INS32 INS8 INS43 INS42 INS21 INS43 INS42 INS21 INS42 INS42 INS27 INS32 INS8 INS8 INS12 INS43 INS42 INS42 INS42 INS9 INS36 INS34 INS43 INS59 INS32 INS43 INS42 INS42 INS42 INS45 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS43 INS45 INS42 INS42 INS42 INS43 INS43 INS42 INS32 INS42 INS42 INS14 INS42 INS42 INS42 INS42 INS42 INS42 INS36 INS21 INS21 INS38 INS38 INS21 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS27 INS42 INS42 INS42 INS42 INS27 INS43 INS42 INS25 INS60 INS25 INS25 INS21 INS21 INS60 INS25 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS38 INS8 INS42 INS14 INS42 INS27 UPD42 UPD42 INS42 INS42 INS42 INS43 INS43 INS42 INS14 INS42 INS42 INS27 INS42 INS34 INS43 INS43 INS42 INS14 INS43 INS42 INS60 INS25 INS14 INS42 INS38 INS27 MOV21 INS21 INS53 INS25 INS21 INS21 INS42 INS42 MOV32 INS42 INS42 INS27 UPD42 INS32 MOV21 INS42 INS42 INS27 INS42 INS42 INS21 INS21 INS42 INS42 INS27 INS42 INS42 INS42 INS42 MOV21 INS41 INS27 INS8 INS25 INS42 INS14 INS32 INS32 INS21 INS41 INS42 INS14 INS42 INS42 INS42 INS42 INS14 INS42 INS42 INS32 INS42 INS42 INS42 INS27 INS42 INS32 INS42 INS32 INS14 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS21 INS42 INS42 INS32 INS42 INS42 INS21 INS42 INS32 INS42 INS32 INS45 INS42 INS45 INS32 INS45 INS42 INS42 INS21 INS21 INS21 INS44 INS8 INS42 UPD42 INS9 INS27 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS43 INS42 INS42 INS42 INS52 INS42 INS27 INS7 INS7 INS32 INS32 INS32 INS36 INS34 INS45 INS32 INS45 INS42 INS45 INS36 INS45 INS42 INS32 INS8 INS43 INS59 INS32 INS8 INS27 INS8 INS37 INS7 INS39 INS59 INS27 INS8 INS32 INS21 INS43 INS42 INS45 INS42 INS45 INS42 INS42 INS74 INS45 INS42 INS45 INS32 INS45 INS42 INS42 INS74 INS32 INS42 INS43 INS59 INS38 INS8 INS8 INS43 INS42 INS42 INS42 INS9 INS42 INS32 INS34 INS32 INS14 INS27 INS8 INS32 INS32 INS45 INS42 INS45 INS42 INS45 INS36 INS45 INS42 INS42 INS42 INS9 INS7 INS45 INS42 INS45 INS36 INS45 INS32 INS32 INS45 INS42 INS45 INS42 INS45 INS36 INS45 INS14 INS32 INS33 INS25 MOV21 MOV41 INS32 MOV8 MOV43 INS27 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS14 INS43 INS42 INS43 INS42 INS42 INS42 INS45 INS42 INS45 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS43 INS27 INS42 INS32 INS42 INS42 INS42 INS32 INS42 INS42 INS27 INS42 INS42 INS42 INS27 INS42 INS42 INS42 INS32 INS32 INS32 INS43 INS42 INS21 UPD45 INS42 INS45 INS32 INS45 UPD45 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS34 INS42 INS32 INS42 INS27 INS42 INS42 INS42 INS34 INS40 INS42 INS27 INS32 INS42 INS27 INS42 INS42 INS10 INS42 INS42 INS32 INS42 INS42 INS21 INS38 INS38 INS27 INS21 INS42 INS42 INS32 INS42 INS32 INS42 INS27 INS21 INS21 INS21 INS21 INS21 INS42 INS42 INS32 INS42 INS42 UPD42 INS43 INS43 INS42 INS42 INS43 INS43 INS42 INS42 INS42 INS42 INS14 INS32 INS21 INS21 INS21 INS21 INS42 INS42 INS42 UPD42 INS42 INS42 INS27 INS43 INS45 INS32 INS34 INS21 INS42 INS42 INS45 INS42 INS42 INS27 INS42 INS32 INS27 INS42 INS42 INS42 INS32 INS52 INS42 INS42 INS42 INS32 INS27 INS43 INS52 INS42 INS42 INS42 INS42 INS42 INS8 MOV42 MOV42 MOV42 INS42 INS21 INS41 INS45 INS42 INS45 INS42 INS42 INS43 INS52 INS42 INS42 INS42 INS42 INS45 INS42 INS42 INS42 INS27 INS42 INS42 INS45 INS42 INS45 INS32 INS45 INS45 INS42 INS45 INS32 INS45 INS42 INS42 INS27 INS42 INS42 INS42 INS42 INS42 INS27 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS34 INS42 INS42 INS32 INS32 INS32 INS32 INS34 INS32 INS42 INS42 INS42 INS42 INS42 INS34 INS32 INS32 INS7 INS7 INS7 INS42 INS42 INS42 INS42 INS42 INS42 MOV42 INS43 INS42 INS42 INS42 INS42 INS32 INS32 INS7 INS32 UPD45 UPD42 UPD45 INS45 INS45 INS42 INS42 INS42 INS32 INS42 INS42 MOV42 MOV42 MOV42 MOV42 INS9 INS32 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS21 INS32 INS14 INS42 INS45 INS42 INS45 INS42 INS42 INS42 INS42 INS45 INS42 INS45 INS32 INS45 INS45 INS42 INS45 INS32 INS45 INS42 INS42 INS27 INS42 INS42 INS42 INS27 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS34 INS42 INS34 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS27 INS42 INS32 INS42 INS42 INS14 INS42 INS42 INS27 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS43 INS52 INS42 INS42 INS42 INS42 INS42 INS45 INS42 INS45 INS32 INS45 INS45 INS42 UPD45 MOV45 MOV32 INS45 INS42 INS42 INS43 INS42 INS42 INS45 INS42 INS45 INS45 INS42 INS42 INS42 INS42 INS42 INS42 INS42 UPD42 INS42 DEL8 DEL27 DEL42 DEL14 DEL53 DEL8 DEL12 DEL54 DEL8 DEL27 DEL42 DEL14 DEL53 DEL8 DEL12 DEL54 DEL42 DEL42 DEL42 DEL32 DEL32 DEL38 DEL25 DEL42 DEL42 DEL42 DEL42 DEL32 DEL21 DEL42 DEL42 DEL45 DEL32 DEL21 DEL42 DEL7 DEL21 DEL42 DEL42 DEL33 DEL7 DEL21

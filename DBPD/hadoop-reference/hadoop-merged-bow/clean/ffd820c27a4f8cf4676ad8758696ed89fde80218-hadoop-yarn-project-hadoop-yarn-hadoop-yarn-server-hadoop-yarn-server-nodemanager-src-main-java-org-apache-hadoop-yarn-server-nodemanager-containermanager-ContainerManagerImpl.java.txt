@@ -1,0 +1,184 @@
+YARN-1645. ContainerManager implementation to support container resizing. Contributed by Meng Ding & Wangda Tan
+
++import org.apache.hadoop.yarn.api.records.Resource;
++import org.apache.hadoop.yarn.server.nodemanager.CMgrDecreaseContainersResourceEvent;
++import org.apache.hadoop.yarn.server.nodemanager.containermanager.container.ChangeContainerResourceEvent;
++import org.apache.hadoop.yarn.util.resource.Resources;
+-   *          of the container to be started
++   *          of the container whose resource is to be started or increased
+-  protected void authorizeStartRequest(NMTokenIdentifier nmTokenIdentifier,
+-      ContainerTokenIdentifier containerTokenIdentifier) throws YarnException {
++  protected void authorizeStartAndResourceIncreaseRequest(
++      NMTokenIdentifier nmTokenIdentifier,
++      ContainerTokenIdentifier containerTokenIdentifier,
++      boolean startRequest)
++      throws YarnException {
++    /*
++     * Check the following:
++     * 1. The request comes from the same application attempt
++     * 2. The request possess a container token that has not expired
++     * 3. The request possess a container token that is granted by a known RM
++     */
+-        new StringBuilder("Unauthorized request to start container. ");
++        new StringBuilder("Unauthorized request to " + (startRequest ?
++            "start container." : "increase container resource."));
+-        .append(" was used for starting container with container token")
++        .append(" was used for "
++            + (startRequest ? "starting " : "increasing resource of ")
++            + "container with container token")
+-    } else if (!this.context.getContainerTokenSecretManager()
++    } else if (startRequest && !this.context.getContainerTokenSecretManager()
++    if (containerTokenIdentifier.getRMIdentifier() != nodeStatusUpdater
++        .getRMIdentifier()) {
++      // Is the container coming from unknown RM
++      StringBuilder sb = new StringBuilder("\nContainer ");
++      sb.append(containerTokenIdentifier.getContainerID().toString())
++        .append(" rejected as it is allocated by a previous RM");
++      throw new InvalidContainerException(sb.toString());
++    }
+-    authorizeUser(remoteUgi,nmTokenIdentifier);
++    authorizeUser(remoteUgi, nmTokenIdentifier);
+-    authorizeStartRequest(nmTokenIdentifier, containerTokenIdentifier);
+- 
+-    if (containerTokenIdentifier.getRMIdentifier() != nodeStatusUpdater
+-        .getRMIdentifier()) {
+-        // Is the container coming from unknown RM
+-        StringBuilder sb = new StringBuilder("\nContainer ");
+-        sb.append(containerTokenIdentifier.getContainerID().toString())
+-          .append(" rejected as it is allocated by a previous RM");
+-        throw new InvalidContainerException(sb.toString());
+-    }
++    authorizeStartAndResourceIncreaseRequest(
++        nmTokenIdentifier, containerTokenIdentifier, true);
+-      throws YarnException, IOException {
+-    // To be implemented in YARN-1645
+-    return null;
++          throws YarnException, IOException {
++    if (blockNewContainerRequests.get()) {
++      throw new NMNotYetReadyException(
++          "Rejecting container resource increase as NodeManager has not"
++              + " yet connected with ResourceManager");
++    }
++    UserGroupInformation remoteUgi = getRemoteUgi();
++    NMTokenIdentifier nmTokenIdentifier = selectNMTokenIdentifier(remoteUgi);
++    authorizeUser(remoteUgi, nmTokenIdentifier);
++    List<ContainerId> successfullyIncreasedContainers
++        = new ArrayList<ContainerId>();
++    Map<ContainerId, SerializedException> failedContainers =
++        new HashMap<ContainerId, SerializedException>();
++    // Process container resource increase requests
++    for (org.apache.hadoop.yarn.api.records.Token token :
++        requests.getContainersToIncrease()) {
++      ContainerId containerId = null;
++      try {
++        if (token.getIdentifier() == null) {
++          throw new IOException(INVALID_CONTAINERTOKEN_MSG);
++        }
++        ContainerTokenIdentifier containerTokenIdentifier =
++            BuilderUtils.newContainerTokenIdentifier(token);
++        verifyAndGetContainerTokenIdentifier(token,
++            containerTokenIdentifier);
++        authorizeStartAndResourceIncreaseRequest(
++            nmTokenIdentifier, containerTokenIdentifier, false);
++        containerId = containerTokenIdentifier.getContainerID();
++        // Reuse the startContainer logic to update NMToken,
++        // as container resource increase request will have come with
++        // an updated NMToken.
++        updateNMTokenIdentifier(nmTokenIdentifier);
++        Resource resource = containerTokenIdentifier.getResource();
++        changeContainerResourceInternal(containerId, resource, true);
++        successfullyIncreasedContainers.add(containerId);
++      } catch (YarnException | InvalidToken e) {
++        failedContainers.put(containerId, SerializedException.newInstance(e));
++      } catch (IOException e) {
++        throw RPCUtil.getRemoteException(e);
++      }
++    }
++    return IncreaseContainersResourceResponse.newInstance(
++        successfullyIncreasedContainers, failedContainers);
++  }
++
++  @SuppressWarnings("unchecked")
++  private void changeContainerResourceInternal(
++      ContainerId containerId, Resource targetResource, boolean increase)
++          throws YarnException, IOException {
++    Container container = context.getContainers().get(containerId);
++    // Check container existence
++    if (container == null) {
++      if (nodeStatusUpdater.isContainerRecentlyStopped(containerId)) {
++        throw RPCUtil.getRemoteException("Container " + containerId.toString()
++            + " was recently stopped on node manager.");
++      } else {
++        throw RPCUtil.getRemoteException("Container " + containerId.toString()
++            + " is not handled by this NodeManager");
++      }
++    }
++    // Check container state
++    org.apache.hadoop.yarn.server.nodemanager.
++        containermanager.container.ContainerState currentState =
++        container.getContainerState();
++    if (currentState != org.apache.hadoop.yarn.server.
++        nodemanager.containermanager.container.ContainerState.RUNNING) {
++      throw RPCUtil.getRemoteException("Container " + containerId.toString()
++          + " is in " + currentState.name() + " state."
++          + " Resource can only be changed when a container is in"
++          + " RUNNING state");
++    }
++    // Check validity of the target resource.
++    Resource currentResource = container.getResource();
++    if (currentResource.equals(targetResource)) {
++      LOG.warn("Unable to change resource for container "
++          + containerId.toString()
++          + ". The target resource "
++          + targetResource.toString()
++          + " is the same as the current resource");
++      return;
++    }
++    if (increase && !Resources.fitsIn(currentResource, targetResource)) {
++      throw RPCUtil.getRemoteException("Unable to increase resource for "
++          + "container " + containerId.toString()
++          + ". The target resource "
++          + targetResource.toString()
++          + " is smaller than the current resource "
++          + currentResource.toString());
++    }
++    if (!increase &&
++        (!Resources.fitsIn(Resources.none(), targetResource)
++            || !Resources.fitsIn(targetResource, currentResource))) {
++      throw RPCUtil.getRemoteException("Unable to decrease resource for "
++          + "container " + containerId.toString()
++          + ". The target resource "
++          + targetResource.toString()
++          + " is not smaller than the current resource "
++          + currentResource.toString());
++    }
++    this.readLock.lock();
++    try {
++      if (!serviceStopped) {
++        dispatcher.getEventHandler().handle(new ChangeContainerResourceEvent(
++            containerId, targetResource));
++      } else {
++        throw new YarnException(
++            "Unable to change container resource as the NodeManager is "
++                + "in the process of shutting down");
++      }
++    } finally {
++      this.readLock.unlock();
++    }
++    case DECREASE_CONTAINERS_RESOURCE:
++      CMgrDecreaseContainersResourceEvent containersDecreasedEvent =
++          (CMgrDecreaseContainersResourceEvent) event;
++      for (org.apache.hadoop.yarn.api.records.Container container
++          : containersDecreasedEvent.getContainersToDecrease()) {
++        try {
++          changeContainerResourceInternal(container.getId(),
++              container.getResource(), false);
++        } catch (YarnException e) {
++          LOG.error("Unable to decrease container resource", e);
++        } catch (IOException e) {
++          LOG.error("Unable to update container resource in store", e);
++        }
++      }
++      break;
+
+INS26 INS26 INS26 INS26 INS40 INS40 INS40 INS40 INS31 UPD42 INS44 INS8 INS79 INS83 INS39 INS42 INS44 INS44 INS44 INS43 INS43 INS8 INS39 INS42 MOV25 INS25 INS60 INS60 INS21 INS60 INS60 INS70 INS41 INS42 INS45 INS43 INS42 INS43 INS42 INS39 INS42 INS42 INS42 INS60 INS25 INS60 INS25 INS60 INS25 INS25 INS25 INS21 INS54 UPD66 MOV43 INS32 INS8 INS43 INS59 INS43 INS59 INS32 INS74 INS59 INS74 INS59 INS44 INS32 INS8 INS32 INS42 INS42 INS43 INS59 INS27 INS8 INS43 INS59 INS27 INS8 INS43 INS59 INS32 INS8 INS27 INS8 INS27 INS8 INS32 INS8 INS8 INS60 INS70 INS10 INS49 INS27 UPD42 INS9 INS42 INS42 INS53 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS42 INS43 INS43 INS42 INS14 INS43 INS43 INS43 INS42 INS14 INS43 INS42 INS42 INS42 INS60 INS54 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS33 INS25 INS40 INS42 INS32 INS42 INS40 INS53 INS42 INS42 INS32 INS42 INS42 INS42 INS21 INS41 INS42 INS38 INS53 INS38 INS36 INS53 INS22 INS42 INS25 INS21 INS42 INS43 INS59 INS44 INS32 INS8 MOV43 INS27 INS42 MOV38 INS14 INS42 INS42 INS42 INS42 INS42 INS74 INS42 INS42 INS42 INS74 INS40 INS43 INS59 INS8 INS12 INS12 INS32 INS42 INS42 INS32 INS8 INS8 INS42 INS42 INS32 INS42 INS42 INS32 INS32 INS32 INS42 INS27 INS32 INS52 INS42 INS38 INS8 INS8 INS32 INS42 INS42 INS11 INS43 INS42 INS42 INS42 INS54 INS45 INS36 INS43 INS27 INS43 INS43 INS43 INS43 INS43 INS42 INS42 INS33 INS25 INS60 INS21 INS21 INS21 INS21 INS60 INS21 INS21 INS44 INS8 INS44 INS8 INS42 INS42 INS42 INS42 INS42 INS53 INS53 INS42 INS42 INS27 INS42 INS42 INS27 INS42 INS42 INS42 INS42 INS42 INS42 INS27 INS38 INS38 INS42 INS42 INS27 INS42 INS21 INS53 INS22 INS42 INS43 INS42 INS40 INS8 INS12 INS12 INS16 INS42 INS45 INS45 INS42 INS42 INS42 INS42 INS42 INS27 INS8 INS43 INS59 INS32 INS32 INS7 INS32 INS43 INS59 INS32 INS32 INS84 INS42 INS21 INS43 INS42 INS53 INS32 INS32 INS45 INS32 INS45 INS32 INS45 INS45 INS45 INS45 INS32 INS45 INS32 INS45 INS27 INS32 INS45 INS32 INS45 INS32 INS32 INS32 INS27 INS32 INS45 INS32 INS45 INS32 INS32 INS14 INS52 INS42 INS42 INS21 INS44 INS8 INS44 INS8 INS42 INS45 INS45 INS27 INS32 INS33 INS53 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS9 INS42 INS32 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS9 INS42 INS42 INS42 INS43 INS43 INS32 INS42 INS32 INS42 INS42 INS27 INS42 INS42 INS27 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS45 INS45 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS45 INS45 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS14 INS43 INS27 INS32 INS43 INS42 INS21 INS43 INS42 INS21 INS45 INS36 INS45 INS42 INS42 INS14 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS45 INS32 INS45 INS45 INS32 INS45 INS42 INS42 INS42 INS42 INS43 INS42 INS42 INS42 INS45 INS45 INS42 INS32 INS32 INS9 INS42 INS32 INS42 INS32 INS16 INS43 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS45 INS42 INS42 INS42 INS45 INS42 INS42 INS45 INS45 INS42 DEL45 DEL45 DEL33 DEL41 DEL8

@@ -1,0 +1,356 @@
+  HADOOP-7524 and MapReduce-2887 Change RPC to allow multiple protocols including multuple versions of the same protocol (sanjay Radia)
+
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/trunk@1164771 13f79535-47bb-0310-9956-ffa450edef68
+
++import java.util.ArrayList;
++import java.util.Arrays;
++import java.util.List;
++import org.apache.hadoop.ipc.VersionedProtocol;
++ 
++  /**
++   * Get all superInterfaces that extend VersionedProtocol
++   * @param childInterfaces
++   * @return the super interfaces that extend VersionedProtocol
++   */
++  private static Class<?>[] getSuperInterfaces(Class<?>[] childInterfaces) {
++    List<Class<?>> allInterfaces = new ArrayList<Class<?>>();
++
++    for (Class<?> childInterface : childInterfaces) {
++      if (VersionedProtocol.class.isAssignableFrom(childInterface)) {
++          allInterfaces.add(childInterface);
++          allInterfaces.addAll(
++              Arrays.asList(
++                  getSuperInterfaces(childInterface.getInterfaces())));
++      } else {
++        LOG.warn("Interface " + childInterface +
++              " ignored because it does not extend VersionedProtocol");
++      }
++    }
++    return (Class<?>[]) allInterfaces.toArray(new Class[allInterfaces.size()]);
++  }
++  
++  /**
++   * Get all interfaces that the given protocol implements or extends
++   * which are assignable from VersionedProtocol.
++   */
++  private static Class<?>[] getProtocolInterfaces(Class<?> protocol) {
++    Class<?>[] interfaces  = protocol.getInterfaces();
++    return getSuperInterfaces(interfaces);
++  }
++
++  
+-  public static long writableRpcVersion = 1L;
++  
++  // 2L - added declared class to Invocation
++  public static final long writableRpcVersion = 2L; 
++  
++    private String declaringClassProtocolName;
++    @SuppressWarnings("unused") // called when deserializing an invocation
++      this.declaringClassProtocolName = 
++          RPC.getProtocolName(method.getDeclaringClass());
++    @SuppressWarnings("unused")
++    @SuppressWarnings("deprecation")
++      declaringClassProtocolName = UTF8.readString(in);
+-        parameters[i] = ObjectWritable.readObject(in, objectWritable, this.conf);
++        parameters[i] = 
++            ObjectWritable.readObject(in, objectWritable, this.conf);
++    @SuppressWarnings("deprecation")
++      UTF8.writeString(out, declaringClassProtocolName);
+-  public Server getServer(Class<?> protocol,
+-                          Object instance, String bindAddress, int port,
+-                          int numHandlers, int numReaders, int queueSizePerHandler,
+-                          boolean verbose, Configuration conf,
++  public RPC.Server getServer(Class<?> protocolClass,
++                      Object protocolImpl, String bindAddress, int port,
++                      int numHandlers, int numReaders, int queueSizePerHandler,
++                      boolean verbose, Configuration conf,
+-    return new Server(instance, conf, bindAddress, port, numHandlers, 
+-        numReaders, queueSizePerHandler, verbose, secretManager);
++    return new Server(protocolClass, protocolImpl, conf, bindAddress, port,
++        numHandlers, numReaders, queueSizePerHandler, verbose, secretManager);
++
+-    private Object instance;
++    
++    /**
++     *  The key in Map
++     */
++    static class ProtoNameVer {
++      final String protocol;
++      final long   version;
++      ProtoNameVer(String protocol, long ver) {
++        this.protocol = protocol;
++        this.version = ver;
++      }
++      @Override
++      public boolean equals(Object o) {
++        if (o == null) 
++          return false;
++        if (this == o) 
++          return true;
++        if (! (o instanceof ProtoNameVer))
++          return false;
++        ProtoNameVer pv = (ProtoNameVer) o;
++        return ((pv.protocol.equals(this.protocol)) && 
++            (pv.version == this.version));     
++      }
++      @Override
++      public int hashCode() {
++        return protocol.hashCode() * 37 + (int) version;    
++      }
++    }
++    
++    /**
++     * The value in map
++     */
++    static class ProtoClassProtoImpl {
++      final Class<?> protocolClass;
++      final Object protocolImpl; 
++      ProtoClassProtoImpl(Class<?> protocolClass, Object protocolImpl) {
++        this.protocolClass = protocolClass;
++        this.protocolImpl = protocolImpl;
++      }
++    }
++    
++    private Map<ProtoNameVer, ProtoClassProtoImpl> protocolImplMap = 
++        new HashMap<ProtoNameVer, ProtoClassProtoImpl>(10);
++    
++    // Register  protocol and its impl for rpc calls
++    private void registerProtocolAndImpl(Class<?> protocolClass, 
++        Object protocolImpl) throws IOException {
++      String protocolName = RPC.getProtocolName(protocolClass);
++      VersionedProtocol vp = (VersionedProtocol) protocolImpl;
++      long version;
++      try {
++        version = vp.getProtocolVersion(protocolName, 0);
++      } catch (Exception ex) {
++        LOG.warn("Protocol "  + protocolClass + 
++             " NOT registered as getProtocolVersion throws exception ");
++        return;
++      }
++      protocolImplMap.put(new ProtoNameVer(protocolName, version),
++          new ProtoClassProtoImpl(protocolClass, protocolImpl)); 
++      LOG.info("ProtocolImpl=" + protocolImpl.getClass().getName() + 
++          " protocolClass=" + protocolClass.getName() + " version=" + version);
++    }
++    
++    private static class VerProtocolImpl {
++      final long version;
++      final ProtoClassProtoImpl protocolTarget;
++      VerProtocolImpl(long ver, ProtoClassProtoImpl protocolTarget) {
++        this.version = ver;
++        this.protocolTarget = protocolTarget;
++      }
++    }
++    
++    
++    @SuppressWarnings("unused") // will be useful later.
++    private VerProtocolImpl[] getSupportedProtocolVersions(
++        String protocolName) {
++      VerProtocolImpl[] resultk = new  VerProtocolImpl[protocolImplMap.size()];
++      int i = 0;
++      for (Map.Entry<ProtoNameVer, ProtoClassProtoImpl> pv :
++                                        protocolImplMap.entrySet()) {
++        if (pv.getKey().protocol.equals(protocolName)) {
++          resultk[i++] = 
++              new VerProtocolImpl(pv.getKey().version, pv.getValue());
++        }
++      }
++      if (i == 0) {
++        return null;
++      }
++      VerProtocolImpl[] result = new VerProtocolImpl[i];
++      System.arraycopy(resultk, 0, result, 0, i);
++      return result;
++    }
++    
++    private VerProtocolImpl getHighestSupportedProtocol(String protocolName) {    
++      Long highestVersion = 0L;
++      ProtoClassProtoImpl highest = null;
++      for (Map.Entry<ProtoNameVer, ProtoClassProtoImpl> pv : protocolImplMap
++          .entrySet()) {
++        if (pv.getKey().protocol.equals(protocolName)) {
++          if ((highest == null) || (pv.getKey().version > highestVersion)) {
++            highest = pv.getValue();
++            highestVersion = pv.getKey().version;
++          } 
++        }
++      }
++      if (highest == null) {
++        return null;
++      }
++      return new VerProtocolImpl(highestVersion,  highest);   
++    }
++ 
++     * 
++     * @deprecated Use #Server(Class, Object, Configuration, String, int)
++     *    
+-    public Server(Object instance, Configuration conf, String bindAddress, int port) 
++    @Deprecated
++    public Server(Object instance, Configuration conf, String bindAddress,
++        int port) 
+-      this(instance, conf,  bindAddress, port, 1, -1, -1, false, null);
++      this(null, instance, conf,  bindAddress, port);
++    }
++    
++    
++    /** Construct an RPC server.
++     * @param protocol class
++     * @param instance the instance whose methods will be called
++     * @param conf the configuration to use
++     * @param bindAddress the address to bind on to listen for connection
++     * @param port the port to listen for connections on
++     */
++    public Server(Class<?> protocolClass, Object protocolImpl, 
++        Configuration conf, String bindAddress, int port) 
++      throws IOException {
++      this(protocolClass, protocolImpl, conf,  bindAddress, port, 1, -1, -1,
++          false, null);
++    
+-     * @param instance the instance whose methods will be called
++     * @param protocolImpl the instance whose methods will be called
++     * @param conf the configuration to use
++     * @param bindAddress the address to bind on to listen for connection
++     * @param port the port to listen for connections on
++     * @param numHandlers the number of method handler threads to run
++     * @param verbose whether each call should be logged
++     * 
++     * @deprecated use Server#Server(Class, Object, 
++     *      Configuration, String, int, int, int, int, boolean, SecretManager)
++     */
++    @Deprecated
++    public Server(Object protocolImpl, Configuration conf, String bindAddress,
++        int port, int numHandlers, int numReaders, int queueSizePerHandler,
++        boolean verbose, SecretManager<? extends TokenIdentifier> secretManager) 
++            throws IOException {
++       this(null, protocolImpl,  conf,  bindAddress,   port,
++                   numHandlers,  numReaders,  queueSizePerHandler,  verbose, 
++                   secretManager);
++   
++    }
++    
++    /** Construct an RPC server.
++     * @param protocolClass - the protocol being registered
++     *     can be null for compatibility with old usage (see below for details)
++     * @param protocolImpl the protocol impl that will be called
+-    public Server(Object instance, Configuration conf, String bindAddress,  int port,
+-                  int numHandlers, int numReaders, int queueSizePerHandler, boolean verbose, 
+-                  SecretManager<? extends TokenIdentifier> secretManager) 
++    public Server(Class<?> protocolClass, Object protocolImpl,
++        Configuration conf, String bindAddress,  int port,
++        int numHandlers, int numReaders, int queueSizePerHandler, 
++        boolean verbose, SecretManager<? extends TokenIdentifier> secretManager) 
+-          classNameBase(instance.getClass().getName()), secretManager);
+-      this.instance = instance;
++          classNameBase(protocolImpl.getClass().getName()), secretManager);
++
++      
++      
++      Class<?>[] protocols;
++      if (protocolClass == null) { // derive protocol from impl
++        /*
++         * In order to remain compatible with the old usage where a single
++         * target protocolImpl is suppled for all protocol interfaces, and
++         * the protocolImpl is derived from the protocolClass(es) 
++         * we register all interfaces extended by the protocolImpl
++         */
++        protocols = getProtocolInterfaces(protocolImpl.getClass());
++
++      } else {
++        if (!protocolClass.isAssignableFrom(protocolImpl.getClass())) {
++          throw new IOException("protocolClass "+ protocolClass +
++              " is not implemented by protocolImpl which is of class " +
++              protocolImpl.getClass());
++        }
++        // register protocol class and its super interfaces
++        registerProtocolAndImpl(protocolClass, protocolImpl);
++        protocols = getProtocolInterfaces(protocolClass);
++      }
++      for (Class<?> p : protocols) {
++        if (!p.equals(VersionedProtocol.class)) {
++          registerProtocolAndImpl(p, protocolImpl);
++        }
++      }
++
+-    public Writable call(Class<?> protocol, Writable param, long receivedTime) 
++ 
++    @Override
++    public <PROTO extends VersionedProtocol, IMPL extends PROTO> Server
++      addProtocol(
++        Class<PROTO> protocolClass, IMPL protocolImpl) throws IOException {
++      registerProtocolAndImpl(protocolClass, protocolImpl);
++      return this;
++    }
++    
++    /**
++     * Process a client call
++     * @param protocolName - the protocol name (the class of the client proxy
++     *      used to make calls to the rpc server.
++     * @param param  parameters
++     * @param receivedTime time at which the call receoved (for metrics)
++     * @return the call's return
++     * @throws IOException
++     */
++    public Writable call(String protocolName, Writable param, long receivedTime) 
+-        Method method = protocol.getMethod(call.getMethodName(),
+-                                           call.getParameterClasses());
+-        method.setAccessible(true);
+-
+-        
+-        //Verify protocol version.
+-        //Bypass the version check for VersionedProtocol
+-        if (!method.getDeclaringClass().equals(VersionedProtocol.class)) {
+-          long clientVersion = call.getProtocolVersion();
+-          ProtocolSignature serverInfo = ((VersionedProtocol) instance)
+-              .getProtocolSignature(protocol.getCanonicalName(), call
+-                  .getProtocolVersion(), call.getClientMethodsHash());
+-          long serverVersion = serverInfo.getVersion();
+-          if (serverVersion != clientVersion) {
+-            LOG.warn("Version mismatch: client version=" + clientVersion
+-                + ", server version=" + serverVersion);
+-            throw new RPC.VersionMismatch(protocol.getName(), clientVersion,
+-                serverVersion);
++
++        long clientVersion = call.getProtocolVersion();
++        final String protoName;
++        ProtoClassProtoImpl protocolImpl;
++        if (call.declaringClassProtocolName.equals(VersionedProtocol.class.getName())) {
++          // VersionProtocol methods are often used by client to figure out
++          // which version of protocol to use.
++          //
++          // Versioned protocol methods should go the protocolName protocol
++          // rather than the declaring class of the method since the
++          // the declaring class is VersionedProtocol which is not 
++          // registered directly.
++          // Send the call to the highest  protocol version
++          protocolImpl = 
++              getHighestSupportedProtocol(protocolName).protocolTarget;
++        } else {
++          protoName = call.declaringClassProtocolName;
++
++          // Find the right impl for the protocol based on client version.
++          ProtoNameVer pv = 
++              new ProtoNameVer(call.declaringClassProtocolName, clientVersion);
++          protocolImpl = protocolImplMap.get(pv);
++          if (protocolImpl == null) { // no match for Protocol AND Version
++             VerProtocolImpl highest = 
++                 getHighestSupportedProtocol(protoName);
++            if (highest == null) {
++              throw new IOException("Unknown protocol: " + protoName);
++            } else { // protocol supported but not the version that client wants
++              throw new RPC.VersionMismatch(protoName, clientVersion,
++                highest.version);
++            }
++        
++
++        // Invoke the protocol method
+-        Object value = method.invoke(instance, call.getParameters());
++        Method method = 
++            protocolImpl.protocolClass.getMethod(call.getMethodName(),
++            call.getParameterClasses());
++        method.setAccessible(true);
++        rpcDetailedMetrics.init(protocolImpl.protocolClass);
++        Object value = 
++            method.invoke(protocolImpl.protocolImpl, call.getParameters());
+
+INS26 INS26 INS26 INS26 INS40 INS40 INS40 INS40 INS31 INS31 MOV23 INS29 INS83 INS83 INS5 INS42 INS44 INS8 INS29 INS83 INS83 INS5 INS42 MOV44 INS8 INS83 INS23 INS43 INS44 INS44 INS55 INS55 INS31 INS55 INS31 INS31 INS31 INS31 INS31 INS65 INS65 INS65 INS74 INS85 INS5 INS42 INS60 INS70 INS41 INS65 INS74 INS85 INS60 INS41 UPD34 INS83 INS43 INS59 INS79 INS79 INS79 INS79 INS40 INS74 INS42 INS43 INS42 INS29 INS83 INS42 INS23 INS23 INS31 INS31 INS31 INS29 INS83 INS42 INS23 INS23 INS31 INS74 INS83 INS39 INS42 INS44 INS44 INS43 INS8 INS83 INS83 INS42 INS23 INS23 INS31 INS79 INS83 INS5 INS42 INS44 INS8 INS83 INS43 INS42 INS44 INS8 MOV29 INS78 INS83 INS42 MOV44 INS44 INS44 INS44 MOV43 INS8 INS29 INS44 INS44 INS44 INS44 INS43 MOV29 INS78 INS83 INS42 INS44 MOV44 MOV44 MOV44 INS44 INS44 INS44 INS44 INS44 INS43 INS8 INS29 INS44 INS78 INS83 INS73 INS73 MOV43 INS42 INS44 INS44 INS43 INS8 INS29 INS66 INS42 INS66 INS43 INS76 INS74 INS85 INS74 INS59 INS44 INS42 INS8 INS11 INS66 INS66 INS43 INS76 INS5 INS59 INS32 INS42 INS42 INS42 INS45 INS21 INS42 INS45 INS42 INS45 INS21 INS42 INS45 INS21 INS43 INS76 INS42 INS65 INS83 INS43 INS59 INS83 INS39 INS59 INS42 INS44 INS44 INS8 INS78 INS83 INS39 INS42 INS44 INS8 INS78 INS83 INS39 INS42 INS8 INS65 INS83 INS74 INS59 INS83 MOV43 INS59 INS42 INS44 INS44 INS8 INS43 INS43 INS43 UPD42 INS14 INS74 INS42 INS43 INS42 INS42 INS60 INS60 INS60 INS54 INS21 INS21 INS83 INS39 INS59 INS83 INS43 INS59 INS42 INS44 INS44 INS8 INS42 INS45 INS43 INS85 INS43 INS42 INS60 INS60 INS70 INS25 INS60 INS21 INS41 INS42 INS43 INS42 INS60 INS60 INS70 INS25 INS41 UPD65 INS42 INS43 INS42 INS43 INS42 INS39 INS42 INS17 MOV65 INS65 MOV65 INS65 INS65 INS65 INS74 INS42 UPD42 INS43 INS42 INS43 INS42 INS39 INS42 INS42 MOV38 INS65 INS65 MOV65 INS65 INS65 INS42 INS43 INS42 INS39 INS42 INS39 INS42 INS39 INS42 INS39 INS42 INS74 INS42 INS42 INS17 INS65 INS65 INS65 INS65 INS65 INS65 INS65 INS65 INS74 INS42 UPD42 INS60 INS25 INS70 INS42 INS42 INS43 INS42 INS43 INS74 INS42 INS43 INS42 INS42 INS21 INS41 INS65 INS65 INS65 INS65 INS65 INS65 INS43 UPD42 INS42 INS43 INS76 INS43 INS74 INS42 INS14 INS74 INS42 INS25 INS5 INS32 INS42 INS74 INS85 INS42 INS32 INS42 INS42 INS7 INS7 INS32 INS42 UPD42 INS42 INS66 INS42 INS42 INS42 INS43 INS42 INS39 INS42 INS21 INS21 INS42 INS43 INS42 INS25 INS25 INS25 INS60 INS41 INS42 INS41 INS66 INS43 INS76 INS42 INS42 INS74 INS42 INS43 INS42 INS21 INS21 INS42 INS42 INS42 INS74 INS34 INS43 INS76 INS42 INS43 INS59 MOV43 INS59 INS39 INS59 INS8 INS12 INS32 INS32 INS42 INS42 INS42 INS39 INS42 INS43 INS42 INS21 INS21 INS42 INS42 INS5 INS59 INS39 INS59 INS44 INS32 INS8 INS27 INS8 INS5 INS59 INS32 INS42 INS42 INS43 INS59 INS43 INS59 INS44 INS32 INS8 INS27 INS8 INS14 UPD66 INS42 INS42 INS33 INS42 INS42 INS42 INS42 INS42 INS66 INS42 INS66 INS42 INS66 INS42 INS66 INS43 INS76 INS42 INS42 UPD42 INS42 INS66 INS42 INS66 MOV42 INS66 INS66 INS66 INS42 INS43 INS76 INS33 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS66 INS42 INS66 INS66 INS42 INS66 INS42 INS66 INS42 INS66 INS42 INS66 INS42 INS66 INS42 INS66 INS43 INS76 INS5 INS59 INS27 INS8 INS8 INS44 INS42 INS8 INS42 INS42 INS43 INS43 INS42 INS32 INS52 INS66 INS42 INS66 INS66 INS42 INS66 INS42 INS66 INS66 INS42 UPD42 MOV42 MOV60 MOV21 INS42 INS42 INS43 INS76 INS74 INS43 INS76 INS32 INS8 INS8 INS74 INS85 INS42 INS42 INS3 INS43 INS76 INS42 INS42 INS22 INS32 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS7 INS7 INS42 INS27 INS41 INS27 INS41 INS38 INS41 INS43 INS59 INS36 INS27 INS42 INS43 INS76 INS42 INS7 INS7 INS43 INS43 INS43 INS42 INS42 INS42 INS32 INS42 INS11 INS42 INS21 INS44 INS8 INS42 INS42 INS14 INS14 INS42 INS42 INS27 INS42 INS7 INS7 INS43 INS85 INS42 INS3 INS42 INS34 INS74 INS42 INS42 INS42 INS25 INS42 INS34 INS41 INS43 INS85 INS42 INS3 INS42 INS42 INS42 INS34 INS42 INS34 INS42 INS42 INS42 INS34 INS42 INS42 INS33 INS74 INS42 INS42 INS42 INS25 INS42 INS33 INS41 INS43 INS42 INS42 INS42 INS42 INS43 INS42 INS74 INS85 INS42 INS42 INS33 MOV21 INS25 INS21 INS21 INS74 INS42 INS25 INS42 INS42 INS42 INS42 INS42 MOV60 INS60 INS60 INS25 INS21 INS42 INS43 INS74 INS42 INS57 INS42 INS42 INS21 INS21 INS21 INS43 INS76 INS5 INS32 INS42 INS52 INS42 INS42 INS42 MOV32 INS42 INS42 INS42 INS22 INS42 INS22 INS42 INS42 INS33 INS9 INS52 INS42 INS9 INS36 INS9 INS42 INS42 INS11 INS27 INS27 INS11 INS42 INS22 INS42 INS22 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS43 INS42 INS7 INS43 INS42 INS21 INS41 INS43 INS42 INS42 INS43 INS42 INS42 INS45 INS32 INS45 INS32 INS45 INS42 INS22 INS42 INS22 INS42 INS42 INS5 INS32 INS43 INS43 INS43 INS32 INS8 INS33 INS42 INS5 INS42 INS43 INS43 INS43 INS32 INS8 INS33 INS42 INS42 INS43 INS76 INS38 INS8 INS32 INS7 INS43 INS76 MOV38 INS8 INS83 UPD43 MOV43 INS59 INS43 INS59 INS32 INS8 INS8 INS32 INS42 INS43 INS76 INS43 INS32 INS32 INS32 INS42 INS43 INS85 INS42 INS42 INS42 INS52 INS42 INS52 INS42 INS62 INS43 INS42 INS36 INS36 INS32 INS34 INS39 INS42 INS52 INS42 INS52 INS42 INS42 INS42 INS32 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS42 INS52 INS42 INS52 INS42 INS43 INS85 INS42 INS42 INS40 INS42 INS42 INS22 INS42 INS42 INS21 INS43 INS85 INS40 INS42 INS42 INS22 INS42 INS42 INS25 UPD42 INS42 INS42 INS32 INS32 INS53 INS42 INS42 INS42 INS42 INS32 INS42 INS21 UPD42 UPD42 MOV42 INS42 INS42 INS40 INS42 MOV32 INS21 INS21 MOV60 INS21 MOV25 INS42 INS42 INS40 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS27 INS42 INS42 INS43 INS42 INS32 INS27 INS42 INS42 INS42 INS42 INS42 INS34 INS42 INS42 INS27 INS42 INS42 INS42 INS32 INS42 INS7 INS42 INS32 INS42 INS27 INS8 INS42 INS32 INS42 INS42 INS32 INS14 INS42 INS42 UPD42 MOV42 INS32 INS57 UPD42 INS7 INS7 INS43 INS7 UPD27 INS40 INS40 INS42 INS42 INS32 INS45 INS42 INS45 INS42 INS40 INS42 INS22 INS40 INS22 INS45 INS42 INS45 INS42 INS42 INS2 INS14 INS42 INS42 INS36 INS36 INS21 INS21 INS42 INS42 INS42 INS42 INS43 INS27 INS42 INS42 INS42 INS43 INS42 INS22 INS42 INS40 INS42 UPD42 INS14 INS42 INS32 UPD42 INS33 INS60 INS25 INS42 INS32 INS52 INS42 INS52 INS42 INS42 INS37 INS43 INS22 INS32 INS27 INS27 INS7 INS7 INS42 INS45 INS42 INS45 INS32 INS42 INS32 INS42 INS43 INS40 INS42 INS42 INS42 INS42 INS43 INS59 INS27 INS8 INS8 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS33 INS22 INS42 INS42 INS32 INS42 INS22 INS42 INS42 UPD42 MOV42 UPD42 MOV42 INS42 INS42 INS42 INS32 INS42 INS33 INS53 MOV53 INS42 INS42 INS32 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS14 INS42 INS42 INS42 INS42 INS43 INS27 INS42 INS40 INS42 UPD45 MOV45 UPD42 MOV42 DEL52 DEL42 DEL22 DEL42 DEL43 DEL76 DEL74 DEL42 DEL39 DEL42 DEL42 DEL32 DEL42 DEL42 DEL42 DEL32 DEL42 DEL42 DEL42 DEL45 DEL42 DEL27 DEL32 DEL21 DEL42 DEL11 DEL36 DEL42 DEL32 DEL42 DEL42 DEL32 DEL32 DEL59 DEL60 DEL8 DEL25 DEL42 DEL42

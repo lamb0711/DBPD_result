@@ -1,0 +1,221 @@
+HDFS-8281. Erasure Coding: implement parallel stateful reading for striped layout. Contributed by Jing Zhao.
+
++import com.google.common.base.Preconditions;
++import java.util.concurrent.ConcurrentHashMap;
+- *   1. Stateful read: TODO: HDFS-8033
++ *   1. Stateful read
++  /** Used to indicate the buffered data's range in the block group */
++  private static class StripeRange {
++    /** start offset in the block group (inclusive) */
++    final long offsetInBlock;
++    /** length of the stripe range */
++    final long length;
++
++    StripeRange(long offsetInBlock, long length) {
++      Preconditions.checkArgument(offsetInBlock >= 0 && length >= 0);
++      this.offsetInBlock = offsetInBlock;
++      this.length = length;
++    }
++
++    boolean include(long pos) {
++      return pos >= offsetInBlock && pos < offsetInBlock + length;
++    }
++  }
++
++  /** the buffer for a complete stripe */
++  private ByteBuffer curStripeBuf;
++  /**
++   * indicate the start/end offset of the current buffered stripe in the
++   * block group
++   */
++  private StripeRange curStripeRange;
++  private final CompletionService<Integer> readingService;
+-    DFSClient.LOG.debug("Creating an striped input stream for file " + src);
++    curStripeRange = new StripeRange(0, 0);
++    readingService =
++        new ExecutorCompletionService<>(dfsClient.getStripedReadsThreadPool());
++    if (DFSClient.LOG.isDebugEnabled()) {
++      DFSClient.LOG.debug("Creating an striped input stream for file " + src);
++    }
++  }
++
++  private void resetCurStripeBuffer() {
++    if (curStripeBuf == null) {
++      curStripeBuf = ByteBuffer.allocateDirect(cellSize * dataBlkNum);
++    }
++    curStripeBuf.clear();
++    curStripeRange = new StripeRange(0, 0);
+-    long offsetIntoBlockGroup = target - targetBlockGroup.getStartOffset();
++    final long offsetIntoBlockGroup = getOffsetInBlockGroup();
+-              readPortions[i].startOffsetInBlock,
+-              targetBlock.getBlockSize() - readPortions[i].startOffsetInBlock,
++              readPortions[i].getStartOffsetInBlock(),
++              targetBlock.getBlockSize() - readPortions[i].getStartOffsetInBlock(),
++    resetCurStripeBuffer();
++  private long getOffsetInBlockGroup() {
++    return pos - currentLocatedBlock.getStartOffset();
++  }
++
++  /**
++   * Read a new stripe covering the current position, and store the data in the
++   * {@link #curStripeBuf}.
++   */
++  private void readOneStripe(
++      Map<ExtendedBlock, Set<DatanodeInfo>> corruptedBlockMap)
++      throws IOException {
++    resetCurStripeBuffer();
++
++    // compute stripe range based on pos
++    final long offsetInBlockGroup = getOffsetInBlockGroup();
++    final long stripeLen = cellSize * dataBlkNum;
++    int stripeIndex = (int) (offsetInBlockGroup / stripeLen);
++    curStripeRange = new StripeRange(stripeIndex * stripeLen,
++        Math.min(currentLocatedBlock.getBlockSize() - (stripeIndex * stripeLen),
++            stripeLen));
++    final int numCell = (int) ((curStripeRange.length - 1) / cellSize + 1);
++
++    // read the whole stripe in parallel
++    Map<Future<Integer>, Integer> futures = new HashMap<>();
++    for (int i = 0; i < numCell; i++) {
++      curStripeBuf.position(cellSize * i);
++      curStripeBuf.limit((int) Math.min(cellSize * (i + 1),
++          curStripeRange.length));
++      ByteBuffer buf = curStripeBuf.slice();
++      ByteBufferStrategy strategy = new ByteBufferStrategy(buf);
++      final int targetLength = buf.remaining();
++      Callable<Integer> readCallable = readCell(blockReaders[i],
++          currentNodes[i], strategy, targetLength, corruptedBlockMap);
++      Future<Integer> request = readingService.submit(readCallable);
++      futures.put(request, i);
++    }
++    while (!futures.isEmpty()) {
++      try {
++        waitNextCompletion(readingService, futures);
++        // TODO: decode and record bad reader if necessary
++      } catch (InterruptedException ignored) {
++        // ignore and retry
++      }
++    }
++  }
++
++  private Callable<Integer> readCell(final BlockReader reader,
++      final DatanodeInfo datanode, final ByteBufferStrategy strategy,
++      final int targetLength,
++      final Map<ExtendedBlock, Set<DatanodeInfo>> corruptedBlockMap) {
++    return new Callable<Integer>() {
++      @Override
++      public Integer call() throws Exception {
++        int result = 0;
++        while (result < targetLength) {
++          int ret = readBuffer(reader, datanode, strategy, corruptedBlockMap);
++          if (ret < 0) {
++            throw new IOException("Unexpected EOS from the reader");
++          }
++          result += ret;
++        }
++        updateReadStatistics(readStatistics, targetLength, reader);
++        return result;
++      }
++    };
++  }
++
+-    Map<ExtendedBlock,Set<DatanodeInfo>> corruptedBlockMap = new HashMap<>();
++    Map<ExtendedBlock, Set<DatanodeInfo>> corruptedBlockMap =
++        new ConcurrentHashMap<>();
+-      /** Index of the target block in a stripe to read from */
+-      int idxInGroup = (int) ((pos / cellSize) % dataBlkNum);
+-          /**
+-           * Temporary position into the file; {@link pos} might not proceed
+-           * to this temporary position in case of exceptions.
+-           */
+-          long tmpPos = pos + result;
+-          /** Start and end offsets of a cell in the file */
+-          long cellStart = (tmpPos / cellSize) * cellSize;
+-          long cellEnd = cellStart + cellSize - 1;
+-
+-          /** Number of bytes to read from the current cell */
+-          int realLenInCell = (int) Math.min(realLen - result,
+-              cellEnd - tmpPos + 1L);
+-          assert realLenInCell > 0 : "Temporary position shouldn't be "
+-              + "after cellEnd";
+-
+-          // Read from one blockReader up to cell boundary
+-          int cellRet = readBuffer(blockReaders[idxInGroup],
+-              currentNodes[idxInGroup], strategy, off + result, realLenInCell,
+-              corruptedBlockMap);
+-          if (cellRet >= 0) {
+-            result += cellRet;
+-            if (cellRet < realLenInCell) {
+-              // A short read indicates the current blockReader buffer is
+-              // already drained. Should return the read call. Otherwise
+-              // should proceed to the next cell.
+-              break;
+-            }
+-          } else {
+-            // got a EOS from reader though we expect more data on it.
+-            throw new IOException("Unexpected EOS from the reader");
++          if (!curStripeRange.include(getOffsetInBlockGroup())) {
++            readOneStripe(corruptedBlockMap);
+-          idxInGroup = (idxInGroup + 1) % dataBlkNum;
++          int ret = copy(strategy, off + result, realLen - result);
++          result += ret;
++          pos += ret;
+-        pos += result;
+-  private synchronized int readBuffer(BlockReader blockReader,
+-      DatanodeInfo currentNode, ReaderStrategy readerStrategy, int off, int len,
++  private int readBuffer(BlockReader blockReader,
++      DatanodeInfo currentNode, ByteBufferStrategy readerStrategy,
+-      return readerStrategy.doRead(blockReader, off, len);
++      return readerStrategy.doRead(blockReader, 0, 0);
+-    // TODO: this should trigger decoding logic (HDFS-7678)
+-  protected class ByteBufferStrategy extends DFSInputStream.ByteBufferStrategy {
+-    ByteBufferStrategy(ByteBuffer buf) {
+-      super(buf);
+-    }
+-
+-    @Override
+-    public int doRead(BlockReader blockReader, int off, int len)
+-        throws IOException {
+-      int oldlimit = buf.limit();
+-      if (buf.remaining() > len) {
+-        buf.limit(buf.position() + len);
+-      }
+-      int ret = super.doRead(blockReader, off, len);
+-      buf.limit(oldlimit);
+-      return ret;
+-    }
++  /**
++   * Copy the data from {@link #curStripeBuf} into the given buffer
++   * @param strategy the ReaderStrategy containing the given buffer
++   * @param offset the offset of the given buffer. Used only when strategy is
++   *               a ByteArrayStrategy
++   * @param length target length
++   * @return number of bytes copied
++   */
++  private int copy(ReaderStrategy strategy, int offset, int length) {
++    final long stripeLen = cellSize * dataBlkNum;
++    final long offsetInBlk = pos - currentLocatedBlock.getStartOffset();
++    // compute the position in the curStripeBuf based on "pos"
++    int bufOffset = (int) (offsetInBlk % stripeLen);
++    curStripeBuf.position(bufOffset);
++    return strategy.copyFrom(curStripeBuf, offset,
++        Math.min(length, curStripeBuf.remaining()));
+-    return StripedBlockUtil.constructInternalBlock(lsb, i, cellSize,
+-        dataBlkNum, idx);
++    return StripedBlockUtil.constructInternalBlock(lsb, i, cellSize, dataBlkNum, idx);
+-      if (rp.readLength <= 0) {
++      if (rp.getReadLength() <= 0) {
+-          blks[i].getStartOffset(), rp.startOffsetInBlock,
+-          rp.startOffsetInBlock + rp.readLength - 1, buf,
++          blks[i].getStartOffset(), rp.getStartOffsetInBlock(),
++          rp.getStartOffsetInBlock() + rp.getReadLength() - 1, buf,
+-  private void waitNextCompletion(CompletionService<Void> stripedReadsService,
+-      Map<Future<Void>, Integer> futures) throws InterruptedException {
++  private <T> void waitNextCompletion(CompletionService<T> service,
++      Map<Future<T>, Integer> futures) throws InterruptedException {
+-    Future<Void> future = null;
++    Future<T> future = null;
+-      future = stripedReadsService.take();
++      future = service.take();
+
+INS26 INS26 INS40 INS40 INS55 INS23 INS23 INS23 MOV31 INS31 INS31 INS31 INS31 INS29 UPD83 MOV83 INS83 INS42 INS23 INS23 INS31 INS31 INS29 INS83 INS43 INS59 INS29 INS83 INS43 INS59 INS83 INS83 INS74 INS59 INS83 INS39 UPD42 INS8 UPD83 MOV83 INS39 INS42 INS8 INS29 INS83 INS39 INS42 INS44 MOV43 INS8 INS83 INS74 INS42 MOV44 INS44 INS44 MOV44 INS44 INS8 INS29 INS83 INS39 INS42 INS44 INS44 INS44 INS8 INS73 UPD66 INS65 INS29 INS83 INS39 INS59 INS29 INS83 INS39 INS59 INS42 INS44 INS44 INS8 INS39 INS42 INS44 INS8 INS65 INS42 INS42 INS65 INS42 INS42 INS43 INS43 INS42 INS21 INS21 INS25 INS25 INS21 INS21 INS21 INS41 INS65 INS74 INS42 INS21 INS60 INS60 INS60 INS21 INS60 INS60 INS24 INS61 INS43 INS43 INS83 UPD42 INS83 INS43 INS42 INS83 INS43 INS42 INS83 UPD42 INS83 INS74 INS42 INS41 UPD43 INS65 INS65 INS65 INS65 INS65 INS43 INS42 INS39 INS42 INS39 INS42 INS60 INS60 INS60 MOV21 MOV41 INS42 UPD74 UPD42 UPD74 INS66 INS65 INS42 INS65 INS42 INS39 INS42 INS39 INS42 INS21 INS21 INS21 INS39 INS42 INS41 INS66 INS66 INS66 INS42 INS42 INS7 INS7 INS32 INS8 INS27 INS8 INS32 INS7 INS83 INS32 INS27 INS66 INS65 INS66 INS43 INS43 INS74 INS32 INS83 INS39 INS59 INS83 INS39 INS59 INS39 INS59 INS7 INS83 INS39 INS59 INS74 MOV59 INS58 INS27 INS37 INS8 INS38 INS8 INS42 INS42 INS42 INS42 INS43 INS43 INS74 INS14 INS59 UPD42 INS66 INS65 INS66 INS42 INS66 INS42 INS66 INS66 INS42 INS66 INS66 INS42 INS83 INS39 INS59 INS83 INS39 INS59 INS39 INS59 INS32 UPD43 UPD74 MOV74 UPD74 MOV74 INS66 INS66 INS32 INS7 INS7 INS27 INS42 INS14 INS42 INS14 INS40 INS42 MOV21 INS42 INS33 INS21 INS42 INS42 INS42 INS14 INS32 INS42 INS42 INS32 INS67 INS42 INS42 INS43 INS43 INS42 INS42 INS32 INS42 INS27 INS42 INS11 INS42 INS14 INS42 INS11 INS43 INS74 INS43 UPD42 INS39 INS59 INS42 INS42 INS42 INS21 INS21 INS60 INS60 INS60 INS60 INS60 INS21 INS32 INS54 INS42 INS42 INS43 INS43 INS74 INS1 INS42 INS14 INS67 INS42 INS27 INS42 INS27 INS42 INS11 UPD42 UPD42 UPD42 INS42 INS42 INS42 INS42 INS32 UPD42 UPD43 UPD43 INS42 INS42 INS27 INS22 INS42 INS22 INS42 INS27 INS27 INS43 INS34 INS34 INS74 INS32 INS7 INS43 INS34 INS34 UPD42 MOV42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS39 INS36 INS43 INS27 INS32 INS39 INS36 INS42 INS43 INS43 INS42 INS42 INS34 INS32 INS32 MOV43 INS59 INS43 INS59 INS83 INS39 INS59 INS74 INS59 INS74 INS59 INS32 INS42 INS42 INS8 INS12 INS42 INS42 INS43 INS43 INS31 INS74 INS42 INS42 INS42 INS42 INS32 INS39 INS36 INS42 INS42 INS42 INS32 UPD42 UPD42 INS27 INS27 INS52 INS42 INS52 INS42 INS42 INS42 INS42 INS27 INS42 INS43 INS42 INS42 INS42 INS32 INS42 INS27 INS42 INS42 INS42 INS42 INS42 INS27 INS42 INS27 INS42 INS42 INS42 INS42 INS27 INS42 INS42 INS11 INS42 INS32 INS42 INS42 INS14 INS42 MOV32 INS43 INS43 INS42 INS32 INS43 INS43 INS42 INS32 INS42 INS42 INS42 INS42 INS21 INS44 INS8 INS42 INS42 MOV78 INS83 INS43 INS42 INS43 INS8 INS43 INS61 INS34 INS34 INS42 INS42 INS27 INS42 INS42 INS32 INS42 INS34 INS42 INS34 INS42 INS42 INS42 INS42 INS42 INS27 INS42 INS42 INS32 INS36 INS27 INS34 INS42 INS42 INS39 INS32 INS42 INS42 INS43 INS42 INS42 INS42 INS42 INS2 INS2 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS43 INS42 INS42 INS42 INS60 INS61 INS21 INS41 INS42 MOV27 INS8 INS42 INS42 INS42 INS42 INS32 UPD42 INS42 INS42 INS42 INS42 INS27 INS36 INS42 INS42 INS42 INS27 INS40 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS39 INS59 INS27 INS8 INS32 INS42 INS25 MOV60 MOV21 MOV21 INS42 INS42 INS42 INS42 INS27 INS42 INS36 INS42 INS34 INS42 INS42 MOV60 INS25 INS21 UPD42 MOV42 UPD42 MOV42 INS42 INS42 INS38 INS8 INS32 INS32 INS40 INS34 INS27 UPD27 MOV27 MOV8 INS7 INS32 INS21 UPD42 UPD42 UPD42 INS42 INS42 INS42 INS42 INS32 INS42 INS34 UPD42 UPD42 INS34 INS42 INS42 INS42 INS42 INS32 INS32 INS42 MOV27 MOV2 INS42 INS32 UPD42 UPD42 INS42 INS42 INS42 INS42 UPD42 MOV42 INS42 MOV2 INS42 DEL42 DEL44 DEL42 DEL46 DEL8 DEL42 DEL42 DEL32 DEL27 DEL42 DEL22 DEL42 DEL22 DEL39 DEL42 DEL39 DEL42 DEL42 DEL27 DEL36 DEL42 DEL27 DEL36 DEL11 DEL59 DEL60 DEL42 DEL42 DEL42 DEL2 DEL42 DEL42 DEL2 DEL42 DEL42 DEL39 DEL42 DEL42 DEL42 DEL27 DEL59 DEL60 DEL39 DEL42 DEL42 DEL42 DEL27 DEL36 DEL42 DEL27 DEL59 DEL60 DEL39 DEL42 DEL42 DEL42 DEL27 DEL34 DEL27 DEL59 DEL60 DEL39 DEL42 DEL39 DEL42 DEL42 DEL42 DEL27 DEL34 DEL27 DEL32 DEL11 DEL59 DEL60 DEL42 DEL34 DEL27 DEL45 DEL45 DEL27 DEL6 DEL42 DEL34 DEL27 DEL42 DEL42 DEL27 DEL10 DEL8 DEL25 DEL8 DEL25 DEL42 DEL42 DEL34 DEL27 DEL36 DEL42 DEL27 DEL7 DEL21 DEL8 DEL61 DEL83 DEL39 DEL42 DEL44 DEL39 DEL42 DEL44 DEL42 DEL42 DEL42 DEL42 DEL40 DEL43 DEL39 DEL42 DEL39 DEL42 DEL44 DEL42 DEL42 DEL32 DEL42 DEL27 DEL32 DEL21 DEL8 DEL25 DEL39 DEL42 DEL42 DEL42 DEL42 DEL42 DEL48 DEL59 DEL60 DEL8 DEL31 DEL55 DEL40 DEL40 DEL40 DEL40

@@ -1,0 +1,233 @@
+HDFS-14316. RBF: Support unavailable subclusters for mount points with multiple destinations. Contributed by Inigo Goiri.
+
++import static org.mockito.ArgumentMatchers.any;
++import static org.mockito.ArgumentMatchers.anyBoolean;
++import static org.mockito.ArgumentMatchers.anyLong;
++import static org.mockito.ArgumentMatchers.anyShort;
++import static org.mockito.ArgumentMatchers.anyString;
++import java.io.FileNotFoundException;
++import java.net.ConnectException;
++import java.util.ArrayList;
++import java.util.List;
++import java.util.Map;
++import java.util.SortedMap;
++import java.util.concurrent.ConcurrentSkipListMap;
++import org.apache.hadoop.fs.FileAlreadyExistsException;
++import org.apache.hadoop.fs.FsServerDefaults;
++import org.apache.hadoop.fs.permission.FsPermission;
++import org.apache.hadoop.hdfs.DFSConfigKeys;
++import org.apache.hadoop.hdfs.HdfsConfiguration;
++import org.apache.hadoop.hdfs.client.HdfsClientConfigKeys;
++import org.apache.hadoop.hdfs.protocol.DatanodeID;
++import org.apache.hadoop.hdfs.protocol.DatanodeInfo;
++import org.apache.hadoop.hdfs.protocol.DirectoryListing;
++import org.apache.hadoop.hdfs.protocol.ExtendedBlock;
++import org.apache.hadoop.hdfs.protocol.HdfsFileStatus;
++import org.apache.hadoop.hdfs.protocol.LocatedBlock;
++import org.apache.hadoop.hdfs.protocol.LocatedBlocks;
++import org.apache.hadoop.hdfs.security.token.block.BlockTokenIdentifier;
++import org.apache.hadoop.hdfs.server.blockmanagement.DatanodeDescriptor;
++import org.apache.hadoop.hdfs.server.namenode.LeaseExpiredException;
++import org.apache.hadoop.hdfs.server.namenode.NotReplicatedYetException;
++import org.apache.hadoop.hdfs.server.namenode.SafeModeException;
++import org.apache.hadoop.io.Text;
++import org.apache.hadoop.ipc.RemoteException;
++import org.apache.hadoop.ipc.StandbyException;
++import org.apache.hadoop.security.AccessControlException;
++import org.apache.hadoop.security.token.Token;
++import org.apache.hadoop.util.DataChecksum;
++import org.apache.hadoop.util.DataChecksum.Type;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++  private static final Logger LOG =
++      LoggerFactory.getLogger(MockNamenode.class);
++
++
++  /** Name service identifier (subcluster). */
++  private String nsId;
+-  public MockNamenode() throws Exception {
+-    Configuration conf = new Configuration();
++  public MockNamenode(final String nsIdentifier) throws IOException {
++    this(nsIdentifier, new HdfsConfiguration());
++  }
++  public MockNamenode(final String nsIdentifier, final Configuration conf)
++      throws IOException {
++    this.nsId = nsIdentifier;
+-    NamespaceInfo nsInfo = new NamespaceInfo(1, "clusterId", "bpId", 1);
++    NamespaceInfo nsInfo = new NamespaceInfo(1, this.nsId, this.nsId, 1);
++    int numHandlers = conf.getInt(
++        DFSConfigKeys.DFS_NAMENODE_HANDLER_COUNT_KEY,
++        DFSConfigKeys.DFS_NAMENODE_HANDLER_COUNT_DEFAULT);
++
++        .setNumHandlers(numHandlers)
++    this.rpcServer.addTerseExceptions(
++        RemoteException.class,
++        SafeModeException.class,
++        FileNotFoundException.class,
++        FileAlreadyExistsException.class,
++        AccessControlException.class,
++        LeaseExpiredException.class,
++        NotReplicatedYetException.class,
++        IOException.class,
++        ConnectException.class,
++        StandbyException.class);
++
++   * Get the name service id (subcluster) of the Mock Namenode.
++   * @return Name service identifier.
++   */
++  public String getNameserviceId() {
++    return nsId;
++  }
++
++  /**
++      rpcServer = null;
++      httpServer = null;
++
++  /**
++   * Add the mock for the FileSystem calls in ClientProtocol.
++   * @throws IOException If it cannot be setup.
++   */
++  public void addFileSystemMock() throws IOException {
++    final SortedMap<String, String> fs =
++        new ConcurrentSkipListMap<String, String>();
++
++    DirectoryListing l = mockNn.getListing(anyString(), any(), anyBoolean());
++    when(l).thenAnswer(invocation -> {
++      String src = getSrc(invocation);
++      LOG.info("{} getListing({})", nsId, src);
++      if (!src.endsWith("/")) {
++        src += "/";
++      }
++      Map<String, String> files =
++          fs.subMap(src, src + Character.MAX_VALUE);
++      List<HdfsFileStatus> list = new ArrayList<>();
++      for (String file : files.keySet()) {
++        if (file.substring(src.length()).indexOf('/') < 0) {
++          HdfsFileStatus fileStatus =
++              getMockHdfsFileStatus(file, fs.get(file));
++          list.add(fileStatus);
++        }
++      }
++      HdfsFileStatus[] array = list.toArray(
++          new HdfsFileStatus[list.size()]);
++      return new DirectoryListing(array, 0);
++    });
++    when(mockNn.getFileInfo(anyString())).thenAnswer(invocation -> {
++      String src = getSrc(invocation);
++      LOG.info("{} getFileInfo({})", nsId, src);
++      return getMockHdfsFileStatus(src, fs.get(src));
++    });
++    HdfsFileStatus c = mockNn.create(anyString(), any(), anyString(), any(),
++        anyBoolean(), anyShort(), anyLong(), any(), any(), any());
++    when(c).thenAnswer(invocation -> {
++      String src = getSrc(invocation);
++      LOG.info("{} create({})", nsId, src);
++      fs.put(src, "FILE");
++      return getMockHdfsFileStatus(src, "FILE");
++    });
++    LocatedBlocks b = mockNn.getBlockLocations(
++        anyString(), anyLong(), anyLong());
++    when(b).thenAnswer(invocation -> {
++      String src = getSrc(invocation);
++      LOG.info("{} getBlockLocations({})", nsId, src);
++      if (!fs.containsKey(src)) {
++        LOG.error("{} cannot find {} for getBlockLocations", nsId, src);
++        throw new FileNotFoundException("File does not exist " + src);
++      }
++      return mock(LocatedBlocks.class);
++    });
++    boolean f = mockNn.complete(anyString(), anyString(), any(), anyLong());
++    when(f).thenAnswer(invocation -> {
++      String src = getSrc(invocation);
++      if (!fs.containsKey(src)) {
++        LOG.error("{} cannot find {} for complete", nsId, src);
++        throw new FileNotFoundException("File does not exist " + src);
++      }
++      return true;
++    });
++    LocatedBlock a = mockNn.addBlock(
++        anyString(), anyString(), any(), any(), anyLong(), any(), any());
++    when(a).thenAnswer(invocation -> {
++      String src = getSrc(invocation);
++      if (!fs.containsKey(src)) {
++        LOG.error("{} cannot find {} for addBlock", nsId, src);
++        throw new FileNotFoundException("File does not exist " + src);
++      }
++      return getMockLocatedBlock(nsId);
++    });
++    boolean m = mockNn.mkdirs(anyString(), any(), anyBoolean());
++    when(m).thenAnswer(invocation -> {
++      String src = getSrc(invocation);
++      LOG.info("{} mkdirs({})", nsId, src);
++      fs.put(src, "DIRECTORY");
++      return true;
++    });
++    when(mockNn.getServerDefaults()).thenAnswer(invocation -> {
++      LOG.info("{} getServerDefaults", nsId);
++      FsServerDefaults defaults = mock(FsServerDefaults.class);
++      when(defaults.getChecksumType()).thenReturn(
++          Type.valueOf(DataChecksum.CHECKSUM_CRC32));
++      when(defaults.getKeyProviderUri()).thenReturn(nsId);
++      return defaults;
++    });
++  }
++
++  private static String getSrc(InvocationOnMock invocation) {
++    return (String) invocation.getArguments()[0];
++  }
++
++  /**
++   * Get a mock HDFS file status.
++   * @param filename Name of the file.
++   * @param type Type of the file (FILE, DIRECTORY, or null).
++   * @return HDFS file status
++   */
++  private static HdfsFileStatus getMockHdfsFileStatus(
++      final String filename, final String type) {
++    if (type == null) {
++      return null;
++    }
++    HdfsFileStatus fileStatus = mock(HdfsFileStatus.class);
++    when(fileStatus.getLocalNameInBytes()).thenReturn(filename.getBytes());
++    when(fileStatus.getPermission()).thenReturn(mock(FsPermission.class));
++    when(fileStatus.getOwner()).thenReturn("owner");
++    when(fileStatus.getGroup()).thenReturn("group");
++    if (type.equals("FILE")) {
++      when(fileStatus.getLen()).thenReturn(100L);
++      when(fileStatus.getReplication()).thenReturn((short) 1);
++      when(fileStatus.getBlockSize()).thenReturn(
++          HdfsClientConfigKeys.DFS_BLOCK_SIZE_DEFAULT);
++    } else if (type.equals("DIRECTORY")) {
++      when(fileStatus.isDir()).thenReturn(true);
++      when(fileStatus.isDirectory()).thenReturn(true);
++    }
++    return fileStatus;
++  }
++
++  /**
++   * Get a mock located block pointing to one of the subclusters. It is
++   * allocated in a fake Datanode.
++   * @param nsId Name service identifier (subcluster).
++   * @return Mock located block.
++   */
++  private static LocatedBlock getMockLocatedBlock(final String nsId) {
++    LocatedBlock lb = mock(LocatedBlock.class);
++    when(lb.getCachedLocations()).thenReturn(new DatanodeInfo[0]);
++    DatanodeID nodeId = new DatanodeID("localhost", "localhost", "dn0",
++        1111, 1112, 1113, 1114);
++    DatanodeInfo dnInfo = new DatanodeDescriptor(nodeId);
++    when(lb.getLocations()).thenReturn(new DatanodeInfo[] {dnInfo});
++    ExtendedBlock eb = mock(ExtendedBlock.class);
++    when(eb.getBlockPoolId()).thenReturn(nsId);
++    when(lb.getBlock()).thenReturn(eb);
++    @SuppressWarnings("unchecked")
++    Token<BlockTokenIdentifier> tok = mock(Token.class);
++    when(tok.getIdentifier()).thenReturn(nsId.getBytes());
++    when(tok.getPassword()).thenReturn(nsId.getBytes());
++    when(tok.getKind()).thenReturn(new Text(nsId));
++    when(tok.getService()).thenReturn(new Text(nsId));
++    when(lb.getBlockToken()).thenReturn(tok);
++    return lb;
++  }
+
+INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS23 INS23 INS31 INS31 INS31 INS31 INS31 INS31 INS83 INS83 INS83 INS43 INS59 INS29 INS83 INS43 INS59 INS83 INS42 INS44 INS43 INS8 INS44 INS44 UPD43 INS29 INS83 INS43 INS42 INS8 INS29 INS83 INS39 INS42 INS43 INS8 INS83 INS83 INS43 INS42 INS44 INS8 INS29 INS83 INS83 INS43 INS42 INS44 INS44 INS8 INS29 INS83 INS83 INS43 INS42 INS44 INS8 INS42 INS42 INS32 INS65 INS42 INS42 INS83 INS43 INS42 INS42 INS17 INS83 INS43 INS42 INS83 INS43 INS42 UPD42 INS21 INS60 INS21 INS65 INS65 INS42 INS41 INS65 INS65 INS42 INS60 INS60 INS21 INS21 INS60 INS21 INS60 INS21 INS60 INS21 INS60 INS21 INS60 INS21 INS21 INS42 INS43 INS42 INS41 INS65 INS65 INS65 INS65 INS42 INS83 INS43 INS42 INS83 INS43 INS42 INS25 INS60 INS21 INS21 INS21 INS21 INS25 INS41 INS65 INS65 INS65 INS42 INS83 INS43 INS42 INS60 INS21 INS60 INS60 INS21 INS60 INS21 INS21 INS60 INS21 INS21 INS21 INS21 INS21 INS41 INS42 INS42 INS57 INS66 INS42 INS42 INS14 INS42 INS42 INS7 MOV43 INS39 INS59 INS32 INS66 INS66 INS42 INS66 INS42 INS66 INS83 INS74 INS59 INS43 INS59 INS32 INS32 INS43 INS59 INS32 INS43 INS59 INS32 INS39 INS59 INS32 INS43 INS59 INS32 INS39 INS59 INS32 INS32 INS42 INS11 INS66 INS42 INS66 INS42 INS66 INS66 INS42 INS42 INS27 INS8 INS43 INS59 INS32 INS32 INS32 INS32 INS32 INS8 INS25 INS42 INS66 INS66 INS42 INS66 INS66 INS42 INS43 INS59 INS32 INS43 INS59 INS43 INS59 INS32 INS43 INS59 INS32 INS32 INS79 INS74 INS59 INS32 INS32 INS32 INS32 INS32 INS42 INS43 INS43 INS22 INS42 INS42 INS32 INS32 INS22 INS42 INS57 INS57 INS57 INS57 INS57 INS57 INS57 INS57 INS57 INS57 INS21 INS21 INS43 INS43 INS43 INS42 INS14 INS42 INS42 INS32 INS32 INS42 INS86 INS32 INS42 INS86 INS42 INS42 INS32 INS32 INS42 INS86 INS42 INS42 INS32 INS32 INS42 INS86 INS42 INS32 INS32 INS42 INS86 INS42 INS42 INS32 INS32 INS42 INS86 INS42 INS32 INS32 INS42 INS86 INS32 INS42 INS86 INS43 INS2 INS42 INS33 INS41 INS42 INS42 INS32 INS32 INS42 INS32 INS32 INS42 INS32 INS32 INS42 INS45 INS32 INS42 INS45 INS42 INS42 INS45 INS21 INS21 INS21 INS32 INS8 INS42 INS42 INS32 INS32 INS42 INS3 INS42 INS42 INS14 INS42 INS42 INS14 INS32 INS42 INS3 INS42 INS42 INS32 INS32 INS42 INS42 INS32 INS42 INS42 INS42 INS45 INS43 INS43 INS42 INS32 INS32 INS42 INS32 INS32 INS42 INS32 INS32 INS42 INS14 INS32 INS42 INS14 INS32 INS42 INS42 INS42 INS42 INS52 INS42 MOV43 INS22 INS22 INS42 INS42 INS40 INS40 MOV32 INS42 INS52 INS42 INS43 INS43 INS43 INS43 INS43 INS43 INS43 INS43 INS43 INS43 INS7 INS7 INS42 INS42 INS42 INS74 INS42 INS42 INS32 INS32 INS32 INS42 INS42 INS59 INS8 INS42 INS32 INS59 INS8 INS42 INS42 INS32 INS32 INS32 INS32 INS32 INS32 INS32 INS32 INS32 INS32 INS42 INS42 INS59 INS8 INS42 INS42 INS32 INS32 INS32 INS42 INS42 INS59 INS8 INS42 INS42 INS32 INS32 INS32 INS32 INS42 INS42 INS59 INS8 INS42 INS42 INS32 INS32 INS32 INS32 INS32 INS32 INS32 INS42 INS42 INS59 INS8 INS42 INS42 INS32 INS32 INS32 INS42 INS42 INS59 INS8 INS42 INS32 INS59 INS8 INS42 INS32 INS34 INS33 INS42 INS57 INS42 INS32 INS42 INS42 INS42 INS32 INS42 INS57 INS42 INS32 INS42 INS32 INS32 INS32 INS32 INS42 INS42 INS45 INS21 INS21 INS42 INS57 INS42 INS32 INS5 INS34 INS43 INS45 INS45 INS45 INS34 INS34 INS34 INS34 INS43 INS42 INS42 INS32 INS5 INS4 INS42 INS57 INS42 INS32 INS42 INS32 INS42 INS42 INS42 INS57 INS42 INS32 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS32 INS43 INS42 INS42 INS32 INS43 INS42 INS42 INS32 INS52 INS42 INS52 INS42 UPD42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS33 INS42 INS33 INS43 INS43 INS43 INS42 INS42 INS42 INS42 INS60 INS21 INS25 INS60 INS60 INS70 INS60 INS41 INS42 INS42 INS32 INS42 INS60 INS21 INS41 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS60 INS21 INS21 INS41 INS42 INS42 INS42 INS42 INS60 INS21 INS25 INS41 INS42 INS42 INS42 INS42 INS42 INS60 INS25 INS41 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS60 INS25 INS41 INS42 INS42 INS42 INS42 INS60 INS21 INS21 INS41 INS42 INS42 INS42 INS21 INS60 INS21 INS21 INS41 INS42 INS42 INS43 INS42 INS42 INS42 INS42 INS43 INS42 INS42 INS42 INS42 INS32 INS42 INS34 INS32 INS42 INS11 INS32 INS42 INS40 INS32 INS32 INS43 INS42 INS42 INS43 INS85 INS42 INS42 INS42 INS42 INS43 INS85 INS42 INS43 INS42 INS42 INS42 INS42 INS43 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS43 INS59 INS32 INS38 INS8 INS74 INS59 INS74 INS59 INS44 INS32 INS8 INS5 INS59 INS14 INS42 INS43 INS59 INS32 INS32 INS43 INS59 INS32 INS32 INS32 INS43 INS59 INS32 INS38 INS8 INS32 INS43 INS59 INS38 INS8 INS9 INS43 INS59 INS38 INS8 INS32 INS43 INS59 INS32 INS32 INS9 INS32 INS43 INS59 INS32 INS32 INS42 INS42 INS42 INS42 INS32 INS42 INS32 INS39 INS34 INS42 INS32 INS32 INS42 INS9 INS32 INS42 INS9 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS45 INS42 INS42 INS32 INS21 INS43 INS43 INS43 INS42 INS32 INS43 INS43 INS42 INS14 INS43 INS42 INS42 INS42 INS25 INS43 INS85 INS42 INS32 INS43 INS42 INS34 INS42 INS42 INS32 INS42 INS42 INS45 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS45 INS42 INS42 INS42 INS42 INS42 INS45 INS42 INS42 INS45 INS42 INS42 INS32 INS42 INS42 INS45 INS42 INS42 INS32 INS21 INS53 INS42 INS57 INS42 INS42 INS32 INS32 INS21 INS53 INS42 INS42 INS32 INS32 INS21 INS53 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS45 INS42 INS42 INS42 INS42 INS42 INS45 INS42 INS42 INS45 INS42 INS42 INS42 INS32 INS32 INS42 INS32 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS32 INS42 INS42 INS42 INS42 INS45 INS7 INS42 INS42 INS42 INS42 INS42 INS42 INS27 INS42 INS42 INS74 INS42 INS27 INS8 INS42 INS42 INS42 INS3 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS14 INS43 INS42 INS42 INS42 INS42 INS42 INS32 INS14 INS42 INS42 INS42 INS42 INS42 INS32 INS14 INS42 INS42 INS42 INS57 INS42 INS32 INS42 INS42 INS40 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS45 INS42 INS40 INS43 INS32 INS34 INS60 INS21 INS5 INS32 INS42 INS42 INS45 INS42 INS42 INS43 INS27 INS42 INS42 INS42 INS45 INS42 INS42 INS43 INS27 INS42 INS42 INS45 INS42 INS42 INS43 INS27 INS43 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS13 INS43 INS59 INS32 INS43 INS85 INS42 INS42 INS42 INS45 INS42 INS42 INS45 INS42 INS42 INS45 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS42 DEL42 DEL43 DEL42 DEL42 DEL43 DEL14 DEL59 DEL60 DEL45 DEL45

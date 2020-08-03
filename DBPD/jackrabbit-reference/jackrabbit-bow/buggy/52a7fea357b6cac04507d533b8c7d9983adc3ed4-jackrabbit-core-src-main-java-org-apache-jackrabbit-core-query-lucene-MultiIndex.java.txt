@@ -1,0 +1,190 @@
+JCR-390: Move text extraction into a background thread
+
+git-svn-id: https://svn.apache.org/repos/asf/jackrabbit/trunk@497067 13f79535-47bb-0310-9956-ffa450edef68
+
++import org.apache.jackrabbit.core.fs.FileSystemException;
++import org.apache.jackrabbit.core.fs.local.LocalFileSystem;
++     * Name of the file that contains the indexing queue log.
++     */
++    private static final String INDEXING_QUEUE_FILE = "indexing_queue.log";
++
++    /**
++     * The indexing queue with pending text extraction jobs.
++     */
++    private IndexingQueue indexingQueue;
++
++    /**
++        IndexingQueueStore store;
++        try {
++            LocalFileSystem fs = new LocalFileSystem();
++            fs.setRoot(indexDir);
++            fs.init();
++            store = new IndexingQueueStore(fs, INDEXING_QUEUE_FILE);
++        } catch (FileSystemException e) {
++            IOException ex = new IOException();
++            ex.initCause(e);
++            throw ex;
++        }
++
++        // initialize indexing queue
++        this.indexingQueue = new IndexingQueue(store, this);
++
++
+-                PersistentIndex index = new PersistentIndex(indexNames.getName(i),
+-                        sub, false, handler.getTextAnalyzer(), cache);
++                PersistentIndex index = new PersistentIndex(
++                        indexNames.getName(i), sub, false,
++                        handler.getTextAnalyzer(), cache, indexingQueue);
++                // check if there are any indexing jobs finished
++                checkIndexingQueue();
++                // check if volatile index should be flushed
+-     * Atomically updates the index by removing some documents and adding others.
++     * Atomically updates the index by removing some documents and adding
++     * others.
+-     * @param add    Iterator of <code>NodeIndexer</code>s to add.
++     * @param add    Iterator of <code>Document</code>s to add. Calls to
++     *               <code>next()</code> on this iterator may return
++     *               <code>null</code>, to indicate that a node could not be
++     *               indexed successfully.
+-                NodeIndexer nodeIdx = (NodeIndexer) add.next();
+-                if (nodeIdx != null) {
+-                    executeAndLog(new AddNode(transactionId, nodeIdx));
++                Document doc = (Document) add.next();
++                if (doc != null) {
++                    executeAndLog(new AddNode(transactionId, doc));
+-                handler.getTextAnalyzer(), cache);
++                handler.getTextAnalyzer(), cache, indexingQueue);
++
++            // finally close indexing queue
++            try {
++                indexingQueue.close();
++            } catch (IOException e) {
++                log.error("Exception while closing search index.", e);
++            }
+-     * Returns a <code>NodeIndexer</code> for the <code>node</code>.
++     * Returns the indexing queue for this multi index.
++     * @return the indexing queue for this multi index.
++     */
++    IndexingQueue getIndexingQueue() {
++        return indexingQueue;
++    }
++
++    /**
++     * Returns a lucene Document for the <code>node</code>.
+-     * @return the node indexer.
++     * @return the index document.
+-    NodeIndexer createNodeIndexer(NodeState node) throws RepositoryException {
+-        return handler.createNodeIndexer(node, nsMappings);
++    Document createDocument(NodeState node) throws RepositoryException {
++        return handler.createDocument(node, nsMappings);
++    }
++
++    /**
++     * Returns a lucene Document for the Node with <code>id</code>.
++     *
++     * @param id the id of the node to index.
++     * @return the index document.
++     * @throws RepositoryException if an error occurs while reading from the
++     *                             workspace or if there is no node with
++     *                             <code>id</code>.
++     */
++    Document createDocument(NodeId id) throws RepositoryException {
++        try {
++            NodeState state = (NodeState) handler.getContext().getItemStateManager().getItemState(id);
++            return createDocument(state);
++        } catch (NoSuchItemStateException e) {
++            throw new RepositoryException("Node " + id + " does not exist", e);
++        } catch (ItemStateException e) {
++            throw new RepositoryException("Error retrieving node: " + id, e);
++        }
+-        volatileIndex = new VolatileIndex(handler.getTextAnalyzer());
++        volatileIndex = new VolatileIndex(
++                handler.getTextAnalyzer(), indexingQueue);
+-     * Returns a <code>NodeIndexer</code> for the Node with <code>id</code>.
+-     *
+-     * @param id the id of the node to index.
+-     * @return the node indexer.
+-     * @throws RepositoryException if an error occurs while reading from the
+-     *                             workspace or if there is no node with
+-     *                             <code>id</code>.
+-     */
+-    private NodeIndexer createNodeIndexer(NodeId id) throws RepositoryException {
+-        try {
+-            NodeState state = (NodeState) handler.getContext().getItemStateManager().getItemState(id);
+-            return createNodeIndexer(state);
+-        } catch (NoSuchItemStateException e) {
+-            throw new RepositoryException("Node " + id + " does not exist", e);
+-        } catch (ItemStateException e) {
+-            throw new RepositoryException("Error retrieving node: " + id, e);
+-        }
+-    }
+-
+-    /**
++            // also flush indexing queue
++            indexingQueue.commit();
++    /**
++     * Checks the indexing queue for finished text extrator jobs and
++     * updates the index accordingly if there are any new ones.
++     */
++    private synchronized void checkIndexingQueue() {
++        Document[] docs = indexingQueue.getFinishedDocuments();
++        Map finished = new HashMap();
++        for (int i = 0; i < docs.length; i++) {
++            String uuid = docs[i].get(FieldNames.UUID);
++            finished.put(UUID.fromString(uuid), docs[i]);
++        }
++
++        // now update index with the remaining ones if there are any
++        if (!finished.isEmpty()) {
++            log.debug("updating index with {} nodes from indexing queue.",
++                    new Long(finished.size()));
++
++            // remove documents from the queue
++            for (Iterator it = finished.keySet().iterator(); it.hasNext(); ) {
++                try {
++                    indexingQueue.removeDocument(it.next().toString());
++                } catch (IOException e) {
++                    log.error("Failed to remove node from indexing queue", e);
++                }
++            }
++
++            try {
++                update(finished.keySet().iterator(),
++                        finished.values().iterator());
++            } catch (IOException e) {
++                // update failed
++                log.warn("Failed to update index with deferred text extraction", e);
++            }
++        }
++    }
++
+-         * The node indexer for a node to add to the index, or <code>null</code>
+-         * if not available.
++         * The document to add to the index, or <code>null</code> if not available.
+-        private NodeIndexer nodeIndexer;
++        private Document doc;
+-         * @param nodeIdx the node indexer to add.
++         * @param doc the document to add.
+-        AddNode(long transactionId, NodeIndexer nodeIdx) {
+-            this(transactionId, nodeIdx.getNodeId().getUUID());
+-            this.nodeIndexer = nodeIdx;
++        AddNode(long transactionId, Document doc) {
++            this(transactionId, UUID.fromString(doc.get(FieldNames.UUID)));
++            this.doc = doc;
+-            if (nodeIndexer == null) {
++            if (doc == null) {
+-                    nodeIndexer = index.createNodeIndexer(new NodeId(uuid));
++                    doc = index.createDocument(new NodeId(uuid));
+-            if (nodeIndexer != null) {
+-                index.volatileIndex.addNode(nodeIndexer);
++            if (doc != null) {
++                index.volatileIndex.addDocument(doc);
+-            Term idTerm = new Term(FieldNames.UUID, uuid.toString());
++            String uuidString = uuid.toString();
++            // check if indexing queue is still working on
++            // this node from a previous update
++            Document doc = index.indexingQueue.removeDocument(uuidString);
++            if (doc != null) {
++                Util.disposeDocument(doc);
++            }
++            Term idTerm = new Term(FieldNames.UUID, uuidString);

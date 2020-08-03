@@ -1,0 +1,238 @@
+HADOOP-16746. mkdirs and s3guard Authoritative mode.
+
+Contributed by Steve Loughran.
+
+This fixes two problems with S3Guard authoritative mode and
+the auth directory flags which are stored in DynamoDB.
+
+1. mkdirs was creating dir markers without the auth bit,
+   forcing needless scans on newly created directories and
+   files subsequently added; it was only with the first listStatus call
+   on that directory that the dir would be marked as authoritative -even
+   though it would be complete already.
+
+2. listStatus(path) would reset the authoritative status bit of all
+   child directories even if they were already marked as authoritative.
+
+Issue #2 is possibly the most expensive, as any treewalk using listStatus
+(e.g globfiles) would clear the auth bit for all child directories before
+listing them. And this would happen every single time...
+essentially you weren't getting authoritative directory listings.
+
+For the curious, that the major bug was actually found during testing
+-we'd all missed it during reviews.
+
+A lesson there: the better the tests the fewer the bugs.
+
+Maybe also: something obvious and significant can get by code reviews.
+
+	modified:   hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/S3AFileSystem.java
+	modified:   hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/BulkOperationState.java
+	modified:   hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/DynamoDBMetadataStore.java
+	modified:   hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/LocalMetadataStore.java
+	modified:   hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/MetadataStore.java
+	modified:   hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/NullMetadataStore.java
+	modified:   hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/S3Guard.java
+	modified:   hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/ITestS3GuardWriteBack.java
+	modified:   hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/auth/ITestRestrictedReadAccess.java
+	modified:   hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/impl/TestPartialDeleteFailures.java
+	modified:   hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/s3guard/ITestDynamoDBMetadataStore.java
+	modified:   hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/s3guard/ITestDynamoDBMetadataStoreAuthoritativeMode.java
+	modified:   hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/s3guard/ITestDynamoDBMetadataStoreScale.java
+	modified:   hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/s3guard/ITestS3GuardFsck.java
+	modified:   hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/s3guard/MetadataStoreTestBase.java
+	modified:   hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/s3guard/TestS3Guard.java
+
+Change-Id: Ic3ffda13f2af2430afedd50fd657b595c83e90a7
+
++import java.util.Collections;
++  /**
++   * Hard-coded policy : {@value}.
++   * If true, when merging an S3 LIST with S3Guard in non-auth mode,
++   * only updated entries are added; new entries are left out.
++   * This policy choice reduces the amount of data stored in Dynamo,
++   * and hence the complexity of the merge in a non-auth listing.
++   */
++  @VisibleForTesting
++  public static final boolean DIR_MERGE_UPDATES_ALL_RECORDS_NONAUTH = false;
++
++      ms.getInstrumentation().directoryMarkedAuthoritative();
+-    Set<Path> deleted = dirMeta.listTombstones();
+-
+-    boolean changed = false;
+-    final Map<Path, FileStatus> dirMetaMap = dirMeta.getListing().stream()
+-        .collect(Collectors.toMap(
+-            pm -> pm.getFileStatus().getPath(), PathMetadata::getFileStatus)
+-        );
++    //
++    // We try to avoid writing any more child entries than need be to :-
++    //  (a) save time and money.
++    //  (b) avoid overwriting the authoritative bit of children (HADOOP-16746).
++    // For auth mode updates, we supply the full listing and a list of which
++    // child entries have not been changed; the store gets to optimize its
++    // update however it chooses.
++    //
++    // for non-auth-mode S3Guard, we just build a list of entries to add and
++    // submit them in a batch; this is more efficient than trickling out the
++    // updates one-by-one.
++
++    if (isAuthoritative) {
++      authoritativeUnion(ms, path, backingStatuses, dirMeta,
++          timeProvider, operationState);
++    } else {
++      nonAuthoritativeUnion(ms, path, backingStatuses, dirMeta,
++          timeProvider, operationState);
++    }
++    IOUtils.cleanupWithLogger(LOG, operationState);
++
++    return dirMetaToStatuses(dirMeta);
++  }
++
++  /**
++   * Perform the authoritative union operation.
++   * Here all updated/missing entries are added back; we take care
++   * not to overwrite unchanged entries as that will lose their
++   * isAuthoritative bit (HADOOP-16746).
++   * @param ms MetadataStore to use.
++   * @param path path to directory
++   * @param backingStatuses Directory listing from the backing store.
++   * @param dirMeta  Directory listing from MetadataStore.  May be null.
++   * @param timeProvider Time provider to use when updating entries
++   * @param operationState ongoing operation
++   * @throws IOException if metadata store update failed
++   */
++  private static void authoritativeUnion(
++      final MetadataStore ms,
++      final Path path,
++      final List<S3AFileStatus> backingStatuses,
++      final DirListingMetadata dirMeta,
++      final ITtlTimeProvider timeProvider,
++      final BulkOperationState operationState) throws IOException {
++    // track all unchanged entries; used so the metastore can identify entries
++    // it doesn't need to update
++    List<Path> unchangedEntries = new ArrayList<>(dirMeta.getListing().size());
++    boolean changed = !dirMeta.isAuthoritative();
++    Set<Path> deleted = dirMeta.listTombstones();
++    final Map<Path, PathMetadata> dirMetaMap = dirMeta.getListing().stream()
++        .collect(Collectors.toMap(pm -> pm.getFileStatus().getPath(), pm -> pm));
+-      if (deleted.contains(s.getPath())) {
++      final Path statusPath = s.getPath();
++      if (deleted.contains(statusPath)) {
+-      final PathMetadata pathMetadata = new PathMetadata(s);
++      // this is built up to be whatever entry is to be added to the dirMeta
++      // collection
++      PathMetadata pathMetadata = dirMetaMap.get(statusPath);
+-      if (!isAuthoritative){
+-        FileStatus status = dirMetaMap.get(s.getPath());
+-        if (status != null
+-            && s.getModificationTime() > status.getModificationTime()) {
+-          LOG.debug("Update ms with newer metadata of: {}", status);
+-          S3Guard.putWithTtl(ms, pathMetadata, timeProvider, operationState);
+-        }
++      if (pathMetadata == null) {
++        // there's no entry in the listing, so create one.
++        pathMetadata = new PathMetadata(s);
++      } else {
++        // no change -add the path to the list of unchangedEntries
++        unchangedEntries.add(statusPath);
+-      boolean updated = dirMeta.put(pathMetadata);
+-      changed = changed || updated;
++      changed |= dirMeta.put(pathMetadata);
+-    // If dirMeta is not authoritative, but isAuthoritative is true the
+-    // directory metadata should be updated. Treat it as a change.
+-    changed = changed || (!dirMeta.isAuthoritative() && isAuthoritative);
+-
+-    if (changed && isAuthoritative) {
++    if (changed) {
++      // in an authoritative update, we pass in the full list of entries,
++      // but do declare which have not changed to avoid needless and potentially
++      // destructive overwrites.
+-      final MetastoreInstrumentation instrumentation
+-          = ms.getInstrumentation();
+-      if (instrumentation != null) {
+-        instrumentation.directoryMarkedAuthoritative();
+-      }
++      ms.getInstrumentation().directoryMarkedAuthoritative();
+-      S3Guard.putWithTtl(ms, dirMeta, timeProvider, operationState);
++      // write the updated dir entry and any changed children.
++      S3Guard.putWithTtl(ms, dirMeta, unchangedEntries, timeProvider, operationState);
+-    IOUtils.cleanupWithLogger(LOG, operationState);
++  }
+-    return dirMetaToStatuses(dirMeta);
++  /**
++   * Perform the authoritative union operation.
++   * @param ms MetadataStore to use.
++   * @param path path to directory
++   * @param backingStatuses Directory listing from the backing store.
++   * @param dirMeta  Directory listing from MetadataStore.  May be null.
++   * @param timeProvider Time provider to use when updating entries
++   * @param operationState ongoing operation
++   * @throws IOException if metadata store update failed
++   */
++  private static void nonAuthoritativeUnion(
++      final MetadataStore ms,
++      final Path path,
++      final List<S3AFileStatus> backingStatuses,
++      final DirListingMetadata dirMeta,
++      final ITtlTimeProvider timeProvider,
++      final BulkOperationState operationState) throws IOException {
++    List<PathMetadata> entriesToAdd = new ArrayList<>(backingStatuses.size());
++    Set<Path> deleted = dirMeta.listTombstones();
++
++    final Map<Path, PathMetadata> dirMetaMap = dirMeta.getListing().stream()
++        .collect(Collectors.toMap(pm -> pm.getFileStatus().getPath(), pm -> pm));
++    for (S3AFileStatus s : backingStatuses) {
++      final Path statusPath = s.getPath();
++      if (deleted.contains(statusPath)) {
++        continue;
++      }
++
++      // this is the record in dynamo
++      PathMetadata pathMetadata = dirMetaMap.get(statusPath);
++
++      // in non-auth listings, we compare the file status of the metastore
++      // list with those in the FS, and overwrite the MS entry if
++      // either of two conditions are met
++      // - there is no entry in the metastore and
++      //   DIR_MERGE_UPDATES_ALL_RECORDS_NONAUTH is compiled to true
++      // - there is an entry in the metastore the FS entry is newer.
++      boolean shouldUpdate;
++      if (pathMetadata != null) {
++        // entry is in DDB; check modification time
++        shouldUpdate = s.getModificationTime() > (pathMetadata.getFileStatus())
++            .getModificationTime();
++        // create an updated record.
++        pathMetadata = new PathMetadata(s);
++      } else {
++        // entry is not present. Create for insertion into dirMeta
++        pathMetadata = new PathMetadata(s);
++        // use hard-coded policy about updating
++        shouldUpdate = DIR_MERGE_UPDATES_ALL_RECORDS_NONAUTH;
++      }
++      if (shouldUpdate) {
++        // we do want to update DDB and the listing with a new entry.
++        LOG.debug("Update ms with newer metadata of: {}", s);
++        // ensure it gets into the dirListing
++        // add to the list of entries to add later,
++        entriesToAdd.add(pathMetadata);
++      }
++      // add the entry to the union; no-op if it was already there.
++      dirMeta.put(pathMetadata);
++    }
++
++    if (!entriesToAdd.isEmpty()) {
++        // non-auth, just push out the updated entry list
++      LOG.debug("Adding {} entries under directory {}", entriesToAdd.size(), path);
++      putWithTtl(ms, entriesToAdd, timeProvider, operationState);
++    }
+-          S3Guard.putWithTtl(ms, dirMeta, timeProvider, null);
++          S3Guard.putWithTtl(ms, dirMeta, Collections.emptyList(), timeProvider, null);
++   * @param unchangedEntries list of unchanged entries from the listing
+-  public static void putWithTtl(MetadataStore ms, DirListingMetadata dirMeta,
++  public static void putWithTtl(MetadataStore ms,
++      DirListingMetadata dirMeta,
++      final List<Path> unchangedEntries,
+-    ms.put(dirMeta, operationState);
++    ms.put(dirMeta, unchangedEntries, operationState);
+
+INS26 INS40 INS23 INS31 INS31 INS29 INS78 INS83 INS83 INS83 INS39 INS59 INS29 INS83 INS83 INS39 INS42 INS44 INS44 INS44 INS44 INS44 INS44 INS43 INS8 INS29 INS83 INS83 INS39 INS42 INS44 INS44 INS44 INS44 INS44 INS44 INS43 INS8 INS44 INS65 INS42 INS42 INS9 INS25 INS65 INS65 INS65 INS65 INS65 INS65 INS65 INS65 INS83 INS43 INS42 INS83 MOV43 INS42 INS83 INS74 INS42 INS83 INS43 INS42 INS83 INS43 INS42 INS83 INS43 INS42 INS42 INS60 INS60 MOV60 MOV60 INS70 INS25 INS65 INS65 INS65 INS65 INS65 INS65 INS65 INS65 INS83 INS43 INS42 INS83 INS43 INS42 INS83 INS74 INS42 INS83 INS43 INS42 INS83 INS43 INS42 INS83 INS43 INS42 INS42 INS60 INS60 INS60 INS70 INS25 INS65 INS83 INS74 INS42 INS66 INS65 INS66 INS66 INS66 INS66 INS66 INS42 MOV8 MOV8 INS66 INS66 INS66 INS66 INS42 INS66 INS42 INS66 INS42 INS66 INS42 INS66 INS42 INS66 INS42 INS66 INS42 INS66 INS42 INS43 INS43 INS42 INS42 INS42 INS74 INS59 INS39 INS59 UPD74 INS44 INS42 INS8 INS42 INS8 INS66 INS42 INS66 INS42 INS66 INS42 INS66 INS42 INS66 INS42 INS66 INS42 INS66 INS42 INS66 INS42 INS42 INS43 INS43 INS42 INS42 INS42 INS74 INS59 INS74 INS59 INS83 INS74 INS59 MOV44 INS42 INS8 INS38 INS8 INS42 INS66 INS43 INS43 INS21 INS42 INS42 INS43 INS43 INS42 INS14 INS42 MOV38 UPD43 INS43 INS43 INS42 MOV60 INS25 INS60 INS25 INS21 MOV21 INS21 MOV21 INS21 INS42 INS42 INS43 MOV43 INS42 INS14 INS43 INS43 INS42 INS32 INS43 INS43 INS43 INS42 INS32 INS60 INS25 INS60 INS60 INS25 INS25 INS21 INS32 INS21 INS21 INS42 INS42 INS42 INS32 INS42 INS42 INS74 INS32 UPD42 INS42 INS42 INS83 UPD43 INS32 MOV8 INS43 INS59 INS27 INS8 INS8 INS7 INS32 INS32 INS42 INS74 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS32 INS83 INS43 INS59 INS32 INS8 INS43 INS59 INS39 INS59 INS27 INS8 INS8 INS42 INS8 INS32 INS42 INS42 INS32 INS32 INS32 INS42 UPD42 INS42 UPD42 UPD42 UPD42 UPD42 INS42 UPD42 UPD42 INS43 INS32 INS42 INS86 UPD42 UPD42 MOV32 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS33 INS21 INS21 INS42 MOV32 MOV32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS43 INS42 INS42 INS32 INS42 INS42 INS42 INS86 INS86 INS42 INS42 MOV32 INS42 INS42 INS42 INS18 INS42 INS42 INS32 INS42 INS42 INS33 INS21 INS21 INS21 INS21 INS21 INS21 INS42 INS42 INS42 INS42 INS42 INS45 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS59 INS42 INS42 INS42 INS42 INS7 INS32 INS42 INS42 INS42 INS59 INS32 INS59 INS42 INS42 INS42 INS42 INS7 INS7 INS7 INS7 INS32 INS32 INS42 INS42 INS42 INS42 MOV14 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS27 INS42 INS14 INS42 INS14 INS42 INS42 INS42 INS42 INS45 INS42 INS42 INS42 INS42 INS42 INS42 MOV32 INS32 INS43 INS42 INS43 INS42 INS36 INS42 INS42 INS42 INS32 INS32 INS42 INS42 INS42 INS42 DEL39 DEL42 DEL9 DEL59 DEL60 DEL42 DEL42 DEL45 DEL42 DEL32 DEL21 DEL83 DEL42 DEL43 DEL42 DEL59 DEL60 DEL42 DEL33 DEL27 DEL42 DEL42 DEL32 DEL21 DEL8 DEL25 DEL42 DEL42 DEL42 DEL32 DEL25 DEL83 DEL42 DEL59 DEL60 DEL42 DEL38 DEL42 DEL33 DEL27 DEL42 DEL42 DEL32 DEL27 DEL27 DEL25 DEL8 DEL25 DEL39 DEL42 DEL59 DEL60 DEL42 DEL42 DEL42 DEL27 DEL7 DEL21 DEL8 DEL70 DEL42 DEL42 DEL42 DEL27 DEL36 DEL27 DEL7 DEL21 DEL42 DEL42 DEL27 DEL25 DEL42 DEL42 DEL90 DEL42 DEL42 DEL32

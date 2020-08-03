@@ -1,0 +1,904 @@
+HADOOP-9747. Reduce unnecessary UGI synchronization. Contributed by Daryn Sharp.
+
+-import static org.apache.hadoop.fs.CommonConfigurationKeys.HADOOP_TREAT_SUBJECT_EXTERNAL_KEY;
+-import static org.apache.hadoop.fs.CommonConfigurationKeys.HADOOP_TREAT_SUBJECT_EXTERNAL_DEFAULT;
++import java.util.EnumMap;
++import java.util.concurrent.atomic.AtomicReference;
++import javax.security.auth.login.Configuration.Parameters;
+-      Principal user = null;
+-      // if we are using kerberos, try it out
+-      if (isAuthenticationMethodEnabled(AuthenticationMethod.KERBEROS)) {
+-        user = getCanonicalUser(KerberosPrincipal.class);
++      Principal user = getCanonicalUser(KerberosPrincipal.class);
++      if (user != null) {
+-          userEntry = new User(user.getName());
++          // LoginContext will be attached later unless it's an external
++          // subject.
++          AuthenticationMethod authMethod = (user instanceof KerberosPrincipal)
++            ? AuthenticationMethod.KERBEROS : AuthenticationMethod.SIMPLE;
++          userEntry = new User(user.getName(), authMethod, null);
+-  /*
+-   * This config is a temporary one for backward compatibility.
+-   * It means whether to treat the subject passed to
+-   * UserGroupInformation(Subject) as external. If true,
+-   * -  no renewal thread will be created to do the renew credential
+-   * -  reloginFromKeytab() and reloginFromTicketCache will not renew
+-   *    credential.
+-   * and it assumes that the owner of the subject to renew; if false, it means
+-   * to retain the old behavior prior to fixing HADOOP-13558 and HADOOP-13805.
+-   * The default is false.
+-   */
+-  private static boolean treatSubjectExternal = false;
+-
+-  /*
+-   * Some test need the renewal thread to be created even if it does
+-   *   UserGroupInformation.loginUserFromSubject(subject);
+-   * The test code may set this variable to true via
+-   *   setEnableRenewThreadCreationForTest(boolean)
+-   * method.
+-   */
+-  private static boolean enableRenewThreadCreationForTest = false;
+-
+-
+-    treatSubjectExternal = conf.getBoolean(HADOOP_TREAT_SUBJECT_EXTERNAL_KEY,
+-        HADOOP_TREAT_SUBJECT_EXTERNAL_DEFAULT);
+-    if (treatSubjectExternal) {
+-      LOG.info("Config " + HADOOP_TREAT_SUBJECT_EXTERNAL_KEY + " is set to "
+-          + "true, the owner of the subject passed to "
+-          + " UserGroupInformation(Subject) is supposed to renew the "
+-          + "credential.");
+-    }
+-  static void setEnableRenewThreadCreationForTest(boolean b) {
+-    enableRenewThreadCreationForTest = b;
+-  }
+-
+-  @InterfaceAudience.Private
+-  @VisibleForTesting
+-  static boolean getEnableRenewThreadCreationForTest() {
+-    return enableRenewThreadCreationForTest;
+-  }
+-
+-  @InterfaceAudience.Private
+-  @VisibleForTesting
+-    setEnableRenewThreadCreationForTest(false);
+-  private static UserGroupInformation loginUser = null;
+-  private static String keytabPrincipal = null;
+-  private static String keytabFile = null;
++  private static final AtomicReference<UserGroupInformation> loginUserRef =
++    new AtomicReference<>();
+-  private final boolean isKeytab;
+-  private final boolean isKrbTkt;
+-  private final boolean isLoginExternal;
+-  
++
+-  
+-  /**
+-   * A JAAS configuration that defines the login modules that we want
+-   * to use for login.
+-   */
+-  private static class HadoopConfiguration 
+-      extends javax.security.auth.login.Configuration {
+-    private static final String SIMPLE_CONFIG_NAME = "hadoop-simple";
+-    private static final String USER_KERBEROS_CONFIG_NAME = 
+-      "hadoop-user-kerberos";
+-    private static final String KEYTAB_KERBEROS_CONFIG_NAME = 
+-      "hadoop-keytab-kerberos";
+-    private static final Map<String, String> BASIC_JAAS_OPTIONS =
+-      new HashMap<String,String>();
+-    static {
+-      String jaasEnvVar = System.getenv("HADOOP_JAAS_DEBUG");
+-      if (jaasEnvVar != null && "true".equalsIgnoreCase(jaasEnvVar)) {
+-        BASIC_JAAS_OPTIONS.put("debug", "true");
+-      }
+-    }
+-    
+-    private static final AppConfigurationEntry OS_SPECIFIC_LOGIN =
+-      new AppConfigurationEntry(OS_LOGIN_MODULE_NAME,
+-                                LoginModuleControlFlag.REQUIRED,
+-                                BASIC_JAAS_OPTIONS);
+-    private static final AppConfigurationEntry HADOOP_LOGIN =
+-      new AppConfigurationEntry(HadoopLoginModule.class.getName(),
+-                                LoginModuleControlFlag.REQUIRED,
+-                                BASIC_JAAS_OPTIONS);
+-    private static final Map<String,String> USER_KERBEROS_OPTIONS = 
+-      new HashMap<String,String>();
+-    static {
+-      if (IBM_JAVA) {
+-        USER_KERBEROS_OPTIONS.put("useDefaultCcache", "true");
+-      } else {
+-        USER_KERBEROS_OPTIONS.put("doNotPrompt", "true");
+-        USER_KERBEROS_OPTIONS.put("useTicketCache", "true");
+-      }
+-      String ticketCache = System.getenv("KRB5CCNAME");
+-      if (ticketCache != null) {
+-        if (IBM_JAVA) {
+-          // The first value searched when "useDefaultCcache" is used.
+-          System.setProperty("KRB5CCNAME", ticketCache);
+-        } else {
+-          USER_KERBEROS_OPTIONS.put("ticketCache", ticketCache);
+-        }
+-      }
+-      USER_KERBEROS_OPTIONS.put("renewTGT", "true");
+-      USER_KERBEROS_OPTIONS.putAll(BASIC_JAAS_OPTIONS);
+-    }
+-    private static final AppConfigurationEntry USER_KERBEROS_LOGIN =
+-      new AppConfigurationEntry(KerberosUtil.getKrb5LoginModuleName(),
+-                                LoginModuleControlFlag.OPTIONAL,
+-                                USER_KERBEROS_OPTIONS);
+-    private static final Map<String,String> KEYTAB_KERBEROS_OPTIONS = 
+-      new HashMap<String,String>();
+-    static {
+-      if (IBM_JAVA) {
+-        KEYTAB_KERBEROS_OPTIONS.put("credsType", "both");
+-      } else {
+-        KEYTAB_KERBEROS_OPTIONS.put("doNotPrompt", "true");
+-        KEYTAB_KERBEROS_OPTIONS.put("useKeyTab", "true");
+-        KEYTAB_KERBEROS_OPTIONS.put("storeKey", "true");
+-      }
+-      KEYTAB_KERBEROS_OPTIONS.put("refreshKrb5Config", "true");
+-      KEYTAB_KERBEROS_OPTIONS.putAll(BASIC_JAAS_OPTIONS);      
+-    }
+-    private static final AppConfigurationEntry KEYTAB_KERBEROS_LOGIN =
+-      new AppConfigurationEntry(KerberosUtil.getKrb5LoginModuleName(),
+-                                LoginModuleControlFlag.REQUIRED,
+-                                KEYTAB_KERBEROS_OPTIONS);
+-    
+-    private static final AppConfigurationEntry[] SIMPLE_CONF = 
+-      new AppConfigurationEntry[]{OS_SPECIFIC_LOGIN, HADOOP_LOGIN};
+-    
+-    private static final AppConfigurationEntry[] USER_KERBEROS_CONF =
+-      new AppConfigurationEntry[]{OS_SPECIFIC_LOGIN, USER_KERBEROS_LOGIN,
+-                                  HADOOP_LOGIN};
+-
+-    private static final AppConfigurationEntry[] KEYTAB_KERBEROS_CONF =
+-      new AppConfigurationEntry[]{KEYTAB_KERBEROS_LOGIN, HADOOP_LOGIN};
+-
+-    @Override
+-    public AppConfigurationEntry[] getAppConfigurationEntry(String appName) {
+-      if (SIMPLE_CONFIG_NAME.equals(appName)) {
+-        return SIMPLE_CONF;
+-      } else if (USER_KERBEROS_CONFIG_NAME.equals(appName)) {
+-        return USER_KERBEROS_CONF;
+-      } else if (KEYTAB_KERBEROS_CONFIG_NAME.equals(appName)) {
+-        if (IBM_JAVA) {
+-          KEYTAB_KERBEROS_OPTIONS.put("useKeytab",
+-              prependFileAuthority(keytabFile));
+-        } else {
+-          KEYTAB_KERBEROS_OPTIONS.put("keyTab", keytabFile);
+-        }
+-        KEYTAB_KERBEROS_OPTIONS.put("principal", keytabPrincipal);
+-        return KEYTAB_KERBEROS_CONF;
+-      }
+-      return null;
+-    }
+-  }
+-
+-  private static String prependFileAuthority(String keytabPath) {
+-    return keytabPath.startsWith("file://") ? keytabPath
+-        : "file://" + keytabPath;
+-  }
+-
+-  /**
+-   * Represents a javax.security configuration that is created at runtime.
+-   */
+-  private static class DynamicConfiguration
+-      extends javax.security.auth.login.Configuration {
+-    private AppConfigurationEntry[] ace;
+-    
+-    DynamicConfiguration(AppConfigurationEntry[] ace) {
+-      this.ace = ace;
+-    }
+-    
+-    @Override
+-    public AppConfigurationEntry[] getAppConfigurationEntry(String appName) {
+-      return ace;
+-    }
+-  }
+-
+-  private static LoginContext
++  private static HadoopLoginContext
+-    javax.security.auth.login.Configuration loginConf)
++                  HadoopConfiguration loginConf)
+-      return new LoginContext(appName, subject, null, loginConf);
++      return new HadoopLoginContext(appName, subject, loginConf);
+-  private LoginContext getLogin() {
+-    return user.getLogin();
++  // return the LoginContext only if it's managed by the ugi.  externally
++  // managed login contexts will be ignored.
++  private HadoopLoginContext getLogin() {
++    LoginContext login = user.getLogin();
++    return (login instanceof HadoopLoginContext)
++      ? (HadoopLoginContext)login : null;
+-  
++
+-    this(subject, treatSubjectExternal);
+-  }
+-
+-  /**
+-   * Create a UGI from the given subject.
+-   * @param subject the subject
+-   * @param isLoginExternal if the subject's keytab is managed by other UGI.
+-   *                       Setting this to true will prevent UGI from attempting
+-   *                       to login the keytab, or to renew it.
+-   */
+-  private UserGroupInformation(Subject subject, final boolean isLoginExternal) {
++    // do not access ANY private credentials since they are mutable
++    // during a relogin.  no principal locking necessary since
++    // relogin/logout does not remove User principal.
+-
+-    this.isKeytab = KerberosUtil.hasKerberosKeyTab(subject);
+-    this.isKrbTkt = KerberosUtil.hasKerberosTicket(subject);
+-    this.isLoginExternal = isLoginExternal;
++    if (user == null || user.getName() == null) {
++      throw new IllegalStateException("Subject does not contain a valid User");
++    }
+-  
++
+-    return isKeytab || isKrbTkt;
++    return user.getAuthenticationMethod() == AuthenticationMethod.KERBEROS;
+-  public synchronized
+-  static UserGroupInformation getCurrentUser() throws IOException {
++  public static UserGroupInformation getCurrentUser() throws IOException {
+-    try {
+-      Map<String,String> krbOptions = new HashMap<String,String>();
+-      if (IBM_JAVA) {
+-        krbOptions.put("useDefaultCcache", "true");
+-        // The first value searched when "useDefaultCcache" is used.
+-        System.setProperty("KRB5CCNAME", ticketCache);
+-      } else {
+-        krbOptions.put("doNotPrompt", "true");
+-        krbOptions.put("useTicketCache", "true");
+-        krbOptions.put("useKeyTab", "false");
+-        krbOptions.put("ticketCache", ticketCache);
+-      }
+-      krbOptions.put("renewTGT", "false");
+-      krbOptions.putAll(HadoopConfiguration.BASIC_JAAS_OPTIONS);
+-      AppConfigurationEntry ace = new AppConfigurationEntry(
+-          KerberosUtil.getKrb5LoginModuleName(),
+-          LoginModuleControlFlag.REQUIRED,
+-          krbOptions);
+-      DynamicConfiguration dynConf =
+-          new DynamicConfiguration(new AppConfigurationEntry[]{ ace });
+-      LoginContext login = newLoginContext(
+-          HadoopConfiguration.USER_KERBEROS_CONFIG_NAME, null, dynConf);
+-      login.login();
+-
+-      Subject loginSubject = login.getSubject();
+-      Set<Principal> loginPrincipals = loginSubject.getPrincipals();
+-      if (loginPrincipals.isEmpty()) {
+-        throw new RuntimeException("No login principals found!");
+-      }
+-      if (loginPrincipals.size() != 1) {
+-        LOG.warn("found more than one principal in the ticket cache file " +
+-          ticketCache);
+-      }
+-      User ugiUser = new User(loginPrincipals.iterator().next().getName(),
+-          AuthenticationMethod.KERBEROS, login);
+-      loginSubject.getPrincipals().add(ugiUser);
+-      UserGroupInformation ugi = new UserGroupInformation(loginSubject, false);
+-      ugi.setLogin(login);
+-      ugi.setAuthenticationMethod(AuthenticationMethod.KERBEROS);
+-      return ugi;
+-    } catch (LoginException le) {
+-      KerberosAuthException kae =
+-          new KerberosAuthException(FAILURE_TO_LOGIN, le);
+-      kae.setUser(user);
+-      kae.setTicketCacheFile(ticketCache);
+-      throw kae;
+-    }
++    LoginParams params = new LoginParams();
++    params.put(LoginParam.PRINCIPAL, user);
++    params.put(LoginParam.CCACHE, ticketCache);
++    return doSubjectLogin(null, params);
+-    KerberosPrincipal principal =
+-        subject.getPrincipals(KerberosPrincipal.class).iterator().next();
+-
+-    User ugiUser = new User(principal.getName(),
+-        AuthenticationMethod.KERBEROS, null);
+-    subject.getPrincipals().add(ugiUser);
+-    UserGroupInformation ugi = new UserGroupInformation(subject);
+-    ugi.setLogin(null);
+-    ugi.setAuthenticationMethod(AuthenticationMethod.KERBEROS);
+-    return ugi;
++    // null params indicate external subject login.  no login context will
++    // be attached.
++    return doSubjectLogin(subject, null);
+-   * Get the currently logged in user.
++   * Get the currently logged in user.  If no explicit login has occurred,
++   * the user will automatically be logged in with either kerberos credentials
++   * if available, or as the local OS user, based on security settings.
+-  public synchronized 
+-  static UserGroupInformation getLoginUser() throws IOException {
++  public static UserGroupInformation getLoginUser() throws IOException {
++    UserGroupInformation loginUser = loginUserRef.get();
++    // a potential race condition exists only for the initial creation of
++    // the login user.  there's no need to penalize all subsequent calls
++    // with sychronization overhead so optimistically create a login user
++    // and discard if we lose the race.
+-      loginUserFromSubject(null);
++      UserGroupInformation newLoginUser = createLoginUser(null);
++      do {
++        // it's extremely unlikely that the login user will be non-null
++        // (lost CAS race), but be nulled before the subsequent get, but loop
++        // for correctness.
++        if (loginUserRef.compareAndSet(null, newLoginUser)) {
++          loginUser = newLoginUser;
++          // only spawn renewal if this login user is the winner.
++          loginUser.spawnAutoRenewalThreadForUserCreds(false);
++        } else {
++          loginUser = loginUserRef.get();
++        }
++      } while (loginUser == null);
+-  public synchronized 
+-  static void loginUserFromSubject(Subject subject) throws IOException {
+-    ensureInitialized();
+-    boolean externalSubject = false;
+-    try {
+-      if (subject == null) {
+-        subject = new Subject();
+-      } else {
+-        if (LOG.isDebugEnabled()) {
+-          LOG.debug("Treat subject external: " + treatSubjectExternal
+-              + ". When true, assuming keytab is managed extenally since "
+-              + " logged in from subject");
+-        }
+-        externalSubject = treatSubjectExternal;
+-      }
+-      LoginContext login =
+-          newLoginContext(authenticationMethod.getLoginAppName(), 
+-                          subject, new HadoopConfiguration());
+-      login.login();
++  public static void loginUserFromSubject(Subject subject) throws IOException {
++    setLoginUser(createLoginUser(subject));
++  }
+-      UserGroupInformation realUser =
+-          new UserGroupInformation(subject, externalSubject);
+-      realUser.setLogin(login);
+-      realUser.setAuthenticationMethod(authenticationMethod);
++  private static
++  UserGroupInformation createLoginUser(Subject subject) throws IOException {
++    UserGroupInformation realUser = doSubjectLogin(subject, null);
++    UserGroupInformation loginUser = null;
++    try {
+-      loginUser.spawnAutoRenewalThreadForUserCreds();
+-    } catch (LoginException le) {
+-      LOG.debug("failure to login", le);
+-      throw new KerberosAuthException(FAILURE_TO_LOGIN, le);
++    } catch (IOException ioe) {
++      LOG.debug("failure to load login credentials", ioe);
++      throw ioe;
+-    } 
++    }
++    return loginUser;
+-  public synchronized static void setLoginUser(UserGroupInformation ugi) {
++  public static void setLoginUser(UserGroupInformation ugi) {
+-    loginUser = ugi;
++    loginUserRef.set(ugi);
++  private String getKeytab() {
++    HadoopLoginContext login = getLogin();
++    return (login != null)
++      ? login.getConfiguration().getParameters().get(LoginParam.KEYTAB)
++      : null;
++  }
++
+-   * Is this user logged in from a keytab file?
++   * Is the ugi managed by the UGI or an external subject?
++   * @return true if managed by UGI.
++   */
++  private boolean isHadoopLogin() {
++    // checks if the private hadoop login context is managing the ugi.
++    return getLogin() != null;
++  }
++
++  /**
++   * Is this user logged in from a keytab file managed by the UGI?
+-    return isKeytab;
++    // can't simply check if keytab is present since a relogin failure will
++    // have removed the keytab from priv creds.  instead, check login params.
++    return hasKerberosCredentials() && isHadoopLogin() && getKeytab() != null;
++   *  Is this user logged in from a ticket (but no keytab) managed by the UGI?
++   * @return true if the credentials are from a ticket cache.
++   */
++  private boolean isFromTicket() {
++    return hasKerberosCredentials() && isHadoopLogin() && getKeytab() == null;
++  }
++
++  /**
+-  private synchronized KerberosTicket getTGT() {
++  private KerberosTicket getTGT() {
+-  /**
+-   * Should relogin if security is enabled using Kerberos, and
+-   * the Subject is not owned by another UGI.
+-   * @return true if this UGI should relogin
+-   */
+-    return isSecurityEnabled()
+-        && user.getAuthenticationMethod() == AuthenticationMethod.KERBEROS
+-        && !isLoginExternal;
++    return hasKerberosCredentials() && isHadoopLogin();
+-  /**Spawn a thread to do periodic renewals of kerberos credentials*/
+-  private void spawnAutoRenewalThreadForUserCreds() {
+-    if (getEnableRenewThreadCreationForTest()) {
+-      LOG.warn("Spawning thread to auto renew user credential since " +
+-          " enableRenewThreadCreationForTest was set to true.");
+-    } else if (!shouldRelogin() || isKeytab) {
++  @InterfaceAudience.Private
++  @InterfaceStability.Unstable
++  @VisibleForTesting
++  /**
++   * Spawn a thread to do periodic renewals of kerberos credentials from
++   * a ticket cache.  NEVER directly call this method.
++   * @param force - used by tests to forcibly spawn thread
++   */
++  void spawnAutoRenewalThreadForUserCreds(boolean force) {
++    if (!force && (!shouldRelogin() || isFromKeytab())) {
+-  public synchronized
++  public
+-    keytabFile = path;
+-    keytabPrincipal = user;
+-    Subject subject = new Subject();
+-    LoginContext login; 
+-    long start = 0;
+-    try {
+-      login = newLoginContext(HadoopConfiguration.KEYTAB_KERBEROS_CONFIG_NAME,
+-            subject, new HadoopConfiguration());
+-      start = Time.now();
+-      login.login();
+-      metrics.loginSuccess.add(Time.now() - start);
+-      loginUser = new UserGroupInformation(subject, false);
+-      loginUser.setLogin(login);
+-      loginUser.setAuthenticationMethod(AuthenticationMethod.KERBEROS);
+-    } catch (LoginException le) {
+-      if (start > 0) {
+-        metrics.loginFailure.add(Time.now() - start);
+-      }
+-      KerberosAuthException kae = new KerberosAuthException(LOGIN_FAILURE, le);
+-      kae.setUser(user);
+-      kae.setKeytabFile(path);
+-      throw kae;
+-    }
+-    LOG.info("Login successful for user " + keytabPrincipal
+-        + " using keytab file " + keytabFile);
++    setLoginUser(loginUserFromKeytabAndReturnUGI(user, path));
++    LOG.info("Login successful for user " + user
++        + " using keytab file " + path);
+-    if (!isSecurityEnabled() ||
+-        user.getAuthenticationMethod() != AuthenticationMethod.KERBEROS) {
++    if (!hasKerberosCredentials()) {
+-    LoginContext login = getLogin();
++    HadoopLoginContext login = getLogin();
++    String keytabFile = getKeytab();
+-      synchronized (UserGroupInformation.class) {
+-        login.logout();
+-      }
++      // hadoop login context internally locks credentials.
++      login.logout();
+-    LOG.info("Logout successful for user " + keytabPrincipal
++    LOG.info("Logout successful for user " + getUserName()
+-  public synchronized void checkTGTAndReloginFromKeytab() throws IOException {
+-    if (!isSecurityEnabled()
+-        || user.getAuthenticationMethod() != AuthenticationMethod.KERBEROS
+-        || !isKeytab) {
+-      return;
+-    }
+-    KerberosTicket tgt = getTGT();
+-    if (tgt != null && !shouldRenewImmediatelyForTests &&
+-        Time.now() < getRefreshTime(tgt)) {
+-      return;
+-    }
+-    reloginFromKeytab();
++  public void checkTGTAndReloginFromKeytab() throws IOException {
++    reloginFromKeytab(true);
+-  public synchronized void reloginFromKeytab() throws IOException {
+-    if (!shouldRelogin() || !isKeytab) {
++  public void reloginFromKeytab() throws IOException {
++    reloginFromKeytab(false);
++  }
++
++  private void reloginFromKeytab(boolean checkTGT) throws IOException {
++    if (!shouldRelogin() || !isFromKeytab()) {
+-
+-    long now = Time.now();
+-    if (!shouldRenewImmediatelyForTests && !hasSufficientTimeElapsed(now)) {
+-      return;
+-    }
+-
+-    KerberosTicket tgt = getTGT();
+-    //Return if TGT is valid and is not going to expire soon.
+-    if (tgt != null && !shouldRenewImmediatelyForTests &&
+-        now < getRefreshTime(tgt)) {
+-      return;
+-    }
+-
+-    LoginContext login = getLogin();
+-    if (login == null || keytabFile == null) {
++    HadoopLoginContext login = getLogin();
++    if (login == null) {
+-
+-    long start = 0;
+-    // register most recent relogin attempt
+-    user.setLastLogin(now);
+-    try {
+-      if (LOG.isDebugEnabled()) {
+-        LOG.debug("Initiating logout for " + getUserName());
++    if (checkTGT) {
++      KerberosTicket tgt = getTGT();
++      if (tgt != null && !shouldRenewImmediatelyForTests &&
++        Time.now() < getRefreshTime(tgt)) {
++        return;
+-      synchronized (UserGroupInformation.class) {
+-        // clear up the kerberos state. But the tokens are not cleared! As per
+-        // the Java kerberos login module code, only the kerberos credentials
+-        // are cleared
+-        login.logout();
+-        // login and also update the subject field of this instance to
+-        // have the new credentials (pass it to the LoginContext constructor)
+-        login = newLoginContext(
+-            HadoopConfiguration.KEYTAB_KERBEROS_CONFIG_NAME, getSubject(),
+-            new HadoopConfiguration());
+-        if (LOG.isDebugEnabled()) {
+-          LOG.debug("Initiating re-login for " + keytabPrincipal);
+-        }
+-        start = Time.now();
+-        login.login();
+-        fixKerberosTicketOrder();
+-        metrics.loginSuccess.add(Time.now() - start);
+-        setLogin(login);
+-      }
+-    } catch (LoginException le) {
+-      if (start > 0) {
+-        metrics.loginFailure.add(Time.now() - start);
+-      }
+-      KerberosAuthException kae = new KerberosAuthException(LOGIN_FAILURE, le);
+-      kae.setPrincipal(keytabPrincipal);
+-      kae.setKeytabFile(keytabFile);
+-      throw kae;
++    relogin(login);
+-  public synchronized void reloginFromTicketCache() throws IOException {
+-    if (!shouldRelogin() || !isKrbTkt) {
++  public void reloginFromTicketCache() throws IOException {
++    if (!shouldRelogin() || !isFromTicket()) {
+-    LoginContext login = getLogin();
++    HadoopLoginContext login = getLogin();
++    relogin(login);
++  }
++
++  private void relogin(HadoopLoginContext login) throws IOException {
++    // ensure the relogin is atomic to avoid leaving credentials in an
++    // inconsistent state.  prevents other ugi instances, SASL, and SPNEGO
++    // from accessing or altering credentials during the relogin.
++    synchronized(login.getSubjectLock()) {
++      // another racing thread may have beat us to the relogin.
++      if (login == getLogin()) {
++        unprotectedRelogin(login);
++      }
++    }
++  }
++
++  private void unprotectedRelogin(HadoopLoginContext login) throws IOException {
++    assert Thread.holdsLock(login.getSubjectLock());
+-      login = 
+-        newLoginContext(HadoopConfiguration.USER_KERBEROS_CONFIG_NAME, 
+-            getSubject(), new HadoopConfiguration());
++      login = newLoginContext(
++        login.getAppName(), login.getSubject(), login.getConfiguration());
++      // this should be unnecessary.  originally added due to improper locking
++      // of the subject during relogin.
+-  public synchronized
++  public
+-    String oldKeytabFile = null;
+-    String oldKeytabPrincipal = null;
+-    long start = 0;
+-    try {
+-      oldKeytabFile = keytabFile;
+-      oldKeytabPrincipal = keytabPrincipal;
+-      keytabFile = path;
+-      keytabPrincipal = user;
+-      Subject subject = new Subject();
+-      
+-      LoginContext login = newLoginContext(
+-          HadoopConfiguration.KEYTAB_KERBEROS_CONFIG_NAME, subject,
+-          new HadoopConfiguration());
+-       
+-      start = Time.now();
+-      login.login();
+-      metrics.loginSuccess.add(Time.now() - start);
+-      UserGroupInformation newLoginUser =
+-          new UserGroupInformation(subject, false);
+-      newLoginUser.setLogin(login);
+-      newLoginUser.setAuthenticationMethod(AuthenticationMethod.KERBEROS);
+-      
+-      return newLoginUser;
+-    } catch (LoginException le) {
+-      if (start > 0) {
+-        metrics.loginFailure.add(Time.now() - start);
+-      }
+-      KerberosAuthException kae = new KerberosAuthException(LOGIN_FAILURE, le);
+-      kae.setUser(user);
+-      kae.setKeytabFile(path);
+-      throw kae;
+-    } finally {
+-      if(oldKeytabFile != null) keytabFile = oldKeytabFile;
+-      if(oldKeytabPrincipal != null) keytabPrincipal = oldKeytabPrincipal;
+-    }
++    LoginParams params = new LoginParams();
++    params.put(LoginParam.PRINCIPAL, user);
++    params.put(LoginParam.KEYTAB, path);
++    return doSubjectLogin(null, params);
+-    if (now - user.getLastLogin() < kerberosMinSecondsBeforeRelogin ) {
++    if (!shouldRenewImmediatelyForTests &&
++        now - user.getLastLogin() < kerberosMinSecondsBeforeRelogin ) {
+-  public synchronized static boolean isLoginKeytabBased() throws IOException {
+-    return getLoginUser().isKeytab;
++  public static boolean isLoginKeytabBased() throws IOException {
++    return getLoginUser().isFromKeytab();
+-    return getLoginUser().isKrbTkt;
++    return getLoginUser().isFromTicket();
+-    UserGroupInformation result = new UserGroupInformation(subject, false);
++    UserGroupInformation result = new UserGroupInformation(subject);
+-        HadoopConfiguration.USER_KERBEROS_CONFIG_NAME),
++        HadoopConfiguration.KERBEROS_CONFIG_NAME),
+-    principals.add(new User(user));
++    principals.add(new User(user, AuthenticationMethod.PROXY, null));
+-    UserGroupInformation result =new UserGroupInformation(subject, false);
+-    result.setAuthenticationMethod(AuthenticationMethod.PROXY);
+-    return result;
++    return new UserGroupInformation(subject);
++   * Login a subject with the given parameters.  If the subject is null,
++   * the login context used to create the subject will be attached.
++   * @param subject to login, null for new subject.
++   * @param params for login, null for externally managed ugi.
++   * @return UserGroupInformation for subject
++   * @throws IOException
++   */
++  private static UserGroupInformation doSubjectLogin(
++      Subject subject, LoginParams params) throws IOException {
++    ensureInitialized();
++    // initial default login.
++    if (subject == null && params == null) {
++      params = LoginParams.getDefaults();
++    }
++    HadoopConfiguration loginConf = new HadoopConfiguration(params);
++    try {
++      HadoopLoginContext login = newLoginContext(
++        authenticationMethod.getLoginAppName(), subject, loginConf);
++      login.login();
++      UserGroupInformation ugi = new UserGroupInformation(login.getSubject());
++      // attach login context for relogin unless this was a pre-existing
++      // subject.
++      if (subject == null) {
++        params.put(LoginParam.PRINCIPAL, ugi.getUserName());
++        ugi.setLogin(login);
++      }
++      return ugi;
++    } catch (LoginException le) {
++      KerberosAuthException kae =
++        new KerberosAuthException(FAILURE_TO_LOGIN, le);
++      if (params != null) {
++        kae.setPrincipal(params.get(LoginParam.PRINCIPAL));
++        kae.setKeytabFile(params.get(LoginParam.KEYTAB));
++        kae.setTicketCacheFile(params.get(LoginParam.CCACHE));
++      }
++      throw kae;
++    }
++  }
++
++  // parameters associated with kerberos logins.  may be extended to support
++  // additional authentication methods.
++  enum LoginParam {
++    PRINCIPAL,
++    KEYTAB,
++    CCACHE,
++  }
++
++  // explicitly private to prevent external tampering.
++  private static class LoginParams extends EnumMap<LoginParam,String>
++      implements Parameters {
++    LoginParams() {
++      super(LoginParam.class);
++    }
++
++    // do not add null values, nor allow existing values to be overriden.
++    @Override
++    public String put(LoginParam param, String val) {
++      boolean add = val != null && !containsKey(param);
++      return add ? super.put(param, val) : null;
++    }
++
++    static LoginParams getDefaults() {
++      LoginParams params = new LoginParams();
++      params.put(LoginParam.PRINCIPAL, System.getenv("KRB5PRINCIPAL"));
++      params.put(LoginParam.KEYTAB, System.getenv("KRB5KEYTAB"));
++      params.put(LoginParam.CCACHE, System.getenv("KRB5CCNAME"));
++      return params;
++    }
++  }
++
++  // wrapper to allow access to fields necessary to recreate the same login
++  // context for relogin.  explicitly private to prevent external tampering.
++  private static class HadoopLoginContext extends LoginContext {
++    private final String appName;
++    private final HadoopConfiguration conf;
++
++    HadoopLoginContext(String appName, Subject subject,
++                       HadoopConfiguration conf) throws LoginException {
++      super(appName, subject, null, conf);
++      this.appName = appName;
++      this.conf = conf;
++    }
++
++    String getAppName() {
++      return appName;
++    }
++
++    HadoopConfiguration getConfiguration() {
++      return conf;
++    }
++
++    // the locking model for logins cannot rely on ugi instance synchronization
++    // since a subject will be referenced by multiple ugi instances.
++    Object getSubjectLock() {
++      Subject subject = getSubject();
++      // if subject is null, the login context will create the subject
++      // so just lock on this context.
++      return (subject == null) ? this : subject.getPrivateCredentials();
++    }
++
++    @Override
++    public void login() throws LoginException {
++      synchronized(getSubjectLock()) {
++        MutableRate metric = metrics.loginFailure;
++        long start = Time.monotonicNow();
++        try {
++          super.login();
++          metric = metrics.loginSuccess;
++        } finally {
++          metric.add(Time.monotonicNow() - start);
++        }
++      }
++    }
++
++    @Override
++    public void logout() throws LoginException {
++      synchronized(getSubjectLock()) {
++        super.logout();
++      }
++    }
++  }
++
++  /**
++   * A JAAS configuration that defines the login modules that we want
++   * to use for login.
++   */
++  @InterfaceAudience.Private
++  @InterfaceStability.Unstable
++  private static class HadoopConfiguration
++  extends javax.security.auth.login.Configuration {
++    static final String KRB5_LOGIN_MODULE =
++        KerberosUtil.getKrb5LoginModuleName();
++    static final String SIMPLE_CONFIG_NAME = "hadoop-simple";
++    static final String KERBEROS_CONFIG_NAME = "hadoop-kerberos";
++
++    private static final Map<String, String> BASIC_JAAS_OPTIONS =
++        new HashMap<String,String>();
++    static {
++      if ("true".equalsIgnoreCase(System.getenv("HADOOP_JAAS_DEBUG"))) {
++        BASIC_JAAS_OPTIONS.put("debug", "true");
++      }
++    }
++
++    static final AppConfigurationEntry OS_SPECIFIC_LOGIN =
++        new AppConfigurationEntry(
++            OS_LOGIN_MODULE_NAME,
++            LoginModuleControlFlag.REQUIRED,
++            BASIC_JAAS_OPTIONS);
++
++    static final AppConfigurationEntry HADOOP_LOGIN =
++        new AppConfigurationEntry(
++            HadoopLoginModule.class.getName(),
++            LoginModuleControlFlag.REQUIRED,
++            BASIC_JAAS_OPTIONS);
++
++    private final LoginParams params;
++
++    HadoopConfiguration(LoginParams params) {
++      this.params = params;
++    }
++
++    @Override
++    public LoginParams getParameters() {
++      return params;
++    }
++
++    @Override
++    public AppConfigurationEntry[] getAppConfigurationEntry(String appName) {
++      ArrayList<AppConfigurationEntry> entries = new ArrayList<>();
++      // login of external subject passes no params.  technically only
++      // existing credentials should be used but other components expect
++      // the login to succeed with local user fallback if no principal.
++      if (params == null || appName.equals(SIMPLE_CONFIG_NAME)) {
++        entries.add(OS_SPECIFIC_LOGIN);
++      } else if (appName.equals(KERBEROS_CONFIG_NAME)) {
++        // existing semantics are the initial default login allows local user
++        // fallback. this is not allowed when a principal explicitly
++        // specified or during a relogin.
++        if (!params.containsKey(LoginParam.PRINCIPAL)) {
++          entries.add(OS_SPECIFIC_LOGIN);
++        }
++        entries.add(getKerberosEntry());
++      }
++      entries.add(HADOOP_LOGIN);
++      return entries.toArray(new AppConfigurationEntry[0]);
++    }
++
++    private AppConfigurationEntry getKerberosEntry() {
++      final Map<String,String> options = new HashMap<>(BASIC_JAAS_OPTIONS);
++      LoginModuleControlFlag controlFlag = LoginModuleControlFlag.OPTIONAL;
++      // kerberos login is mandatory if principal is specified.  principal
++      // will not be set for initial default login, but will always be set
++      // for relogins.
++      final String principal = params.get(LoginParam.PRINCIPAL);
++      if (principal != null) {
++        options.put("principal", principal);
++        controlFlag = LoginModuleControlFlag.REQUIRED;
++      }
++
++      // use keytab if given else fallback to ticket cache.
++      if (IBM_JAVA) {
++        if (params.containsKey(LoginParam.KEYTAB)) {
++          final String keytab = params.get(LoginParam.KEYTAB);
++          if (keytab != null) {
++            options.put("useKeytab", prependFileAuthority(keytab));
++          } else {
++            options.put("useDefaultKeytab", "true");
++          }
++          options.put("credsType", "both");
++        } else {
++          String ticketCache = params.get(LoginParam.CCACHE);
++          if (ticketCache != null) {
++            options.put("useCcache", prependFileAuthority(ticketCache));
++          } else {
++            options.put("useDefaultCcache", "true");
++          }
++          options.put("renewTGT", "true");
++        }
++      } else {
++        if (params.containsKey(LoginParam.KEYTAB)) {
++          options.put("useKeyTab", "true");
++          final String keytab = params.get(LoginParam.KEYTAB);
++          if (keytab != null) {
++            options.put("keyTab", keytab);
++          }
++          options.put("storeKey", "true");
++        } else {
++          options.put("useTicketCache", "true");
++          String ticketCache = params.get(LoginParam.CCACHE);
++          if (ticketCache != null) {
++            options.put("ticketCache", ticketCache);
++          }
++          options.put("renewTGT", "true");
++        }
++        options.put("doNotPrompt", "true");
++      }
++      options.put("refreshKrb5Config", "true");
++
++      return new AppConfigurationEntry(
++          KRB5_LOGIN_MODULE, controlFlag, options);
++    }
++
++    private static String prependFileAuthority(String keytabPath) {
++      return keytabPath.startsWith("file://")
++          ? keytabPath
++          : "file://" + keytabPath;
++    }
++  }
++
++  /**
+-    System.out.println("Keytab " + ugi.isKeytab);
++    System.out.println("Keytab " + ugi.isFromKeytab());
+-      System.out.println("Auth method " + loginUser.user.getAuthenticationMethod());
+-      System.out.println("Keytab " + loginUser.isKeytab);
++      UserGroupInformation loginUgi = getLoginUser();
++      System.out.println("Auth method " + loginUgi.getAuthenticationMethod());
++      System.out.println("Keytab " + loginUgi.isFromKeytab());
+
+MOV26 MOV26 INS26 MOV23 MOV31 MOV31 UPD40 INS40 UPD40 INS31 INS31 INS31 INS31 INS31 MOV31 INS31 MOV31 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS71 INS55 INS55 INS55 MOV29 MOV29 INS83 INS74 INS43 INS83 INS43 INS42 INS8 MOV29 MOV29 INS83 INS39 INS42 MOV8 MOV29 MOV78 MOV78 INS83 INS83 MOV43 INS42 MOV44 MOV44 MOV43 INS8 MOV29 MOV78 MOV78 INS83 INS83 MOV43 INS42 MOV43 INS8 MOV29 MOV78 MOV78 INS83 INS83 INS39 INS42 INS44 INS43 INS8 UPD83 MOV43 UPD42 UPD83 MOV43 UPD42 INS29 INS83 INS39 INS42 MOV8 MOV29 INS39 UPD42 INS29 INS39 UPD42 UPD83 UPD42 MOV78 INS78 MOV78 INS44 MOV29 MOV78 MOV78 MOV83 MOV83 INS39 UPD42 MOV42 MOV44 MOV44 MOV43 INS8 MOV29 INS83 INS39 INS42 INS43 INS8 MOV29 MOV78 MOV78 INS83 INS39 INS42 MOV43 INS8 INS83 INS39 INS42 INS44 MOV43 INS8 MOV29 MOV78 MOV78 INS83 INS39 INS42 INS43 INS8 INS83 INS39 INS42 INS44 INS43 INS8 UPD83 INS42 INS44 MOV29 INS83 INS83 MOV43 INS42 MOV44 MOV44 MOV43 INS8 INS8 MOV29 MOV83 MOV83 MOV39 INS42 MOV43 MOV8 MOV29 MOV83 MOV83 MOV43 UPD42 MOV42 INS44 INS44 INS43 INS8 INS42 INS72 INS72 INS72 INS83 INS83 INS42 INS74 INS43 INS31 INS31 INS31 INS83 INS83 INS42 MOV43 INS23 INS23 INS31 INS31 INS31 INS31 INS31 INS31 MOV29 MOV78 INS78 INS83 INS83 INS42 MOV43 INS23 MOV23 INS23 MOV23 MOV28 MOV23 MOV23 INS23 INS31 INS31 INS31 INS31 MOV31 INS43 MOV43 UPD42 INS14 INS42 MOV43 INS42 INS60 INS41 INS25 MOV25 INS60 MOV21 MOV21 INS41 INS41 INS60 INS25 MOV41 INS43 INS42 UPD42 MOV42 INS21 INS60 INS41 INS60 INS41 INS65 UPD65 MOV65 INS41 INS65 INS65 INS40 INS39 INS42 MOV25 MOV21 MOV21 INS25 INS60 INS60 INS42 MOV21 MOV21 INS39 INS42 MOV25 MOV60 INS25 INS25 MOV21 UPD42 MOV42 MOV25 MOV60 MOV25 MOV21 INS43 INS42 INS42 INS51 INS43 INS42 INS6 MOV25 MOV60 MOV21 MOV21 INS41 INS41 MOV60 UPD40 INS41 INS65 INS65 INS65 INS43 INS42 INS43 INS42 INS42 MOV21 INS25 INS60 INS54 INS42 INS42 INS42 INS43 INS43 MOV43 INS42 INS42 INS8 MOV78 INS83 MOV43 INS42 INS44 INS44 INS8 INS83 INS43 INS42 INS8 INS83 INS83 MOV43 INS59 INS83 INS83 INS43 INS59 INS42 MOV44 MOV44 INS44 INS43 INS8 MOV43 INS42 INS8 MOV43 INS42 INS8 INS43 INS42 INS8 MOV78 INS83 INS39 INS42 INS43 INS8 INS78 INS83 INS39 INS42 INS43 INS8 INS40 INS83 INS83 MOV43 MOV59 INS83 INS83 MOV43 INS59 INS83 INS83 INS43 INS59 INS42 INS44 INS8 INS78 INS83 INS43 INS42 INS8 INS78 INS83 MOV5 INS42 MOV44 INS8 INS83 MOV43 INS42 INS8 INS42 INS74 MOV43 INS59 INS16 INS27 INS8 MOV27 INS43 INS59 INS32 INS32 UPD66 INS66 INS66 MOV43 INS59 MOV27 INS8 UPD42 MOV42 INS32 MOV43 MOV43 MOV59 INS42 INS32 INS43 INS59 INS16 INS66 UPD66 INS27 UPD66 INS27 INS66 INS66 INS27 UPD27 INS27 MOV8 INS32 INS38 MOV8 INS43 MOV59 MOV43 INS59 MOV8 UPD43 INS27 MOV8 INS42 MOV8 UPD43 UPD42 MOV42 INS32 INS8 INS42 INS32 UPD43 INS32 INS27 INS32 INS32 MOV43 INS14 UPD66 UPD66 INS42 INS66 INS42 INS66 UPD66 INS42 MOV42 UPD42 MOV42 INS27 INS8 MOV43 INS59 INS8 INS12 INS42 INS42 INS46 INS43 INS42 MOV43 INS42 INS60 INS41 UPD42 MOV42 MOV60 MOV21 MOV21 MOV21 INS41 INS42 INS42 INS42 MOV43 INS42 INS42 INS46 MOV21 MOV21 INS41 INS41 INS42 INS60 INS41 MOV42 INS51 INS42 UPD42 MOV42 INS51 UPD42 MOV32 UPD42 MOV42 INS45 INS42 UPD42 MOV42 INS43 INS42 MOV21 INS42 INS42 INS41 INS42 MOV60 INS25 INS21 INS41 MOV60 INS60 INS60 INS25 INS25 INS21 MOV41 INS27 INS43 INS42 MOV32 INS36 INS11 INS33 INS27 INS27 INS53 UPD42 MOV42 UPD42 MOV42 MOV14 UPD42 INS40 INS42 UPD42 INS40 UPD42 MOV42 INS33 UPD42 MOV42 UPD42 MOV42 MOV42 MOV33 UPD42 MOV42 INS32 INS60 INS19 INS42 INS32 INS42 INS32 INS8 INS42 INS42 INS42 INS42 INS42 INS32 INS36 INS32 INS33 INS32 INS33 INS32 INS32 INS27 INS32 INS32 INS27 INS32 INS32 INS38 INS36 INS42 INS32 UPD42 UPD42 INS27 MOV32 INS42 INS42 INS32 MOV21 UPD42 INS9 UPD42 INS9 UPD42 INS42 INS33 UPD42 UPD42 INS38 UPD42 UPD42 UPD42 MOV42 UPD42 MOV42 MOV25 UPD42 MOV42 INS42 INS32 UPD42 UPD42 UPD42 MOV42 UPD42 INS40 UPD42 UPD42 UPD42 UPD40 INS42 UPD42 MOV42 INS33 UPD42 MOV42 MOV38 MOV27 MOV32 INS42 MOV32 INS42 INS42 UPD42 MOV43 MOV42 MOV27 INS27 MOV21 INS42 MOV14 INS60 MOV21 MOV60 MOV25 MOV41 MOV44 INS8 INS57 UPD42 MOV42 INS39 INS59 INS16 INS43 INS42 INS42 INS42 INS33 INS42 INS7 INS42 INS42 MOV43 INS59 INS16 INS32 INS8 INS32 INS8 INS32 INS42 INS42 INS74 INS27 INS8 INS25 INS32 INS32 INS83 UPD43 MOV43 INS59 INS83 MOV43 MOV59 INS27 INS8 INS42 INS8 INS8 INS32 INS14 INS60 MOV32 INS42 INS33 INS42 INS62 INS43 INS42 INS42 INS33 INS32 INS33 INS14 INS43 UPD42 MOV42 UPD42 MOV42 MOV43 INS59 INS8 INS27 INS42 INS42 INS42 INS42 INS33 UPD43 UPD42 INS21 INS53 UPD42 MOV42 INS27 INS32 UPD42 MOV42 INS40 INS42 INS42 INS42 INS32 INS33 INS42 INS42 INS32 INS33 INS42 INS42 INS42 INS27 UPD42 MOV42 INS42 UPD42 MOV42 INS45 INS42 INS45 INS42 UPD42 UPD42 MOV42 INS42 INS32 INS32 INS32 UPD27 INS42 UPD42 MOV42 UPD43 INS40 INS33 INS42 INS33 INS42 INS43 INS59 UPD43 UPD27 MOV60 INS25 MOV53 INS43 INS42 INS27 INS42 INS48 INS33 INS42 UPD42 INS14 UPD42 UPD42 INS40 INS32 UPD42 UPD42 INS40 INS32 UPD42 UPD42 INS40 MOV32 INS22 INS42 INS22 INS42 INS42 MOV32 INS36 INS52 INS32 INS42 INS60 INS60 INS54 UPD42 MOV42 MOV21 MOV45 MOV42 MOV32 INS22 UPD42 INS43 MOV43 UPD42 INS27 INS32 INS21 INS32 INS8 INS42 MOV42 INS42 UPD42 MOV42 UPD42 MOV42 MOV3 UPD42 UPD42 INS42 INS40 UPD42 INS32 INS42 INS33 MOV21 INS21 INS25 INS25 INS21 INS42 INS42 INS45 INS45 MOV43 INS42 INS42 INS42 INS32 MOV43 INS59 UPD43 INS42 INS43 INS42 UPD42 MOV42 UPD42 MOV42 INS43 INS45 UPD42 MOV42 UPD42 MOV42 INS32 MOV25 INS42 INS33 UPD42 INS32 INS42 INS42 INS33 INS32 UPD42 MOV42 INS42 INS42 MOV38 INS32 INS42 INS42 UPD42 INS42 INS42 INS32 UPD42 UPD42 UPD42 MOV42 INS42 INS32 UPD42 UPD42 INS14 UPD42 INS33 MOV21 INS27 INS8 INS42 MOV27 MOV38 INS42 INS42 INS42 INS43 UPD42 MOV42 INS42 INS45 INS42 UPD42 MOV42 INS45 INS52 INS42 INS52 INS42 INS27 INS42 INS42 INS43 INS59 INS39 INS59 INS8 INS8 INS48 INS52 INS42 UPD42 MOV42 INS74 INS42 INS33 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS25 MOV21 INS34 UPD74 INS42 INS42 INS42 INS40 INS7 INS32 INS8 INS8 INS32 INS8 INS8 INS32 INS42 INS42 INS42 INS32 INS60 UPD42 INS42 INS42 INS42 INS33 INS32 INS8 INS8 INS42 INS42 INS45 INS42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 INS32 INS32 INS32 UPD42 UPD42 UPD42 MOV42 MOV32 UPD42 MOV42 UPD42 MOV42 MOV43 MOV32 INS42 INS33 INS21 MOV21 MOV21 UPD42 INS32 INS42 INS42 INS33 INS42 INS42 INS40 INS42 INS32 INS21 INS21 MOV21 INS42 INS43 INS42 INS42 INS42 INS38 INS8 UPD42 UPD42 INS45 UPD42 INS42 INS40 UPD42 MOV42 UPD42 MOV42 UPD40 MOV40 INS60 MOV25 INS21 INS60 INS25 INS21 INS42 INS42 INS40 INS21 INS60 MOV25 INS21 INS21 INS60 MOV25 INS21 INS42 INS42 INS45 INS45 INS42 INS32 INS43 INS59 UPD42 MOV42 UPD42 MOV42 INS33 INS42 MOV21 MOV21 MOV21 UPD42 MOV42 UPD42 UPD42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 UPD40 INS32 INS32 INS42 INS42 INS42 INS42 INS48 INS7 UPD42 MOV42 INS32 MOV21 UPD42 UPD42 INS32 INS83 MOV43 INS59 UPD27 INS8 INS32 MOV43 MOV59 MOV27 INS8 INS8 INS32 INS32 INS83 MOV43 INS59 INS8 INS32 INS32 MOV43 INS59 INS8 INS32 INS42 INS42 INS42 INS42 INS42 INS16 INS7 INS7 UPD42 MOV42 UPD42 MOV42 INS42 INS42 INS32 UPD42 INS32 UPD42 INS32 INS42 INS42 INS40 INS42 INS42 UPD42 MOV42 UPD40 MOV40 INS32 INS42 INS42 INS32 UPD42 INS33 INS21 INS42 INS42 INS45 INS45 UPD42 INS32 MOV21 MOV21 INS42 INS42 INS45 INS45 INS42 INS42 INS45 INS45 INS42 INS32 UPD42 INS21 INS42 INS42 INS45 INS45 INS42 INS42 INS45 INS45 INS42 INS32 UPD42 INS21 INS42 INS42 INS45 INS45 INS36 INS40 INS40 INS42 INS33 INS42 INS42 UPD42 UPD42 INS9 INS42 INS32 INS42 INS42 INS40 UPD42 MOV42 INS42 INS40 UPD42 MOV42 INS42 INS40 INS42 UPD42 MOV42 UPD42 MOV42 INS42 INS42 INS40 INS32 INS42 INS42 INS40 INS42 INS42 INS40 INS32 INS42 INS42 INS40 INS32 INS62 UPD42 MOV42 UPD42 MOV42 UPD42 UPD42 INS42 INS45 INS32 INS42 INS42 INS45 INS45 UPD42 UPD42 INS45 INS32 UPD42 UPD42 INS45 INS45 INS42 INS42 INS45 INS42 INS42 INS42 INS45 INS42 INS42 MOV43 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 INS42 DEL33 DEL42 DEL40 DEL32 DEL42 DEL7 DEL21 DEL83 DEL83 DEL39 DEL42 DEL9 DEL59 DEL23 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL7 DEL21 DEL42 DEL42 DEL42 DEL45 DEL42 DEL45 DEL45 DEL45 DEL45 DEL27 DEL32 DEL21 DEL8 DEL25 DEL42 DEL78 DEL83 DEL39 DEL42 DEL39 DEL42 DEL44 DEL42 DEL42 DEL7 DEL21 DEL8 DEL31 DEL83 DEL39 DEL42 DEL42 DEL41 DEL8 DEL31 DEL42 DEL9 DEL32 DEL21 DEL39 DEL9 DEL83 DEL83 DEL23 DEL83 DEL83 DEL42 DEL33 DEL59 DEL23 DEL83 DEL83 DEL42 DEL33 DEL59 DEL23 DEL83 DEL83 DEL39 DEL42 DEL59 DEL23 DEL83 DEL83 DEL39 DEL42 DEL59 DEL23 DEL83 DEL83 DEL39 DEL42 DEL59 DEL23 DEL83 DEL83 DEL42 DEL83 DEL83 DEL83 DEL42 DEL45 DEL59 DEL23 DEL83 DEL83 DEL83 DEL42 DEL45 DEL59 DEL23 DEL83 DEL83 DEL83 DEL43 DEL42 DEL43 DEL42 DEL43 DEL74 DEL59 DEL23 DEL83 DEL42 DEL8 DEL42 DEL42 DEL45 DEL45 DEL32 DEL21 DEL42 DEL42 DEL45 DEL45 DEL32 DEL21 DEL8 DEL25 DEL42 DEL59 DEL60 DEL42 DEL42 DEL42 DEL45 DEL42 DEL32 DEL21 DEL8 DEL8 DEL25 DEL8 DEL25 DEL45 DEL45 DEL32 DEL21 DEL42 DEL42 DEL42 DEL32 DEL21 DEL8 DEL28 DEL83 DEL83 DEL83 DEL42 DEL43 DEL42 DEL43 DEL32 DEL40 DEL42 DEL14 DEL59 DEL23 DEL83 DEL83 DEL83 DEL42 DEL43 DEL42 DEL43 DEL42 DEL43 DEL74 DEL42 DEL43 DEL74 DEL14 DEL59 DEL23 DEL83 DEL42 DEL42 DEL45 DEL45 DEL32 DEL21 DEL42 DEL42 DEL42 DEL32 DEL21 DEL8 DEL28 DEL83 DEL83 DEL83 DEL42 DEL43 DEL42 DEL42 DEL42 DEL32 DEL40 DEL42 DEL14 DEL59 DEL23 DEL83 DEL83 DEL83 DEL42 DEL43 DEL85 DEL5 DEL42 DEL42 DEL43 DEL85 DEL5 DEL42 DEL42 DEL4 DEL3 DEL59 DEL23 DEL83 DEL83 DEL83 DEL42 DEL43 DEL85 DEL5 DEL42 DEL43 DEL85 DEL5 DEL42 DEL42 DEL42 DEL4 DEL3 DEL59 DEL23 DEL83 DEL83 DEL83 DEL43 DEL85 DEL5 DEL42 DEL42 DEL43 DEL85 DEL5 DEL42 DEL42 DEL4 DEL3 DEL59 DEL23 DEL55 DEL29 DEL83 DEL83 DEL42 DEL40 DEL43 DEL83 DEL42 DEL43 DEL85 DEL5 DEL42 DEL59 DEL23 DEL42 DEL42 DEL43 DEL85 DEL5 DEL42 DEL44 DEL31 DEL55 DEL40 DEL33 DEL42 DEL42 DEL42 DEL17 DEL8 DEL31 DEL66 DEL65 DEL42 DEL66 DEL65 DEL42 DEL66 DEL66 DEL66 DEL65 DEL29 DEL83 DEL83 DEL39 DEL42 DEL44 DEL52 DEL42 DEL22 DEL42 DEL32 DEL7 DEL21 DEL52 DEL42 DEL22 DEL42 DEL42 DEL42 DEL32 DEL7 DEL21 DEL52 DEL42 DEL22 DEL42 DEL7 DEL21 DEL42 DEL32 DEL27 DEL42 DEL38 DEL27 DEL83 DEL43 DEL74 DEL45 DEL45 DEL45 DEL42 DEL8 DEL42 DEL42 DEL45 DEL45 DEL32 DEL21 DEL42 DEL42 DEL45 DEL42 DEL32 DEL21 DEL8 DEL25 DEL42 DEL42 DEL45 DEL45 DEL32 DEL21 DEL60 DEL42 DEL43 DEL42 DEL43 DEL14 DEL59 DEL60 DEL42 DEL43 DEL42 DEL42 DEL40 DEL33 DEL42 DEL32 DEL59 DEL60 DEL42 DEL43 DEL43 DEL74 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL32 DEL42 DEL43 DEL45 DEL14 DEL53 DEL8 DEL25 DEL42 DEL42 DEL9 DEL14 DEL59 DEL60 DEL42 DEL41 DEL8 DEL42 DEL32 DEL21 DEL42 DEL42 DEL42 DEL32 DEL21 DEL8 DEL12 DEL54 DEL8 DEL31 DEL42 DEL42 DEL42 DEL43 DEL57 DEL32 DEL42 DEL32 DEL42 DEL32 DEL59 DEL60 DEL42 DEL43 DEL42 DEL42 DEL43 DEL42 DEL42 DEL32 DEL40 DEL33 DEL14 DEL59 DEL60 DEL42 DEL32 DEL42 DEL42 DEL32 DEL21 DEL42 DEL42 DEL32 DEL21 DEL42 DEL42 DEL40 DEL32 DEL21 DEL42 DEL42 DEL45 DEL45 DEL32 DEL45 DEL45 DEL45 DEL45 DEL32 DEL42 DEL45 DEL45 DEL32 DEL21 DEL8 DEL8 DEL83 DEL42 DEL42 DEL33 DEL32 DEL21 DEL8 DEL25 DEL8 DEL31 DEL83 DEL39 DEL39 DEL42 DEL9 DEL42 DEL14 DEL7 DEL21 DEL8 DEL42 DEL42 DEL32 DEL42 DEL42 DEL45 DEL42 DEL45 DEL45 DEL27 DEL32 DEL21 DEL8 DEL25 DEL42 DEL42 DEL7 DEL21 DEL8 DEL25 DEL42 DEL43 DEL42 DEL42 DEL42 DEL14 DEL32 DEL59 DEL60 DEL42 DEL42 DEL42 DEL14 DEL59 DEL60 DEL42 DEL42 DEL42 DEL32 DEL21 DEL42 DEL42 DEL42 DEL32 DEL21 DEL42 DEL42 DEL32 DEL21 DEL83 DEL42 DEL42 DEL7 DEL42 DEL43 DEL85 DEL5 DEL42 DEL42 DEL42 DEL32 DEL42 DEL41 DEL8 DEL42 DEL42 DEL32 DEL42 DEL41 DEL8 DEL32 DEL42 DEL42 DEL45 DEL42 DEL42 DEL32 DEL32 DEL21 DEL8 DEL42 DEL42 DEL45 DEL42 DEL32 DEL21 DEL8 DEL25 DEL42 DEL42 DEL45 DEL42 DEL32 DEL21 DEL42 DEL41 DEL8 DEL25 DEL25 DEL25 DEL33 DEL41 DEL52 DEL42 DEL22 DEL42 DEL7 DEL21 DEL42 DEL83 DEL42 DEL42 DEL41 DEL8 DEL31 DEL83 DEL42 DEL42 DEL39 DEL42 DEL31 DEL66 DEL65 DEL29 DEL83 DEL32 DEL42 DEL45 DEL45 DEL27 DEL32 DEL21 DEL8 DEL45 DEL45 DEL32 DEL45 DEL42 DEL83 DEL83 DEL39 DEL42 DEL42 DEL7 DEL21 DEL42 DEL42 DEL7 DEL21 DEL43 DEL42 DEL42 DEL43 DEL14 DEL59 DEL60 DEL43 DEL42 DEL59 DEL60 DEL39 DEL42 DEL34 DEL59 DEL60 DEL42 DEL42 DEL40 DEL42 DEL14 DEL32 DEL7 DEL21 DEL42 DEL42 DEL32 DEL21 DEL40 DEL42 DEL42 DEL42 DEL32 DEL42 DEL27 DEL32 DEL21 DEL42 DEL42 DEL9 DEL14 DEL7 DEL21 DEL32 DEL21 DEL42 DEL42 DEL40 DEL32 DEL21 DEL8 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL42 DEL43 DEL42 DEL42 DEL14 DEL59 DEL60 DEL42 DEL53 DEL8 DEL12 DEL54 DEL42 DEL42 DEL45 DEL42 DEL45 DEL42 DEL27 DEL32 DEL21 DEL8 DEL31 DEL38 DEL42 DEL32 DEL40 DEL27 DEL27 DEL25 DEL42 DEL43 DEL57 DEL8 DEL51 DEL42 DEL42 DEL45 DEL45 DEL83 DEL83 DEL39 DEL42 DEL31 DEL42 DEL45 DEL45 DEL42 DEL42 DEL42 DEL45 DEL42 DEL32 DEL21 DEL42 DEL42 DEL32 DEL38 DEL42 DEL42 DEL32 DEL40 DEL27 DEL27 DEL42 DEL38 DEL27 DEL25 DEL42 DEL32 DEL21 DEL40 DEL42 DEL42 DEL32 DEL34 DEL45 DEL42 DEL27 DEL83 DEL83 DEL39 DEL42 DEL39 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL42 DEL32 DEL38 DEL27 DEL41 DEL8 DEL25 DEL43 DEL42 DEL42 DEL32 DEL59 DEL60 DEL27 DEL42 DEL42 DEL42 DEL32 DEL27 DEL27 DEL41 DEL8 DEL25 DEL42 DEL33 DEL27 DEL42 DEL33 DEL27 DEL27 DEL43 DEL42 DEL14 DEL53 DEL8 DEL25 DEL42 DEL42 DEL32 DEL8 DEL25 DEL42 DEL43 DEL57 DEL42 DEL42 DEL40 DEL42 DEL32 DEL14 DEL32 DEL7 DEL21 DEL42 DEL42 DEL32 DEL42 DEL42 DEL45 DEL42 DEL27 DEL32 DEL21 DEL8 DEL25 DEL42 DEL32 DEL21 DEL40 DEL42 DEL42 DEL42 DEL32 DEL42 DEL27 DEL32 DEL21 DEL42 DEL42 DEL32 DEL21 DEL8 DEL51 DEL8 DEL43 DEL42 DEL44 DEL42 DEL34 DEL27 DEL8 DEL25 DEL42 DEL43 DEL42 DEL43 DEL42 DEL42 DEL14 DEL59 DEL60 DEL42 DEL42 DEL32 DEL21 DEL42 DEL53 DEL8 DEL12 DEL54 DEL8 DEL31 DEL83 DEL42 DEL42 DEL38 DEL27 DEL41 DEL8 DEL25 DEL42 DEL43 DEL60 DEL40 DEL42 DEL42 DEL32 DEL42 DEL32 DEL42 DEL32 DEL40 DEL42 DEL42 DEL32 DEL83 DEL83 DEL83 DEL42 DEL33 DEL59 DEL60 DEL42 DEL33 DEL59 DEL60 DEL39 DEL34 DEL59 DEL60 DEL42 DEL42 DEL7 DEL21 DEL42 DEL42 DEL7 DEL21 DEL42 DEL42 DEL7 DEL21 DEL42 DEL43 DEL42 DEL42 DEL14 DEL32 DEL59 DEL60 DEL40 DEL32 DEL42 DEL27 DEL32 DEL21 DEL60 DEL32 DEL21 DEL42 DEL41 DEL8 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL60 DEL42 DEL53 DEL8 DEL12 DEL8 DEL54 DEL8 DEL31 DEL83 DEL42 DEL22 DEL83 DEL83 DEL39 DEL42 DEL8 DEL31 DEL42 DEL42 DEL9 DEL14 DEL59 DEL60 DEL42 DEL9 DEL14 DEL59 DEL60 DEL42 DEL42 DEL40 DEL32 DEL21 DEL42 DEL41 DEL34 DEL42 DEL32 DEL42 DEL27 DEL42 DEL39 DEL34 DEL45 DEL32 DEL27 DEL42 DEL42 DEL42 DEL32 DEL42 DEL42 DEL32 DEL40 DEL42 DEL42 DEL42 DEL32 DEL40 DEL42 DEL14 DEL83 DEL42 DEL59 DEL60 DEL42 DEL33 DEL27 DEL42 DEL32 DEL27 DEL83 DEL83 DEL42 DEL43 DEL43 DEL42 DEL32 DEL7 DEL42 DEL4 DEL42 DEL43 DEL42 DEL9 DEL14 DEL34 DEL40 DEL32 DEL42 DEL27 DEL42 DEL43 DEL42 DEL42 DEL14 DEL42 DEL42 DEL42 DEL7 DEL21 DEL42 DEL42 DEL7 DEL21 DEL42 DEL22 DEL40 DEL40 DEL40

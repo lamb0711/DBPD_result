@@ -1,0 +1,318 @@
+JCR-3263 load in structural node information immediately for better performance and add option to load the complete node graph first before checking for consistency. performance is boosted dozens of times on large repositories when enabling this option but requires more memory
+
+git-svn-id: https://svn.apache.org/repos/asf/jackrabbit/trunk@1351240 13f79535-47bb-0310-9956-ffa450edef68
+
++import java.util.Collections;
++import java.util.Map;
++import org.apache.jackrabbit.core.persistence.util.NodeInfo;
+-    private static Logger log = LoggerFactory
+-            .getLogger(ConsistencyCheckerImpl.class);
++    private static Logger log = LoggerFactory.getLogger(ConsistencyCheckerImpl.class);
+-    // process 64K nodes at once
+-    private static int NODESATONCE = 1024 * 64;
++    /**
++     * The number of nodes to fetch at once from the persistence manager. Defaults to 8kb
++     */
++    private static final int NODESATONCE = Integer.getInteger("org.apache.jackrabbit.checker.nodesatonce", 1024 * 8);
++
++    /**
++     * Whether to load all node infos before checking or to check nodes as they are loaded.
++     * The former is magnitudes faster but requires more memory.
++     */
++    private static final boolean CHECKAFTERLOADING = Boolean.getBoolean("org.apache.jackrabbit.checker.checkafterloading");
+-        int total = internalCheckConsistency(uuids, recursive, fix, reports,
+-                lostNFoundId);
++        int total = internalCheckConsistency(uuids, recursive, fix, reports, lostNFoundId);
+-        if (fix && lostNFoundId != null) {
+-            // do we have a "lost+found" node?
+-            try {
+-                NodeId tmpid = new NodeId(lostNFoundId);
+-                NodePropBundle lfBundle = pm.loadBundle(tmpid);
+-                if (lfBundle == null) {
+-                    error(lostNFoundId,
+-                            "specified 'lost+found' node does not exist");
+-                } else if (!NameConstants.NT_UNSTRUCTURED.equals(lfBundle
+-                        .getNodeTypeName())) {
+-                    error(lostNFoundId,
+-                            "specified 'lost+found' node is not of type nt:unstructured");
+-                } else {
+-                    lostNFound = lfBundle.getId();
++        if (fix) {
++            if (lostNFoundId != null) {
++                // do we have a "lost+found" node?
++                try {
++                    NodeId tmpid = new NodeId(lostNFoundId);
++                    NodePropBundle lfBundle = pm.loadBundle(tmpid);
++                    if (lfBundle == null) {
++                        error(lostNFoundId, "Specified 'lost+found' node does not exist");
++                    } else if (!NameConstants.NT_UNSTRUCTURED.equals(lfBundle .getNodeTypeName())) {
++                        error(lostNFoundId, "Specified 'lost+found' node is not of type nt:unstructured");
++                    } else {
++                        lostNFound = lfBundle.getId();
++                    }
++                } catch (Exception ex) {
++                    error(lostNFoundId, "finding 'lost+found' folder", ex);
+-            } catch (Exception ex) {
+-                error(lostNFoundId, "finding 'lost+found' folder", ex);
++            } else {
++                log.info("No 'lost+found' node specified: orphans cannot be fixed");
+-                List<NodeId> allIds = pm.getAllNodeIds(null, NODESATONCE);
++                Map<NodeId, NodeInfo> batch = pm.getAllNodeInfos(null, NODESATONCE);
++                Map<NodeId, NodeInfo> allInfos = batch;
+-                while (!allIds.isEmpty()) {
++                while (!batch.isEmpty()) {
+-                    for (NodeId id : allIds) {
++                    for (Map.Entry<NodeId, NodeInfo> entry : batch.entrySet()) {
++                        NodeId id = entry.getKey();
+-                        try {
+-                            // parse and check bundle
+-                            NodePropBundle bundle = pm.loadBundle(id);
+-                            if (bundle == null) {
+-                                error(id.toString(), "No bundle found for id '"
+-                                        + id + "'");
+-                            } else {
+-                                checkBundleConsistency(id, bundle, fix, lostNFound, reports);
+-                                count++;
+-                                if (count % 1000 == 0 && listener == null) {
+-                                    log.info(pm + ": checked " + count
+-                                            + " bundles...");
+-                                }
+-                            }
+-                        } catch (ItemStateException e) {
+-                            // problem already logged (loadBundle called with
+-                            // logDetailedErrors=true)
++                        count++;
++                        if (count % 1000 == 0) {
++                            log.info(pm + ": loaded " + count + " infos...");
++                        }
++
++                        if (!CHECKAFTERLOADING) {
++                            // check immediately
++                            NodeInfo nodeInfo = entry.getValue();
++                            checkBundleConsistency(id, nodeInfo, fix, lostNFound, reports, batch);
+-                    if (!allIds.isEmpty()) {
+-                        allIds = pm.getAllNodeIds(lastId, NODESATONCE);
++                    batch = pm.getAllNodeInfos(lastId, NODESATONCE);
++
++                    if (CHECKAFTERLOADING) {
++                        allInfos.putAll(batch);
++                    }
++                }
++
++                if (CHECKAFTERLOADING) {
++                    // check info
++                    for (Map.Entry<NodeId, NodeInfo> entry : allInfos.entrySet()) {
++                        checkBundleConsistency(entry.getKey(), entry.getValue(), fix, lostNFound, reports, allInfos);
+-                        checkBundleConsistency(id, bundle, fix, lostNFound, reports);
++                        checkBundleConsistency(id, new NodeInfo(bundle), fix, lostNFound,
++                                reports, Collections.<NodeId, NodeInfo>emptyMap());
++        // clear the NodeId pool
++        NodeInfo.clearPool();
++
+-     * Checks a single bundle for inconsistencies, ie. inexistent child nodes
+-     * and inexistent parents.
+-     * 
+-     * @param id
+-     *            node id for the bundle to check
+-     * @param bundle
+-     *            the bundle to check
+-     * @param fix
+-     *            if <code>true</code>, repair things that can be repaired
++     * Checks a single bundle for inconsistencies, ie. inexistent child nodes, inexistent parents, and other
++     * structural inconsistencies.
++     *
++     * @param id node id for the bundle to check
++     * @param nodeInfo the node info for the node to check
++     * @param fix if <code>true</code>, repair things that can be repaired
++     * {@linkplain org.apache.jackrabbit.core.persistence.util.NodePropBundle bundles} here
++     * @param infos all the {@link NodeInfo}s loaded in the current batch
+-    private void checkBundleConsistency(NodeId id, NodePropBundle bundle, boolean fix, NodeId lostNFoundId, Set<ReportItem> reports) {
++    private void checkBundleConsistency(NodeId id, NodeInfo nodeInfo,
++                                        boolean fix, NodeId lostNFoundId,
++                                        Set<ReportItem> reports, Map<NodeId, NodeInfo> infos) {
+-        for (NodePropBundle.ChildNodeEntry entry : bundle.getChildNodeEntries()) {
+-            final NodeId childNodeId = entry.getId();
++        NodePropBundle bundle = null;
++
++        for (final NodeId childNodeId : nodeInfo.getChildren()) {
+-                final NodePropBundle childBundle = pm.loadBundle(childNodeId);
+-                String message = null;
+-                if (childBundle == null) {
+-                    // double check whether we still exist and the child entry is still there
+-                    bundle = pm.loadBundle(id);
++                NodePropBundle childBundle = null;
++                NodeInfo childNodeInfo = infos.get(childNodeId);
+-                    if (bundle != null) {
+-                        boolean stillThere = false;
+-                        for (NodePropBundle.ChildNodeEntry entryRetry : bundle.getChildNodeEntries()) {
+-                            if (entryRetry.getId().equals(childNodeId)) {
+-                                stillThere = true;
+-                                break;
+-                            }
++                String message = null;
++                // does the child exist?
++                if (childNodeInfo == null) {
++                    // try to load the bundle
++                    childBundle = pm.loadBundle(childNodeId);
++                    if (childBundle == null) {
++                        // the child indeed does not exist
++                        // double check whether we still exist and the child entry is still there
++                        if (bundle == null) {
++                            bundle = pm.loadBundle(id);
+-                        if (stillThere) {
+-                            message = "NodeState '" + id
+-                                    + "' references inexistent child" + " '"
+-                                    + entry.getName() + "' with id " + "'"
+-                                    + childNodeId + "'";
+-                            log.error(message);
+-                            missingChildren.add(entry);
+-                        }
+-                    } else {
+-                        return;
+-                    }
+-                } else {
+-                    NodeId cp = childBundle.getParentId();
+-                    if (!id.equals(cp)) {
+-                        // double check whether the child entry is still there
+-                        bundle = pm.loadBundle(id);
+-                            boolean stillThere = false;
+-                            for (NodePropBundle.ChildNodeEntry entryRetry : bundle.getChildNodeEntries()) {
+-                                if (entryRetry.getId().equals(childNodeId)) {
+-                                    stillThere = true;
++                            NodePropBundle.ChildNodeEntry childNodeEntry = null;
++                            for (NodePropBundle.ChildNodeEntry entry : bundle.getChildNodeEntries()) {
++                                if (entry.getId().equals(childNodeId)) {
++                                    childNodeEntry = entry;
+-                            if (stillThere) {
+-                                // indeed we have a disconnected child
+-                                message = "ChildNode has invalid parent id: '" + cp + "' (instead of '" + id + "')";
++                            if (childNodeEntry != null) {
++                                message = "NodeState '" + id + "' references inexistent child '" + childNodeId + "'";
+-                                disconnectedChildren.add(entry);
++                                missingChildren.add(childNodeEntry);
++                    } else {
++                        // exists after all
++                        childNodeInfo = new NodeInfo(childBundle);
++                    }
++                }
++                if (childNodeInfo != null) {
++                    // if the child exists does it reference the current node as its parent?
++                    NodeId cp = childNodeInfo.getParentId();
++                    if (!id.equals(cp)) {
++                        // double check whether the child still has a different parent
++                        if (childBundle == null) {
++                            childBundle = pm.loadBundle(childNodeId);
++                        }
++                        if (childBundle != null && !childBundle.getParentId().equals(id)) {
++                            // double check if we still exist
++                            if (bundle == null) {
++                                bundle = pm.loadBundle(id);
++                            }
++                            if (bundle != null) {
++                                // double check if the child node entry is still there
++                                NodePropBundle.ChildNodeEntry childNodeEntry = null;
++                                for (NodePropBundle.ChildNodeEntry entry : bundle.getChildNodeEntries()) {
++                                    if (entry.getId().equals(childNodeId)) {
++                                        childNodeEntry = entry;
++                                        break;
++                                    }
++                                }
++                                if (childNodeEntry != null) {
++                                    // indeed we have a disconnected child
++                                    message = "ChildNode has invalid parent id: '" + cp + "' (instead of '" + id + "')";
++                                    log.error(message);
++                                    disconnectedChildren.add(childNodeEntry);
++                                }
++                            } else {
++                                return;
++                            }
++
++                        }
+-        NodeId parentId = bundle.getParentId();
++        NodeId parentId = nodeInfo.getParentId();
+-                NodePropBundle parentBundle = pm.loadBundle(parentId);
++                NodePropBundle parentBundle = null;
++                NodeInfo parentInfo = infos.get(parentId);
+-                if (parentBundle == null) {
+-                    // double check whether we still exist and the parent is still the same
+-                    bundle = pm.loadBundle(id);
+-                    if (bundle != null) {
+-                        if (parentId.equals(bundle.getParentId())) {
+-                            String message = "NodeState '" + id
+-                                    + "' references inexistent parent id '" + parentId
+-                                    + "'";
+-                            log.error(message);
+-                            addMessage(reports, id, message);
+-                            if (fix && lostNFoundId != null) {
+-                                // add a child to lost+found
+-                                NodePropBundle lfBundle = pm.loadBundle(lostNFoundId);
+-                                lfBundle.markOld();
+-                                String nodeName = id + "-" + System.currentTimeMillis();
+-                                lfBundle.addChildNodeEntry(NF.create("", nodeName), id);
+-                                pm.storeBundle(lfBundle);
+-                                pm.evictBundle(lostNFoundId);
++                // does the parent exist?
++                if (parentInfo == null) {
++                    // try to load the bundle
++                    parentBundle = pm.loadBundle(parentId);
++                    if (parentBundle == null) {
++                        // indeed the parent doesn't exist
++                        // double check whether we still exist and the parent is still the same\
++                        if (bundle == null) {
++                            bundle = pm.loadBundle(id);
++                        }
++                        if (bundle != null) {
++                            if (parentId.equals(bundle.getParentId())) {
++                                // indeed we have an orphaned node
++                                String message = "NodeState '" + id + "' references inexistent parent id '" + parentId + "'";
++                                log.error(message);
++                                addMessage(reports, id, message);
++                                if (fix && lostNFoundId != null) {
++                                    // add a child to lost+found
++                                    NodePropBundle lfBundle = pm.loadBundle(lostNFoundId);
++                                    lfBundle.markOld();
++                                    String nodeName = id + "-" + System.currentTimeMillis();
++                                    lfBundle.addChildNodeEntry(NF.create("", nodeName), id);
++                                    pm.storeBundle(lfBundle);
++                                    pm.evictBundle(lostNFoundId);
+-                                // set lost+found parent
+-                                bundle.setParentId(lostNFoundId);
+-                                fixBundle(bundle);
++                                    // set lost+found parent
++                                    bundle.setParentId(lostNFoundId);
++                                    fixBundle(bundle);
++                                }
++                        } else {
++                            return;
+-                        return;
++                        // parent exists after all
++                        parentInfo = new NodeInfo(parentBundle);
+-                } else {
++                }
++                if (parentInfo != null) {
++                    // if the parent exists, does it have a child node entry for us?
+-                    for (NodePropBundle.ChildNodeEntry entry : parentBundle.getChildNodeEntries()) {
+-                        if (entry.getId().equals(id)) {
++                    for (NodeId childNodeId : parentInfo.getChildren()) {
++                        if (childNodeId.equals(id)){
++                    if (!found && parentBundle == null) {
++                        // double check the parent
++                        parentBundle = pm.loadBundle(parentId);
++                        if (parentBundle != null) {
++                            for (NodePropBundle.ChildNodeEntry entry : parentBundle.getChildNodeEntries()) {
++                                if (entry.getId().equals(id)) {
++                                    found = true;
++                                    break;
++                                }
++                            }
++                        }
++                    }
+-                        // double check whether we still exist and the parent is still the same
+-                        bundle = pm.loadBundle(id);
++                        // double check whether we still exist and the parent id is still the same
++                        if (bundle == null) {
++                            bundle = pm.loadBundle(id);
++                        }
++                                // indeed we have an abandoned node
+
+INS26 INS26 INS26 INS40 INS40 INS40 INS23 INS29 INS83 INS29 INS83 INS83 INS83 INS39 INS59 INS44 INS44 MOV8 INS65 INS32 INS65 INS42 INS32 INS25 INS21 INS65 UPD43 MOV43 UPD42 MOV42 INS74 INS42 MOV25 MOV25 MOV60 MOV60 INS60 INS70 MOV25 INS60 INS54 INS66 INS42 INS42 INS45 INS27 INS66 INS66 INS42 INS42 INS45 INS42 INS8 INS32 UPD66 UPD66 UPD66 UPD42 UPD66 UPD66 INS65 INS66 INS42 INS66 INS65 INS66 UPD42 INS43 MOV43 INS43 MOV43 INS59 INS44 INS32 INS8 MOV43 INS59 MOV8 MOV12 MOV34 UPD34 MOV34 MOV25 INS42 INS42 INS40 INS66 INS42 UPD42 MOV42 INS42 INS42 INS33 INS83 INS43 INS42 INS42 INS42 MOV25 INS54 INS42 INS32 MOV27 INS8 INS42 INS8 MOV12 INS42 INS42 MOV27 INS8 INS43 INS42 INS21 INS60 INS61 INS25 INS60 INS60 MOV60 INS25 INS25 MOV25 INS60 INS60 INS25 INS25 INS42 INS32 UPD74 INS74 INS59 MOV38 INS8 INS42 INS8 MOV43 INS59 INS43 INS59 INS27 INS8 INS27 INS8 MOV43 INS59 INS43 INS59 INS27 INS8 INS27 MOV8 INS42 INS42 INS42 INS45 UPD43 INS43 UPD42 INS43 INS43 INS43 INS42 INS42 MOV60 INS70 INS21 MOV25 INS70 INS42 INS33 INS42 INS42 INS32 INS42 INS33 INS21 INS25 INS42 INS33 INS60 INS25 INS42 INS33 INS42 INS42 INS32 INS42 INS33 INS21 INS25 INS42 INS33 INS70 INS25 UPD42 INS42 UPD42 INS42 INS42 INS42 UPD42 MOV44 INS32 INS8 INS7 INS42 INS44 INS32 INS8 INS42 INS42 INS42 INS7 MOV27 INS8 INS8 MOV43 INS59 MOV38 INS8 INS42 INS42 INS42 INS7 MOV27 MOV8 INS8 INS44 INS32 INS8 INS27 INS8 INS74 INS42 INS42 INS42 MOV60 MOV21 MOV21 INS25 INS25 INS42 INS32 INS74 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 MOV21 INS42 MOV32 INS25 INS25 INS21 INS42 INS32 INS25 INS25 INS42 MOV32 INS25 INS21 INS43 INS42 INS42 INS42 INS25 INS38 INS27 INS21 INS25 INS25 INS43 INS43 INS43 UPD43 MOV27 MOV8 INS38 INS8 INS42 INS42 INS42 INS42 INS43 INS43 INS43 INS32 MOV27 INS8 MOV27 INS8 MOV8 INS7 INS42 INS42 INS27 INS8 INS27 INS8 INS27 INS8 INS7 INS42 INS32 INS8 INS42 INS42 INS33 INS7 INS27 INS8 INS27 INS8 UPD45 INS40 MOV42 INS42 UPD42 UPD42 INS42 INS60 MOV21 UPD42 INS42 INS42 INS40 UPD42 MOV42 INS42 INS42 INS32 INS32 INS42 UPD42 MOV42 UPD42 MOV42 INS42 INS14 INS32 MOV21 INS60 INS70 INS25 INS42 INS14 INS42 INS33 INS21 INS27 INS38 INS25 INS25 INS42 INS33 MOV21 INS42 INS14 INS42 INS42 INS42 INS21 INS10 INS42 INS32 INS42 INS33 MOV70 INS42 INS33 MOV21 UPD45 UPD42 UPD42 INS43 INS59 UPD42 MOV42 UPD42 MOV42 INS42 INS42 INS43 INS42 INS42 INS43 INS43 INS42 MOV43 INS59 MOV44 MOV32 INS8 INS27 INS8 INS43 INS42 INS7 INS42 INS33 INS32 INS27 INS8 MOV27 INS8 MOV8 INS43 INS42 INS7 INS42 INS42 INS42 UPD42 UPD42 MOV42 INS42 INS42 INS32 UPD42 INS42 INS42 INS42 INS42 INS42 INS33 MOV25 INS42 INS33 INS21 MOV21 INS21 INS42 INS42 INS32 MOV32 INS42 INS42 INS42 INS33 MOV21 INS60 INS70 MOV25 INS42 INS42 INS9 INS42 UPD45 UPD42 UPD45 INS42 INS42 INS32 INS8 INS7 INS32 INS42 INS42 INS42 MOV43 INS59 INS44 MOV32 INS8 INS27 MOV32 INS42 INS42 INS21 INS10 INS42 INS27 INS42 INS42 INS42 INS42 INS33 INS43 INS42 INS25 INS42 INS33 INS7 INS45 INS42 INS45 INS42 INS45 INS40 INS32 INS8 INS42 INS42 INS32 INS42 INS42 INS21 INS10 UPD42 INS42 INS42 INS7 INS42 INS42 DEL27 DEL42 DEL27 DEL43 DEL42 DEL42 DEL42 DEL32 DEL42 DEL33 DEL27 DEL27 DEL42 DEL42 DEL45 DEL42 DEL45 DEL27 DEL42 DEL32 DEL7 DEL42 DEL8 DEL25 DEL8 DEL43 DEL44 DEL8 DEL12 DEL54 DEL8 DEL70 DEL32 DEL38 DEL8 DEL25 DEL8 DEL61 DEL42 DEL42 DEL44 DEL42 DEL42 DEL59 DEL60 DEL42 DEL42 DEL32 DEL83 DEL42 DEL59 DEL60 DEL83 DEL42 DEL59 DEL60 DEL39 DEL42 DEL9 DEL59 DEL60 DEL42 DEL44 DEL42 DEL42 DEL32 DEL42 DEL42 DEL32 DEL42 DEL9 DEL7 DEL21 DEL10 DEL8 DEL25 DEL8 DEL70 DEL42 DEL42 DEL45 DEL42 DEL45 DEL45 DEL42 DEL42 DEL32 DEL45 DEL45 DEL42 DEL45 DEL27 DEL7 DEL21 DEL42 DEL42 DEL42 DEL32 DEL21 DEL8 DEL25 DEL8 DEL25 DEL8 DEL42 DEL59 DEL60 DEL39 DEL42 DEL9 DEL59 DEL60 DEL42 DEL44 DEL42 DEL42 DEL32 DEL42 DEL42 DEL32 DEL42 DEL9 DEL7 DEL21 DEL10 DEL8 DEL25 DEL8 DEL70 DEL8 DEL25 DEL8 DEL25 DEL8 DEL25 DEL8 DEL54 DEL8 DEL70 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL54 DEL8

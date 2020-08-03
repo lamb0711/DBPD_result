@@ -1,0 +1,227 @@
+Merging r1573814 through r1574170 from trunk.
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/branches/HDFS-5535@1574171 13f79535-47bb-0310-9956-ffa450edef68
+
++import java.util.concurrent.locks.ReentrantLock;
+-  private static final int START_TIME_CACHE_SIZE = 10000;
++  private static final int DEFAULT_START_TIME_READ_CACHE_SIZE = 10000;
++  private static final int DEFAULT_START_TIME_WRITE_CACHE_SIZE = 10000;
+-  @SuppressWarnings("unchecked")
+-  private final Map<EntityIdentifier, Long> startTimeCache =
+-      Collections.synchronizedMap(new LRUMap(START_TIME_CACHE_SIZE));
++  private Map<EntityIdentifier, Long> startTimeWriteCache;
++  private Map<EntityIdentifier, Long> startTimeReadCache;
++
++  /**
++   * Per-entity locks are obtained when writing.
++   */
++  private final LockMap<EntityIdentifier> writeLocks =
++      new LockMap<EntityIdentifier>();
++  @SuppressWarnings("unchecked")
++    startTimeWriteCache =
++        Collections.synchronizedMap(new LRUMap(getStartTimeWriteCacheSize(
++            conf)));
++    startTimeReadCache =
++        Collections.synchronizedMap(new LRUMap(getStartTimeReadCacheSize(
++            conf)));
++  private static class LockMap<K> {
++    private static class CountingReentrantLock<K> extends ReentrantLock {
++      private int count;
++      private K key;
++
++      CountingReentrantLock(K key) {
++        super();
++        this.count = 0;
++        this.key = key;
++      }
++    }
++
++    private Map<K, CountingReentrantLock<K>> locks =
++        new HashMap<K, CountingReentrantLock<K>>();
++
++    synchronized CountingReentrantLock<K> getLock(K key) {
++      CountingReentrantLock<K> lock = locks.get(key);
++      if (lock == null) {
++        lock = new CountingReentrantLock<K>(key);
++        locks.put(key, lock);
++      }
++
++      lock.count++;
++      return lock;
++    }
++
++    synchronized void returnLock(CountingReentrantLock<K> lock) {
++      if (lock.count == 0) {
++        throw new IllegalStateException("Returned lock more times than it " +
++            "was retrieved");
++      }
++      lock.count--;
++
++      if (lock.count == 0) {
++        locks.remove(lock.key);
++      }
++    }
++  }
++
+-      byte[] revStartTime = getStartTime(entityId, entityType, null, null, null);
++      byte[] revStartTime = getStartTime(entityId, entityType);
+-        byte[] startTime = getStartTime(entity, entityType, null, null, null);
++        byte[] startTime = getStartTime(entity, entityType);
++    LockMap.CountingReentrantLock<EntityIdentifier> lock =
++        writeLocks.getLock(new EntityIdentifier(entity.getEntityId(),
++            entity.getEntityType()));
++    lock.lock();
+-      byte[] revStartTime = getStartTime(entity.getEntityId(),
++      byte[] revStartTime = getAndSetStartTime(entity.getEntityId(),
+-            byte[] relatedEntityStartTime = getStartTime(relatedEntityId,
++            byte[] relatedEntityStartTime = getAndSetStartTime(relatedEntityId,
+-              startTimeCache.put(new EntityIdentifier(relatedEntityId,
++              startTimeWriteCache.put(new EntityIdentifier(relatedEntityId,
++      lock.unlock();
++      writeLocks.returnLock(lock);
++   * @return A byte array
++   * @throws IOException
++   */
++  private byte[] getStartTime(String entityId, String entityType)
++      throws IOException {
++    EntityIdentifier entity = new EntityIdentifier(entityId, entityType);
++    // start time is not provided, so try to look it up
++    if (startTimeReadCache.containsKey(entity)) {
++      // found the start time in the cache
++      return writeReverseOrderedLong(startTimeReadCache.get(entity));
++    } else {
++      // try to look up the start time in the db
++      byte[] b = createStartTimeLookupKey(entity.getId(), entity.getType());
++      byte[] v = db.get(b);
++      if (v == null) {
++        // did not find the start time in the db
++        return null;
++      } else {
++        // found the start time in the db
++        startTimeReadCache.put(entity, readReverseOrderedLong(v, 0));
++        return v;
++      }
++    }
++  }
++
++  /**
++   * Get the unique start time for a given entity as a byte array that sorts
++   * the timestamps in reverse order (see {@link
++   * GenericObjectMapper#writeReverseOrderedLong(long)}). If the start time
++   * doesn't exist, set it based on the information provided.
++   *
++   * @param entityId The id of the entity
++   * @param entityType The type of the entity
+-  private byte[] getStartTime(String entityId, String entityType,
++  private byte[] getAndSetStartTime(String entityId, String entityType,
+-      if (startTimeCache.containsKey(entity)) {
++      if (startTimeWriteCache.containsKey(entity)) {
+-        startTime = startTimeCache.get(entity);
++        startTime = startTimeWriteCache.get(entity);
++        return writeReverseOrderedLong(startTime);
+-        // try to look up the start time in the db
+-        byte[] b = createStartTimeLookupKey(entity.getId(), entity.getType());
+-        byte[] v = db.get(b);
+-        if (v == null) {
+-          // did not find the start time in the db
+-          // if this is a put, try to set it from the provided events
+-          if (events == null || writeBatch == null) {
+-            // no events, or not a put, so return null
+-            return null;
+-          }
++        if (events != null) {
++          // prepare a start time from events in case it is needed
+-          for (TimelineEvent e : events)
+-            if (min > e.getTimestamp())
++          for (TimelineEvent e : events) {
++            if (min > e.getTimestamp()) {
+-          startTime = min;
+-          // selected start time as minimum timestamp of provided events
+-          // write start time to db and cache
+-          writeBatch.put(b, writeReverseOrderedLong(startTime));
+-          startTimeCache.put(entity, startTime);
+-        } else {
+-          // found the start time in the db
+-          startTime = readReverseOrderedLong(v, 0);
+-          if (writeBatch != null) {
+-            // if this is a put, re-add the start time to the cache
+-            startTimeCache.put(entity, startTime);
++            }
++          startTime = min;
++        return checkStartTimeInDb(entity, startTime, writeBatch);
+-      // TODO: verify start time in db as well as cache?
+-      if (startTimeCache.containsKey(entity)) {
+-        // if the start time is already in the cache,
+-        // and it is different from the provided start time,
+-        // use the one from the cache
+-        if (!startTime.equals(startTimeCache.get(entity)))
+-          startTime = startTimeCache.get(entity);
+-      } else if (writeBatch != null) {
+-        // if this is a put, write the provided start time to the db and the
+-        // cache
+-        byte[] b = createStartTimeLookupKey(entity.getId(), entity.getType());
+-        writeBatch.put(b, writeReverseOrderedLong(startTime));
+-        startTimeCache.put(entity, startTime);
++      if (startTimeWriteCache.containsKey(entity)) {
++        // check the provided start time matches the cache
++        if (!startTime.equals(startTimeWriteCache.get(entity))) {
++          // the start time is already in the cache,
++          // and it is different from the provided start time,
++          // so use the one from the cache
++          startTime = startTimeWriteCache.get(entity);
++        }
++        return writeReverseOrderedLong(startTime);
++      } else {
++        // check the provided start time matches the db
++        return checkStartTimeInDb(entity, startTime, writeBatch);
+-    return writeReverseOrderedLong(startTime);
++  }
++
++  /**
++   * Checks db for start time and returns it if it exists.  If it doesn't
++   * exist, writes the suggested start time (if it is not null).  This is
++   * only called when the start time is not found in the cache,
++   * so it adds it back into the cache if it is found.
++   */
++  private byte[] checkStartTimeInDb(EntityIdentifier entity,
++      Long suggestedStartTime, WriteBatch writeBatch) throws IOException {
++    // create lookup key for start time
++    byte[] b = createStartTimeLookupKey(entity.getId(), entity.getType());
++    // retrieve value for key
++    byte[] v = db.get(b);
++    byte[] revStartTime;
++    if (v == null) {
++      // start time doesn't exist in db
++      if (suggestedStartTime == null) {
++        return null;
++      }
++      // write suggested start time
++      revStartTime = writeReverseOrderedLong(suggestedStartTime);
++      writeBatch.put(b, revStartTime);
++    } else {
++      // found start time in db, so ignore suggested start time
++      suggestedStartTime = readReverseOrderedLong(v, 0);
++      revStartTime = v;
++    }
++    startTimeWriteCache.put(entity, suggestedStartTime);
++    startTimeReadCache.put(entity, suggestedStartTime);
++    return revStartTime;
+-    startTimeCache.clear();
++    startTimeWriteCache.clear();
++    startTimeReadCache.clear();
++  }
++
++  @VisibleForTesting
++  static int getStartTimeReadCacheSize(Configuration conf) {
++    return conf.getInt(
++        YarnConfiguration.TIMELINE_SERVICE_LEVELDB_START_TIME_READ_CACHE_SIZE,
++        DEFAULT_START_TIME_READ_CACHE_SIZE);
++  }
++
++  @VisibleForTesting
++  static int getStartTimeWriteCacheSize(Configuration conf) {
++    return conf.getInt(
++        YarnConfiguration.TIMELINE_SERVICE_LEVELDB_START_TIME_WRITE_CACHE_SIZE,
++        DEFAULT_START_TIME_WRITE_CACHE_SIZE);
+
+INS26 INS40 INS23 INS23 INS23 INS23 INS55 INS31 INS31 INS31 INS31 INS31 INS83 INS83 INS83 INS39 INS59 MOV83 MOV74 INS59 INS83 INS74 INS59 INS29 INS83 MOV83 INS74 INS59 MOV79 INS83 INS83 INS42 INS73 INS55 INS23 INS31 INS31 MOV29 MOV83 INS5 MOV42 INS44 INS44 INS43 INS8 INS29 INS83 MOV5 INS42 MOV44 MOV44 MOV44 MOV44 MOV44 MOV43 INS8 INS29 INS83 INS5 INS42 INS44 INS44 INS44 INS43 INS8 INS78 INS83 INS39 INS42 INS44 INS8 INS78 INS83 INS39 INS42 INS44 INS8 INS42 INS34 UPD42 INS42 INS43 INS43 INS43 INS42 INS65 INS43 INS43 INS42 INS14 INS21 INS21 INS42 INS83 INS83 INS42 INS73 INS43 INS23 INS23 INS31 INS83 INS74 INS59 INS83 INS74 INS42 INS44 INS8 INS83 INS39 INS42 INS44 INS8 INS60 INS21 INS39 INS85 INS43 INS42 INS43 INS42 INS42 INS60 INS25 INS65 INS65 INS65 MOV65 MOV65 MOV65 INS65 INS65 MOV60 INS25 INS65 INS39 INS85 INS43 INS42 INS43 INS42 INS43 INS42 INS42 MOV60 INS60 INS60 INS25 MOV21 INS21 INS41 INS21 INS42 INS43 INS42 INS41 INS42 INS43 INS42 INS41 INS42 INS42 INS42 INS66 INS42 INS42 INS74 INS7 INS7 INS42 INS42 INS83 INS39 INS59 INS83 INS43 INS59 INS42 INS44 INS8 INS43 INS43 INS74 INS42 INS14 INS43 INS43 INS43 INS42 INS60 INS25 INS21 INS41 INS74 INS42 INS25 INS21 INS25 INS74 INS59 INS32 INS42 INS42 INS43 INS59 INS32 INS8 INS8 INS66 INS66 INS65 INS66 INS66 INS42 INS66 INS42 INS66 INS66 INS42 MOV27 MOV8 INS8 INS66 INS66 INS66 INS66 INS42 INS42 INS42 INS5 INS59 INS5 INS59 UPD27 MOV27 INS8 MOV8 INS32 INS42 INS32 INS42 INS32 INS42 INS32 INS43 INS43 INS42 INS32 INS42 INS32 INS42 INS42 INS42 INS43 INS42 INS46 INS21 INS21 INS42 INS42 INS43 INS43 INS74 INS42 INS42 INS42 INS74 INS59 INS27 INS8 INS37 INS42 INS43 INS43 INS27 INS8 INS37 INS27 INS8 INS43 INS43 INS42 INS32 INS42 INS42 INS21 INS21 INS42 INS42 INS14 INS42 INS42 INS42 INS41 MOV60 MOV60 INS25 INS68 INS25 INS39 INS85 INS42 INS32 INS39 INS85 INS42 UPD42 INS25 INS21 MOV21 MOV21 UPD42 UPD42 INS42 INS42 INS42 INS42 UPD42 INS42 INS42 INS42 INS42 INS40 INS42 INS42 INS42 INS40 INS42 INS42 INS42 INS42 INS42 MOV14 INS42 INS42 INS14 INS42 INS7 INS7 INS42 INS42 INS43 INS43 INS74 INS43 INS43 UPD42 MOV42 MOV32 INS42 INS33 INS21 INS21 INS40 INS42 INS42 INS40 INS34 INS53 INS40 INS40 INS34 INS21 INS40 INS42 INS42 INS42 INS14 INS32 INS32 INS43 INS42 INS42 INS32 MOV27 MOV8 INS8 INS42 INS42 INS69 MOV32 MOV8 INS8 INS42 INS42 INS42 INS27 INS8 INS7 INS7 INS32 INS43 INS32 INS22 INS34 INS22 INS42 INS42 INS42 INS43 INS43 INS42 INS42 UPD42 UPD42 INS42 INS7 INS32 INS14 INS32 INS43 INS32 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS21 INS41 INS39 UPD42 MOV41 INS41 UPD42 INS41 INS41 INS42 INS33 INS41 INS42 INS32 UPD42 MOV42 UPD42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS52 INS42 INS52 INS42 INS42 INS42 INS42 INS14 INS42 INS42 INS42 INS42 INS43 INS27 INS42 INS42 INS40 INS42 INS42 INS42 INS42 INS42 UPD42 INS42 INS42 INS42 INS32 INS42 INS27 INS32 INS8 INS32 INS32 INS33 INS42 INS42 INS74 INS42 INS42 INS45 INS45 INS42 INS42 INS42 INS32 INS42 INS33 INS42 INS42 INS42 INS42 INS21 INS42 INS42 INS42 INS42 INS42 INS42 INS43 INS43 INS42 INS42 INS34 UPD42 INS8 MOV7 INS42 INS42 MOV25 UPD42 INS8 UPD42 MOV21 UPD42 UPD42 DEL59 DEL23 DEL42 DEL33 DEL33 DEL33 DEL33 DEL33 DEL33 DEL42 DEL33 DEL27 DEL42 DEL33 DEL27 DEL27 DEL25 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL32 DEL21 DEL42 DEL42 DEL42 DEL42 DEL32 DEL21 DEL21 DEL42 DEL32 DEL42 DEL42 DEL42 DEL42 DEL32 DEL42 DEL33 DEL27 DEL8 DEL25 DEL8 DEL25 DEL25 DEL8 DEL25 DEL8 DEL31

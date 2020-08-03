@@ -1,0 +1,283 @@
+YARN-1222. Make improvements in ZKRMStateStore for fencing (Karthik Kambatla via bikas)
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/trunk@1541995 13f79535-47bb-0310-9956-ffa450edef68
+
++import java.security.NoSuchAlgorithmException;
++import java.util.Collections;
++import org.apache.hadoop.ha.HAServiceProtocol;
++import org.apache.hadoop.yarn.client.RMHAServiceTarget;
++import org.apache.hadoop.yarn.conf.HAUtil;
++import org.apache.hadoop.yarn.server.resourcemanager.ResourceManager;
++import org.apache.zookeeper.ZooDefs;
++import org.apache.zookeeper.data.Id;
++import org.apache.zookeeper.server.auth.DigestAuthenticationProvider;
++  /** Fencing related variables */
++  private static final String FENCING_LOCK = "RM_ZK_FENCING_LOCK";
++  private String fencingNodePath;
++  private Op createFencingNodePathOp;
++  private Op deleteFencingNodePathOp;
++
++  @VisibleForTesting
++  List<ACL> zkRootNodeAcl;
++  private boolean useDefaultFencingScheme = false;
++  public static final int CREATE_DELETE_PERMS =
++      ZooDefs.Perms.CREATE | ZooDefs.Perms.DELETE;
++  private final String zkRootNodeAuthScheme =
++      new DigestAuthenticationProvider().getScheme();
++
++  private String zkRootNodeUsername;
++  private String zkRootNodePassword;
++
++  /**
++   * Given the {@link Configuration} and {@link ACL}s used (zkAcl) for
++   * ZooKeeper access, construct the {@link ACL}s for the store's root node.
++   * In the constructed {@link ACL}, all the users allowed by zkAcl are given
++   * rwa access, while the current RM has exclude create-delete access.
++   *
++   * To be called only when HA is enabled and the configuration doesn't set ACL
++   * for the root node.
++   */
++  @VisibleForTesting
++  @Private
++  @Unstable
++  protected List<ACL> constructZkRootNodeACL(
++      Configuration conf, List<ACL> sourceACLs) throws NoSuchAlgorithmException {
++    List<ACL> zkRootNodeAcl = new ArrayList<ACL>();
++    for (ACL acl : sourceACLs) {
++      zkRootNodeAcl.add(new ACL(
++          ZKUtil.removeSpecificPerms(acl.getPerms(), CREATE_DELETE_PERMS),
++          acl.getId()));
++    }
++
++    zkRootNodeUsername = HAUtil.getConfValueForRMInstance(
++        YarnConfiguration.RM_ADDRESS,
++        YarnConfiguration.DEFAULT_RM_ADDRESS, conf);
++    zkRootNodePassword = Long.toString(ResourceManager.getClusterTimeStamp());
++    Id rmId = new Id(zkRootNodeAuthScheme,
++        DigestAuthenticationProvider.generateDigest(
++            zkRootNodeUsername + ":" + zkRootNodePassword));
++    zkRootNodeAcl.add(new ACL(CREATE_DELETE_PERMS, rmId));
++    return zkRootNodeAcl;
++  }
++
++
++    /* Initialize fencing related paths, acls, and ops */
++    fencingNodePath = zkRootNodePath + "/" + FENCING_LOCK;
++    createFencingNodePathOp = Op.create(fencingNodePath, new byte[0], zkAcl,
++        CreateMode.PERSISTENT);
++    deleteFencingNodePathOp = Op.delete(fencingNodePath, -1);
++    if (HAUtil.isHAEnabled(conf)) {
++      String zkRootNodeAclConf = HAUtil.getConfValueForRMInstance
++          (YarnConfiguration.ZK_RM_STATE_STORE_ROOT_NODE_ACL, conf);
++      if (zkRootNodeAclConf != null) {
++        zkRootNodeAclConf = ZKUtil.resolveConfIndirection(zkRootNodeAclConf);
++        try {
++          zkRootNodeAcl = ZKUtil.parseACLs(zkRootNodeAclConf);
++        } catch (ZKUtil.BadAclFormatException bafe) {
++          LOG.error("Invalid format for " +
++              YarnConfiguration.ZK_RM_STATE_STORE_ROOT_NODE_ACL);
++          throw bafe;
++        }
++      } else {
++        useDefaultFencingScheme = true;
++        zkRootNodeAcl = constructZkRootNodeACL(conf, zkAcl);
++      }
++    }
++    if (HAUtil.isHAEnabled(getConfig())){
++      fence();
++    }
+-  private void createRootDir(String rootPath) throws Exception {
++  private void createRootDir(final String rootPath) throws Exception {
++    // For root dirs, we shouldn't use the doMulti helper methods
+-      createWithRetries(rootPath, null, zkAcl, CreateMode.PERSISTENT);
++      new ZKAction<String>() {
++        @Override
++        public String run() throws KeeperException, InterruptedException {
++          return zkClient.create(rootPath, null, zkAcl, CreateMode.PERSISTENT);
++        }
++      }.runWithRetries();
+-      if (ke.code() != Code.NODEEXISTS) {
++      if (ke.code() == Code.NODEEXISTS) {
++        LOG.debug(rootPath + "znode already exists!");
++      } else {
++  private void logRootNodeAcls(String prefix) throws KeeperException,
++      InterruptedException {
++    Stat getStat = new Stat();
++    List<ACL> getAcls = zkClient.getACL(zkRootNodePath, getStat);
++
++    StringBuilder builder = new StringBuilder();
++    builder.append(prefix);
++    for (ACL acl : getAcls) {
++      builder.append(acl.toString());
++    }
++    builder.append(getStat.toString());
++    LOG.debug(builder.toString());
++  }
++
++  private synchronized void fence() throws Exception {
++    if (LOG.isTraceEnabled()) {
++      logRootNodeAcls("Before fencing\n");
++    }
++
++    new ZKAction<Void>() {
++      @Override
++      public Void run() throws KeeperException, InterruptedException {
++        zkClient.setACL(zkRootNodePath, zkRootNodeAcl, -1);
++        return null;
++      }
++    }.runWithRetries();
++
++    // delete fencingnodepath
++    new ZKAction<Void>() {
++      @Override
++      public Void run() throws KeeperException, InterruptedException {
++        try {
++          zkClient.multi(Collections.singletonList(deleteFencingNodePathOp));
++        } catch (KeeperException.NoNodeException nne) {
++          LOG.info("Fencing node " + fencingNodePath + " doesn't exist to delete");
++        }
++        return null;
++      }
++    }.runWithRetries();
++
++    if (LOG.isTraceEnabled()) {
++      logRootNodeAcls("After fencing\n");
++    }
++  }
++
+-    List<String> childNodes = zkClient.getChildren(rmDTSecretManagerRoot, true);
++    List<String> childNodes =
++        getChildrenWithRetries(rmDTSecretManagerRoot, true);
+-    List<String> childNodes = zkClient.getChildren(rmAppRoot, true);
++    List<String> childNodes = getChildrenWithRetries(rmAppRoot, true);
++  @Private
++  @Unstable
++  @Private
++  @Unstable
+-  @VisibleForTesting
+-  public String createWithRetries(
+-      final String path, final byte[] data, final List<ACL> acl,
+-      final CreateMode mode) throws Exception {
+-    return new ZKAction<String>() {
++  /**
++   * Helper method that creates fencing node, executes the passed operations,
++   * and deletes the fencing node.
++   */
++  private synchronized void doMultiWithRetries(
++      final List<Op> opList) throws Exception {
++    final List<Op> execOpList = new ArrayList<Op>(opList.size() + 2);
++    execOpList.add(createFencingNodePathOp);
++    execOpList.addAll(opList);
++    execOpList.add(deleteFencingNodePathOp);
++    new ZKAction<Void>() {
+-      public String run() throws KeeperException, InterruptedException {
+-        return zkClient.create(path, data, acl, mode);
++      public Void run() throws KeeperException, InterruptedException {
++        zkClient.multi(execOpList);
++        return null;
++  /**
++   * Helper method that creates fencing node, executes the passed operation,
++   * and deletes the fencing node.
++   */
++  private void doMultiWithRetries(final Op op) throws Exception {
++    doMultiWithRetries(Collections.singletonList(op));
++  }
++
++  @VisibleForTesting
++  @Private
++  @Unstable
++  public void createWithRetries(
++      final String path, final byte[] data, final List<ACL> acl,
++      final CreateMode mode) throws Exception {
++    doMultiWithRetries(Op.create(path, data, acl, mode));
++  }
++
+-    new ZKAction<Void>() {
+-      @Override
+-      public Void run() throws KeeperException, InterruptedException {
+-        /**
+-         * Call exists() to leave a watch on the node denoted by path.
+-         * Delete node if exists. To pass the existence information to the
+-         * caller, call delete irrespective of whether node exists or not.
+-         */
+-        if (zkClient.exists(path, true) == null) {
+-          LOG.error("Trying to delete a path (" + path
+-              + ") that doesn't exist.");
+-        }
+-        zkClient.delete(path, version);
+-        return null;
++    try {
++      doMultiWithRetries(Op.delete(path, version));
++    } catch (KeeperException.NoNodeException nne) {
++      // We tried to delete a node that doesn't exist
++      if (LOG.isDebugEnabled()) {
++        LOG.debug("Attempted to delete a non-existing znode " + path);
+-    }.runWithRetries();
+-  }
+-
+-  private void doMultiWithRetries(final ArrayList<Op> opList) throws Exception {
+-    new ZKAction<Void>() {
+-      @Override
+-      public Void run() throws KeeperException, InterruptedException {
+-        zkClient.multi(opList);
+-        return null;
+-      }
+-    }.runWithRetries();
++    }
++  @Private
++  @Unstable
+-    new ZKAction<Void>() {
+-      @Override
+-      public Void run() throws KeeperException, InterruptedException {
+-        zkClient.setData(path, data, version);
+-        return null;
+-      }
+-    }.runWithRetries();
++    doMultiWithRetries(Op.setData(path, data, version));
++  @Private
++  @Unstable
++  private List<String> getChildrenWithRetries(
++      final String path, final boolean watch) throws Exception {
++    return new ZKAction<List<String>>() {
++      @Override
++      List<String> run() throws KeeperException, InterruptedException {
++        return zkClient.getChildren(path, watch);
++      }
++    }.runWithRetries();
++  }
++
++    private boolean shouldRetry(Code code) {
++      switch (code) {
++        case CONNECTIONLOSS:
++        case OPERATIONTIMEOUT:
++          return true;
++        default:
++          break;
++      }
++      return false;
++    }
++
++        } catch (KeeperException.NoAuthException nae) {
++          if (HAUtil.isHAEnabled(getConfig())) {
++            // NoAuthException possibly means that this store is fenced due to
++            // another RM becoming active. Even if not,
++            // it is safer to assume we have been fenced
++            throw new StoreFencedException();
++          }
+-  private static boolean shouldRetry(Code code) {
+-    switch (code) {
+-      case CONNECTIONLOSS:
+-      case OPERATIONTIMEOUT:
+-        return true;
+-      default:
+-        break;
+-    }
+-    return false;
+-  }
+-
++        if (useDefaultFencingScheme) {
++          zkClient.addAuthInfo(zkRootNodeAuthScheme,
++              (zkRootNodeUsername + ":" + zkRootNodePassword).getBytes());
++        }
++  @Private
++  @Unstable

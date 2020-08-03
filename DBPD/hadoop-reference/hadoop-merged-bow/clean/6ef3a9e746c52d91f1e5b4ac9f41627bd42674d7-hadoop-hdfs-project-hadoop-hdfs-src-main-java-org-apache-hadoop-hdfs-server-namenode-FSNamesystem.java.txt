@@ -1,0 +1,260 @@
+HDFS-6386. HDFS Encryption Zones (clamb)
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/branches/fs-encryption@1603658 13f79535-47bb-0310-9956-ffa450edef68
+
++import static org.apache.hadoop.hdfs.protocol.HdfsConstants.CRYPTO_KEY_SIZE;
++import static org.apache.hadoop.hdfs.protocol.HdfsConstants.CRYPTO_XATTR_IV;
++import static org.apache.hadoop.hdfs.protocol.HdfsConstants.CRYPTO_XATTR_KEY_VERSION_ID;
++import java.security.NoSuchAlgorithmException;
++import java.util.UUID;
++import org.apache.hadoop.crypto.key.KeyProvider;
++import org.apache.hadoop.crypto.key.KeyProvider.KeyVersion;
++import org.apache.hadoop.crypto.key.KeyProviderFactory;
++import org.apache.hadoop.hdfs.XAttrHelper;
++import com.google.common.base.Joiner;
++  private KeyProvider provider = null;
++  private KeyProvider.Options providerOptions = null;
++
++  private final Map<String, EncryptionZone> encryptionZones;
++
++    initializeKeyProvider(conf);
++    providerOptions = KeyProvider.options(conf);
++      this.encryptionZones = new HashMap<String, EncryptionZone>();
++  private void initializeKeyProvider(final Configuration conf) {
++    try {
++      final List<KeyProvider> providers = KeyProviderFactory.getProviders(conf);
++      if (providers == null) {
++        return;
++      }
++
++      if (providers.size() == 0) {
++        LOG.info("No KeyProviders found.");
++        return;
++      }
++
++      if (providers.size() > 1) {
++        final String err =
++            "Multiple KeyProviders found. Only one is permitted.";
++        LOG.error(err);
++        throw new RuntimeException(err);
++      }
++      provider = providers.get(0);
++      if (provider.isTransient()) {
++        final String err =
++            "A KeyProvider was found but it is a transient provider.";
++        LOG.error(err);
++        throw new RuntimeException(err);
++      }
++      LOG.info("Found KeyProvider: " + provider.toString());
++    } catch (IOException e) {
++      LOG.error("Exception while initializing KeyProvider", e);
++    }
++  }
++
++  @VisibleForTesting
++  public KeyProvider getProvider() {
++    return provider;
++  }
++
+-  
++
+-  void createEncryptionZone(final String src, final String keyId)
+-          throws IOException {
++  /**
++   * Create an encryption zone on directory src either using keyIdArg if
++   * supplied or generating a keyId if it's null.
++   *
++   * @param src the path of a directory which will be the root of the
++   * encryption zone. The directory must be empty.
++   *
++   * @param keyIdArg an optional keyId of a key in the configured
++   * KeyProvider. If this is null, then a a new key is generated.
++   *
++   * @throws AccessControlException if the caller is not the superuser.
++   *
++   * @throws UnresolvedLinkException if the path can't be resolved.
++   *
++   * @throws SafeModeException if the Namenode is in safe mode.
++   */
++  void createEncryptionZone(final String src, String keyIdArg)
++    throws IOException, UnresolvedLinkException,
++      SafeModeException, AccessControlException {
++    final CacheEntry cacheEntry = RetryCache.waitForCompletion(retryCache);
++    if (cacheEntry != null && cacheEntry.isSuccess()) {
++      return; // Return previous response
++    }
++
++    boolean createdKey = false;
++    String keyId = keyIdArg;
++    boolean success = false;
++    try {
++      if (keyId == null || keyId.isEmpty()) {
++        keyId = createNewKey(src);
++        createdKey = true;
++      } else {
++        if (provider.getCurrentKey(keyId) == null) {
++
++          /*
++           * It would be nice if we threw something more specific than
++           * IOException when the key is not found, but the KeyProvider API
++           * doesn't provide for that. If that API is ever changed to throw
++           * something more specific (e.g. UnknownKeyException) then we can
++           * update this to match it, or better yet, just rethrow the
++           * KeyProvider's exception.
++           */
++          throw new IOException("Key " + keyId + " doesn't exist.");
++        }
++      }
++      createEncryptionZoneInt(src, keyId, cacheEntry != null);
++      success = true;
++    } catch (AccessControlException e) {
++      logAuditEvent(false, "createEncryptionZone", src);
++      throw e;
++    } finally {
++      RetryCache.setState(cacheEntry, success);
++      if (!success && createdKey) {
++        /* Unwind key creation. */
++        provider.deleteKey(keyId);
++      }
++    }
+-  void deleteEncryptionZone(final String src) throws IOException {
++  private void createEncryptionZoneInt(final String srcArg, String keyId,
++    final boolean logRetryCache) throws IOException {
++    String src = srcArg;
++    HdfsFileStatus resultingStat = null;
++    checkSuperuserPrivilege();
++    checkOperation(OperationCategory.WRITE);
++    final byte[][] pathComponents =
++      FSDirectory.getPathComponentsForReservedPath(src);
++    writeLock();
++    try {
++      checkSuperuserPrivilege();
++      checkOperation(OperationCategory.WRITE);
++      checkNameNodeSafeMode("Cannot create encryption zone on " + src);
++      src = FSDirectory.resolvePath(src, pathComponents, dir);
++
++      EncryptionZone ez = getEncryptionZoneForPath(src);
++      if (ez != null) {
++        throw new IOException("Directory " + src +
++          " is already in an encryption zone. (" + ez.getPath() + ")");
++      }
++
++      final XAttr keyIdXAttr = dir.createEncryptionZone(src, keyId);
++      getEditLog().logSetXAttr(src, keyIdXAttr, logRetryCache);
++      encryptionZones.put(src, new EncryptionZone(src, keyId));
++      resultingStat = getAuditFileInfo(src, false);
++    } finally {
++      writeUnlock();
++    }
++    getEditLog().logSync();
++    logAuditEvent(true, "createEncryptionZone", src, null, resultingStat);
++  }
++
++  private String createNewKey(String src)
++    throws IOException {
++    final String keyId = UUID.randomUUID().toString();
++    // TODO pass in hdfs://HOST:PORT (HDFS-6490)
++    providerOptions.setDescription(src);
++    providerOptions.setBitLength(CRYPTO_KEY_SIZE);
++    try {
++      provider.createKey(keyId, providerOptions);
++    } catch (NoSuchAlgorithmException e) {
++      throw new IOException(e);
++    }
++    return keyId;
++  }
++
++  /**
++   * Delete the encryption zone on directory src.
++   *
++   * @param src the path of a directory which is the root of the encryption
++   * zone. The directory must be empty and must be marked as an encryption
++   * zone.
++   *
++   * @throws AccessControlException if the caller is not the superuser.
++   *
++   * @throws UnresolvedLinkException if the path can't be resolved.
++   *
++   * @throws SafeModeException if the Namenode is in safe mode.
++   */
++  void deleteEncryptionZone(final String src)
++    throws IOException, UnresolvedLinkException,
++      SafeModeException, AccessControlException {
++    final CacheEntry cacheEntry = RetryCache.waitForCompletion(retryCache);
++    if (cacheEntry != null && cacheEntry.isSuccess()) {
++      return; // Return previous response
++    }
++
++    boolean success = false;
++    try {
++      deleteEncryptionZoneInt(src, cacheEntry != null);
++      encryptionZones.remove(src);
++      success = true;
++    } catch (AccessControlException e) {
++      logAuditEvent(false, "deleteEncryptionZone", src);
++      throw e;
++    } finally {
++      RetryCache.setState(cacheEntry, success);
++    }
++  }
++
++  private void deleteEncryptionZoneInt(final String srcArg,
++    final boolean logRetryCache) throws IOException {
++    String src = srcArg;
++    HdfsFileStatus resultingStat = null;
++    checkSuperuserPrivilege();
++    checkOperation(OperationCategory.WRITE);
++    final byte[][] pathComponents =
++      FSDirectory.getPathComponentsForReservedPath(src);
++    writeLock();
++    try {
++      checkSuperuserPrivilege();
++      checkOperation(OperationCategory.WRITE);
++      checkNameNodeSafeMode("Cannot delete encryption zone on " + src);
++      src = FSDirectory.resolvePath(src, pathComponents, dir);
++      final EncryptionZone ez = encryptionZones.get(src);
++      if (ez == null) {
++        throw new IOException("Directory " + src +
++          " is not the root of an encryption zone.");
++      }
++      final XAttr removedXAttr = dir.deleteEncryptionZone(src);
++      if (removedXAttr != null) {
++        getEditLog().logRemoveXAttr(src, removedXAttr);
++      }
++      encryptionZones.remove(src);
++      resultingStat = getAuditFileInfo(src, false);
++    } finally {
++      writeUnlock();
++    }
++    getEditLog().logSync();
++    logAuditEvent(true, "deleteEncryptionZone", src, null, resultingStat);
++    boolean success = false;
++    checkSuperuserPrivilege();
++    checkOperation(OperationCategory.READ);
++    readLock();
++    try {
++      checkSuperuserPrivilege();
++      checkOperation(OperationCategory.READ);
++      final List<EncryptionZone> ret =
++          Lists.newArrayList(encryptionZones.values());
++      success = true;
++      return ret;
++    } finally {
++      readUnlock();
++      logAuditEvent(success, "listEncryptionZones", null);
++    }
++  }
++
++  /** Lookup the encryption zone of a path. */
++  private EncryptionZone getEncryptionZoneForPath(String src) {
++    final String[] components = INode.getPathNames(src);
++    for (int i = components.length; i > 0; i--) {
++      final List<String> l = Arrays.asList(Arrays.copyOfRange(components, 0, i));
++      String p = Joiner.on(Path.SEPARATOR).join(l);
++      final EncryptionZone ret = encryptionZones.get(p);
++      if (ret != null) {
++        return ret;
++      }
++    }
+
+INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS23 INS23 INS23 INS31 INS31 INS31 INS31 INS31 INS31 INS83 INS43 INS59 INS83 INS43 INS59 INS83 INS83 INS74 INS59 INS83 INS39 INS42 INS44 INS8 INS78 INS83 INS43 INS42 INS8 INS29 MOV44 INS44 INS43 INS43 INS43 INS43 INS8 INS83 INS39 INS42 MOV44 INS44 INS44 INS43 INS8 INS83 INS43 INS42 INS44 MOV43 INS8 INS29 MOV44 INS43 INS43 INS43 INS8 INS83 INS39 INS42 INS44 INS44 INS43 INS8 INS8 INS29 INS83 INS43 INS42 INS44 INS8 INS42 INS42 INS33 INS40 INS42 INS33 INS43 INS43 INS43 INS42 INS21 INS21 INS83 INS43 INS42 INS54 INS42 INS42 INS41 INS65 INS65 INS65 INS65 INS65 INS65 INS43 INS42 INS42 INS42 INS42 INS42 INS60 INS25 INS60 INS60 INS60 INS54 UPD42 INS43 INS42 INS83 INS39 INS42 INS42 INS60 INS60 INS21 INS21 INS60 INS21 INS54 INS21 INS21 INS42 INS43 INS42 INS60 INS21 INS21 INS54 INS41 INS65 INS65 INS65 INS65 INS65 INS42 INS42 INS42 INS60 INS25 INS60 INS54 INS83 INS43 INS42 INS83 INS39 INS42 INS42 INS60 INS60 INS21 INS21 INS60 INS21 INS54 INS21 INS21 INS60 INS21 INS21 INS21 INS54 INS65 INS42 INS43 INS42 INS60 INS24 MOV41 INS42 INS42 INS42 INS32 INS7 INS42 INS8 INS12 INS42 INS66 INS66 INS42 INS66 INS66 INS42 INS66 INS66 INS42 INS66 INS42 INS66 INS42 INS66 INS42 INS83 INS43 INS59 INS27 INS8 INS39 INS59 INS43 INS59 INS39 INS59 INS8 INS12 INS8 INS42 INS43 INS59 INS43 INS59 INS32 INS32 INS83 INS5 INS59 INS32 INS8 INS8 INS32 INS32 INS42 INS83 INS43 INS59 INS32 INS32 INS8 INS12 INS42 INS66 INS42 INS66 INS66 INS66 INS42 INS66 INS42 INS66 INS42 INS66 INS83 INS43 INS59 INS27 INS8 INS39 INS59 INS8 INS12 INS8 INS42 INS43 INS59 INS43 INS59 INS32 INS32 INS83 INS5 INS59 INS32 INS8 INS8 INS32 INS32 INS39 INS59 INS32 INS32 INS32 INS8 INS8 INS66 INS42 INS83 INS5 INS59 INS58 INS27 INS37 INS8 INS42 INS42 INS42 INS32 INS21 INS60 INS25 INS25 INS25 INS21 INS25 INS21 INS44 INS8 INS42 INS42 INS32 INS27 INS32 INS41 INS42 INS9 INS42 INS42 INS42 INS42 INS9 INS25 INS21 INS21 INS44 INS8 INS21 INS25 INS42 INS42 INS42 INS42 INS42 INS33 INS42 INS42 INS40 INS39 INS85 INS85 INS42 INS32 INS42 INS21 INS21 INS21 INS21 INS60 INS25 INS60 INS21 INS21 INS21 INS21 INS32 INS42 INS42 INS9 INS45 INS42 INS33 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS21 INS44 INS8 INS42 INS42 INS32 INS27 INS32 INS41 INS42 INS9 INS21 INS21 INS21 INS44 INS8 INS21 INS42 INS42 INS42 INS42 INS42 INS33 INS42 INS42 INS40 INS39 INS85 INS85 INS42 INS32 INS42 INS21 INS21 INS21 INS21 INS60 INS25 INS60 INS25 INS21 INS21 INS21 INS32 INS42 INS42 INS9 INS45 INS42 INS33 INS42 INS42 INS9 INS42 INS42 INS40 INS42 INS21 INS21 INS60 INS21 INS41 INS21 INS21 INS43 INS85 INS42 INS32 INS39 INS59 INS42 INS34 INS42 INS60 INS60 INS60 INS25 INS42 INS42 INS42 INS7 INS83 INS74 INS59 INS27 INS8 INS27 INS8 INS27 INS8 INS7 INS32 INS8 INS32 INS43 INS42 INS21 INS42 INS42 INS42 INS42 INS33 INS42 INS42 INS27 INS8 INS8 INS32 INS7 INS43 INS42 INS21 INS53 INS32 INS27 INS8 INS42 INS42 INS42 INS32 INS32 INS32 INS7 INS43 INS59 INS27 INS8 INS83 INS43 INS59 INS32 INS32 INS7 INS32 INS42 INS32 INS42 INS32 INS43 INS42 INS53 INS42 INS42 INS42 INS42 INS33 INS42 INS42 INS32 INS32 INS7 INS43 INS42 INS21 INS53 INS32 INS42 INS42 INS42 INS32 INS32 INS32 INS7 INS83 INS43 INS59 INS27 INS8 INS83 INS43 INS59 INS27 INS8 INS32 INS7 INS32 INS42 INS32 INS32 INS83 INS74 INS59 INS7 INS42 INS32 INS32 INS42 INS42 INS42 INS42 INS42 INS40 INS83 INS74 INS59 INS43 INS59 INS83 INS43 INS59 INS27 INS8 INS22 INS14 INS43 INS43 INS42 INS32 INS42 INS33 INS41 INS32 INS34 INS21 INS41 INS32 INS34 INS60 INS21 INS53 INS42 INS32 INS42 INS42 INS60 INS21 INS53 INS42 INS42 INS27 INS42 INS32 INS27 INS32 INS21 INS21 INS25 INS42 INS42 INS42 INS27 INS42 INS9 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS38 INS42 INS21 INS42 INS42 INS40 INS42 INS27 INS42 INS32 INS42 INS42 INS32 INS42 INS33 INS53 INS42 INS42 INS32 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS14 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS14 INS42 INS42 INS27 INS42 INS42 INS42 INS42 INS9 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS40 INS42 INS27 INS42 INS32 INS42 INS42 INS32 INS42 INS33 INS53 INS42 INS42 INS32 INS42 INS33 INS21 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS40 INS43 INS43 INS42 INS32 INS42 INS9 INS42 INS42 INS42 INS45 INS33 INS43 INS43 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS33 INS41 INS52 INS42 INS74 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS83 INS43 INS59 INS32 INS14 INS42 INS42 INS34 INS83 INS43 INS59 INS32 INS14 INS45 INS32 INS42 INS42 INS45 INS42 INS42 INS33 INS42 INS42 INS7 INS7 INS27 INS8 INS42 INS33 INS42 INS9 INS45 INS42 INS42 INS32 INS45 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS14 INS42 INS42 INS42 INS42 INS42 INS43 INS42 INS42 INS42 INS42 INS9 INS43 INS42 INS42 INS33 INS42 INS9 INS45 INS42 INS45 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS14 INS42 INS42 INS42 INS32 INS42 INS42 INS9 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS32 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS43 INS43 INS43 INS42 INS42 INS45 INS42 INS42 INS45 INS42 INS42 INS42 INS43 INS42 INS42 INS42 INS45 INS42 INS42 INS42 INS43 INS42 INS42 INS42 INS42 INS32 INS42 INS9 INS32 INS33 INS53 INS42 INS42 INS42 INS43 INS27 INS42 INS42 INS43 INS27 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS34 INS42 INS42 INS42 INS40 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS14 INS42 INS45 INS42 INS45 INS32 INS45 INS42 INS45 INS42 INS45 INS42 INS43 INS27 INS42 INS42 INS42 INS45 INS42 INS45 DEL8 DEL8 DEL8

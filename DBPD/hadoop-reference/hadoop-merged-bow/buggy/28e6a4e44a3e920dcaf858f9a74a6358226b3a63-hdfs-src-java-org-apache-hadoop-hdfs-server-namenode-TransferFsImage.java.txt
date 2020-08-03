@@ -1,0 +1,248 @@
+HDFS-1073. Redesign the NameNode's storage layout for image checkpoints and edit logs to introduce transaction IDs and be more robust. Contributed by Todd Lipcon and Ivan Kelly.
+
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/trunk@1152295 13f79535-47bb-0310-9956-ffa450edef68
+
+-import java.util.Iterator;
+-import java.util.Map;
++import java.util.List;
+-import javax.servlet.http.HttpServletResponse;
+-import javax.servlet.http.HttpServletRequest;
++import org.apache.commons.logging.Log;
++import org.apache.commons.logging.LogFactory;
++import org.apache.hadoop.hdfs.server.namenode.NNStorage.NameNodeDirType;
++import org.apache.hadoop.hdfs.server.protocol.RemoteEditLog;
++import com.google.common.collect.Lists;
++
+-  
+-  private boolean isGetImage;
+-  private boolean isGetEdit;
+-  private boolean isPutImage;
+-  private int remoteport;
+-  private String machineName;
+-  private CheckpointSignature token;
+-  private MD5Hash newChecksum = null;
+-  
+-  /**
+-   * File downloader.
+-   * @param pmap key=value[] map that is passed to the http servlet as 
+-   *        url parameters
+-   * @param request the object from which this servelet reads the url contents
+-   * @param response the object into which this servelet writes the url contents
+-   * @throws IOException
+-   */
+-  public TransferFsImage(Map<String,String[]> pmap,
+-                         HttpServletRequest request,
+-                         HttpServletResponse response
+-                         ) throws IOException {
+-    isGetImage = isGetEdit = isPutImage = false;
+-    remoteport = 0;
+-    machineName = null;
+-    token = null;
++  public final static String MD5_HEADER = "X-MD5-Digest";
+-    for (Iterator<String> it = pmap.keySet().iterator(); it.hasNext();) {
+-      String key = it.next();
+-      if (key.equals("getimage")) { 
+-        isGetImage = true;
+-      } else if (key.equals("getedit")) { 
+-        isGetEdit = true;
+-      } else if (key.equals("putimage")) { 
+-        isPutImage = true;
+-      } else if (key.equals("port")) { 
+-        remoteport = new Integer(pmap.get("port")[0]).intValue();
+-      } else if (key.equals("machine")) { 
+-        machineName = pmap.get("machine")[0];
+-      } else if (key.equals("token")) { 
+-        token = new CheckpointSignature(pmap.get("token")[0]);
+-      } else if (key.equals("newChecksum")) {
+-        newChecksum = new MD5Hash(pmap.get("newChecksum")[0]);
++  private static final Log LOG = LogFactory.getLog(TransferFsImage.class);
++
++  static MD5Hash downloadImageToStorage(
++      String fsName, long imageTxId, NNStorage dstStorage, boolean needDigest)
++      throws IOException {
++    String fileid = GetImageServlet.getParamStringForImage(
++        imageTxId, dstStorage);
++    String fileName = NNStorage.getCheckpointImageFileName(imageTxId);
++    
++    List<File> dstFiles = dstStorage.getFiles(
++        NameNodeDirType.IMAGE, fileName);
++    if (dstFiles.isEmpty()) {
++      throw new IOException("No targets in destination storage!");
++    }
++    
++    MD5Hash hash = getFileClient(fsName, fileid, dstFiles, dstStorage, needDigest);
++    LOG.info("Downloaded file " + dstFiles.get(0).getName() + " size " +
++        dstFiles.get(0).length() + " bytes.");
++    return hash;
++  }
++  
++  static void downloadEditsToStorage(String fsName, RemoteEditLog log,
++      NNStorage dstStorage) throws IOException {
++    String fileid = GetImageServlet.getParamStringForLog(
++        log, dstStorage);
++    String fileName = NNStorage.getFinalizedEditsFileName(
++        log.getStartTxId(), log.getEndTxId());
++
++    List<File> dstFiles = dstStorage.getFiles(NameNodeDirType.EDITS, fileName);
++    assert !dstFiles.isEmpty() : "No checkpoint targets.";
++    
++    for (File f : dstFiles) {
++      if (f.exists() && f.canRead()) {
++        LOG.info("Skipping download of remote edit log " +
++            log + " since it already is stored locally at " + f);
++        return;
++      } else {
++        LOG.debug("Dest file: " + f);
+-    int numGets = (isGetImage?1:0) + (isGetEdit?1:0);
+-    if ((numGets > 1) || (numGets == 0) && !isPutImage) {
+-      throw new IOException("Illegal parameters to TransferFsImage");
+-    }
++    getFileClient(fsName, fileid, dstFiles, dstStorage, false);
++    LOG.info("Downloaded file " + dstFiles.get(0).getName() + " size " +
++        dstFiles.get(0).length() + " bytes.");
+-
+-  boolean getEdit() {
+-    return isGetEdit;
+-  }
+-
+-  boolean getImage() {
+-    return isGetImage;
+-  }
+-
+-  boolean putImage() {
+-    return isPutImage;
+-  }
+-
+-  CheckpointSignature getToken() {
+-    return token;
+-  }
+-
++ 
+-   * Get the MD5 digest of the new image
+-   * @return the MD5 digest of the new image
++   * Requests that the NameNode download an image from this node.
++   *
++   * @param fsName the http address for the remote NN
++   * @param imageListenAddress the host/port where the local node is running an
++   *                           HTTPServer hosting GetImageServlet
++   * @param storage the storage directory to transfer the image from
++   * @param txid the transaction ID of the image to be uploaded
+-  MD5Hash getNewChecksum() {
+-    return newChecksum;
+-  }
+-  
+-  String getInfoServer() throws IOException{
+-    if (machineName == null || remoteport == 0) {
+-      throw new IOException ("MachineName and port undefined");
+-    }
+-    return machineName + ":" + remoteport;
++  static void uploadImageFromStorage(String fsName,
++      InetSocketAddress imageListenAddress,
++      NNStorage storage, long txid) throws IOException {
++    
++    String fileid = GetImageServlet.getParamStringToPutImage(
++        txid, imageListenAddress, storage);
++    // this doesn't directly upload an image, but rather asks the NN
++    // to connect back to the 2NN to download the specified image.
++    TransferFsImage.getFileClient(fsName, fileid, null, null, false);
++    LOG.info("Uploaded image with txid " + txid + " to namenode at " +
++    		fsName);
++  
++
++        if (ErrorSimulator.getErrorSimulation(4)) {
++          // Simulate a corrupted byte on the wire
++          LOG.warn("SIMULATING A CORRUPT BYTE IN IMAGE TRANSFER!");
++          buf[0]++;
++        }
++        
+-   * 
++   * @param dstStorage if an error occurs writing to one of the files,
++   *                   this storage object will be notified. 
+-  static MD5Hash getFileClient(String fsName, String id, File[] localPath,
+-      boolean getChecksum)
+-    throws IOException {
++  static MD5Hash getFileClient(String nnHostPort,
++      String queryString, List<File> localPaths,
++      NNStorage dstStorage, boolean getChecksum) throws IOException {
+-    StringBuilder str = new StringBuilder(proto+fsName+"/getimage?");
+-    str.append(id);
++    StringBuilder str = new StringBuilder(proto+nnHostPort+"/getimage?");
++    str.append(queryString);
+-    URLConnection connection = url.openConnection();
++    HttpURLConnection connection = (HttpURLConnection) url.openConnection();
++    
++    if (connection.getResponseCode() != HttpURLConnection.HTTP_OK) {
++      throw new IOException(
++          "Image transfer servlet at " + url +
++          " failed with status code " + connection.getResponseCode() +
++          "\nResponse message:\n" + connection.getResponseMessage());
++    }
++    
++    
++    MD5Hash advertisedDigest = parseMD5Header(connection);
++
+-    FileOutputStream[] output = null;
++    List<FileOutputStream> outputStreams = Lists.newArrayList();
++
+-      if (localPath != null) {
+-        output = new FileOutputStream[localPath.length];
+-        for (int i = 0; i < output.length; i++) {
+-          output[i] = new FileOutputStream(localPath[i]);
++      if (localPaths != null) {
++        for (File f : localPaths) {
++          try {
++            if (f.exists()) {
++              LOG.warn("Overwriting existing file " + f
++                  + " with file downloaded from " + str);
++            }
++            outputStreams.add(new FileOutputStream(f));
++          } catch (IOException ioe) {
++            LOG.warn("Unable to download file " + f, ioe);
++            dstStorage.reportErrorOnFile(f);
++          }
++        }
++        
++        if (outputStreams.isEmpty()) {
++          throw new IOException(
++              "Unable to download to any storage directory");
++      
+-        if (num > 0 && localPath != null) {
++        if (num > 0) {
+-          for (int i = 0; i < output.length; i++) {
+-            output[i].write(buf, 0, num);
++          for (FileOutputStream fos : outputStreams) {
++            fos.write(buf, 0, num);
+-      if (output != null) {
+-        for (int i = 0; i < output.length; i++) {
+-          if (output[i] != null) {
+-            output[i].getChannel().force(true);
+-            output[i].close();
+-          }
+-        }
++      for (FileOutputStream fos : outputStreams) {
++        fos.getChannel().force(true);
++        fos.close();
+-    return digester==null ? null : new MD5Hash(digester.digest());
++
++    if (digester != null) {
++      MD5Hash computedDigest = new MD5Hash(digester.digest());
++      
++      if (advertisedDigest != null &&
++          !computedDigest.equals(advertisedDigest)) {
++        throw new IOException("File " + str + " computed digest " +
++            computedDigest + " does not match advertised digest " + 
++            advertisedDigest);
++      }
++      return computedDigest;
++    } else {
++      return null;
++    }    
++
++  private static MD5Hash parseMD5Header(HttpURLConnection connection) {
++    String header = connection.getHeaderField(MD5_HEADER);
++    return (header != null) ? new MD5Hash(header) : null;
++  }
++
+
+MOV26 MOV26 MOV26 INS26 INS26 UPD40 UPD40 INS40 UPD40 UPD40 INS40 INS23 INS23 INS31 INS31 INS31 INS31 UPD83 MOV83 UPD83 MOV83 UPD83 MOV83 MOV43 MOV59 MOV83 UPD83 MOV83 UPD83 MOV83 UPD43 MOV43 INS59 UPD83 MOV83 MOV43 UPD42 MOV42 MOV44 INS44 MOV44 INS44 INS43 INS8 INS83 INS39 INS42 INS44 INS44 INS44 MOV43 INS8 INS29 INS83 UPD39 MOV39 UPD42 MOV42 MOV44 INS44 INS44 INS44 UPD43 MOV43 INS8 INS44 INS44 INS44 MOV60 INS83 INS83 MOV43 INS42 INS44 INS8 UPD42 INS45 UPD42 UPD42 MOV42 INS32 INS43 UPD42 INS39 INS42 UPD43 UPD42 INS39 INS42 UPD42 MOV42 INS60 INS60 INS60 INS25 MOV60 INS21 INS41 INS43 INS42 INS43 INS42 INS43 INS42 INS60 INS60 INS60 INS6 INS70 INS21 INS21 INS65 INS65 INS65 INS65 INS65 INS43 INS42 INS43 INS42 INS39 INS42 UPD42 INS60 INS21 INS21 INS65 UPD42 INS43 INS42 INS74 INS42 INS43 INS42 INS25 INS60 INS25 INS43 INS42 INS60 INS41 INS42 INS42 INS57 UPD42 MOV42 UPD42 MOV43 INS59 MOV43 INS59 INS74 INS59 INS32 MOV8 MOV43 INS32 INS42 INS42 UPD42 MOV42 INS42 MOV43 INS59 MOV43 INS59 INS74 INS59 INS38 INS45 INS44 INS42 INS8 INS32 INS32 INS66 INS42 INS66 INS42 INS66 INS66 INS42 INS66 INS42 INS66 INS42 INS42 MOV43 INS59 INS32 INS32 INS42 INS66 INS66 INS42 INS43 INS43 INS42 MOV43 UPD43 INS27 INS8 INS43 INS59 INS74 INS8 INS27 INS8 INS8 INS42 INS43 INS59 INS16 INS43 INS42 INS32 INS42 INS32 UPD43 MOV43 INS43 UPD42 MOV42 MOV32 UPD42 MOV42 UPD42 MOV42 UPD42 UPD42 MOV42 UPD42 MOV42 INS27 INS42 INS32 INS42 INS32 INS43 INS43 INS42 INS32 INS32 INS43 INS42 INS25 INS42 INS42 INS42 INS42 INS42 INS9 INS42 INS42 INS27 INS42 INS32 INS42 INS42 INS42 INS42 INS33 INS33 INS9 INS42 INS42 INS27 INS42 INS42 UPD42 UPD42 INS11 INS32 INS40 INS53 INS42 INS42 INS32 INS43 INS43 UPD42 INS32 MOV21 INS70 MOV25 MOV42 MOV33 INS60 INS25 INS41 INS41 INS42 INS42 INS32 INS36 INS14 INS33 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 UPD42 INS42 UPD42 MOV42 UPD42 MOV42 INS40 UPD42 UPD42 INS42 INS42 INS42 INS42 UPD42 INS45 INS32 INS45 INS32 INS45 UPD42 MOV42 UPD42 MOV42 INS42 INS42 INS42 INS42 INS32 INS32 INS42 UPD42 MOV42 INS42 UPD42 MOV42 INS40 INS42 INS42 INS42 INS42 INS27 INS8 MOV8 INS45 INS32 INS45 INS32 INS45 INS42 INS42 INS42 INS42 INS42 INS45 UPD42 MOV42 UPD45 MOV45 UPD42 MOV42 MOV43 INS43 MOV32 INS42 INS42 INS14 INS42 INS42 INS42 INS42 INS42 INS42 INS8 INS44 INS42 INS8 INS43 INS59 INS27 INS8 INS42 INS33 INS42 INS42 INS42 INS27 INS43 INS42 UPD45 INS32 UPD42 MOV42 INS32 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 INS32 INS32 INS21 INS41 INS32 INS42 INS32 INS42 INS25 UPD42 INS42 MOV43 INS27 UPD42 INS70 INS25 MOV43 INS42 MOV21 MOV21 INS42 INS42 MOV14 INS27 INS38 INS53 INS42 INS33 INS42 INS42 UPD42 MOV42 INS34 INS42 UPD42 MOV42 INS34 INS42 INS42 INS42 INS42 INS32 INS32 INS42 INS42 INS34 INS42 INS42 INS34 INS32 INS8 INS45 INS42 INS45 INS32 INS45 INS32 MOV44 INS42 INS8 INS32 INS8 MOV27 INS42 INS33 INS32 INS14 UPD42 MOV42 UPD42 MOV42 INS27 UPD42 MOV42 UPD42 MOV42 INS27 INS42 INS42 INS34 INS21 INS21 INS42 INS42 INS42 INS42 MOV43 UPD42 INS54 INS42 INS42 INS53 INS70 INS42 INS42 INS42 INS42 INS43 INS27 INS45 INS42 INS45 INS42 INS45 INS42 INS32 INS37 INS8 INS12 INS14 INS44 INS42 INS8 INS42 INS42 INS45 INS42 INS45 INS42 INS45 INS42 INS42 INS42 INS45 INS2 INS25 MOV21 INS44 INS8 INS43 INS45 MOV43 INS42 MOV21 INS42 INS34 INS32 INS8 INS32 MOV43 INS42 INS21 MOV21 INS42 INS42 INS42 INS21 INS42 INS42 MOV14 INS32 INS32 INS42 INS32 INS42 INS42 INS42 INS27 INS42 INS42 INS42 INS42 INS42 INS42 INS27 INS45 UPD42 MOV42 INS45 INS42 INS45 INS42 DEL43 DEL85 DEL5 DEL74 DEL32 DEL42 DEL45 DEL32 DEL34 DEL2 DEL14 DEL7 DEL39 DEL42 DEL59 DEL23 DEL39 DEL42 DEL59 DEL23 DEL39 DEL23 DEL39 DEL42 DEL59 DEL23 DEL42 DEL59 DEL23 DEL59 DEL23 DEL83 DEL42 DEL33 DEL59 DEL23 DEL66 DEL65 DEL42 DEL66 DEL66 DEL65 DEL42 DEL66 DEL65 DEL42 DEL66 DEL65 DEL42 DEL65 DEL29 DEL43 DEL42 DEL44 DEL42 DEL42 DEL42 DEL9 DEL7 DEL7 DEL7 DEL21 DEL42 DEL34 DEL7 DEL21 DEL42 DEL33 DEL7 DEL21 DEL42 DEL33 DEL7 DEL21 DEL74 DEL59 DEL58 DEL32 DEL45 DEL32 DEL42 DEL9 DEL7 DEL21 DEL8 DEL45 DEL32 DEL42 DEL9 DEL7 DEL21 DEL8 DEL45 DEL32 DEL42 DEL9 DEL7 DEL21 DEL8 DEL42 DEL42 DEL45 DEL32 DEL42 DEL43 DEL42 DEL42 DEL45 DEL32 DEL34 DEL2 DEL14 DEL42 DEL32 DEL7 DEL21 DEL8 DEL45 DEL32 DEL42 DEL45 DEL32 DEL34 DEL2 DEL7 DEL21 DEL8 DEL45 DEL32 DEL42 DEL43 DEL42 DEL45 DEL32 DEL34 DEL2 DEL14 DEL7 DEL21 DEL8 DEL45 DEL32 DEL25 DEL25 DEL25 DEL25 DEL25 DEL25 DEL25 DEL8 DEL24 DEL39 DEL42 DEL42 DEL34 DEL34 DEL16 DEL36 DEL42 DEL34 DEL34 DEL16 DEL36 DEL27 DEL59 DEL60 DEL42 DEL34 DEL27 DEL36 DEL42 DEL34 DEL27 DEL36 DEL42 DEL38 DEL27 DEL27 DEL25 DEL8 DEL31 DEL42 DEL41 DEL8 DEL31 DEL39 DEL42 DEL42 DEL41 DEL8 DEL31 DEL39 DEL42 DEL42 DEL41 DEL8 DEL31 DEL42 DEL42 DEL41 DEL8 DEL31 DEL66 DEL65 DEL66 DEL65 DEL29 DEL42 DEL42 DEL41 DEL8 DEL31 DEL42 DEL42 DEL33 DEL27 DEL42 DEL34 DEL27 DEL27 DEL45 DEL14 DEL53 DEL8 DEL25 DEL27 DEL41 DEL8 DEL31 DEL85 DEL5 DEL33 DEL85 DEL5 DEL42 DEL42 DEL2 DEL42 DEL85 DEL5 DEL40 DEL3 DEL7 DEL42 DEL42 DEL2 DEL7 DEL39 DEL42 DEL34 DEL59 DEL58 DEL40 DEL27 DEL42 DEL37 DEL8 DEL24 DEL8 DEL42 DEL33 DEL27 DEL27 DEL42 DEL42 DEL2 DEL39 DEL42 DEL34 DEL59 DEL58 DEL42 DEL40 DEL27 DEL42 DEL37 DEL8 DEL24 DEL42 DEL42 DEL2 DEL42 DEL42 DEL2 DEL42 DEL33 DEL27 DEL39 DEL42 DEL34 DEL59 DEL58 DEL42 DEL40 DEL27 DEL42 DEL37 DEL42 DEL42 DEL2 DEL33 DEL27 DEL8 DEL25 DEL8 DEL24 DEL8 DEL25 DEL8 DEL27 DEL33 DEL16 DEL41

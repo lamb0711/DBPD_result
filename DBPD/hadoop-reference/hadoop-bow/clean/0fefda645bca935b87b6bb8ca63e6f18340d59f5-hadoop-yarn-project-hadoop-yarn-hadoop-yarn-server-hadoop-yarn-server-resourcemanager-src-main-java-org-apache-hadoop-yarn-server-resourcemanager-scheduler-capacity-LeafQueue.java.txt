@@ -1,0 +1,370 @@
+YARN-3361. CapacityScheduler side changes to support non-exclusive node labels. Contributed by Wangda Tan
+
+-import java.util.HashSet;
++import org.apache.hadoop.yarn.server.resourcemanager.rmapp.attempt.RMAppAttempt;
+-
+-  private static final CSAssignment NULL_ASSIGNMENT =
+-      new CSAssignment(Resources.createResource(0, 0), NodeType.NODE_LOCAL);
+-  
+-  private static final CSAssignment SKIP_ASSIGNMENT = new CSAssignment(true);
+-  
+-  private static Set<String> getRequestLabelSetByExpression(
+-      String labelExpression) {
+-    Set<String> labels = new HashSet<String>();
+-    if (null == labelExpression) {
+-      return labels;
+-    }
+-    for (String l : labelExpression.split("&&")) {
+-      if (l.trim().isEmpty()) {
+-        continue;
+-      }
+-      labels.add(l.trim());
+-    }
+-    return labels;
+-  }
+-  
+-  private boolean checkResourceRequestMatchingNodeLabel(ResourceRequest offswitchResourceRequest,
+-      FiCaSchedulerNode node) {
+-    String askedNodeLabel = offswitchResourceRequest.getNodeLabelExpression();
+-    if (null == askedNodeLabel) {
+-      askedNodeLabel = RMNodeLabelsManager.NO_LABEL;
+-    }
+-    return askedNodeLabel.equals(node.getPartition());
+-  }
+-      FiCaSchedulerNode node, ResourceLimits currentResourceLimits) {
++      FiCaSchedulerNode node, ResourceLimits currentResourceLimits,
++      SchedulingMode schedulingMode) {
+-    // if our queue cannot access this node, just return
+-    if (!SchedulerUtils.checkQueueAccessToNode(accessibleLabels,
+-        node.getLabels())) {
+-      return NULL_ASSIGNMENT;
+-    }
+-    
+-            clusterResource);
++            clusterResource, schedulingMode);
++    // if our queue cannot access this node, just return
++    if (schedulingMode == SchedulingMode.RESPECT_PARTITION_EXCLUSIVITY
++        && !accessibleToPartition(node.getPartition())) {
++      return NULL_ASSIGNMENT;
++    }
++    
++    // Check if this queue need more resource, simply skip allocation if this
++    // queue doesn't need more resources.
++    if (!hasPendingResourceRequest(node.getPartition(),
++        clusterResource, schedulingMode)) {
++      if (LOG.isDebugEnabled()) {
++        LOG.debug("Skip this queue=" + getQueuePath()
++            + ", because it doesn't need more resource, schedulingMode="
++            + schedulingMode.name() + " node-partition=" + node.getPartition());
++      }
++      return NULL_ASSIGNMENT;
++    }
++    
++      
++      // Check if application needs more resource, skip if it doesn't need more.
++      if (!application.hasPendingResourceRequest(resourceCalculator,
++          node.getPartition(), clusterResource, schedulingMode)) {
++        if (LOG.isDebugEnabled()) {
++          LOG.debug("Skip app_attempt=" + application.getApplicationAttemptId()
++              + ", because it doesn't need more resource, schedulingMode="
++              + schedulingMode.name() + " node-label=" + node.getPartition());
++        }
++        continue;
++      }
++          // AM container allocation doesn't support non-exclusive allocation to
++          // avoid painful of preempt an AM container
++          if (schedulingMode == SchedulingMode.IGNORE_PARTITION_EXCLUSIVITY) {
++            RMAppAttempt rmAppAttempt =
++                csContext.getRMContext().getRMApps()
++                    .get(application.getApplicationId()).getCurrentAppAttempt();
++            if (null == rmAppAttempt.getMasterContainer()) {
++              if (LOG.isDebugEnabled()) {
++                LOG.debug("Skip allocating AM container to app_attempt="
++                    + application.getApplicationAttemptId()
++                    + ", don't allow to allocate AM container in non-exclusive mode");
++              }
++              break;
++            }
++          }
++          
+-          if (!checkResourceRequestMatchingNodeLabel(anyRequest, node)) {
++          if (!SchedulerUtils.checkResourceRequestMatchingNodePartition(
++              anyRequest, node.getPartition(), schedulingMode)) {
+-          Set<String> requestedNodeLabels =
+-              getRequestLabelSetByExpression(anyRequest
+-                  .getNodeLabelExpression());
+-
+-                  required, requestedNodeLabels);          
++                  required, node.getPartition(), schedulingMode);          
+-          if (!super.canAssignToThisQueue(clusterResource, node.getLabels(),
+-              this.currentResourceLimits, required, application.getCurrentReservation())) {
++          if (!super.canAssignToThisQueue(clusterResource, node.getPartition(),
++              this.currentResourceLimits, required,
++              application.getCurrentReservation(), schedulingMode)) {
+-              application, true, requestedNodeLabels)) {
++              application, true, node.getPartition())) {
++          // Increase missed-non-partitioned-resource-request-opportunity.
++          // This is to make sure non-partitioned-resource-request will prefer
++          // to be allocated to non-partitioned nodes
++          int missedNonPartitionedRequestSchedulingOpportunity = 0;
++          if (anyRequest.getNodeLabelExpression().equals(
++              RMNodeLabelsManager.NO_LABEL)) {
++            missedNonPartitionedRequestSchedulingOpportunity =
++                application
++                    .addMissedNonPartitionedRequestSchedulingOpportunity(priority);
++          }
++          
++          if (schedulingMode == SchedulingMode.IGNORE_PARTITION_EXCLUSIVITY) {
++            // Before doing allocation, we need to check scheduling opportunity to
++            // make sure : non-partitioned resource request should be scheduled to
++            // non-partitioned partition first.
++            if (missedNonPartitionedRequestSchedulingOpportunity < scheduler
++                .getNumClusterNodes()) {
++              if (LOG.isDebugEnabled()) {
++                LOG.debug("Skip app_attempt="
++                    + application.getApplicationAttemptId()
++                    + " priority="
++                    + priority
++                    + " because missed-non-partitioned-resource-request"
++                    + " opportunity under requred:"
++                    + " Now=" + missedNonPartitionedRequestSchedulingOpportunity
++                    + " required="
++                    + scheduler.getNumClusterNodes());
++              }
++
++              break;
++            }
++          }
++          
+-                null);
++                null, schedulingMode);
+-                node.getLabels());
++                node.getPartition());
+-            // Don't reset scheduling opportunities for non-local assignments
++            // Don't reset scheduling opportunities for offswitch assignments
++            // Non-exclusive scheduling opportunity is different: we need reset
++            // it every time to make sure non-labeled resource request will be
++            // most likely allocated on non-labeled nodes first. 
++            application.resetMissedNonPartitionedRequestSchedulingOpportunity(priority);
+-      RMContainer rmContainer, Resource clusterResource) {
++      RMContainer rmContainer, Resource clusterResource,
++      SchedulingMode schedulingMode) {
+-          rmContainer);
++          rmContainer, schedulingMode);
+-	  computeUserLimit(application, clusterResource, required, user, null));
++        computeUserLimit(application, clusterResource, required, user,
++            RMNodeLabelsManager.NO_LABEL, SchedulingMode.RESPECT_PARTITION_EXCLUSIVITY));
+-      Resource clusterResource, Resource required, Set<String> requestedLabels) {
++      Resource clusterResource, Resource required, String nodePartition,
++      SchedulingMode schedulingMode) {
+-            queueUser, requestedLabels);
++            queueUser, nodePartition, schedulingMode);
+-      Set<String> requestedLabels) {
++      String nodePartition, SchedulingMode schedulingMode) {
+-    Resource queueCapacity = Resource.newInstance(0, 0);
+-    if (requestedLabels != null && !requestedLabels.isEmpty()) {
+-      // if we have multiple labels to request, we will choose to use the first
+-      // label
+-      String firstLabel = requestedLabels.iterator().next();
+-      queueCapacity =
+-          Resources
+-              .max(resourceCalculator, clusterResource, queueCapacity,
+-                  Resources.multiplyAndNormalizeUp(resourceCalculator,
+-                      labelManager.getResourceByLabel(firstLabel,
+-                          clusterResource),
+-                      queueCapacities.getAbsoluteCapacity(firstLabel),
+-                      minimumAllocation));
+-    } else {
+-      // else there's no label on request, just to use absolute capacity as
+-      // capacity for nodes without label
+-      queueCapacity =
+-          Resources.multiplyAndNormalizeUp(resourceCalculator, labelManager
+-                .getResourceByLabel(CommonNodeLabelsManager.NO_LABEL, clusterResource),
+-              queueCapacities.getAbsoluteCapacity(), minimumAllocation);
+-    }
++    Resource queueCapacity =
++        Resources.multiplyAndNormalizeUp(resourceCalculator,
++            labelManager.getResourceByLabel(nodePartition, clusterResource),
++            queueCapacities.getAbsoluteCapacity(nodePartition),
++            minimumAllocation);
+-        Resources.lessThan(resourceCalculator, clusterResource, 
+-            queueUsage.getUsed(), queueCapacity) ?
+-            queueCapacity : Resources.add(queueUsage.getUsed(), required);
++        Resources.lessThan(resourceCalculator, clusterResource,
++            queueUsage.getUsed(nodePartition), queueCapacity) ? queueCapacity
++            : Resources.add(queueUsage.getUsed(nodePartition), required);
+-    final int activeUsers = activeUsersManager.getNumActiveUsers();  
+-    		
+-    Resource limit =
++    final int activeUsers = activeUsersManager.getNumActiveUsers();
++    
++    // User limit resource is determined by:
++    // max{currentCapacity / #activeUsers, currentCapacity * user-limit-percentage%)
++    Resource userLimitResource = Resources.max(
++        resourceCalculator, clusterResource, 
++        Resources.divideAndCeil(
++            resourceCalculator, currentCapacity, activeUsers),
++        Resources.divideAndCeil(
++            resourceCalculator, 
++            Resources.multiplyAndRoundDown(
++                currentCapacity, userLimit), 
++            100)
++        );
++    
++    // User limit is capped by maxUserLimit
++    // - maxUserLimit = queueCapacity * user-limit-factor (RESPECT_PARTITION_EXCLUSIVITY)
++    // - maxUserLimit = total-partition-resource (IGNORE_PARTITION_EXCLUSIVITY)
++    //
++    // In IGNORE_PARTITION_EXCLUSIVITY mode, if a queue cannot access a
++    // partition, its guaranteed resource on that partition is 0. And
++    // user-limit-factor computation is based on queue's guaranteed capacity. So
++    // we will not cap user-limit as well as used resource when doing
++    // IGNORE_PARTITION_EXCLUSIVITY allocation.
++    Resource maxUserLimit = Resources.none();
++    if (schedulingMode == SchedulingMode.RESPECT_PARTITION_EXCLUSIVITY) {
++      maxUserLimit =
++          Resources.multiplyAndRoundDown(queueCapacity, userLimitFactor);
++    } else if (schedulingMode == SchedulingMode.IGNORE_PARTITION_EXCLUSIVITY) {
++      maxUserLimit =
++          labelManager.getResourceByLabel(nodePartition, clusterResource);
++    }
++    
++    // Cap final user limit with maxUserLimit
++    userLimitResource =
+-                Resources.max(
+-                    resourceCalculator, clusterResource, 
+-                    Resources.divideAndCeil(
+-                        resourceCalculator, currentCapacity, activeUsers),
+-                    Resources.divideAndCeil(
+-                        resourceCalculator, 
+-                        Resources.multiplyAndRoundDown(
+-                            currentCapacity, userLimit), 
+-                        100)
+-                    ), 
+-                Resources.multiplyAndRoundDown(queueCapacity, userLimitFactor)
++                  userLimitResource,
++                  maxUserLimit
+-          " userLimit=" + userLimit +
++          " userLimitPercent=" + userLimit +
+-          " limit: " + limit +
++          " user-limit-resource: " + userLimitResource +
+-    user.setUserResourceLimit(limit);
+-    return limit;
++    user.setUserResourceLimit(userLimitResource);
++    return userLimitResource;
+-      boolean checkReservations, Set<String> requestLabels) {
++      boolean checkReservations, String nodePartition) {
+-    
+-    String label = CommonNodeLabelsManager.NO_LABEL;
+-    if (requestLabels != null && !requestLabels.isEmpty()) {
+-      label = requestLabels.iterator().next();
+-    }
+-            user.getUsed(label),
++            user.getUsed(nodePartition),
+-          && label.equals(CommonNodeLabelsManager.NO_LABEL)) {
++          && nodePartition.equals(CommonNodeLabelsManager.NO_LABEL)) {
+-            + user.getUsed() + " limit: " + limit);
++            + user.getUsed(nodePartition) + " limit: " + limit);
+-      RMContainer reservedContainer) {
++      RMContainer reservedContainer, SchedulingMode schedulingMode) {
+-            allocatedContainer);
++            allocatedContainer, schedulingMode);
+-            allocatedContainer);
++            allocatedContainer, schedulingMode);
+-            allocatedContainer);
++            allocatedContainer, schedulingMode);
+-      FiCaSchedulerApp application, Resource capability) {
++      FiCaSchedulerApp application, Resource capability, String nodePartition,
++      SchedulingMode schedulingMode) {
+-        clusterResource, capability, null);
++        clusterResource, capability, nodePartition, schedulingMode);
+-    if (!canAssignToThisQueue(clusterResource, null,
+-        this.currentResourceLimits, capability, Resources.none())) {
++    if (!canAssignToThisQueue(clusterResource, RMNodeLabelsManager.NO_LABEL,
++        this.currentResourceLimits, capability, Resources.none(), schedulingMode)) {
+-        application, false, null)) {
++        application, false, nodePartition)) {
+-      RMContainer reservedContainer, MutableObject allocatedContainer) {
++      RMContainer reservedContainer, MutableObject allocatedContainer,
++      SchedulingMode schedulingMode) {
+-          allocatedContainer);
++          allocatedContainer, schedulingMode);
+-      RMContainer reservedContainer, MutableObject allocatedContainer) {
++      RMContainer reservedContainer, MutableObject allocatedContainer,
++      SchedulingMode schedulingMode) {
+-          allocatedContainer);
++          allocatedContainer, schedulingMode);
+-      RMContainer reservedContainer, MutableObject allocatedContainer) {
++      RMContainer reservedContainer, MutableObject allocatedContainer,
++      SchedulingMode schedulingMode) {
+-          allocatedContainer);
++          allocatedContainer, schedulingMode);
++  
++  private int getActualNodeLocalityDelay() {
++    return Math.min(scheduler.getNumClusterNodes(), getNodeLocalityDelay());
++  }
+-      return (
+-          Math.min(scheduler.getNumClusterNodes(), getNodeLocalityDelay()) < 
+-          missedOpportunities
+-          );
++      return getActualNodeLocalityDelay() < missedOpportunities;
+-      MutableObject createdContainer) {
++      MutableObject createdContainer, SchedulingMode schedulingMode) {
+-    if (!SchedulerUtils.checkNodeLabelExpression(
+-        node.getLabels(),
+-        request.getNodeLabelExpression())) {
++    if (!SchedulerUtils.checkResourceRequestMatchingNodePartition(request,
++        node.getPartition(), schedulingMode)) {
+-          if (!checkLimitsToReserve(clusterResource, 
+-              application, capability)) {
++          if (!checkLimitsToReserve(clusterResource,
++              application, capability, node.getPartition(), schedulingMode)) {
+-              container.getResource(), node.getLabels());
++              container.getResource(), node.getPartition());
+-      Set<String> nodeLabels) {
+-    super.allocateResource(clusterResource, resource, nodeLabels);
++      String nodePartition) {
++    super.allocateResource(clusterResource, resource, nodePartition);
+-    user.assignContainer(resource, nodeLabels);
++    user.assignContainer(resource, nodePartition);
+-      FiCaSchedulerApp application, Resource resource, Set<String> nodeLabels) {
+-    super.releaseResource(clusterResource, resource, nodeLabels);
++      FiCaSchedulerApp application, Resource resource, String nodePartition) {
++    super.releaseResource(clusterResource, resource, nodePartition);
+-    user.releaseContainer(resource, nodeLabels);
++    user.releaseContainer(resource, nodePartition);
+-        Resources.multiplyAndNormalizeUp(resourceCalculator, clusterResource,
++        Resources.multiplyAndNormalizeUp(resourceCalculator, labelManager
++            .getResourceByLabel(RMNodeLabelsManager.NO_LABEL, clusterResource),
+-        computeUserLimitAndSetHeadroom(application, clusterResource, 
+-            Resources.none(), null);
++        computeUserLimitAndSetHeadroom(application, clusterResource,
++            Resources.none(), RMNodeLabelsManager.NO_LABEL,
++            SchedulingMode.RESPECT_PARTITION_EXCLUSIVITY);
+-    public void assignContainer(Resource resource,
+-        Set<String> nodeLabels) {
+-      if (nodeLabels == null || nodeLabels.isEmpty()) {
+-        userResourceUsage.incUsed(resource);
+-      } else {
+-        for (String label : nodeLabels) {
+-          userResourceUsage.incUsed(label, resource);
+-        }
+-      }
++    public void assignContainer(Resource resource, String nodePartition) {
++      userResourceUsage.incUsed(nodePartition, resource);
+-    public void releaseContainer(Resource resource, Set<String> nodeLabels) {
+-      if (nodeLabels == null || nodeLabels.isEmpty()) {
+-        userResourceUsage.decUsed(resource);
+-      } else {
+-        for (String label : nodeLabels) {
+-          userResourceUsage.decUsed(label, resource);
+-        }
+-      }
++    public void releaseContainer(Resource resource, String nodePartition) {
++      userResourceUsage.decUsed(nodePartition, resource);
+-          .getResource(), node.getLabels());
++          .getResource(), node.getPartition());
+-          .getResource(), node.getLabels());
++          .getResource(), node.getPartition());
+-          .getResource(), node.getLabels());
++          .getResource(), node.getPartition());

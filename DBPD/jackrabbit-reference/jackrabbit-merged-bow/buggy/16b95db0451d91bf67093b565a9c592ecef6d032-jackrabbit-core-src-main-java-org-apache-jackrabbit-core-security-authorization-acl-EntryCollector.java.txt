@@ -1,0 +1,258 @@
+JCR-2890: Deadlock in acl.EntryCollector / ItemManager
+
+Use a fresh new session in EntryCollector.onEvents() for sifting through the observed changes. This prevents a deadlock with other threads that are concurrently using the systemSession instance.
+
+git-svn-id: https://svn.apache.org/repos/asf/jackrabbit/trunk@1089436 13f79535-47bb-0310-9956-ffa450edef68
+
++import org.apache.jackrabbit.spi.Name;
++import javax.jcr.Session;
+-    
+-    /**
+-     * Standard JCR name form of the {@link #N_POLICY} constant.
+-     */
+-    private final String repPolicyName;
+-        repPolicyName = systemSession.getJCRName(N_POLICY);
+-
+-    //------------------------------------------------------------< private >---
+-
+-    private static NodeId accessControlledIdFromAclNode(Node aclNode) throws RepositoryException {
+-        return ((NodeImpl) aclNode.getParent()).getNodeId();
+-    }
+-
+-    private static NodeId accessControlledIdFromAceNode(Node aceNode) throws RepositoryException {
+-        return ((NodeImpl) aceNode.getParent().getParent()).getNodeId();
+-    }
+-
+-    private static void addModification(NodeId accessControllNodeId, int modType,
+-                                        Map<NodeId,Integer> modMap) {
+-        if (modMap.containsKey(accessControllNodeId)) {
+-            // update modMap
+-            modMap.put(accessControllNodeId, modType | modMap.get(accessControllNodeId));
+-        } else {
+-            modMap.put(accessControllNodeId, modType);
+-        }
+-    }
+-    
++
+-     * Collect is of access controlled nodes that are effected by access control
+-     * modification together with the corresponding modification type and
+-     * finally inform listeners about the modifications.
++     * Collects access controlled nodes that are effected by access control
++     * changes together with the corresponding modification types, and
++     * notifies access control listeners about the modifications.
+-        /* map of access-controlled nodeId to type of ac modification */
+-        Map<NodeId,Integer> modMap = new HashMap<NodeId,Integer>();
+-
+-        // collect the ids of all access controlled nodes that have been affected
+-        // by the events and thus need their cache entries updated or cleared.
+-        while (events.hasNext()) {
++        try {
++            // JCR-2890: We need to use a fresh new session here to avoid
++            // deadlocks caused by concurrent threads possibly using the
++            // systemSession instance for other purposes.
++            String workspaceName = systemSession.getWorkspace().getName();
++            Session session = systemSession.createSession(workspaceName);
+-                Event ev = events.nextEvent();
+-                String identifier = ev.getIdentifier();
+-                String path = ev.getPath();
++                // Sift through the events to find access control modifications
++                ACLEventSieve sieve = new ACLEventSieve(session);
++                sieve.siftEvents(events);
+-                switch (ev.getType()) {
++                // Notify listeners and eventually clean up internal caches
++                AccessControlModifications<NodeId> mods =
++                    sieve.getModifications();
++                if (!mods.getNodeIdentifiers().isEmpty()) {
++                    notifyListeners(mods);
++                }
++            } finally {
++                session.logout();
++            }
++        } catch (RepositoryException e) {
++            log.error("Failed to process access control modifications", e);
++        }
++    }
++
++    /**
++     * Private utility class for sifting through observation events on
++     * ACL, ACE and Policy nodes to find out the nodes whose access controls
++     * have changed. Used by the {@link EntryCollector#onEvent(EventIterator)}
++     * method.
++     */
++    private static class ACLEventSieve {
++
++        /** Session with system privileges. */
++        private final Session session;
++
++        /**
++         * Standard JCR name form of the
++         * {@link AccessControlConstants#N_POLICY} constant.
++         */
++        private final String repPolicyName;
++
++        /**
++         * Map of access-controlled nodeId to type of access control modification.
++         */
++        private final Map<NodeId, Integer> modMap =
++            new HashMap<NodeId,Integer>();
++
++        public ACLEventSieve(Session session) throws RepositoryException {
++            this.session = session;
++            Name repPolicy = AccessControlConstants.N_POLICY;
++            this.repPolicyName =
++                session.getNamespacePrefix(repPolicy.getNamespaceURI())
++                + ":" + repPolicy.getLocalName();
++        }
++
++        /**
++         * Collects the identifiers of all access controlled nodes that have
++         * been affected by the events, and thus need their cache entries
++         * updated or cleared.
++         *
++         * @param events access control modification events
++         */
++        public void siftEvents(EventIterator events) {
++            while (events.hasNext()) {
++                Event event = events.nextEvent();
++                try {
++                    switch (event.getType()) {
+-                        NodeImpl n = (NodeImpl) systemSession.getNodeByIdentifier(identifier);
+-                        if (n.isNodeType(NT_REP_ACL)) {
+-                            // a new ACL was added -> use the added node to update
+-                            // the cache.
+-                            addModification(accessControlledIdFromAclNode(n), POLICY_ADDED, modMap);
+-                        } else if (n.isNodeType(NT_REP_ACE)) {
+-                            // a new ACE was added -> use the parent node (acl)
+-                            // to update the cache.
+-                            addModification(accessControlledIdFromAceNode(n), POLICY_MODIFIED, modMap);
+-                        } /* else: some other node added below an access controlled
+-                             parent node -> not interested. */
++                        siftNodeAdded(event.getIdentifier());
+-                        String parentPath = Text.getRelativeParent(path, 1);
+-                        if (systemSession.nodeExists(parentPath)) {
+-                            NodeImpl parent = (NodeImpl) systemSession.getNode(parentPath);
+-                            if (repPolicyName.equals(Text.getName(path))){
+-                                // the complete acl was removed -> clear cache entry
+-                                addModification(parent.getNodeId(), POLICY_REMOVED, modMap);
+-                            } else if (parent.isNodeType(NT_REP_ACL)) {
+-                                // an ace was removed -> refresh cache for the
+-                                // containing access control list upon next access
+-                                addModification(accessControlledIdFromAclNode(parent), POLICY_MODIFIED, modMap);
+-                            } /* else:
+-                             a) some other child node of an access controlled
+-                                node -> not interested.
+-                             b) a child node of an ACE. not relevant for this
+-                                implementation -> ignore
+-                           */
+-                        } else {
+-                            log.debug("Cannot process NODE_REMOVED event. Parent " + parentPath + " doesn't exist (anymore).");
+-                        }
++                        siftNodeRemoved(event.getPath());
+-                        // test if the changed prop belongs to an ACE
+-                        NodeImpl parent = (NodeImpl) systemSession.getNodeByIdentifier(identifier);
+-                        if (parent.isNodeType(NT_REP_ACE)) {
+-                            addModification(accessControlledIdFromAceNode(parent), POLICY_MODIFIED, modMap);
+-                        } /* some other property below an access controlled node
+-                             changed -> not interested. (NOTE: rep:ACL doesn't
+-                             define any properties. */
++                        siftPropertyChanged(event.getIdentifier());
++                    }
++                } catch (RepositoryException e) {
++                    // should not get here
++                    log.error("Failed to process ACL event: " + event, e);
+-            } catch (RepositoryException e) {
+-                // should not get here
+-                log.error("Internal error: ", e);
+-        if (!modMap.isEmpty()) {
+-            // notify listeners and eventually clean up internal caches.
+-            notifyListeners(new AccessControlModifications<NodeId>(modMap));
++        /**
++         * Returns the access control modifications collected from
++         * related observation events.
++         *
++         * @return access control modifications
++         */
++        public AccessControlModifications<NodeId> getModifications() {
++            return new AccessControlModifications<NodeId>(modMap);
++
++        private void siftNodeAdded(String identifier)
++                throws RepositoryException {
++            NodeImpl n = (NodeImpl) session.getNodeByIdentifier(identifier);
++            if (n.isNodeType(EntryCollector.NT_REP_ACL)) {
++                // a new ACL was added -> use the added node to update
++                // the cache.
++                addModification(
++                        accessControlledIdFromAclNode(n),
++                        AccessControlObserver.POLICY_ADDED);
++            } else if (n.isNodeType(EntryCollector.NT_REP_ACE)) {
++                // a new ACE was added -> use the parent node (acl)
++                // to update the cache.
++                addModification(
++                        accessControlledIdFromAceNode(n),
++                        AccessControlObserver.POLICY_MODIFIED);
++            } /* else: some other node added below an access controlled
++               parent node -> not interested. */
++        }
++
++        private void siftNodeRemoved(String path) throws RepositoryException {
++            String parentPath = Text.getRelativeParent(path, 1);
++            if (session.nodeExists(parentPath)) {
++                NodeImpl parent = (NodeImpl) session.getNode(parentPath);
++                if (repPolicyName.equals(Text.getName(path))){
++                    // the complete ACL was removed -> clear cache entry
++                    addModification(
++                            parent.getNodeId(),
++                            AccessControlObserver.POLICY_REMOVED);
++                } else if (parent.isNodeType(EntryCollector.NT_REP_ACL)) {
++                    // an ace was removed -> refresh cache for the
++                    // containing access control list upon next access
++                    addModification(
++                            accessControlledIdFromAclNode(parent),
++                            AccessControlObserver.POLICY_MODIFIED);
++                } /* else:
++                         a) some other child node of an access controlled
++                            node -> not interested.
++                         b) a child node of an ACE. not relevant for this
++                            implementation -> ignore
++                 */
++            } else {
++                log.debug("Cannot process NODE_REMOVED event."
++                        + " Parent {} doesn't exist (anymore).",
++                        parentPath);
++            }
++        }
++
++        private void siftPropertyChanged(String identifier)
++                throws RepositoryException {
++            // test if the changed prop belongs to an ACE
++            NodeImpl parent = (NodeImpl) session.getNodeByIdentifier(identifier);
++            if (parent.isNodeType(EntryCollector.NT_REP_ACE)) {
++                addModification(
++                        accessControlledIdFromAceNode(parent),
++                        AccessControlObserver.POLICY_MODIFIED);
++            } /* some other property below an access controlled node
++                 changed -> not interested. (NOTE: rep:ACL doesn't
++                 define any properties. */
++        }
++
++        private NodeId accessControlledIdFromAclNode(Node aclNode)
++                throws RepositoryException {
++            return ((NodeImpl) aclNode.getParent()).getNodeId();
++        }
++
++        private NodeId accessControlledIdFromAceNode(Node aceNode)
++                throws RepositoryException {
++            return accessControlledIdFromAclNode(aceNode.getParent());
++        }
++
++        private void addModification(NodeId accessControllNodeId, int modType) {
++            if (modMap.containsKey(accessControllNodeId)) {
++                // update modMap
++                modType |= modMap.get(accessControllNodeId);
++            }
++            modMap.put(accessControllNodeId, modType);
++        }
++
++
+
+INS26 INS26 INS40 INS40 INS31 INS55 INS29 INS83 INS39 INS42 INS44 INS8 INS29 INS83 INS83 INS42 INS23 MOV23 INS23 INS31 INS31 INS31 INS31 INS31 INS31 MOV31 MOV31 MOV31 INS65 MOV65 INS43 INS42 INS54 INS65 INS29 INS83 INS83 INS43 INS59 INS29 INS83 INS83 MOV74 MOV59 INS83 INS42 INS44 INS43 INS8 MOV29 MOV83 MOV39 UPD42 MOV42 MOV44 INS8 INS29 INS83 INS74 INS42 MOV8 INS83 INS39 INS42 INS44 INS43 INS8 INS83 INS39 INS42 INS44 INS43 MOV8 INS83 INS39 INS42 INS44 INS43 INS8 MOV8 INS66 INS66 INS66 INS42 INS8 INS12 INS66 INS66 INS66 INS65 INS66 INS65 INS42 INS42 INS65 INS43 INS42 INS42 INS21 INS60 INS21 INS65 MOV61 INS65 INS65 INS43 INS43 INS41 MOV43 INS42 INS42 INS60 MOV25 INS43 INS42 INS42 MOV60 MOV25 INS43 INS42 INS42 INS60 MOV25 INS25 INS60 INS60 INS54 INS44 INS8 INS68 INS66 UPD66 INS66 INS42 INS7 INS43 INS59 INS7 UPD66 UPD66 UPD66 INS42 INS66 INS66 INS66 INS66 INS42 INS42 MOV14 MOV43 INS59 INS42 INS42 MOV43 INS59 MOV32 MOV32 MOV32 MOV8 MOV43 INS59 INS43 INS59 INS8 INS8 INS43 INS42 INS21 INS42 INS42 INS69 INS22 INS42 INS42 INS42 INS40 INS22 INS27 MOV60 INS42 INS11 INS40 UPD42 INS42 INS11 INS40 UPD42 INS42 INS32 INS42 INS42 INS32 INS60 INS21 INS60 INS25 INS21 INS42 INS32 INS43 INS42 INS52 INS42 INS52 INS42 INS32 INS45 INS32 INS8 MOV43 INS32 INS40 MOV43 MOV43 INS32 INS7 INS32 INS42 INS42 INS42 INS42 INS43 INS59 INS32 INS74 INS59 INS38 INS8 INS32 INS42 INS42 INS45 INS42 INS42 INS42 INS42 INS32 INS42 INS42 UPD42 INS50 UPD42 MOV42 INS42 UPD42 MOV42 INS40 INS42 INS42 INS42 INS42 INS40 INS42 MOV32 INS42 INS42 INS42 INS42 INS14 INS42 INS42 INS42 INS43 INS43 INS42 INS32 INS32 INS21 INS42 INS42 INS42 INS42 INS32 MOV49 INS21 INS10 MOV49 INS21 INS10 MOV49 INS21 INS10 INS49 INS40 MOV43 INS40 UPD45 UPD45 INS43 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS32 INS42 INS42 INS32 INS32 INS32 UPD42 INS40 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS32 INS42 INS32 INS27 INS40 INS42 INS42 INS42 INS42 INS42 INS42 INS45 INS42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL7 DEL21 DEL45 DEL42 DEL32 DEL21 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL42 DEL32 DEL42 DEL42 DEL42 DEL42 DEL32 DEL11 DEL59 DEL60 DEL10 DEL10 DEL42 DEL42 DEL42 DEL42 DEL32 DEL11 DEL59 DEL60 DEL10 DEL49 DEL50 DEL42 DEL42 DEL42 DEL83 DEL83 DEL42 DEL43 DEL11 DEL36 DEL42 DEL32 DEL83 DEL42 DEL42 DEL42 DEL42 DEL27 DEL32 DEL42 DEL43 DEL42 DEL43 DEL42 DEL43 DEL74 DEL42 DEL44 DEL25 DEL8 DEL60 DEL32 DEL38 DEL25 DEL8 DEL31

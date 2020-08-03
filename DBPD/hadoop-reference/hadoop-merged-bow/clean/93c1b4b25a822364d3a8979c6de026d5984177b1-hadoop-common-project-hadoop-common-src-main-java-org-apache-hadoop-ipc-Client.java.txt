@@ -1,0 +1,152 @@
+Merge r1414455:r1426018 from trunk
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/branches/HDFS-2802@1432246 13f79535-47bb-0310-9956-ffa450edef68
+
++import java.util.concurrent.ExecutionException;
++import java.util.concurrent.ExecutorService;
++import java.util.concurrent.Executors;
++import java.util.concurrent.Future;
++import java.util.concurrent.RejectedExecutionException;
+-import org.apache.hadoop.ipc.protobuf.IpcConnectionContextProtos.IpcConnectionContextProto;
+-import org.apache.hadoop.ipc.protobuf.RpcPayloadHeaderProtos.RpcPayloadHeaderProto;
+-import org.apache.hadoop.ipc.protobuf.RpcPayloadHeaderProtos.RpcPayloadOperationProto;
+-import org.apache.hadoop.ipc.protobuf.RpcPayloadHeaderProtos.RpcResponseHeaderProto;
+-import org.apache.hadoop.ipc.protobuf.RpcPayloadHeaderProtos.RpcStatusProto;
++import org.apache.hadoop.ipc.protobuf.RpcHeaderProtos.RpcRequestHeaderProto;
++import org.apache.hadoop.ipc.protobuf.RpcHeaderProtos.RpcRequestHeaderProto.OperationProto;
++import org.apache.hadoop.ipc.protobuf.RpcHeaderProtos.RpcResponseHeaderProto;
++import org.apache.hadoop.ipc.protobuf.RpcHeaderProtos.RpcResponseHeaderProto.RpcStatusProto;
++import com.google.common.util.concurrent.ThreadFactoryBuilder;
++
++   * Executor on which IPC calls' parameters are sent. Deferring
++   * the sending of parameters to a separate thread isolates them
++   * from thread interruptions in the calling code.
++   */
++  private static final ExecutorService SEND_PARAMS_EXECUTOR = 
++    Executors.newCachedThreadPool(
++        new ThreadFactoryBuilder()
++        .setDaemon(true)
++        .setNameFormat("IPC Parameter Sending Thread #%d")
++        .build());
++
++  
++  /**
+-    final Writable rpcRequest;  // the serialized rpc request - RpcPayload
++    final Writable rpcRequest;  // the serialized rpc request
++    
++    private final Object sendRpcRequestLock = new Object();
+-      // Write out the payload length
++      // Write out the packet length
+-          receiveResponse();
++          receiveRpcResponse();
+-    /** Initiates a call by sending the parameter to the remote server.
++    /** Initiates a rpc call by sending the rpc request to the remote server.
++     * @param call - the rpc request
+-    public void sendParam(Call call) {
++    public void sendRpcRequest(final Call call)
++        throws InterruptedException, IOException {
+-      DataOutputBuffer d=null;
+-      try {
+-        synchronized (this.out) {
+-          if (LOG.isDebugEnabled())
+-            LOG.debug(getName() + " sending #" + call.id);
++      // Serialize the call to be sent. This is done from the actual
++      // caller thread, rather than the SEND_PARAMS_EXECUTOR thread,
++      // so that if the serialization throws an error, it is reported
++      // properly. This also parallelizes the serialization.
++      //
++      // Format of a call on the wire:
++      // 0) Length of rest below (1 + 2)
++      // 1) RpcRequestHeader  - is serialized Delimited hence contains length
++      // 2) RpcRequest
++      //
++      // Items '1' and '2' are prepared here. 
++      final DataOutputBuffer d = new DataOutputBuffer();
++      RpcRequestHeaderProto header = ProtoUtil.makeRpcRequestHeader(
++         call.rpcKind, OperationProto.RPC_FINAL_PACKET, call.id);
++      header.writeDelimitedTo(d);
++      call.rpcRequest.write(d);
++
++      synchronized (sendRpcRequestLock) {
++        Future<?> senderFuture = SEND_PARAMS_EXECUTOR.submit(new Runnable() {
++          @Override
++          public void run() {
++            try {
++              synchronized (Connection.this.out) {
++                if (shouldCloseConnection.get()) {
++                  return;
++                }
++                
++                if (LOG.isDebugEnabled())
++                  LOG.debug(getName() + " sending #" + call.id);
++         
++                byte[] data = d.getData();
++                int totalLength = d.getLength();
++                out.writeInt(totalLength); // Total Length
++                out.write(data, 0, totalLength);// RpcRequestHeader + RpcRequest
++                out.flush();
++              }
++            } catch (IOException e) {
++              // exception at this point would leave the connection in an
++              // unrecoverable state (eg half a call left on the wire).
++              // So, close the connection, killing any outstanding calls
++              markClosed(e);
++            } finally {
++              //the buffer is just an in-memory buffer, but it is still polite to
++              // close early
++              IOUtils.closeStream(d);
++            }
++          }
++        });
++      
++        try {
++          senderFuture.get();
++        } catch (ExecutionException e) {
++          Throwable cause = e.getCause();
+-          // Serializing the data to be written.
+-          // Format:
+-          // 0) Length of rest below (1 + 2)
+-          // 1) PayloadHeader  - is serialized Delimited hence contains length
+-          // 2) the Payload - the RpcRequest
+-          //
+-          d = new DataOutputBuffer();
+-          RpcPayloadHeaderProto header = ProtoUtil.makeRpcPayloadHeader(
+-             call.rpcKind, RpcPayloadOperationProto.RPC_FINAL_PAYLOAD, call.id);
+-          header.writeDelimitedTo(d);
+-          call.rpcRequest.write(d);
+-          byte[] data = d.getData();
+-   
+-          int totalLength = d.getLength();
+-          out.writeInt(totalLength); // Total Length
+-          out.write(data, 0, totalLength);//PayloadHeader + RpcRequest
+-          out.flush();
++          // cause should only be a RuntimeException as the Runnable above
++          // catches IOException
++          if (cause instanceof RuntimeException) {
++            throw (RuntimeException) cause;
++          } else {
++            throw new RuntimeException("unexpected checked exception", cause);
++          }
+-      } catch(IOException e) {
+-        markClosed(e);
+-      } finally {
+-        //the buffer is just an in-memory buffer, but it is still polite to
+-        // close early
+-        IOUtils.closeStream(d);
+-    }  
++    }
+-    private void receiveResponse() {
++    private void receiveRpcResponse() {
+-    connection.sendParam(call);                 // send the parameter
++    try {
++      connection.sendRpcRequest(call);                 // send the rpc request
++    } catch (RejectedExecutionException e) {
++      throw new IOException("connection has been closed", e);
++    } catch (InterruptedException e) {
++      Thread.currentThread().interrupt();
++      LOG.warn("interrupted waiting to send rpc request to server", e);
++      throw new IOException(e);
++    }
++
+
+MOV26 INS26 INS26 INS26 INS26 INS26 INS40 INS40 INS40 INS40 UPD40 UPD40 UPD40 UPD40 UPD40 INS40 INS23 INS29 INS83 INS83 INS83 INS43 INS59 INS23 INS31 INS65 INS42 INS42 INS32 INS83 INS83 INS43 INS59 INS29 INS83 INS39 INS42 MOV44 INS43 INS43 INS8 UPD42 INS54 INS66 INS66 INS66 INS42 INS42 INS32 INS42 INS42 INS14 INS65 INS65 INS83 INS42 INS42 INS25 INS60 INS60 MOV21 MOV21 INS51 INS8 INS12 INS12 INS32 INS42 INS43 INS66 INS66 INS66 INS42 INS66 INS32 INS8 INS83 MOV43 INS59 INS43 INS59 INS42 INS8 MOV21 INS44 INS8 INS44 INS8 INS32 INS42 INS45 INS42 INS42 INS42 INS41 INS42 MOV14 INS42 INS42 INS32 INS60 INS54 INS43 INS42 INS53 INS43 INS42 INS21 INS21 INS53 INS14 INS42 INS9 INS42 INS42 INS40 INS40 INS40 INS74 INS59 INS8 INS12 UPD42 INS42 INS14 INS42 INS32 INS32 INS14 INS43 INS43 INS76 INS42 INS32 INS21 INS44 INS8 INS43 INS45 INS42 INS32 INS42 INS42 INS42 INS45 INS42 INS43 INS42 INS42 INS42 INS42 INS42 INS14 INS32 INS43 INS42 INS60 INS25 INS42 INS42 INS42 INS42 UPD42 INS43 INS1 INS42 INS42 INS42 INS43 INS59 INS62 INS8 INS8 INS42 MOV31 INS42 INS42 INS32 INS42 INS43 INS53 INS53 INS78 UPD42 INS42 INS42 INS42 INS11 INS14 INS42 INS43 INS42 INS43 INS45 INS42 INS42 INS42 MOV25 INS42 DEL66 DEL66 DEL66 DEL65 DEL29 DEL42 DEL33 DEL59 DEL60 DEL42 DEL7 DEL21 DEL42 DEL43 DEL42 DEL42 DEL42 DEL40 DEL40 DEL40 DEL32 DEL59 DEL60

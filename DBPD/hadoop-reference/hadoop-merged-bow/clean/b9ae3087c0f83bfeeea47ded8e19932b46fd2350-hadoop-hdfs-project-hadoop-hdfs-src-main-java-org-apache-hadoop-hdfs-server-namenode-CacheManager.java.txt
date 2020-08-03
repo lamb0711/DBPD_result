@@ -1,0 +1,189 @@
+HDFS-5636. Enforce a max TTL per cache pool (awang via cmccabe)
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/trunk@1552841 13f79535-47bb-0310-9956-ffa450edef68
+
++import java.util.Date;
++import org.apache.hadoop.hdfs.protocol.CacheDirectiveInfo.Expiration;
+-   * @param directive from which to get the expiry time
+-   * @param defaultValue to use if Expiration is not set
+-   * @return Absolute expiry time in milliseconds since Unix epoch
+-   * @throws InvalidRequestException if the Expiration is invalid
++   * @param info to validate.
++   * @param maxRelativeExpiryTime of the info's pool.
++   * @return the expiration time, or the pool's max absolute expiration if the
++   *         info's expiration was not set.
++   * @throws InvalidRequestException if the info's Expiration is invalid.
+-  private static long validateExpiryTime(CacheDirectiveInfo directive,
+-      long defaultValue) throws InvalidRequestException {
+-    long expiryTime;
+-    CacheDirectiveInfo.Expiration expiration = directive.getExpiration();
+-    if (expiration != null) {
+-      if (expiration.getMillis() < 0) {
+-        throw new InvalidRequestException("Cannot set a negative expiration: "
+-            + expiration.getMillis());
+-      }
+-      // Converts a relative duration into an absolute time based on the local
+-      // clock
+-      expiryTime = expiration.getAbsoluteMillis();
+-    } else {
+-      expiryTime = defaultValue;
++  private static long validateExpiryTime(CacheDirectiveInfo info,
++      long maxRelativeExpiryTime) throws InvalidRequestException {
++    if (LOG.isTraceEnabled()) {
++      LOG.trace("Validating directive " + info
++          + " pool maxRelativeExpiryTime " + maxRelativeExpiryTime);
+-    return expiryTime;
++    final long now = new Date().getTime();
++    final long maxAbsoluteExpiryTime = now + maxRelativeExpiryTime;
++    if (info == null || info.getExpiration() == null) {
++      return maxAbsoluteExpiryTime;
++    }
++    Expiration expiry = info.getExpiration();
++    if (expiry.getMillis() < 0l) {
++      throw new InvalidRequestException("Cannot set a negative expiration: "
++          + expiry.getMillis());
++    }
++    long relExpiryTime, absExpiryTime;
++    if (expiry.isRelative()) {
++      relExpiryTime = expiry.getMillis();
++      absExpiryTime = now + relExpiryTime;
++    } else {
++      absExpiryTime = expiry.getMillis();
++      relExpiryTime = absExpiryTime - now;
++    }
++    // Need to cap the expiry so we don't overflow a long when doing math
++    if (relExpiryTime > Expiration.MAX_RELATIVE_EXPIRY_MS) {
++      throw new InvalidRequestException("Expiration "
++          + expiry.toString() + " is too far in the future!");
++    }
++    // Fail if the requested expiry is greater than the max
++    if (relExpiryTime > maxRelativeExpiryTime) {
++      throw new InvalidRequestException("Expiration " + expiry.toString()
++          + " exceeds the max relative expiration time of "
++          + maxRelativeExpiryTime + " ms.");
++    }
++    return absExpiryTime;
++    if (pool.getLimit() == CachePoolInfo.LIMIT_UNLIMITED) {
++      return;
++    }
+-   * To be called only from the edit log loading code
++   * Adds a directive, skipping most error checking. This should only be called
++   * internally in special scenarios like edit log replay.
+-    CacheDirective entry =
+-        new CacheDirective(
+-            directive.getId(),
+-            directive.getPath().toUri().getPath(),
+-            directive.getReplication(),
+-            directive.getExpiration().getAbsoluteMillis());
++    CacheDirective entry = new CacheDirective(directive);
+-      long expiryTime = validateExpiryTime(info,
+-          CacheDirectiveInfo.Expiration.EXPIRY_NEVER);
++      long expiryTime = validateExpiryTime(info, pool.getMaxRelativeExpiryMs());
++  /**
++   * Factory method that makes a new CacheDirectiveInfo by applying fields in a
++   * CacheDirectiveInfo to an existing CacheDirective.
++   * 
++   * @param info with some or all fields set.
++   * @param defaults directive providing default values for unset fields in
++   *          info.
++   * 
++   * @return new CacheDirectiveInfo of the info applied to the defaults.
++   */
++  private static CacheDirectiveInfo createFromInfoAndDefaults(
++      CacheDirectiveInfo info, CacheDirective defaults) {
++    // Initialize the builder with the default values
++    CacheDirectiveInfo.Builder builder =
++        new CacheDirectiveInfo.Builder(defaults.toInfo());
++    // Replace default with new value if present
++    if (info.getPath() != null) {
++      builder.setPath(info.getPath());
++    }
++    if (info.getReplication() != null) {
++      builder.setReplication(info.getReplication());
++    }
++    if (info.getPool() != null) {
++      builder.setPool(info.getPool());
++    }
++    if (info.getExpiration() != null) {
++      builder.setExpiration(info.getExpiration());
++    }
++    return builder.build();
++  }
++
++  /**
++   * Modifies a directive, skipping most error checking. This is for careful
++   * internal use only. modifyDirective can be non-deterministic since its error
++   * checking depends on current system time, which poses a problem for edit log
++   * replay.
++   */
++  void modifyDirectiveFromEditLog(CacheDirectiveInfo info)
++      throws InvalidRequestException {
++    // Check for invalid IDs.
++    Long id = info.getId();
++    if (id == null) {
++      throw new InvalidRequestException("Must supply an ID.");
++    }
++    CacheDirective prevEntry = getById(id);
++    CacheDirectiveInfo newInfo = createFromInfoAndDefaults(info, prevEntry);
++    removeInternal(prevEntry);
++    addInternal(new CacheDirective(newInfo), getCachePool(newInfo.getPool()));
++  }
++
+-      String path = prevEntry.getPath();
+-      if (info.getPath() != null) {
+-        path = validatePath(info);
+-      }
+-      short replication = prevEntry.getReplication();
+-      replication = validateReplication(info, replication);
++      // Fill in defaults
++      CacheDirectiveInfo infoWithDefaults =
++          createFromInfoAndDefaults(info, prevEntry);
++      CacheDirectiveInfo.Builder builder =
++          new CacheDirectiveInfo.Builder(infoWithDefaults);
+-      long expiryTime = prevEntry.getExpiryTime();
+-      expiryTime = validateExpiryTime(info, expiryTime);
+-
+-      CachePool pool = prevEntry.getPool();
+-      if (info.getPool() != null) {
+-        pool = getCachePool(validatePoolName(info));
+-        checkWritePermission(pc, pool);
++      // Do validation
++      validatePath(infoWithDefaults);
++      validateReplication(infoWithDefaults, (short)-1);
++      // Need to test the pool being set here to avoid rejecting a modify for a
++      // directive that's already been forced into a pool
++      CachePool srcPool = prevEntry.getPool();
++      CachePool destPool = getCachePool(validatePoolName(infoWithDefaults));
++      if (!srcPool.getPoolName().equals(destPool.getPoolName())) {
++        checkWritePermission(pc, destPool);
+-          // Can't kick and wait if caching is disabled
+-          if (monitor != null) {
+-            monitor.waitForRescan();
+-          }
+-          checkLimit(pool, path, replication);
++          checkLimit(destPool, infoWithDefaults.getPath().toUri().getPath(),
++              infoWithDefaults.getReplication());
++      // Verify the expiration against the destination pool
++      validateExpiryTime(infoWithDefaults, destPool.getMaxRelativeExpiryMs());
++
++      // Indicate changes to the CRM
++      if (monitor != null) {
++        monitor.setNeedsRescan();
++      }
++
++      // Validation passed
+-      CacheDirective newEntry =
+-          new CacheDirective(id, path, replication, expiryTime);
+-      addInternal(newEntry, pool);
++      addInternal(new CacheDirective(builder.build()), destPool);
+-  public void removeInternal(CacheDirective directive)
++  private void removeInternal(CacheDirective directive)
++      if (info.getMaxRelativeExpiryMs() != null) {
++        final Long maxRelativeExpiry = info.getMaxRelativeExpiryMs();
++        pool.setMaxRelativeExpiryMs(maxRelativeExpiry);
++        bld.append(prefix).append("set maxRelativeExpiry to "
++            + maxRelativeExpiry);
++        prefix = "; ";
++      }
+
+INS26 INS26 INS40 INS40 INS31 INS31 INS29 INS83 INS83 INS43 INS42 INS44 INS44 INS8 INS29 INS39 INS42 INS44 INS43 INS8 UPD83 UPD42 UPD42 INS25 INS25 INS60 MOV25 INS60 INS25 INS25 INS25 INS25 INS65 INS65 INS65 INS65 INS42 INS43 INS42 MOV43 INS42 INS60 INS25 INS25 INS25 INS25 INS41 INS65 INS43 INS42 INS42 INS60 INS25 INS60 INS60 INS21 INS21 UPD42 UPD66 UPD42 UPD66 UPD66 INS66 UPD66 INS32 INS8 INS83 INS83 INS39 INS27 INS8 INS43 INS59 INS39 INS59 INS59 INS32 INS8 MOV8 INS27 INS8 INS27 INS8 UPD42 INS27 INS8 UPD66 INS66 MOV43 INS66 INS66 INS42 INS66 INS42 INS66 INS66 INS66 INS42 INS43 INS59 MOV27 INS8 INS27 INS8 MOV27 INS8 INS27 INS8 INS32 INS66 INS66 INS66 INS66 INS42 INS43 INS59 INS27 INS8 INS43 INS59 INS43 INS59 INS32 INS32 MOV60 INS42 INS42 INS21 INS42 INS32 UPD42 INS27 INS27 INS27 INS41 INS42 INS42 INS32 UPD34 INS42 INS42 INS42 INS42 MOV21 INS21 INS21 INS42 INS40 INS53 INS42 INS42 INS53 INS32 INS40 INS41 INS40 INS42 INS14 INS21 INS32 INS33 INS21 INS21 INS32 INS33 INS21 INS42 INS42 INS42 INS42 INS32 INS42 INS33 INS53 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS42 INS14 INS32 INS60 INS21 INS25 INS21 INS25 INS25 INS32 INS14 INS42 INS42 INS42 INS42 INS33 INS32 MOV33 INS42 INS42 INS42 UPD42 INS7 INS7 INS14 INS14 INS42 INS42 MOV43 INS42 INS43 INS32 INS32 INS42 INS42 INS32 INS32 INS42 INS42 INS32 INS42 INS42 INS14 INS42 INS42 INS42 INS42 INS42 MOV43 INS42 INS42 INS32 UPD43 INS43 INS59 INS32 INS32 INS43 INS38 INS8 INS32 INS27 INS8 INS27 INS8 INS42 INS42 INS27 INS43 INS42 INS42 UPD42 INS42 INS27 INS42 INS32 UPD42 INS27 INS43 INS27 INS43 INS27 INS40 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS32 INS43 INS45 INS42 INS42 UPD42 UPD42 INS40 INS42 INS14 MOV42 UPD42 MOV42 MOV42 UPD42 MOV42 INS11 UPD42 INS42 UPD42 INS32 MOV21 MOV25 INS42 INS42 INS32 INS42 INS33 INS21 INS14 UPD42 INS32 INS33 INS60 INS21 INS21 INS21 INS45 INS42 INS45 INS42 INS42 UPD42 UPD42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS45 INS32 INS45 INS42 INS45 INS32 INS45 INS42 INS45 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS43 INS42 INS39 INS38 UPD42 INS32 INS32 INS42 INS32 INS42 INS42 INS32 INS43 INS32 INS42 INS42 INS83 INS43 INS59 INS32 INS32 INS7 UPD42 INS42 INS42 INS42 INS42 INS42 INS42 INS40 INS34 UPD42 MOV42 INS42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 UPD42 INS21 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS32 INS42 INS27 INS42 INS45 INS32 INS42 INS42 INS42 INS42 INS42 INS45 INS42 INS42 INS42 INS32 INS32 INS32 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 INS32 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 DEL42 DEL40 DEL43 DEL42 DEL42 DEL32 DEL42 DEL42 DEL27 DEL8 DEL25 DEL42 DEL42 DEL32 DEL42 DEL42 DEL32 DEL42 DEL32 DEL42 DEL32 DEL42 DEL42 DEL32 DEL42 DEL42 DEL32 DEL42 DEL32 DEL40 DEL42 DEL42 DEL32 DEL7 DEL21 DEL8 DEL25 DEL39 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL42 DEL32 DEL7 DEL42 DEL42 DEL32 DEL7 DEL21 DEL39 DEL42 DEL33 DEL27 DEL32 DEL21 DEL8 DEL25 DEL32 DEL21 DEL42 DEL42 DEL32 DEL32 DEL7 DEL21 DEL8 DEL25 DEL42 DEL42 DEL42 DEL42 DEL42 DEL14 DEL59 DEL60 DEL42

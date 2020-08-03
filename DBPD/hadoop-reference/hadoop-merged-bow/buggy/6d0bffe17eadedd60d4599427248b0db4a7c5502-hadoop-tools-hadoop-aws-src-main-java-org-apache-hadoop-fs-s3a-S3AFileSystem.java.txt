@@ -1,0 +1,413 @@
+HADOOP-14556. S3A to support Delegation Tokens.
+
+Contributed by Steve Loughran and Daryn Sharp.
+
++import java.util.Optional;
++import org.apache.hadoop.fs.s3a.auth.RoleModel;
++import org.apache.hadoop.fs.s3a.auth.delegation.AWSPolicyProvider;
++import org.apache.hadoop.fs.s3a.auth.delegation.EncryptionSecretOperations;
++import org.apache.hadoop.fs.s3a.auth.delegation.EncryptionSecrets;
++import org.apache.hadoop.fs.s3a.auth.delegation.S3ADelegationTokens;
++import org.apache.hadoop.fs.s3a.auth.delegation.AbstractS3ATokenIdentifier;
++import org.apache.hadoop.security.token.Token;
+-import static org.apache.commons.lang3.StringUtils.isNotBlank;
++import static org.apache.hadoop.fs.s3a.auth.RolePolicies.STATEMENT_ALLOW_SSE_KMS_RW;
++import static org.apache.hadoop.fs.s3a.auth.RolePolicies.allowS3Operations;
++import static org.apache.hadoop.fs.s3a.auth.delegation.S3ADelegationTokens.TokenIssuingPolicy.NoTokensAvailable;
++import static org.apache.hadoop.fs.s3a.auth.delegation.S3ADelegationTokens.hasDelegationTokenBinding;
++import static org.apache.hadoop.io.IOUtils.cleanupWithLogger;
+-public class S3AFileSystem extends FileSystem implements StreamCapabilities {
++public class S3AFileSystem extends FileSystem implements StreamCapabilities,
++    AWSPolicyProvider {
+-  private S3AEncryptionMethods serverSideEncryptionAlgorithm;
++
++  /**
++   * This must never be null; until initialized it just declares that there
++   * is no encryption.
++   */
++  private EncryptionSecrets encryptionSecrets = new EncryptionSecrets();
++  /** Delegation token integration; non-empty when DT support is enabled. */
++  private Optional<S3ADelegationTokens> delegationTokens = Optional.empty();
++
++  /** Principal who created the FS; recorded during initialization. */
++  private UserGroupInformation owner;
++
+-    setUri(name);
++    // patch the Hadoop security providers
+-    super.initialize(name, conf);
++    // look for delegation token support early.
++    boolean delegationTokensEnabled = hasDelegationTokenBinding(conf);
++    if (delegationTokensEnabled) {
++      LOG.debug("Using delegation tokens");
++    }
++    // set the URI, this will do any fixup of the URI to remove secrets,
++    // canonicalize.
++    setUri(name, delegationTokensEnabled);
++    super.initialize(uri, conf);
+-      instrumentation = new S3AInstrumentation(name);
++
++      // look for encryption data
++      // DT Bindings may override this
++      setEncryptionSecrets(new EncryptionSecrets(
++          getEncryptionAlgorithm(bucket, conf),
++          getServerSideEncryptionKey(bucket, getConf())));
++
++      invoker = new Invoker(new S3ARetryPolicy(getConf()), onRetry);
++      instrumentation = new S3AInstrumentation(uri);
+-      username = UserGroupInformation.getCurrentUser().getShortUserName();
++      owner = UserGroupInformation.getCurrentUser();
++      username = owner.getShortUserName();
+-
+-      Class<? extends S3ClientFactory> s3ClientFactoryClass = conf.getClass(
+-          S3_CLIENT_FACTORY_IMPL, DEFAULT_S3_CLIENT_FACTORY_IMPL,
+-          S3ClientFactory.class);
+-
+-      credentials = createAWSCredentialProviderSet(name, conf);
+-      s3 = ReflectionUtils.newInstance(s3ClientFactoryClass, conf)
+-          .createS3Client(name, bucket, credentials);
+-      invoker = new Invoker(new S3ARetryPolicy(getConf()), onRetry);
++      // creates the AWS client, including overriding auth chain if
++      // the FS came with a DT
++      // this may do some patching of the configuration (e.g. setting
++      // the encryption algorithms)
++      bindAWSClient(name, delegationTokensEnabled);
++
+-      serverSideEncryptionAlgorithm = getEncryptionAlgorithm(bucket, conf);
++  /**
++   * Set up the client bindings.
++   * If delegation tokens are enabled, the FS first looks for a DT
++   * ahead of any other bindings;.
++   * If there is a DT it uses that to do the auth
++   * and switches to the DT authenticator automatically (and exclusively)
++   * @param name URI of the FS
++   * @param dtEnabled are delegation tokens enabled?
++   * @throws IOException failure.
++   */
++  private void bindAWSClient(URI name, boolean dtEnabled) throws IOException {
++    Configuration conf = getConf();
++    credentials = null;
++    String uaSuffix = "";
++
++    if (dtEnabled) {
++      // Delegation support.
++      // Create and start the DT integration.
++      // Then look for an existing DT for this bucket, switch to authenticating
++      // with it if so.
++
++      LOG.debug("Using delegation tokens");
++      S3ADelegationTokens tokens = new S3ADelegationTokens();
++      this.delegationTokens = Optional.of(tokens);
++      tokens.bindToFileSystem(getCanonicalUri(), this);
++      tokens.init(conf);
++      tokens.start();
++      // switch to the DT provider and bypass all other configured
++      // providers.
++      if (tokens.isBoundToDT()) {
++        // A DT was retrieved.
++        LOG.debug("Using existing delegation token");
++        // and use the encryption settings from that client, whatever they were
++      } else {
++        LOG.debug("No delegation token for this instance");
++      }
++      // Get new credential chain
++      credentials = tokens.getCredentialProviders();
++      // and any encryption secrets which came from a DT
++      tokens.getEncryptionSecrets()
++          .ifPresent(this::setEncryptionSecrets);
++      // and update the UA field with any diagnostics provided by
++      // the DT binding.
++      uaSuffix = tokens.getUserAgentField();
++    } else {
++      // DT support is disabled, so create the normal credential chain
++      credentials = createAWSCredentialProviderSet(name, conf);
++    }
++    LOG.debug("Using credential provider {}", credentials);
++    Class<? extends S3ClientFactory> s3ClientFactoryClass = conf.getClass(
++        S3_CLIENT_FACTORY_IMPL, DEFAULT_S3_CLIENT_FACTORY_IMPL,
++        S3ClientFactory.class);
++
++    s3 = ReflectionUtils.newInstance(s3ClientFactoryClass, conf)
++        .createS3Client(getUri(), bucket, credentials, uaSuffix);
++  }
++
++  /**
++   * Set the encryption secrets for requests.
++   * @param secrets secrets
++   */
++  protected void setEncryptionSecrets(final EncryptionSecrets secrets) {
++    this.encryptionSecrets = secrets;
++  }
++
++  /**
++   * Get the encryption secrets.
++   * This potentially sensitive information and must be treated with care.
++   * @return the current encryption secrets.
++   */
++  public EncryptionSecrets getEncryptionSecrets() {
++    return encryptionSecrets;
++  }
++
+-   * Set the URI field through {@link S3xLoginHelper}.
++   * Set the URI field through {@link S3xLoginHelper} and
++   * optionally {@link #canonicalizeUri(URI)}
+-   * @param uri filesystem URI.
++   * @param fsUri filesystem URI.
++   * @param canonicalize true if the URI should be canonicalized.
+-  protected void setUri(URI uri) {
+-    this.uri = S3xLoginHelper.buildFSURI(uri);
++  protected void setUri(URI fsUri, boolean canonicalize) {
++    URI u = S3xLoginHelper.buildFSURI(fsUri);
++    this.uri = canonicalize ? u : canonicalizeUri(u);
++  /**
++   * Get the canonical URI.
++   * @return the canonical URI of this FS.
++   */
++  public URI getCanonicalUri() {
++    return uri;
++  }
++
++  @VisibleForTesting
+-    return Constants.S3A_DEFAULT_PORT;
++    return 0;
+-    return serverSideEncryptionAlgorithm;
++    return encryptionSecrets.getEncryptionMethod();
++  /**
++   * Override the base canonicalization logic and relay to
++   * {@link S3xLoginHelper#canonicalizeUri(URI, int)}.
++   * This allows for the option of changing this logic for better DT handling.
++   * @param rawUri raw URI.
++   * @return the canonical URI to use in delegation tokens and file context.
++   */
+-                serverSideEncryptionAlgorithm,
+-                getServerSideEncryptionKey(bucket, getConf())),
++                getServerSideEncryptionAlgorithm(),
++                encryptionSecrets.getEncryptionKey()),
+-  @Retries.RetryRaw
++  @Retries.RetryTranslated
+-    return getObjectMetadata(pathToKey(path));
++    return once("getObjectMetadata", path.toString(),
++        () ->
++          // this always does a full HEAD to the object
++          getObjectMetadata(pathToKey(path)));
++  }
++
++  /**
++   * Get all the headers of the object of a path, if the object exists.
++   * @param path path to probe
++   * @return an immutable map of object headers.
++   * @throws IOException failure of the query
++   */
++  @Retries.RetryTranslated
++  public Map<String, Object> getObjectHeaders(Path path) throws IOException {
++    LOG.debug("getObjectHeaders({})", path);
++    checkNotClosed();
++    incrementReadOperations();
++    return getObjectMetadata(path).getRawMetadata();
+-    if(S3AEncryptionMethods.SSE_C.equals(serverSideEncryptionAlgorithm) &&
+-        isNotBlank(getServerSideEncryptionKey(bucket, getConf()))){
+-      request.setSSECustomerKey(generateSSECustomerKey());
+-    }
++    generateSSECustomerKey().ifPresent(request::setSSECustomerKey);
++   * Get the owner of this FS: who created it?
++   * @return the owner of the FS.
++   */
++  public UserGroupInformation getOwner() {
++    return owner;
++  }
++
++  /**
++      cleanupWithLogger(LOG, delegationTokens.orElse(null));
+-   * Override getCanonicalServiceName because we don't support token in S3A.
++   * Get the delegation token support for this filesystem;
++   * not null iff delegation support is enabled.
++   * @return the token support, or an empty option.
++   */
++  @VisibleForTesting
++  public Optional<S3ADelegationTokens> getDelegationTokens() {
++    return delegationTokens;
++  }
++
++  /**
++   * Return a service name iff delegation tokens are enabled and the
++   * token binding is issuing delegation tokens.
++   * @return the canonical service name or null
+-    // Does not support Token
+-    return null;
++    // this could all be done in map statements, but it'd be harder to
++    // understand and maintain.
++    // Essentially: no DTs, no canonical service name.
++    if (!delegationTokens.isPresent()) {
++      return null;
++    }
++    // DTs present: ask the binding if it is willing to
++    // serve tokens (or fail noisily).
++    S3ADelegationTokens dt = delegationTokens.get();
++    return dt.getTokenIssuingPolicy() != NoTokensAvailable
++        ? dt.getCanonicalServiceName()
++        : null;
++  }
++
++  /**
++   * Get a delegation token if the FS is set up for them.
++   * If the user already has a token, it is returned,
++   * <i>even if it has expired</i>.
++   * @param renewer the account name that is allowed to renew the token.
++   * @return the delegation token or null
++   * @throws IOException IO failure
++   */
++  @Override
++  public Token<AbstractS3ATokenIdentifier> getDelegationToken(String renewer)
++      throws IOException {
++    entryPoint(Statistic.INVOCATION_GET_DELEGATION_TOKEN);
++    LOG.debug("Delegation token requested");
++    if (delegationTokens.isPresent()) {
++      return delegationTokens.get().getBoundOrNewDT(encryptionSecrets);
++    } else {
++      // Delegation token support is not set up
++      LOG.debug("Token support is not enabled");
++      return null;
++    }
++  }
++
++  /**
++   * Build the AWS policy for restricted access to the resources needed
++   * by this bucket.
++   * The policy generated includes S3 access, S3Guard access
++   * if needed, and KMS operations.
++   * @param access access level desired.
++   * @return a policy for use in roles
++   */
++  @Override
++  public List<RoleModel.Statement> listAWSPolicyRules(
++      final Set<AccessLevel> access) {
++    if (access.isEmpty()) {
++      return Collections.emptyList();
++    }
++    List<RoleModel.Statement> statements = new ArrayList<>(
++        allowS3Operations(bucket,
++            access.contains(AccessLevel.WRITE)
++                || access.contains(AccessLevel.ADMIN)));
++
++    // no attempt is made to qualify KMS access; there's no
++    // way to predict read keys, and not worried about granting
++    // too much encryption access.
++    statements.add(STATEMENT_ALLOW_SSE_KMS_RW);
++
++    // add any metastore policies
++    if (metadataStore instanceof AWSPolicyProvider) {
++      statements.addAll(
++          ((AWSPolicyProvider) metadataStore).listAWSPolicyRules(access));
++    }
++    return statements;
++  /**
++   * Set the optional parameters when initiating the request (encryption,
++   * headers, storage, etc).
++   * @param request request to patch.
++   */
+-      InitiateMultipartUploadRequest req) {
+-    switch (serverSideEncryptionAlgorithm) {
+-    case SSE_KMS:
+-      req.setSSEAwsKeyManagementParams(generateSSEAwsKeyParams());
+-      break;
+-    case SSE_C:
+-      if (isNotBlank(getServerSideEncryptionKey(bucket, getConf()))) {
+-        //at the moment, only supports copy using the same key
+-        req.setSSECustomerKey(generateSSECustomerKey());
+-      }
+-      break;
+-    default:
+-    }
++      InitiateMultipartUploadRequest request) {
++    generateSSEAwsKeyParams().ifPresent(request::setSSEAwsKeyManagementParams);
++    generateSSECustomerKey().ifPresent(request::setSSECustomerKey);
+-    switch (serverSideEncryptionAlgorithm) {
+-    case SSE_C:
+-      if (isNotBlank(getServerSideEncryptionKey(bucket, getConf()))) {
+-        request.setSSECustomerKey(generateSSECustomerKey());
+-      }
+-      break;
+-    default:
+-    }
++    generateSSECustomerKey().ifPresent(request::setSSECustomerKey);
+-    switch (serverSideEncryptionAlgorithm) {
++    switch (getServerSideEncryptionAlgorithm()) {
+-      copyObjectRequest.setSSEAwsKeyManagementParams(
+-          generateSSEAwsKeyParams()
+-      );
++      generateSSEAwsKeyParams().ifPresent(
++          copyObjectRequest::setSSEAwsKeyManagementParams);
+-      if (isNotBlank(getServerSideEncryptionKey(bucket, getConf()))) {
+-        //at the moment, only supports copy using the same key
+-        SSECustomerKey customerKey = generateSSECustomerKey();
++      generateSSECustomerKey().ifPresent(customerKey -> {
+-      }
++      });
+-    switch (serverSideEncryptionAlgorithm) {
+-    case SSE_KMS:
+-      request.setSSEAwsKeyManagementParams(generateSSEAwsKeyParams());
+-      break;
+-    case SSE_C:
+-      if (isNotBlank(getServerSideEncryptionKey(bucket, getConf()))) {
+-        request.setSSECustomerKey(generateSSECustomerKey());
+-      }
+-      break;
+-    default:
+-    }
++    generateSSEAwsKeyParams().ifPresent(request::setSSEAwsKeyManagementParams);
++    generateSSECustomerKey().ifPresent(request::setSSECustomerKey);
+-    if (S3AEncryptionMethods.SSE_S3.equals(serverSideEncryptionAlgorithm)) {
+-      metadata.setSSEAlgorithm(serverSideEncryptionAlgorithm.getMethod());
++    final S3AEncryptionMethods algorithm
++        = getServerSideEncryptionAlgorithm();
++    if (S3AEncryptionMethods.SSE_S3.equals(algorithm)) {
++      metadata.setSSEAlgorithm(algorithm.getMethod());
+-   * Create the AWS SDK structure used to configure SSE, based on the
+-   * configuration.
+-   * @return an instance of the class, which main contain the encryption key
++   * Create the AWS SDK structure used to configure SSE,
++   * if the encryption secrets contain the information/settings for this.
++   * @return an optional set of KMS Key settings
+-  @Retries.OnceExceptionsSwallowed
+-  private SSEAwsKeyManagementParams generateSSEAwsKeyParams() {
+-    //Use specified key, otherwise default to default master aws/s3 key by AWS
+-    SSEAwsKeyManagementParams sseAwsKeyManagementParams =
+-        new SSEAwsKeyManagementParams();
+-    String encryptionKey = getServerSideEncryptionKey(bucket, getConf());
+-    if (isNotBlank(encryptionKey)) {
+-      sseAwsKeyManagementParams = new SSEAwsKeyManagementParams(encryptionKey);
+-    }
+-    return sseAwsKeyManagementParams;
++  private Optional<SSEAwsKeyManagementParams> generateSSEAwsKeyParams() {
++    return EncryptionSecretOperations.createSSEAwsKeyManagementParams(
++        encryptionSecrets);
+-   * Create the SSE-C structure for the AWS SDK.
++   * Create the SSE-C structure for the AWS SDK, if the encryption secrets
++   * contain the information/settings for this.
+-   * @return the customer key.
++   * @return an optional customer key.
+-  @Retries.OnceExceptionsSwallowed
+-  private SSECustomerKey generateSSECustomerKey() {
+-    SSECustomerKey customerKey = new SSECustomerKey(
+-        getServerSideEncryptionKey(bucket, getConf()));
+-    return customerKey;
++  private Optional<SSECustomerKey> generateSSECustomerKey() {
++    return EncryptionSecretOperations.createSSECustomerKey(
++        encryptionSecrets);
+-    if (serverSideEncryptionAlgorithm != null) {
++    if (getServerSideEncryptionAlgorithm() != null) {
+-          .append(serverSideEncryptionAlgorithm)
++          .append(getServerSideEncryptionAlgorithm())
++    sb.append(", delegation tokens=")
++        .append(delegationTokens.map(Objects::toString).orElse("disabled"));
+-      return once("getFileChecksum", path.toString(),
+-          () -> {
+-            // this always does a full HEAD to the object
+-            ObjectMetadata headers = getObjectMetadata(path);
+-            String eTag = headers.getETag();
+-            return eTag != null ? new EtagChecksum(eTag) : null;
+-          });
++      ObjectMetadata headers = getObjectMetadata(path);
++      String eTag = headers.getETag();
++      return eTag != null ? new EtagChecksum(eTag) : null;
+
+MOV26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 MOV31 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 UPD40 INS43 INS23 INS23 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS42 INS29 INS43 INS29 INS83 INS74 INS59 INS29 INS83 INS43 INS59 MOV21 INS29 INS83 INS39 INS42 INS44 INS44 INS43 INS8 INS29 INS83 INS39 INS42 INS44 INS8 INS29 INS83 INS43 INS42 INS8 INS44 INS29 INS83 INS43 INS42 INS8 INS78 INS29 INS29 INS78 INS83 INS74 INS42 INS44 INS43 INS8 INS29 INS83 INS43 INS42 INS8 INS29 INS78 INS83 INS74 INS42 INS8 INS8 INS29 INS78 UPD83 INS74 UPD42 INS44 INS43 INS8 INS29 INS78 UPD83 INS74 INS42 INS44 INS29 UPD83 MOV83 MOV39 UPD42 MOV42 MOV44 INS8 MOV29 INS83 INS39 INS42 MOV44 INS8 INS83 INS39 INS42 MOV44 INS8 INS74 INS42 INS8 INS74 INS42 INS8 MOV8 INS65 INS42 INS42 INS14 INS65 INS43 INS43 INS42 INS32 INS65 INS42 INS42 INS60 INS25 INS65 INS65 INS65 INS65 INS43 INS42 INS39 INS42 INS42 INS60 INS21 INS60 INS25 INS21 MOV60 MOV21 INS65 INS65 INS83 INS43 INS42 INS21 INS65 INS65 INS42 INS41 INS65 INS43 UPD42 INS39 INS42 INS60 INS21 INS65 INS65 INS42 INS41 INS42 INS65 INS65 INS65 UPD40 INS65 INS65 INS65 INS65 INS40 INS43 INS43 INS43 INS43 INS42 INS42 INS21 INS21 INS21 INS41 MOV21 INS65 INS65 INS42 INS41 INS65 INS65 INS42 INS43 INS43 INS41 INS65 UPD65 INS25 INS60 INS41 INS65 INS65 INS65 INS65 INS42 INS43 INS43 MOV43 INS42 INS42 INS21 INS21 INS25 INS65 INS65 INS65 INS42 INS43 INS43 INS83 INS74 INS42 INS25 INS60 INS21 INS25 INS41 INS65 INS65 UPD42 INS21 INS21 INS21 INS21 MOV21 INS60 INS43 MOV43 INS41 INS43 MOV43 INS41 INS21 MOV21 MOV21 INS25 INS66 INS66 INS43 INS66 INS42 INS42 INS42 INS42 INS66 INS39 INS59 INS42 INS8 MOV21 MOV21 INS66 INS66 INS66 INS66 INS66 INS42 INS66 INS42 INS66 INS42 INS66 INS42 INS43 INS59 INS7 INS43 INS59 INS42 INS8 INS8 INS32 INS66 INS42 INS66 INS42 INS7 INS66 INS66 INS66 INS42 UPD66 INS66 INS65 UPD42 INS42 INS66 INS42 INS43 INS59 INS7 INS66 INS66 INS42 INS34 INS32 INS66 INS65 INS66 INS66 INS42 INS66 INS66 INS32 INS66 INS42 INS66 INS66 INS42 INS66 INS42 INS42 INS42 INS42 INS32 INS32 INS32 INS32 INS66 INS66 INS42 INS66 INS66 INS66 INS42 INS42 INS42 INS66 INS66 UPD66 INS38 MOV8 INS43 INS59 INS16 INS66 INS66 INS66 INS42 INS66 INS66 INS42 INS66 INS42 INS42 INS32 MOV32 INS32 INS8 MOV8 INS66 INS66 INS66 INS66 INS42 INS66 INS66 INS42 INS40 INS43 INS43 INS32 INS8 INS74 INS59 INS32 INS62 MOV8 INS42 INS66 INS66 INS42 INS66 INS32 MOV32 INS32 INS32 INS21 INS32 INS83 MOV43 INS59 UPD66 UPD66 UPD66 UPD42 MOV42 INS32 UPD66 INS66 UPD66 UPD42 MOV42 INS32 INS32 MOV32 MOV8 MOV8 INS42 INS42 INS32 INS21 INS42 UPD42 INS21 INS21 INS42 INS42 INS32 INS42 INS33 INS42 INS42 INS45 INS21 INS60 INS21 INS21 INS21 INS21 INS25 INS21 INS21 INS21 MOV21 INS42 INS42 INS45 INS42 INS22 INS42 INS68 INS42 INS42 INS32 MOV22 INS16 INS42 INS42 INS68 INS42 INS45 MOV32 INS86 INS42 INS42 INS45 INS42 INS42 INS42 INS32 INS42 INS42 INS90 INS21 INS32 INS42 INS42 INS32 INS27 INS32 INS33 INS42 INS40 UPD42 UPD42 INS45 INS42 UPD42 MOV42 INS41 INS41 INS42 INS42 INS42 INS42 INS41 INS43 INS43 INS42 INS14 INS42 INS42 INS42 INS42 INS43 MOV32 INS42 INS90 MOV32 INS42 INS90 MOV32 UPD42 MOV42 INS90 INS42 INS32 MOV32 UPD42 MOV42 INS90 MOV32 INS42 INS90 INS42 INS32 UPD42 INS42 INS42 INS42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 INS32 INS32 INS42 INS32 MOV60 MOV21 INS42 INS42 INS32 INS32 INS32 INS42 INS32 INS43 INS59 INS7 INS32 INS32 INS32 INS32 INS8 INS8 INS7 INS32 INS7 INS32 INS42 INS52 INS42 INS42 INS69 MOV42 MOV42 UPD42 MOV42 INS42 INS42 INS32 INS42 INS42 INS69 INS69 MOV32 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS32 INS33 INS32 INS42 INS40 INS74 INS32 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS90 MOV32 UPD42 MOV42 INS86 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS45 INS32 INS42 INS45 INS42 INS42 INS45 INS42 INS14 UPD42 MOV32 UPD42 INS32 INS42 INS42 INS42 INS42 INS42 INS45 INS42 INS42 INS14 INS22 INS32 INS42 INS42 INS32 INS52 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS21 INS21 INS42 INS32 INS32 INS42 INS90 INS42 INS32 UPD42 MOV42 MOV43 INS42 INS42 INS43 INS39 INS32 INS42 INS42 INS32 INS42 INS42 INS32 UPD42 MOV42 INS42 UPD42 UPD42 INS45 INS42 INS42 INS43 UPD42 MOV42 MOV42 INS27 INS42 INS42 INS32 INS42 INS42 INS59 MOV8 INS42 INS42 INS90 INS43 MOV32 MOV32 UPD42 INS42 INS42 INS43 INS52 INS42 INS42 INS42 INS42 INS42 INS32 INS32 INS42 INS42 INS42 INS42 INS52 INS42 INS42 INS42 INS42 INS42 UPD42 UPD42 MOV42 INS42 INS42 INS33 UPD42 MOV42 UPD42 MOV42 INS42 INS32 INS32 INS36 INS42 INS42 INS42 UPD42 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS45 INS42 INS42 INS45 UPD42 MOV42 INS42 INS40 INS42 INS42 INS40 INS11 UPD42 MOV42 INS43 INS42 INS42 DEL42 DEL42 DEL32 DEL32 DEL7 DEL21 DEL40 DEL42 DEL42 DEL42 DEL32 DEL42 DEL42 DEL40 DEL42 DEL42 DEL32 DEL42 DEL32 DEL27 DEL8 DEL25 DEL39 DEL42 DEL42 DEL49 DEL21 DEL10 DEL42 DEL49 DEL32 DEL32 DEL32 DEL25 DEL10 DEL49 DEL50 DEL8 DEL39 DEL42 DEL42 DEL42 DEL32 DEL42 DEL42 DEL49 DEL42 DEL32 DEL32 DEL32 DEL25 DEL10 DEL49 DEL50 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL43 DEL42 DEL59 DEL60 DEL42 DEL42 DEL42 DEL32 DEL32 DEL32 DEL25 DEL42 DEL42 DEL42 DEL42 DEL49 DEL21 DEL10 DEL42 DEL49 DEL42 DEL42 DEL32 DEL32 DEL32 DEL8 DEL25 DEL10 DEL49 DEL50 DEL8 DEL31 DEL40 DEL78 DEL42 DEL43 DEL42 DEL42 DEL43 DEL14 DEL59 DEL60 DEL42 DEL42 DEL42 DEL42 DEL32 DEL32 DEL59 DEL60 DEL42 DEL42 DEL32 DEL42 DEL42 DEL43 DEL42 DEL14 DEL7 DEL21 DEL8 DEL25 DEL42 DEL41 DEL8 DEL40 DEL78 DEL42 DEL43 DEL42 DEL42 DEL43 DEL32 DEL32 DEL14 DEL59 DEL60 DEL42 DEL41 DEL8 DEL42 DEL42 DEL45 DEL86 DEL32 DEL25 DEL8

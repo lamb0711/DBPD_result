@@ -1,0 +1,276 @@
+Refactoring step 4 (JCR-53)
+ - Moved repository.xml parsing to ConfigurationParser
+ - Moved workspace creation code to ConfigurationParser (TODO find a better place)
+ - Removed AbstractConfig as it is no longer needed
+ - Added the ConfigurationEntityResolver utility class
+ - Fixed broken unit tests (need to call FileSystem.init()!)
+
+git-svn-id: https://svn.apache.org/repos/asf/incubator/jackrabbit/trunk@156082 13f79535-47bb-0310-9956-ffa450edef68
+
++import java.io.FileOutputStream;
+-import java.io.InputStream;
++import java.util.Enumeration;
++import java.util.HashMap;
++import org.apache.jackrabbit.core.fs.FileSystemException;
+-import org.xml.sax.EntityResolver;
++import org.jdom.output.Format;
++import org.jdom.output.XMLOutputter;
+-import org.xml.sax.SAXException;
+-    /**
+-     * public id
+-     */
+-    public static final String PUBLIC_ID = "-//The Apache Software Foundation//DTD Workspace//EN";
++    private static final String SECURITY_ELEMENT = "Security";
++    private static final String APP_NAME_ATTRIB = "appName";
++    private static final String ACCESS_MANAGER_ELEMENT = "AccessManager";
+-    public static final String CONFIG_DTD_RESOURCE_PATH =
+-            "org/apache/jackrabbit/core/config/config.dtd";
++    private static final String WORKSPACES_ELEMENT = "Workspaces";
++    private static final String ROOT_PATH_ATTRIB = "rootPath";
++    private static final String DEFAULT_WORKSPACE_ATTRIB = "defaultWorkspace";
++
++    private static final String WORKSPACE_ELEMENT = "Workspace";
++
++    private static final String VERSIONING_ELEMENT = "Versioning";
++
++    /**
++     * wellknown variables (will be replaced with their respective values
++     * whereever they occur within the configuration)
++     */
++    public static final String REPOSITORY_HOME_VARIABLE = "${rep.home}";
++    public Document parse(InputSource xml) throws IOException, JDOMException {
++        SAXBuilder builder = new SAXBuilder();
++        builder.setEntityResolver(new ConfigurationEntityResolver());
++        return builder.build(xml);
++    }
++    
++    /**
++     * Creates a new <code>RepositoryFactory</code> instance. The configuration
++     * is read from the specified configuration file.
++     *
++     * @param configFilePath path to the configuration file
++     * @param repHomeDir     repository home directory
++     * @return a new <code>RepositoryConfig</code> instance
++     * @throws RepositoryException If an error occurs
++     */
++    public RepositoryConfig parseRepositoryConfig(
++            String configFilePath, String repHomeDir) throws RepositoryException {
++        try {
++            File config = new File(configFilePath);
++            InputSource is = new InputSource(new FileReader(config));
++            is.setSystemId(config.toURI().toString());
++            return parseRepositoryConfig(is, repHomeDir);
++        } catch (IOException ioe) {
++            String msg = "error while reading config file " + configFilePath;
++            throw new RepositoryException(msg, ioe);
++        }
++    }
++
++    /**
++     * private constructor.
++     *
++     * @param is
++     * @param repHomeDir
++     * @throws RepositoryException
++     */
++    public RepositoryConfig parseRepositoryConfig(
++            InputSource xml, String repHomeDir)
++            throws RepositoryException {
++        Properties newVariables = new Properties(variables);
++        newVariables.setProperty(REPOSITORY_HOME_VARIABLE, repHomeDir);
++        ConfigurationParser parser = new ConfigurationParser(newVariables);
++        return parser.parseRepositoryConfig(xml);
++    }
++
++    public RepositoryConfig parseRepositoryConfig(InputSource xml)
++            throws RepositoryException {
++        try {
++            Document config = parse(xml);
++            Element root = config.getRootElement();
++
++            String home = variables.getProperty(REPOSITORY_HOME_VARIABLE);
++
++            // file system
++            BeanConfig fsc = parseBeanConfig(root, FILE_SYSTEM_ELEMENT);
++            FileSystem repFS = (FileSystem) fsc.newInstance();
++            repFS.init();
++
++            // security & access manager config
++            Element secEleme = root.getChild(SECURITY_ELEMENT);
++            String appName = secEleme.getAttributeValue(APP_NAME_ATTRIB);
++            BeanConfig amc = parseBeanConfig(secEleme, ACCESS_MANAGER_ELEMENT);
++
++            // workspaces
++            Element wspsElem = root.getChild(WORKSPACES_ELEMENT);
++            String wspConfigRootDir = replaceVariables(wspsElem.getAttributeValue(ROOT_PATH_ATTRIB));
++            String defaultWspName = replaceVariables(wspsElem.getAttributeValue(DEFAULT_WORKSPACE_ATTRIB));
++
++            // load wsp configs
++            Map wspConfigs = new HashMap();
++            File wspRoot = new File(wspConfigRootDir);
++            if (!wspRoot.exists()) {
++                wspRoot.mkdir();
++            }
++            File[] files = wspRoot.listFiles();
++            if (files == null) {
++                String msg = "invalid repsitory home directory";
++                throw new RepositoryException(msg);
++            }
++            for (int i = 0; i < files.length; i++) {
++                // check if <subfolder>/workspace.xml exists
++                File configFile = new File(files[i], "workspace.xml");
++                if (configFile.isFile()) {
++                    // create workspace config
++                    WorkspaceConfig wspConfig = parseWorkspaceConfig(
++                                configFile.getPath(), configFile.getParent());
++                    String wspName = wspConfig.getName();
++                    if (wspConfigs.containsKey(wspName)) {
++                        String msg = "duplicate workspace name: " + wspName;
++                        throw new RepositoryException(msg);
++                    }
++                    wspConfigs.put(wspName, wspConfig);
++                }
++            }
++            if (wspConfigs.isEmpty()) {
++                // create initial default workspace
++                wspConfigs.put(defaultWspName, createWorkspaceConfig(
++                        config, wspConfigRootDir, defaultWspName));
++            } else {
++                if (!wspConfigs.containsKey(defaultWspName)) {
++                    String msg = "no configuration found for default workspace: " + defaultWspName;
++                    throw new RepositoryException(msg);
++                }
++            }
++
++            // load versioning config
++            Element vElement = config.getRootElement().getChild(VERSIONING_ELEMENT);
++            VersioningConfig vc = parseVersioningConfig(vElement);
++
++            return new RepositoryConfig(config, this, home, appName, wspConfigs, repFS, wspConfigRootDir, defaultWspName, amc, vc);
++        } catch (FileSystemException ex) {
++            throw new RepositoryException(ex);
++        } catch (JDOMException ex) {
++            throw new RepositoryException(ex);
++        } catch (IOException ex) {
++            throw new RepositoryException(ex);
++        } catch (ClassNotFoundException ex) {
++            throw new RepositoryException(ex);
++        } catch (InstantiationException ex) {
++            throw new RepositoryException(ex);
++        } catch (IllegalAccessException ex) {
++            throw new RepositoryException(ex);
++        } catch (ClassCastException ex) {
++            throw new RepositoryException(ex);
++        }
++    }
++
++    /**
++     * Creates a new workspace configuration with the specified name.
++     *
++     * @param name workspace name
++     * @return a new <code>WorkspaceConfig</code> object.
++     * @throws RepositoryException if the specified name already exists or
++     *                             if an error occured during the creation.
++     */
++    public WorkspaceConfig createWorkspaceConfig(
++            Document config, String root, String name)
++            throws RepositoryException {
++        // create the workspace folder (i.e. the workspace home directory)
++        File wspFolder = new File(root, name);
++        if (!wspFolder.mkdir()) {
++            String msg = "Failed to create the workspace home directory: " + wspFolder.getPath();
++            throw new RepositoryException(msg);
++        }
++        // clone the workspace definition template
++        Element wspCongigElem =
++            (Element) config.getRootElement().getChild("Workspace").clone();
++        wspCongigElem.setAttribute("name", name);
++
++        // create workspace.xml file
++/*
++        DocType docType = new DocType(WORKSPACE_ELEMENT, null, WorkspaceConfig.PUBLIC_ID);
++        Document doc = new Document(wspCongigElem, docType);
++*/
++        Document doc = new Document(wspCongigElem);
++        XMLOutputter out = new XMLOutputter(Format.getPrettyFormat());
++        File configFile = new File(wspFolder, "workspace.xml");
++        FileOutputStream fos = null;
++        try {
++            fos = new FileOutputStream(configFile);
++            out.output(doc, fos);
++        } catch (IOException ioe) {
++            String msg = "Failed to create workspace configuration file: " + configFile.getPath();
++            throw new RepositoryException(msg, ioe);
++        } finally {
++            if (fos != null) {
++                try {
++                    fos.close();
++                } catch (IOException e) {
++                    // ignore
++                }
++            }
++        }
++
++        // create workspace config object
++        return parseWorkspaceConfig(configFile.getPath(), configFile.getParent());
++    }
++
++    /**
++     * Initializes this <code>RepositoryConfig</code> object.
++     *
++     * @param config
++     * @throws RepositoryException
++     */
++    protected void init(Document config) throws RepositoryException {
++    }
++
+-    public static WorkspaceConfig parseWorkspaceConfig(
++    public WorkspaceConfig parseWorkspaceConfig(
+-    public static WorkspaceConfig parseWorkspaceConfig(
++    public WorkspaceConfig parseWorkspaceConfig(
+-            SAXBuilder builder = new SAXBuilder();
+-            builder.setEntityResolver(new EntityResolver() {
+-                public InputSource resolveEntity(String publicId, String systemId)
+-                throws SAXException, IOException {
+-                    if (publicId.equals(PUBLIC_ID)) {
+-                        // load dtd resource
+-                        return new InputSource(getClass().getClassLoader().getResourceAsStream(CONFIG_DTD_RESOURCE_PATH));
+-                    } else {
+-                        // use the default behaviour
+-                        return null;
+-                    }
+-                }
+-            });
+-            Document config = builder.build(xml);
++            Document config = parse(xml);
+-            Properties variables = new Properties();
+-            variables.setProperty(WORKSPACE_HOME_VARIABLE, home);
+-            ConfigurationParser parser = new ConfigurationParser(variables);
++            Properties newVariables = new Properties(variables);
++            newVariables.setProperty(WORKSPACE_HOME_VARIABLE, home);
++            ConfigurationParser parser = new ConfigurationParser(newVariables);
++            wspFS.init();
+-            
++
++        } catch (FileSystemException ex) {
++            throw new RepositoryException(ex);
++            fs.init();
++        } catch (FileSystemException ex) {
++            throw new RepositoryException(ex);
++            fs.init();
++        } catch (FileSystemException ex) {
++            throw new RepositoryException(ex);
+-            return null;
++            throw new IllegalArgumentException(name);
++            // return null;
+-        Iterator iterator = variables.keySet().iterator();
+-        while (iterator.hasNext()) {
+-            String varName = (String) iterator.next();
+-            String varValue = (String) variables.get(varName);
++        String ovalue = value;
++        Enumeration e = variables.propertyNames();
++        while (e.hasMoreElements()) {
++            String varName = (String) e.nextElement();
++            String varValue = variables.getProperty(varName);
+
+MOV26 MOV26 MOV26 INS26 INS26 INS26 UPD40 UPD40 INS40 UPD40 INS40 INS40 INS23 INS23 INS23 INS23 INS23 INS23 INS23 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS83 INS83 INS83 INS43 INS59 INS83 INS83 INS83 MOV43 INS59 INS83 INS83 INS83 INS43 INS59 UPD83 INS43 UPD83 INS43 INS83 INS83 INS83 INS43 INS59 INS83 INS83 INS83 INS43 INS59 INS83 INS83 INS83 INS43 INS59 INS29 INS83 INS83 INS83 MOV43 INS59 INS83 MOV43 UPD42 MOV42 INS44 MOV43 INS43 INS8 INS29 INS83 INS43 INS42 INS44 MOV44 INS43 INS8 INS29 INS83 INS43 INS42 INS44 INS44 INS43 INS8 MOV83 INS43 INS42 MOV44 UPD43 MOV43 INS8 INS29 INS83 INS43 INS42 INS44 INS44 INS44 INS43 INS8 INS29 INS83 INS39 INS42 INS44 INS43 INS8 MOV29 INS83 MOV43 INS42 MOV44 MOV44 MOV43 INS8 INS42 INS42 INS45 INS42 INS45 INS42 INS42 INS45 INS42 UPD42 UPD45 INS42 UPD42 UPD45 INS42 INS42 INS45 INS42 INS42 INS45 INS42 INS42 INS45 INS65 INS42 INS45 INS43 INS42 INS42 MOV60 INS21 INS41 INS65 INS65 INS65 INS65 INS65 INS42 INS43 INS42 UPD42 INS42 INS54 INS65 INS65 INS65 INS65 INS42 INS43 INS42 INS43 INS42 INS42 INS60 INS21 INS60 INS41 INS42 INS43 INS42 UPD42 INS54 INS65 INS65 INS65 INS65 INS42 INS43 INS42 MOV43 INS42 INS43 INS42 INS42 INS60 INS25 MOV60 INS21 INS60 INS60 INS60 INS60 INS54 INS41 INS65 INS65 INS65 INS43 INS42 INS42 INS54 INS60 INS66 INS66 INS42 INS32 MOV32 INS66 INS66 INS42 INS66 INS42 INS66 INS66 INS42 INS66 INS42 INS8 INS12 INS66 INS42 INS42 INS42 INS42 INS42 INS43 INS59 INS32 INS43 INS59 INS32 INS42 INS8 INS12 INS12 INS12 INS12 INS12 INS12 INS12 INS66 INS42 INS66 INS66 INS42 INS66 INS66 INS42 INS42 INS43 INS59 INS38 INS8 INS43 INS32 INS43 INS59 INS43 INS59 INS43 INS59 INS43 INS59 INS8 INS12 INS8 INS32 INS66 INS42 INS42 INS42 INS8 MOV12 MOV12 INS12 INS12 INS12 INS43 INS59 UPD43 MOV42 MOV42 INS14 INS60 INS60 INS21 INS41 INS44 INS8 INS42 INS42 INS14 INS42 INS42 INS42 INS42 INS42 INS42 INS14 INS42 INS42 INS42 INS60 INS60 INS60 INS60 INS60 INS21 INS60 INS60 INS60 INS60 INS60 INS60 INS60 INS60 INS25 INS60 INS25 INS24 INS25 INS60 INS60 MOV41 INS44 INS8 INS44 INS8 INS44 INS8 INS44 INS8 INS44 INS8 INS44 INS8 INS44 INS8 INS42 INS42 INS14 INS32 INS60 INS53 INS42 INS42 INS11 INS42 INS42 INS45 INS42 INS42 INS42 INS14 INS42 INS42 INS14 INS42 INS42 INS14 INS42 INS42 INS33 INS21 INS21 INS44 INS8 INS25 INS42 INS32 INS32 INS60 MOV60 MOV21 MOV60 MOV41 INS21 INS44 INS8 INS21 INS44 INS8 INS21 INS44 INS8 INS53 INS42 INS42 INS42 UPD42 UPD42 INS32 UPD42 UPD42 UPD43 MOV43 INS43 INS59 MOV43 INS59 INS32 INS32 INS43 INS42 INS60 INS53 INS43 INS42 INS43 INS42 INS43 INS59 INS43 INS59 INS43 INS59 INS43 INS59 INS43 INS59 INS32 INS43 INS59 INS43 INS59 INS43 INS59 INS43 INS59 INS43 INS59 INS43 INS59 INS43 INS59 INS43 INS59 INS38 INS8 INS5 INS59 INS27 INS8 INS58 INS27 INS37 INS8 INS32 INS8 INS8 INS43 INS59 INS43 INS59 INS14 INS43 INS42 INS53 INS43 INS42 INS53 INS43 INS42 INS53 INS43 INS42 INS53 INS43 INS42 INS53 INS43 INS42 INS53 INS43 INS42 INS53 INS43 INS42 INS42 INS42 INS42 MOV43 INS59 INS14 INS43 INS32 INS43 INS42 INS43 INS32 INS43 INS42 INS45 INS7 INS32 INS43 INS42 INS60 INS53 INS27 INS8 INS42 INS42 INS42 INS42 INS43 INS59 INS32 INS43 INS42 INS53 INS32 INS43 INS42 INS53 INS32 INS43 INS42 INS53 INS14 MOV42 UPD42 MOV42 INS43 INS43 UPD42 INS42 INS42 INS14 INS42 INS14 INS42 INS42 INS32 INS42 INS42 INS42 INS42 MOV43 INS59 INS14 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS11 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS14 INS42 INS42 INS14 INS32 INS21 INS43 INS85 INS42 INS32 INS42 INS33 INS60 INS53 INS39 INS59 INS42 INS40 INS42 INS60 INS25 INS42 INS42 INS21 INS25 INS42 INS42 INS32 INS42 INS42 INS32 INS43 INS42 INS52 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS14 INS42 INS14 INS42 INS14 INS42 INS14 INS42 INS14 INS42 INS14 INS42 INS14 INS42 INS42 INS27 INS43 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS14 INS42 INS42 INS42 INS42 INS42 MOV43 INS59 INS14 INS42 INS33 INS54 INS42 INS42 INS32 UPD42 UPD42 INS42 INS42 INS42 INS14 INS42 INS42 INS42 INS14 INS42 INS42 INS42 INS14 INS43 INS42 INS42 INS42 INS32 INS43 INS42 MOV43 INS14 INS32 INS42 INS42 INS27 INS43 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 INS43 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS32 INS43 INS43 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS43 INS59 INS14 INS42 INS34 INS43 INS59 INS32 MOV8 INS32 INS38 INS8 INS32 INS42 INS42 INS42 INS42 INS42 INS43 INS42 INS43 INS42 INS43 INS42 INS43 INS42 INS43 INS42 INS43 INS42 INS43 INS42 INS45 INS32 INS42 INS32 INS42 INS45 INS43 INS42 INS42 INS27 INS43 INS42 INS42 INS8 INS12 INS42 INS42 INS42 UPD42 INS43 INS42 INS43 INS42 INS43 INS42 INS42 INS43 MOV42 UPD42 MOV42 MOV42 INS42 INS43 INS42 INS42 INS42 INS45 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS45 INS43 INS42 INS42 INS42 INS14 INS42 INS42 INS60 INS60 INS25 INS21 INS42 INS42 INS42 INS32 INS32 INS60 INS53 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS45 INS32 INS42 INS21 INS44 INS8 INS42 INS42 INS42 INS42 UPD42 UPD42 INS42 INS42 INS43 INS2 INS45 INS43 INS59 INS43 INS59 INS32 INS8 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 MOV43 INS59 INS14 INS42 INS42 INS32 INS43 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS32 UPD42 MOV42 INS42 INS42 INS60 INS53 INS42 INS42 INS42 INS42 INS42 INS27 INS43 INS42 INS42 INS42 INS42 INS42 MOV32 INS32 INS42 UPD42 MOV42 INS43 INS59 INS14 INS45 INS42 INS42 INS42 UPD42 INS42 UPD42 MOV42 INS42 INS42 INS27 INS43 INS42 INS45 INS42 INS42 DEL66 DEL65 DEL29 DEL42 DEL32 DEL32 DEL14 DEL41 DEL33 DEL42 DEL83 DEL83 DEL83 DEL42 DEL32 DEL8 DEL25 DEL8 DEL31 DEL1 DEL14 DEL32 DEL21 DEL8 DEL54 DEL8 DEL31 DEL33 DEL41 DEL32 DEL42 DEL32 DEL32 DEL11

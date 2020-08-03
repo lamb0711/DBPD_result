@@ -1,0 +1,156 @@
+YARN-7939.  Added support to upgrade a component instance.
+            Contributed by Chandni Singh
+
++import org.apache.hadoop.yarn.service.ServiceEvent;
++import org.apache.hadoop.yarn.service.ServiceEventType;
++import org.apache.hadoop.yarn.service.api.records.ContainerState;
++import org.apache.hadoop.yarn.service.api.records.ResourceInformation;
++import org.apache.hadoop.yarn.service.component.instance.ComponentInstance;
++import org.apache.hadoop.yarn.service.component.instance.ComponentInstanceId;
+-import org.apache.hadoop.yarn.service.ServiceMaster;
+-import org.apache.hadoop.yarn.service.api.records.ResourceInformation;
+-import org.apache.hadoop.yarn.service.component.instance.ComponentInstance;
+-import org.apache.hadoop.yarn.service.component.instance.ComponentInstanceId;
++import org.apache.hadoop.yarn.service.containerlaunch.ContainerLaunchService;
++import java.util.concurrent.atomic.AtomicBoolean;
++  private AtomicBoolean upgradeInProgress = new AtomicBoolean(false);
++  private ComponentEvent upgradeEvent;
++  private AtomicLong numContainersThatNeedUpgrade = new AtomicLong(0);
++
+-          .addTransition(FLEXING, EnumSet.of(STABLE, FLEXING),
++          .addTransition(FLEXING, EnumSet.of(STABLE, FLEXING, UPGRADING),
+-          .addTransition(STABLE, UPGRADING, UPGRADE,
++          .addTransition(STABLE, UPGRADING, ComponentEventType.UPGRADE,
+-          .addTransition(FLEXING, UPGRADING, UPGRADE,
++          //Upgrade while previous upgrade is still in progress
++          .addTransition(UPGRADING, UPGRADING, ComponentEventType.UPGRADE,
+-          .addTransition(UPGRADING, UPGRADING, UPGRADE,
+-              new ComponentNeedsUpgradeTransition())
++          .addTransition(UPGRADING, EnumSet.of(UPGRADING, FLEXING, STABLE),
++              CHECK_STABLE, new CheckStableTransition())
++          .addTransition(FLEXING, EnumSet.of(UPGRADING, FLEXING, STABLE),
++              CHECK_STABLE, new CheckStableTransition())
++          .addTransition(STABLE, EnumSet.of(STABLE), CHECK_STABLE,
++              new CheckStableTransition())
++          .addTransition(UPGRADING, FLEXING, CONTAINER_COMPLETED,
++              new ContainerCompletedTransition())
+-      ProviderUtils.initCompInstanceDir(component.getContext().fs, instance);
++
++      ProviderUtils.initCompInstanceDir(component.getContext().fs,
++          component.createLaunchContext(component.componentSpec,
++              component.scheduler.getApp().getVersion()), instance);
+-        .getComponentSpec().getNumberOfContainers()) {
++        .getComponentSpec().getNumberOfContainers() &&
++        component.numContainersThatNeedUpgrade.get() == 0) {
+-    } else {
++    } else if (component.componentMetrics.containersReady.value() != component
++        .getComponentSpec().getNumberOfContainers()) {
++    } else {
++      //  component.numContainersThatNeedUpgrade.get() > 0
++      component.componentSpec.setState(org.apache.hadoop.yarn.service.api.
++          records.ComponentState.NEEDS_UPGRADE);
++      return UPGRADING;
+-      if (component.componentMetrics.containersReady
+-          .value() == component.componentMetrics.containersDesired.value()) {
++      if (component.numContainersThatNeedUpgrade.get() == 0 &&
++          component.componentMetrics.containersReady.value() ==
++              component.componentMetrics.containersDesired.value()) {
+-        ServiceMaster.checkAndUpdateServiceState(component.scheduler,
+-            isIncrement);
++        component.context.getServiceManager().checkAndUpdateServiceState(true);
+-        ServiceMaster.checkAndUpdateServiceState(component.scheduler,
+-            isIncrement);
++        component.context.getServiceManager().checkAndUpdateServiceState(false);
++    // when the service is stable then the state of component needs to
++    // transition to stable
++    component.dispatcher.getEventHandler().handle(new ComponentEvent(
++        component.getName(), ComponentEventType.CHECK_STABLE));
+-      component.getScheduler().getApp().setState(ServiceState.STARTED);
++      if (component.context.service.getState().equals(ServiceState.STABLE)) {
++        component.getScheduler().getApp().setState(ServiceState.STARTED);
++        LOG.info("Service def state changed from {} -> {}",
++            ServiceState.STABLE, ServiceState.STARTED);
++      }
++      component.upgradeInProgress.set(true);
++      component.numContainersThatNeedUpgrade.set(
++          component.componentSpec.getNumberOfContainers());
++      component.componentSpec.getContainers().forEach(container ->
++          container.setState(ContainerState.NEEDS_UPGRADE));
++      component.upgradeEvent = event;
++    }
++  }
++
++  private static class CheckStableTransition implements MultipleArcTransition
++      <Component, ComponentEvent, ComponentState> {
++
++    @Override
++    public ComponentState transition(Component component,
++        ComponentEvent componentEvent) {
++      org.apache.hadoop.yarn.service.api.records.ComponentState currState =
++          component.componentSpec.getState();
++      if (currState.equals(org.apache.hadoop.yarn.service.api.records
++          .ComponentState.STABLE)) {
++        return ComponentState.STABLE;
++      }
++      // checkIfStable also updates the state in definition when STABLE
++      ComponentState targetState = checkIfStable(component);
++      if (targetState.equals(STABLE) && component.upgradeInProgress.get()) {
++        component.componentSpec.overwrite(
++            component.upgradeEvent.getTargetSpec());
++        component.upgradeEvent = null;
++        ServiceEvent checkStable = new ServiceEvent(ServiceEventType.
++            CHECK_STABLE);
++        component.dispatcher.getEventHandler().handle(checkStable);
++        component.upgradeInProgress.set(false);
++      }
++      return targetState;
+-    scheduler.getContainerLaunchService()
+-        .launchCompInstance(scheduler.getApp(), instance, container);
++    if (upgradeInProgress.get()) {
++      scheduler.getContainerLaunchService()
++          .launchCompInstance(scheduler.getApp(), instance, container,
++              createLaunchContext(upgradeEvent.getTargetSpec(),
++                  upgradeEvent.getUpgradeVersion()));
++    } else {
++      scheduler.getContainerLaunchService().launchCompInstance(
++          scheduler.getApp(), instance, container,
++          createLaunchContext(componentSpec, scheduler.getApp().getVersion()));
++    }
++  }
++
++  public ContainerLaunchService.ComponentLaunchContext createLaunchContext(
++      org.apache.hadoop.yarn.service.api.records.Component compSpec,
++      String version) {
++    ContainerLaunchService.ComponentLaunchContext launchContext =
++        new ContainerLaunchService.ComponentLaunchContext(compSpec.getName(),
++            version);
++    launchContext.setArtifact(compSpec.getArtifact())
++        .setConfiguration(compSpec.getConfiguration())
++        .setLaunchCommand(compSpec.getLaunchCommand());
++    return launchContext;
+-  public void incContainersReady() {
++  public void incContainersReady(boolean updateDefinition) {
+-    checkAndUpdateComponentState(this, true);
++    if (updateDefinition) {
++      checkAndUpdateComponentState(this, true);
++    }
+-  public void decContainersReady() {
++  public void decContainersReady(boolean updateDefinition) {
+-    checkAndUpdateComponentState(this, false);
++    if (updateDefinition) {
++      checkAndUpdateComponentState(this, false);
++    }
++  }
++
++  public void decContainersThatNeedUpgrade() {
++    numContainersThatNeedUpgrade.decrementAndGet();
++
++  public ComponentEvent getUpgradeEvent() {
++    this.readLock.lock();
++    try {
++      return upgradeEvent;
++    } finally {
++      this.readLock.unlock();
++    }
++  }
++

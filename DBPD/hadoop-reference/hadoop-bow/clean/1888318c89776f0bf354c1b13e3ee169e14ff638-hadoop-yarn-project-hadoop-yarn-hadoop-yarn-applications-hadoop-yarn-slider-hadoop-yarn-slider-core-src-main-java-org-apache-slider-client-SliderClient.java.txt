@@ -1,0 +1,169 @@
+YARN-6903. Yarn-native-service framework core rewrite. Contributed by Jian He
+
++import org.apache.hadoop.yarn.proto.ClientAMProtocol.GetStatusRequestProto;
++import org.apache.hadoop.net.NetUtils;
++import org.apache.hadoop.yarn.ipc.YarnRPC;
++import org.apache.hadoop.yarn.util.resource.ResourceCalculator;
+-import org.apache.slider.common.SliderExitCodes;
+-import org.apache.slider.common.SliderKeys;
+-import org.apache.slider.common.SliderXmlConfKeys;
+-import org.apache.slider.common.params.AbstractActionArgs;
++import org.apache.hadoop.yarn.service.conf.SliderExitCodes;
++import org.apache.hadoop.yarn.service.conf.SliderKeys;
++import org.apache.hadoop.yarn.service.conf.SliderXmlConfKeys;
++import org.apache.hadoop.yarn.service.client.params.AbstractActionArgs;
+-import org.apache.slider.common.params.ActionDependencyArgs;
++import org.apache.hadoop.yarn.service.client.params.ActionDependencyArgs;
+-import org.apache.slider.common.params.ActionFlexArgs;
++import org.apache.hadoop.yarn.service.client.params.ActionFlexArgs;
+-import org.apache.slider.common.params.Arguments;
+-import org.apache.slider.common.params.ClientArgs;
+-import org.apache.slider.common.params.CommonArgs;
++import org.apache.hadoop.yarn.service.client.params.Arguments;
++import org.apache.hadoop.yarn.service.client.params.ClientArgs;
++import org.apache.hadoop.yarn.service.client.params.CommonArgs;
+-import org.apache.slider.providers.AbstractClientProvider;
+-import org.apache.slider.providers.ProviderUtils;
+-import org.apache.slider.server.appmaster.SliderAppMaster;
++import org.apache.hadoop.yarn.service.provider.AbstractClientProvider;
++import org.apache.hadoop.yarn.service.provider.ProviderUtils;
++import org.apache.hadoop.yarn.service.ClientAMProtocol;
++import org.apache.hadoop.yarn.service.client.ClientAMProxy;
++import org.apache.hadoop.yarn.service.ServiceMaster;
+-import org.apache.slider.util.ServiceApiUtil;
++import org.apache.hadoop.yarn.service.utils.ServiceApiUtil;
++import java.net.InetSocketAddress;
++import static org.apache.hadoop.yarn.api.records.YarnApplicationState.*;
+-import static org.apache.slider.common.params.SliderActions.*;
++import static org.apache.hadoop.yarn.service.client.params.SliderActions.*;
++import org.apache.hadoop.yarn.proto.ClientAMProtocol.GetStatusResponseProto;
+-
++  private YarnRPC rpc;
+-
++  ResourceCalculator calculator;
+-  private static EnumSet<YarnApplicationState> terminatedStates = EnumSet
+-      .of(YarnApplicationState.FINISHED, YarnApplicationState.FAILED,
+-          YarnApplicationState.KILLED);
++  private static EnumSet<YarnApplicationState> terminatedStates =
++      EnumSet.of(FINISHED, FAILED, KILLED);
++  private static EnumSet<YarnApplicationState> waitingStates =
++      EnumSet.of(NEW, NEW_SAVING, SUBMITTED, RUNNING);
++
++    rpc = YarnRPC.create(conf);
++  @Override
++  protected void serviceStart() throws Exception {
++    super.serviceStart();
++  }
++
++  @Override
++  protected void serviceStop() throws Exception {
++    super.serviceStop();
++  }
++
+-    YarnClientApplication yarnApp =  yarnClient.createApplication();
++    YarnClientApplication yarnApp = yarnClient.createApplication();
++    ServiceApiUtil.validateCompResourceSize(
++        yarnApp.getNewApplicationResponse().getMaximumResourceCapability(),
++        app);
++
+-    CLI.add(SliderAppMaster.SERVICE_CLASSNAME);
++    CLI.add(ServiceMaster.class.getCanonicalName());
+-    CLI.add(Arguments.ARG_CLUSTER_URI, appRootDir.toUri());
+-//    InetSocketAddress rmSchedulerAddress = getRmSchedulerAddress(conf);
++    CLI.add(Arguments.ARG_CLUSTER_URI, new Path(appRootDir, appName + ".json"));
++    //    InetSocketAddress rmSchedulerAddress = getRmSchedulerAddress(conf);
+-  private Path addJarResource(String appName,
++  protected Path addJarResource(String appName,
+-        .addProviderJar(localResources, SliderAppMaster.class, SLIDER_JAR,
++        .addProviderJar(localResources, ServiceMaster.class, SLIDER_JAR,
+-    EnumSet<YarnApplicationState> appStates = EnumSet.range(
+-        YarnApplicationState.NEW, YarnApplicationState.RUNNING);
++    EnumSet<YarnApplicationState> appStates = EnumSet.range(NEW, RUNNING);
+-      min = YarnApplicationState.NEW;
+-      max = YarnApplicationState.RUNNING;
++      min = NEW;
++      max = RUNNING;
+-      min = YarnApplicationState.NEW;
+-      max = YarnApplicationState.KILLED;
++      min = NEW;
++      max = KILLED;
+-  
++
+-    return report.getYarnApplicationState() == YarnApplicationState.RUNNING
++    return report.getYarnApplicationState() == RUNNING
+-      inDesiredState =
+-            appstate.ordinal() < YarnApplicationState.FINISHED.ordinal();
++      inDesiredState = appstate.ordinal() < FINISHED.ordinal();
++  private ClientAMProtocol connectToAM(String appName)
++      throws IOException, YarnException {
++    if (applicationId == null) {
++      Application persistedApp = ServiceApiUtil.loadApplication(sliderFileSystem,
++          appName);
++      if (persistedApp == null) {
++        throw new YarnException("Application " + appName
++            + " doesn't exist on hdfs. Please check if the app exists in RM");
++      }
++      applicationId = ApplicationId.fromString(persistedApp.getId());
++    }
++    // Wait until app becomes running.
++    long startTime = System.currentTimeMillis();
++    int pollCount = 0;
++    ApplicationReport appReport = null;
++    while (true) {
++      appReport = yarnClient.getApplicationReport(applicationId);
++      YarnApplicationState state = appReport.getYarnApplicationState();
++      if (state == RUNNING) {
++        break;
++      }
++      if (terminatedStates.contains(state)) {
++        throw new YarnException(
++            "Failed to getStatus " + applicationId + ": " + appReport
++                .getDiagnostics());
++      }
++      long elapsedMillis = System.currentTimeMillis() - startTime;
++      // if over 5 min, quit
++      if (elapsedMillis >= 300000) {
++        throw new YarnException(
++            "Timed out while waiting for application " + applicationId
++                + " to be running");
++      }
++
++      if (++pollCount % 10 == 0) {
++        log.info("Waiting for application {} to be running, current state is {}",
++            applicationId, state);
++      }
++      try {
++        Thread.sleep(3000);
++      } catch (InterruptedException ie) {
++        String msg =
++            "Interrupted while waiting for application " + applicationId
++                + " to be running.";
++        throw new YarnException(msg, ie);
++      }
++    }
++
++    // Make the connection
++    InetSocketAddress address = NetUtils
++        .createSocketAddrForHost(appReport.getHost(), appReport.getRpcPort());
++    return ClientAMProxy
++        .createProxy(getConfig(), ClientAMProtocol.class,
++            UserGroupInformation.getCurrentUser(), rpc, address);
++  }
++
++  public Application getStatus(String appName)
++      throws IOException, YarnException {
++    ClientAMProtocol proxy = connectToAM(appName);
++    GetStatusResponseProto response =
++        proxy.getStatus(GetStatusRequestProto.newBuilder().build());
++    Application app = jsonSerDeser.fromJson(response.getStatus());
++    return app;
++  }
++
++
+-        
++
+-  
++
+-    return yarnClient.monitorAppToState(applicationId, YarnApplicationState
+-        .RUNNING, duration);
++    return yarnClient.monitorAppToState(applicationId, RUNNING, duration);

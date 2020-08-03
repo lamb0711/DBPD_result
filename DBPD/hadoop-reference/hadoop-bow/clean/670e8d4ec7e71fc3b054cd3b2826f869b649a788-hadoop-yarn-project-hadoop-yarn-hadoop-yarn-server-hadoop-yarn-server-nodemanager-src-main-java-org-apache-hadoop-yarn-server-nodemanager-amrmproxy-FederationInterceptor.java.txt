@@ -1,0 +1,273 @@
+YARN-6704. Add support for work preserving NM restart when FederationInterceptor is enabled in AMRMProxyService. (Botong Huang via Subru).
+
++import org.apache.hadoop.yarn.api.ApplicationClientProtocol;
++import org.apache.hadoop.yarn.api.protocolrecords.GetContainersRequest;
++import org.apache.hadoop.yarn.api.protocolrecords.GetContainersResponse;
++import org.apache.hadoop.yarn.api.protocolrecords.impl.pb.RegisterApplicationMasterRequestPBImpl;
++import org.apache.hadoop.yarn.api.protocolrecords.impl.pb.RegisterApplicationMasterResponsePBImpl;
++import org.apache.hadoop.yarn.api.records.ApplicationAttemptId;
++import org.apache.hadoop.yarn.api.records.ContainerReport;
++import org.apache.hadoop.yarn.proto.YarnServiceProtos.RegisterApplicationMasterRequestProto;
++import org.apache.hadoop.yarn.proto.YarnServiceProtos.RegisterApplicationMasterResponseProto;
++  public static final String NMSS_CLASS_PREFIX = "FederationInterceptor/";
++
++  public static final String NMSS_REG_REQUEST_KEY =
++      NMSS_CLASS_PREFIX + "registerRequest";
++  public static final String NMSS_REG_RESPONSE_KEY =
++      NMSS_CLASS_PREFIX + "registerResponse";
++
++  /*
++   * When AMRMProxy HA is enabled, secondary AMRMTokens will be stored in Yarn
++   * Registry. Otherwise if NM recovery is enabled, the UAM token are store in
++   * local NMSS instead under this directory name.
++   */
++  public static final String NMSS_SECONDARY_SC_PREFIX =
++      NMSS_CLASS_PREFIX + "secondarySC/";
++  public static final String STRING_TO_BYTE_FORMAT = "UTF-8";
++
+-    // Add all app tokens for Yarn Registry access
+-    if (this.registryClient != null && appContext.getCredentials() != null) {
+-      this.appOwner.addCredentials(appContext.getCredentials());
++
++    if (appContext.getRegistryClient() != null) {
++      this.registryClient = new FederationRegistryClient(conf,
++          appContext.getRegistryClient(), this.appOwner);
++      // Add all app tokens for Yarn Registry access
++      if (appContext.getCredentials() != null) {
++        this.appOwner.addCredentials(appContext.getCredentials());
++      }
+-    this.homeRM = createHomeRMProxy(appContext);
++    this.homeRM = createHomeRMProxy(appContext, ApplicationMasterProtocol.class,
++        this.appOwner);
++  }
+-    if (appContext.getRegistryClient() != null) {
+-      this.registryClient = new FederationRegistryClient(conf,
+-          appContext.getRegistryClient(), this.appOwner);
++  @Override
++  public void recover(Map<String, byte[]> recoveredDataMap) {
++    super.recover(recoveredDataMap);
++    LOG.info("Recovering data for FederationInterceptor");
++    if (recoveredDataMap == null) {
++      return;
++
++    ApplicationAttemptId attemptId =
++        getApplicationContext().getApplicationAttemptId();
++    try {
++      if (recoveredDataMap.containsKey(NMSS_REG_REQUEST_KEY)) {
++        RegisterApplicationMasterRequestProto pb =
++            RegisterApplicationMasterRequestProto
++                .parseFrom(recoveredDataMap.get(NMSS_REG_REQUEST_KEY));
++        this.amRegistrationRequest =
++            new RegisterApplicationMasterRequestPBImpl(pb);
++        LOG.info("amRegistrationRequest recovered for {}", attemptId);
++      }
++      if (recoveredDataMap.containsKey(NMSS_REG_RESPONSE_KEY)) {
++        RegisterApplicationMasterResponseProto pb =
++            RegisterApplicationMasterResponseProto
++                .parseFrom(recoveredDataMap.get(NMSS_REG_RESPONSE_KEY));
++        this.amRegistrationResponse =
++            new RegisterApplicationMasterResponsePBImpl(pb);
++        LOG.info("amRegistrationResponse recovered for {}", attemptId);
++      }
++
++      // Recover UAM amrmTokens from registry or NMSS
++      Map<String, Token<AMRMTokenIdentifier>> uamMap;
++      if (this.registryClient != null) {
++        uamMap = this.registryClient
++            .loadStateFromRegistry(attemptId.getApplicationId());
++        LOG.info("Found {} existing UAMs for application {} in Yarn Registry",
++            uamMap.size(), attemptId.getApplicationId());
++      } else {
++        uamMap = new HashMap<>();
++        for (Entry<String, byte[]> entry : recoveredDataMap.entrySet()) {
++          if (entry.getKey().startsWith(NMSS_SECONDARY_SC_PREFIX)) {
++            // entry for subClusterId -> UAM amrmToken
++            String scId =
++                entry.getKey().substring(NMSS_SECONDARY_SC_PREFIX.length());
++            Token<AMRMTokenIdentifier> amrmToken = new Token<>();
++            amrmToken.decodeFromUrlString(
++                new String(entry.getValue(), STRING_TO_BYTE_FORMAT));
++            uamMap.put(scId, amrmToken);
++            LOG.debug("Recovered UAM in " + scId + " from NMSS");
++          }
++        }
++        LOG.info("Found {} existing UAMs for application {} in NMStateStore",
++            uamMap.size(), attemptId.getApplicationId());
++      }
++
++      // Re-attach the UAMs
++      int containers = 0;
++      for (Map.Entry<String, Token<AMRMTokenIdentifier>> entry : uamMap
++          .entrySet()) {
++        SubClusterId subClusterId = SubClusterId.newInstance(entry.getKey());
++
++        // Create a config loaded with federation on and subclusterId
++        // for each UAM
++        YarnConfiguration config = new YarnConfiguration(getConf());
++        FederationProxyProviderUtil.updateConfForFederation(config,
++            subClusterId.getId());
++
++        try {
++          this.uamPool.reAttachUAM(subClusterId.getId(), config,
++              attemptId.getApplicationId(),
++              this.amRegistrationResponse.getQueue(),
++              getApplicationContext().getUser(), this.homeSubClusterId.getId(),
++              entry.getValue());
++
++          RegisterApplicationMasterResponse response =
++              this.uamPool.registerApplicationMaster(subClusterId.getId(),
++                  this.amRegistrationRequest);
++
++          // Running containers from secondary RMs
++          for (Container container : response
++              .getContainersFromPreviousAttempts()) {
++            containerIdToSubClusterIdMap.put(container.getId(), subClusterId);
++            containers++;
++          }
++          LOG.info("Recovered {} running containers from UAM in {}",
++              response.getContainersFromPreviousAttempts().size(),
++              subClusterId);
++
++        } catch (Exception e) {
++          LOG.error(
++              "Error reattaching UAM to " + subClusterId + " for " + attemptId,
++              e);
++        }
++      }
++
++      // Get the running containers from home RM, note that we will also get the
++      // AM container itself from here. We don't need it, but no harm to put the
++      // map as well.
++      UserGroupInformation appSubmitter = UserGroupInformation
++          .createRemoteUser(getApplicationContext().getUser());
++      ApplicationClientProtocol rmClient =
++          createHomeRMProxy(getApplicationContext(),
++              ApplicationClientProtocol.class, appSubmitter);
++
++      GetContainersResponse response =
++          rmClient.getContainers(GetContainersRequest.newInstance(attemptId));
++      for (ContainerReport container : response.getContainerList()) {
++        containerIdToSubClusterIdMap.put(container.getContainerId(),
++            this.homeSubClusterId);
++        containers++;
++        LOG.debug("  From home RM " + this.homeSubClusterId
++            + " running container " + container.getContainerId());
++      }
++      LOG.info("{} running containers including AM recovered from home RM ",
++          response.getContainerList().size(), this.homeSubClusterId);
++
++      LOG.info(
++          "In all {} UAMs {} running containers including AM recovered for {}",
++          uamMap.size(), containers, attemptId);
++
++      if (this.amRegistrationResponse != null) {
++        // Initialize the AMRMProxyPolicy
++        String queue = this.amRegistrationResponse.getQueue();
++        this.policyInterpreter =
++            FederationPolicyUtils.loadAMRMPolicy(queue, this.policyInterpreter,
++                getConf(), this.federationFacade, this.homeSubClusterId);
++      }
++    } catch (IOException | YarnException e) {
++      throw new YarnRuntimeException(e);
++    }
++
++      if (getNMStateStore() != null) {
++        try {
++          RegisterApplicationMasterRequestPBImpl pb =
++              (RegisterApplicationMasterRequestPBImpl)
++                  this.amRegistrationRequest;
++          getNMStateStore().storeAMRMProxyAppContextEntry(
++              getApplicationContext().getApplicationAttemptId(),
++              NMSS_REG_REQUEST_KEY, pb.getProto().toByteArray());
++        } catch (Exception e) {
++          LOG.error("Error storing AMRMProxy application context entry for "
++              + getApplicationContext().getApplicationAttemptId(), e);
++        }
++      }
++    if (getNMStateStore() != null) {
++      try {
++        RegisterApplicationMasterResponsePBImpl pb =
++            (RegisterApplicationMasterResponsePBImpl)
++                this.amRegistrationResponse;
++        getNMStateStore().storeAMRMProxyAppContextEntry(
++            getApplicationContext().getApplicationAttemptId(),
++            NMSS_REG_RESPONSE_KEY, pb.getProto().toByteArray());
++      } catch (Exception e) {
++        LOG.error("Error storing AMRMProxy application context entry for "
++            + getApplicationContext().getApplicationAttemptId(), e);
++      }
++    }
++
++          } else if (getNMStateStore() != null) {
++            getNMStateStore().removeAMRMProxyAppContextEntry(
++                getApplicationContext().getApplicationAttemptId(),
++                NMSS_SECONDARY_SC_PREFIX + uamResponse.getSubClusterId());
++  @VisibleForTesting
++  protected FederationRegistryClient getRegistryClient() {
++    return this.registryClient;
++  }
++
+-   * Returns instance of the ApplicationMasterProtocol proxy class that is used
+-   * to connect to the Home resource manager.
++   * Create a proxy instance that is used to connect to the Home resource
++   * manager.
++   * @param protocol the protocol class for the proxy
++   * @param user the ugi for the proxy
++   * @param <T> the type of the proxy
+-  protected ApplicationMasterProtocol createHomeRMProxy(
+-      AMRMProxyApplicationContext appContext) {
++  protected <T> T createHomeRMProxy(AMRMProxyApplicationContext appContext,
++      Class<T> protocol, UserGroupInformation user) {
+-          ApplicationMasterProtocol.class, this.homeSubClusterId, this.appOwner,
+-          appContext.getAMRMToken());
++          protocol, this.homeSubClusterId, user, appContext.getAMRMToken());
+-              // Save the new AMRMToken for the UAM in registry if present
++              // Save the new AMRMToken for the UAM if present
+-                // Update the token in registry
++                // Update the token in registry or NMSS
++                } else if (getNMStateStore() != null) {
++                  try {
++                    getNMStateStore().storeAMRMProxyAppContextEntry(
++                        getApplicationContext().getApplicationAttemptId(),
++                        NMSS_SECONDARY_SC_PREFIX + subClusterId.getId(),
++                        newToken.encodeToUrlString()
++                            .getBytes(STRING_TO_BYTE_FORMAT));
++                  } catch (IOException e) {
++                    LOG.error(
++                        "Error storing UAM token as AMRMProxy "
++                            + "context entry in NMSS for "
++                            + getApplicationContext().getApplicationAttemptId(),
++                        e);
++                  }
++            // Save the UAM token in registry or NMSS
++            } else if (getNMStateStore() != null) {
++              getNMStateStore().storeAMRMProxyAppContextEntry(
++                  getApplicationContext().getApplicationAttemptId(),
++                  NMSS_SECONDARY_SC_PREFIX
++                      + uamResponse.getSubClusterId().getId(),
++                  uamResponse.getUamToken().encodeToUrlString()
++                      .getBytes(STRING_TO_BYTE_FORMAT));
+-    if (LOG.isDebugEnabled()) {
+-      LOG.debug("Remove containers: "
+-          + homeResponse.getCompletedContainersStatuses());
+-      LOG.debug("Adding containers: " + homeResponse.getAllocatedContainers());
+-    }
++      LOG.debug("Completed container {}", container);
++      LOG.debug("Adding container {}", container);
+-          // When RM fails over, the new RM master might send out the same
+-          // container allocation more than once. Just move on in this case.
++          /*
++           * When RM fails over, the new RM master might send out the same
++           * container allocation more than once.
++           *
++           * It is also possible because of a recent NM restart with NM recovery
++           * enabled. We recover running containers from RM. But RM might not
++           * notified AM of some of these containers yet. When RM dose notify,
++           * we will already have these containers in the map.
++           *
++           * Either case, just warn and move on.
++           */
+-      LOG.error("AM is trying to {} a container {} that does not exist. ",
++      LOG.error(
++          "AM is trying to {} a container {} that does not exist. Might happen "
++              + "shortly after NM restart when NM recovery is enabled",

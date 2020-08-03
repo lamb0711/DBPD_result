@@ -1,0 +1,186 @@
+HDDS-2026. Overlapping chunk region cannot be read concurrently
+
+Signed-off-by: Anu Engineer <aengineer@apache.org>
+
++import com.google.common.annotations.VisibleForTesting;
++import org.apache.ratis.util.function.CheckedSupplier;
+-import java.nio.channels.AsynchronousFileChannel;
++import java.nio.file.Path;
++import java.util.Set;
++import java.util.concurrent.ConcurrentHashMap;
++  private static final Set<Path> LOCKS = ConcurrentHashMap.newKeySet();
++
+-   * @param volumeIOStats
++   * @param volumeIOStats statistics collector
+-   * @throws StorageContainerException
+-    FileChannel file = null;
+-    FileLock lock = null;
++    Path path = chunkFile.toPath();
++    long startTime = Time.monotonicNow();
++    processFileExclusively(path, () -> {
++      FileChannel file = null;
++      try {
++        // skip SYNC and DSYNC to reduce contention on file.lock
++        file = FileChannel.open(path,
++            StandardOpenOption.CREATE,
++            StandardOpenOption.WRITE,
++            StandardOpenOption.SPARSE);
+-    try {
+-      long writeTimeStart = Time.monotonicNow();
+-
+-      // skip SYNC and DSYNC to reduce contention on file.lock
+-      file = FileChannel.open(chunkFile.toPath(),
+-              StandardOpenOption.CREATE,
+-              StandardOpenOption.WRITE,
+-              StandardOpenOption.SPARSE);
+-
+-      lock = file.lock();
+-      int size = file.write(data, chunkInfo.getOffset());
+-      // Increment volumeIO stats here.
+-      volumeIOStats.incWriteTime(Time.monotonicNow() - writeTimeStart);
+-      volumeIOStats.incWriteOpCount();
+-      volumeIOStats.incWriteBytes(size);
+-      if (size != bufferSize) {
+-        log.error("Invalid write size found. Size:{}  Expected: {} ", size,
+-            bufferSize);
+-        throw new StorageContainerException("Invalid write size found. " +
+-            "Size: " + size + " Expected: " + bufferSize, INVALID_WRITE_SIZE);
+-      }
+-    } catch (StorageContainerException ex) {
+-      throw ex;
+-    } catch(IOException e) {
+-      throw new StorageContainerException(e, IO_EXCEPTION);
+-
+-    } finally {
+-      if (lock != null) {
+-        try {
+-          lock.release();
+-        } catch (IOException e) {
+-          log.error("Unable to release lock ??, Fatal Error.");
+-          throw new StorageContainerException(e, CONTAINER_INTERNAL_ERROR);
+-
++        int size;
++        try (FileLock ignored = file.lock()) {
++          size = file.write(data, chunkInfo.getOffset());
+-      }
+-      if (file != null) {
+-        try {
+-          if (sync) {
+-            // ensure data and metadata is persisted. Outside the lock
+-            file.force(true);
+-          }
+-          file.close();
+-        } catch (IOException e) {
+-          throw new StorageContainerException("Error closing chunk file",
+-              e, CONTAINER_INTERNAL_ERROR);
++
++        // Increment volumeIO stats here.
++        volumeIOStats.incWriteTime(Time.monotonicNow() - startTime);
++        volumeIOStats.incWriteOpCount();
++        volumeIOStats.incWriteBytes(size);
++        if (size != bufferSize) {
++          log.error("Invalid write size found. Size:{}  Expected: {} ", size,
++              bufferSize);
++          throw new StorageContainerException("Invalid write size found. " +
++              "Size: " + size + " Expected: " + bufferSize, INVALID_WRITE_SIZE);
++      } catch (StorageContainerException ex) {
++        throw ex;
++      } catch (IOException e) {
++        throw new StorageContainerException(e, IO_EXCEPTION);
++      } finally {
++        closeFile(file, sync);
+-    }
++
++      return null;
++    });
++
+-   * @param volumeIOStats
++   * @param volumeIOStats statistics collector
+-   * @throws StorageContainerException
+-   * @throws ExecutionException
+-   * @throws InterruptedException
+-    AsynchronousFileChannel file = null;
+-    FileLock lock = null;
+-    try {
+-      long readStartTime = Time.monotonicNow();
+-      file =
+-          AsynchronousFileChannel.open(chunkFile.toPath(),
+-              StandardOpenOption.READ);
+-      lock = file.lock(data.getOffset(), data.getLen(), true).get();
++    long offset = data.getOffset();
++    long len = data.getLen();
++    ByteBuffer buf = ByteBuffer.allocate((int) len);
+-      ByteBuffer buf = ByteBuffer.allocate((int) data.getLen());
+-      file.read(buf, data.getOffset()).get();
++    Path path = chunkFile.toPath();
++    long startTime = Time.monotonicNow();
++    return processFileExclusively(path, () -> {
++      FileChannel file = null;
+-      // Increment volumeIO stats here.
+-      volumeIOStats.incReadTime(Time.monotonicNow() - readStartTime);
+-      volumeIOStats.incReadOpCount();
+-      volumeIOStats.incReadBytes(data.getLen());
++      try {
++        file = FileChannel.open(path, StandardOpenOption.READ);
+-      return buf;
+-    } catch (IOException e) {
+-      throw new StorageContainerException(e, IO_EXCEPTION);
+-    } finally {
+-      if (lock != null) {
+-        try {
+-          lock.release();
+-        } catch (IOException e) {
+-          log.error("I/O error is lock release.");
++        try (FileLock ignored = file.lock(offset, len, true)) {
++          file.read(buf, offset);
++        }
++
++        // Increment volumeIO stats here.
++        volumeIOStats.incReadTime(Time.monotonicNow() - startTime);
++        volumeIOStats.incReadOpCount();
++        volumeIOStats.incReadBytes(len);
++
++        return buf;
++      } catch (IOException e) {
++        throw new StorageContainerException(e, IO_EXCEPTION);
++      } finally {
++        if (file != null) {
++          IOUtils.closeStream(file);
+-      if (file != null) {
+-        IOUtils.closeStream(file);
+-      }
+-    }
++    });
++
++  @VisibleForTesting
++  static <T, E extends Exception> T processFileExclusively(
++      Path path, CheckedSupplier<T, E> op
++  ) throws E {
++    for (;;) {
++      if (LOCKS.add(path)) {
++        break;
++      }
++    }
++
++    try {
++      return op.get();
++    } finally {
++      LOCKS.remove(path);
++    }
++  }
++
++  private static void closeFile(FileChannel file, boolean sync)
++      throws StorageContainerException {
++    if (file != null) {
++      try {
++        if (sync) {
++          // ensure data and metadata is persisted
++          file.force(true);
++        }
++        file.close();
++      } catch (IOException e) {
++        throw new StorageContainerException("Error closing chunk file",
++            e, CONTAINER_INTERNAL_ERROR);
++      }
++    }
++  }

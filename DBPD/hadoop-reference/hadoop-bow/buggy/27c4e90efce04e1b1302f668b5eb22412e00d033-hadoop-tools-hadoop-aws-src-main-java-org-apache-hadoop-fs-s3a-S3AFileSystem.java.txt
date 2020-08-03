@@ -1,0 +1,465 @@
+HADOOP-13028 add low level counter metrics for S3A; use in read performance tests. contributed by: stevel
+patch includes
+HADOOP-12844 Recover when S3A fails on IOException in read()
+HADOOP-13058 S3A FS fails during init against a read-only FS if multipart purge
+HADOOP-13047 S3a Forward seek in stream length to be configurable
+
++import java.io.InterruptedIOException;
++import com.google.common.base.Preconditions;
++import org.apache.hadoop.classification.InterfaceAudience;
++import org.apache.hadoop.classification.InterfaceStability;
++/**
++ * The core S3A Filesystem implementation.
++ *
++ * This subclass is marked as private as code should not be creating it
++ * directly; use {@link FileSystem#get(Configuration)} and variants to
++ * create one.
++ *
++ * If cast to {@code S3AFileSystem}, extra methods and features may be accessed.
++ * Consider those private and unstable.
++ *
++ * Because it prints some of the state of the instrumentation,
++ * the output of {@link #toString()} must also be considered unstable.
++ */
++@InterfaceAudience.Private
++@InterfaceStability.Evolving
+-   * Default blocksize as used in blocksize and FS status queries
++   * Default blocksize as used in blocksize and FS status queries.
++  private S3AInstrumentation instrumentation;
++  private long readAhead;
++    setConf(conf);
++    instrumentation = new S3AInstrumentation(name);
+-    workingDir = new Path("/user", System.getProperty("user.name")).makeQualified(this.uri,
+-        this.getWorkingDirectory());
++    workingDir = new Path("/user", System.getProperty("user.name"))
++        .makeQualified(this.uri, this.getWorkingDirectory());
+-    awsConf.setMaxConnections(conf.getInt(MAXIMUM_CONNECTIONS,
+-      DEFAULT_MAXIMUM_CONNECTIONS));
++    awsConf.setMaxConnections(intOption(conf, MAXIMUM_CONNECTIONS,
++        DEFAULT_MAXIMUM_CONNECTIONS, 1));
+-    awsConf.setMaxErrorRetry(conf.getInt(MAX_ERROR_RETRIES,
+-      DEFAULT_MAX_ERROR_RETRIES));
+-    awsConf.setConnectionTimeout(conf.getInt(ESTABLISH_TIMEOUT,
+-        DEFAULT_ESTABLISH_TIMEOUT));
+-    awsConf.setSocketTimeout(conf.getInt(SOCKET_TIMEOUT,
+-      DEFAULT_SOCKET_TIMEOUT));
++    awsConf.setMaxErrorRetry(intOption(conf, MAX_ERROR_RETRIES,
++        DEFAULT_MAX_ERROR_RETRIES, 0));
++    awsConf.setConnectionTimeout(intOption(conf, ESTABLISH_TIMEOUT,
++        DEFAULT_ESTABLISH_TIMEOUT, 0));
++    awsConf.setSocketTimeout(intOption(conf, SOCKET_TIMEOUT,
++        DEFAULT_SOCKET_TIMEOUT, 0));
+-    if(!signerOverride.isEmpty()) {
++    if (!signerOverride.isEmpty()) {
++      LOG.debug("Signer override = {}", signerOverride);
+-    maxKeys = conf.getInt(MAX_PAGING_KEYS, DEFAULT_MAX_PAGING_KEYS);
++    maxKeys = intOption(conf, MAX_PAGING_KEYS, DEFAULT_MAX_PAGING_KEYS, 1);
+-    multiPartThreshold = conf.getLong(MIN_MULTIPART_THRESHOLD,
+-      DEFAULT_MIN_MULTIPART_THRESHOLD);
+-    enableMultiObjectsDelete = conf.getBoolean(ENABLE_MULTI_DELETE, true);
+-
++    multiPartThreshold = conf.getLong(MIN_MULTIPART_THRESHOLD,
++        DEFAULT_MIN_MULTIPART_THRESHOLD);
++    //check but do not store the block size
++    longOption(conf, FS_S3A_BLOCK_SIZE, DEFAULT_BLOCKSIZE, 1);
++    enableMultiObjectsDelete = conf.getBoolean(ENABLE_MULTI_DELETE, true);
++    readAhead = longOption(conf, READAHEAD_RANGE, DEFAULT_READAHEAD_RANGE, 0);
+-      throw new IOException("Bucket " + bucket + " does not exist");
++      throw new FileNotFoundException("Bucket " + bucket + " does not exist");
+-    setConf(conf);
+-      boolean secureConnections) throws IllegalArgumentException,
+-      IllegalArgumentException {
++      boolean secureConnections) throws IllegalArgumentException {
+-            awsConf.getProxyPort(), String.valueOf(awsConf.getProxyUsername()),
++            awsConf.getProxyPort(),
++            String.valueOf(awsConf.getProxyUsername()),
+-    String endPoint = conf.getTrimmed(ENDPOINT,"");
++    String endPoint = conf.getTrimmed(ENDPOINT, "");
+-      DEFAULT_PURGE_EXISTING_MULTIPART);
+-    long purgeExistingMultipartAge = conf.getLong(PURGE_EXISTING_MULTIPART_AGE,
+-      DEFAULT_PURGE_EXISTING_MULTIPART_AGE);
++        DEFAULT_PURGE_EXISTING_MULTIPART);
++    long purgeExistingMultipartAge = longOption(conf,
++        PURGE_EXISTING_MULTIPART_AGE, DEFAULT_PURGE_EXISTING_MULTIPART_AGE, 0);
+-      Date purgeBefore = new Date(new Date().getTime() - purgeExistingMultipartAge*1000);
++      Date purgeBefore =
++          new Date(new Date().getTime() - purgeExistingMultipartAge * 1000);
+-      transfers.abortMultipartUploads(bucket, purgeBefore);
++      try {
++        transfers.abortMultipartUploads(bucket, purgeBefore);
++      } catch (AmazonServiceException e) {
++        if (e.getStatusCode() == 403) {
++          instrumentation.errorIgnored();
++          LOG.debug("Failed to abort multipart uploads against {}," +
++              " FS may be read only", bucket, e);
++        } else {
++          throw e;
++        }
++      }
+-    if (LOG.isDebugEnabled()) {
+-      LOG.debug("Opening '{}' for reading.", f);
+-    }
++    LOG.debug("Opening '{}' for reading.", f);
+-      throw new FileNotFoundException("Can't open " + f + " because it is a directory");
++      throw new FileNotFoundException("Can't open " + f
++          + " because it is a directory");
+-      fileStatus.getLen(), s3, statistics));
++      fileStatus.getLen(), s3, statistics, instrumentation, readAhead));
++    instrumentation.fileCreated();
+-    // We pass null to FSDataOutputStream so it won't count writes that are being buffered to a file
+-    return new FSDataOutputStream(new S3AOutputStream(getConf(), transfers, this,
+-      bucket, key, progress, cannedACL, statistics,
+-      serverSideEncryptionAlgorithm), null);
++    // We pass null to FSDataOutputStream so it won't count writes that
++    // are being buffered to a file
++    return new FSDataOutputStream(
++        new S3AOutputStream(getConf(),
++            transfers,
++            this,
++            bucket,
++            key,
++            progress,
++            cannedACL,
++            statistics,
++            serverSideEncryptionAlgorithm),
++        null);
+-    Progressable progress) throws IOException {
++      Progressable progress) throws IOException {
+-    if (LOG.isDebugEnabled()) {
+-      LOG.debug("Rename path {} to {}", src, dst);
+-    }
++    LOG.debug("Rename path {} to {}", src, dst);
+-      if (LOG.isDebugEnabled()) {
+-        LOG.debug("rename: src or dst are empty");
+-      }
++      LOG.debug("rename: source {} or dest {}, is empty", srcKey, dstKey);
+-      if (LOG.isDebugEnabled()) {
+-        LOG.debug("rename: src and dst refer to the same file or directory");
+-      }
++      LOG.debug("rename: src and dst refer to the same file or directory: {}",
++          dst);
+-        if (LOG.isDebugEnabled()) {
+-          LOG.debug("rename: src is a directory and dst is a file");
+-        }
++        LOG.debug("rename: src {} is a directory and dst {} is a file",
++            src, dst);
++      LOG.debug("rename: destination path {} not found", dst);
++          LOG.debug("rename: destination path {} has no parent {}",
++              dst, parent);
+-      if (LOG.isDebugEnabled()) {
+-        LOG.debug("rename: renaming file " + src + " to " + dst);
+-      }
++      LOG.debug("rename: renaming file {} to {}", src, dst);
+-        copyFile(srcKey, newDstKey);
++        copyFile(srcKey, newDstKey, srcStatus.getLen());
+-        copyFile(srcKey, dstKey);
++        copyFile(srcKey, dstKey, srcStatus.getLen());
+-      if (LOG.isDebugEnabled()) {
+-        LOG.debug("rename: renaming directory " + src + " to " + dst);
+-      }
++      LOG.debug("rename: renaming directory {} to {}", src, dst);
+-        if (LOG.isDebugEnabled()) {
+-          LOG.debug("cannot rename a directory to a subdirectory of self");
+-        }
++        LOG.debug("cannot rename a directory {}" +
++              " to a subdirectory of self: {}", srcKey, dstKey);
+-      List<DeleteObjectsRequest.KeyVersion> keysToDelete =
+-        new ArrayList<>();
++      List<DeleteObjectsRequest.KeyVersion> keysToDelete = new ArrayList<>();
+-          copyFile(summary.getKey(), newDstKey);
++          copyFile(summary.getKey(), newDstKey, summary.getSize());
++      instrumentation.fileDeleted(keysToDelete.size());
+-
++      instrumentation.fileDeleted(keysToDelete.size());
+-    if (LOG.isDebugEnabled()) {
+-      LOG.debug("Delete path " + f + " - recursive " + recursive);
+-    }
++    LOG.debug("Delete path {} - recursive {}", f , recursive);
+-      if (LOG.isDebugEnabled()) {
+-        LOG.debug("Couldn't delete " + f + " - does not exist");
+-      }
++      LOG.debug("Couldn't delete {} - does not exist", f);
++      instrumentation.errorIgnored();
+-      if (LOG.isDebugEnabled()) {
+-        LOG.debug("delete: Path is a directory");
+-      }
++      LOG.debug("delete: Path is a directory: {}", f);
+-        if (LOG.isDebugEnabled()) {
+-          LOG.debug("Deleting fake empty directory");
+-        }
++        LOG.debug("Deleting fake empty directory {}", key);
++        instrumentation.directoryDeleted();
+-        if (LOG.isDebugEnabled()) {
+-          LOG.debug("Getting objects for directory prefix " + key + " to delete");
+-        }
++        LOG.debug("Getting objects for directory prefix {} to delete", key);
+-        List<DeleteObjectsRequest.KeyVersion> keys =
+-          new ArrayList<>();
++        List<DeleteObjectsRequest.KeyVersion> keys = new ArrayList<>();
+-            if (LOG.isDebugEnabled()) {
+-              LOG.debug("Got object to delete " + summary.getKey());
+-            }
++            LOG.debug("Got object to delete {}", summary.getKey());
+-      if (LOG.isDebugEnabled()) {
+-        LOG.debug("delete: Path is a file");
+-      }
++      LOG.debug("delete: Path is a file");
++      instrumentation.fileDeleted(1);
+-      if (LOG.isDebugEnabled()) {
+-        LOG.debug("Creating new fake directory at " + f);
+-      }
++      LOG.debug("Creating new fake directory at {}", f);
+-    if (LOG.isDebugEnabled()) {
+-      LOG.debug("List status for path: " + f);
+-    }
++    LOG.debug("List status for path: {}", f);
+-      if (LOG.isDebugEnabled()) {
+-        LOG.debug("listStatus: doing listObjects for directory " + key);
+-      }
++      LOG.debug("listStatus: doing listObjects for directory {}", key);
+-            if (LOG.isDebugEnabled()) {
+-              LOG.debug("Ignoring: " + keyPath);
+-            }
++            LOG.debug("Ignoring: {}", keyPath);
+-            if (LOG.isDebugEnabled()) {
+-              LOG.debug("Adding: fd: " + keyPath);
+-            }
++            LOG.debug("Adding: fd: {}", keyPath);
+-            if (LOG.isDebugEnabled()) {
+-              LOG.debug("Adding: fi: " + keyPath);
+-            }
++            LOG.debug("Adding: fi: {}", keyPath);
+-          if (LOG.isDebugEnabled()) {
+-            LOG.debug("Adding: rd: " + keyPath);
+-          }
++          LOG.debug("Adding: rd: {}", keyPath);
+-          if (LOG.isDebugEnabled()) {
+-            LOG.debug("listStatus: list truncated - getting next batch");
+-          }
+-
++          LOG.debug("listStatus: list truncated - getting next batch");
+-      if (LOG.isDebugEnabled()) {
+-        LOG.debug("Adding: rd (not a dir): " + f);
+-      }
++      LOG.debug("Adding: rd (not a dir): {}", f);
+-   * @param new_dir the current working directory.
++   * @param newDir the current working directory.
+-  public void setWorkingDirectory(Path new_dir) {
+-    workingDir = new_dir;
++  public void setWorkingDirectory(Path newDir) {
++    workingDir = newDir;
+-   * Get the current working directory for the given file system
++   * Get the current working directory for the given file system.
+-    if (LOG.isDebugEnabled()) {
+-      LOG.debug("Making directory: " + f);
+-    }
+-
++    LOG.debug("Making directory: {}", f);
++          instrumentation.errorIgnored();
+-    if (LOG.isDebugEnabled()) {
+-      LOG.debug("Getting path status for " + f + " (" + key + ")");
+-    }
+-
++    LOG.debug("Getting path status for {}  ({})", f , key);
+-          if (LOG.isDebugEnabled()) {
+-            LOG.debug("Found exact file: fake directory");
+-          }
++          LOG.debug("Found exact file: fake directory");
+-          if (LOG.isDebugEnabled()) {
+-            LOG.debug("Found exact file: normal file");
+-          }
++          LOG.debug("Found exact file: normal file");
+-          printAmazonServiceException(e);
++          printAmazonServiceException(f.toString(), e);
+-        printAmazonClientException(e);
++        printAmazonClientException(f.toString(), e);
++        String newKey = key + "/";
+-          String newKey = key + "/";
+-            if (LOG.isDebugEnabled()) {
+-              LOG.debug("Found file (with /): fake directory");
+-            }
++            LOG.debug("Found file (with /): fake directory");
+-            printAmazonServiceException(e);
++            printAmazonServiceException(newKey, e);
+-          printAmazonClientException(e);
++          printAmazonClientException(newKey, e);
+-          || objects.getObjectSummaries().size() > 0) {
++          || !objects.getObjectSummaries().isEmpty()) {
+-          LOG.debug("Found path as directory (with /): " +
+-              objects.getCommonPrefixes().size() + "/" +
++          LOG.debug("Found path as directory (with /): {}/{}",
++              objects.getCommonPrefixes().size() ,
+-            LOG.debug("Summary: " + summary.getKey() + " " + summary.getSize());
++            LOG.debug("Summary: {} {}", summary.getKey(), summary.getSize());
+-            LOG.debug("Prefix: " + prefix);
++            LOG.debug("Prefix: {}", prefix);
+-        printAmazonServiceException(e);
++        printAmazonServiceException(key, e);
+-      printAmazonClientException(e);
++      printAmazonClientException(key, e);
+-    if (LOG.isDebugEnabled()) {
+-      LOG.debug("Not Found: " + f);
+-    }
++    LOG.debug("Not Found: {}", f);
+-    Path dst) throws IOException {
++      Path dst) throws IOException {
+-      throw new IOException(dst + " already exists");
++      throw new FileAlreadyExistsException(dst + " already exists");
+-    if (LOG.isDebugEnabled()) {
+-      LOG.debug("Copying local file from " + src + " to " + dst);
+-    }
++    LOG.debug("Copying local file from {} to {}", src, dst);
++    statistics.incrementWriteOps(1);
+-      statistics.incrementWriteOps(1);
+-      throw new IOException("Got interrupted, cancelling");
++      throw new InterruptedIOException("Interrupted copying " + src
++          + " to "  + dst + ", cancelling");
+-  * Override getCononicalServiceName because we don't support token in S3A
++  * Override getCanonicalServiceName because we don't support token in S3A.
+-  private void copyFile(String srcKey, String dstKey) throws IOException {
+-    if (LOG.isDebugEnabled()) {
+-      LOG.debug("copyFile " + srcKey + " -> " + dstKey);
+-    }
++  private void copyFile(String srcKey, String dstKey, long size)
++      throws IOException {
++    LOG.debug("copyFile {} -> {} ", srcKey, dstKey);
+-    CopyObjectRequest copyObjectRequest = new CopyObjectRequest(bucket, srcKey, bucket, dstKey);
++    CopyObjectRequest copyObjectRequest =
++        new CopyObjectRequest(bucket, srcKey, bucket, dstKey);
++      instrumentation.filesCopied(1, size);
+-      throw new IOException("Got interrupted, cancelling");
++      throw new InterruptedIOException("Interrupted copying " + srcKey
++          + " to " + dstKey + ", cancelling");
+-    return !name.isEmpty() && name.charAt(name.length() - 1) == '/' && size == 0L;
++    return !name.isEmpty()
++        && name.charAt(name.length() - 1) == '/'
++        && size == 0L;
++      String key = "";
+-        String key = pathToKey(f);
++        key = pathToKey(f);
+-          if (LOG.isDebugEnabled()) {
+-            LOG.debug("Deleting fake directory " + key + "/");
+-          }
++          LOG.debug("Deleting fake directory {}/", key);
++        LOG.debug("While deleting key {} ", key, e);
++        instrumentation.errorIgnored();
+-    PutObjectRequest putObjectRequest = new PutObjectRequest(bucketName, objectName, im, om);
++    PutObjectRequest putObjectRequest =
++        new PutObjectRequest(bucketName, objectName, im, om);
++    instrumentation.directoryCreated();
+-   * be split into to minimize i/o time.
++   * be split into to minimize I/O time.
+-    // default to 32MB: large enough to minimize the impact of seeks
+-  private void printAmazonServiceException(AmazonServiceException ase) {
+-    LOG.info("Caught an AmazonServiceException, which means your request made it " +
+-        "to Amazon S3, but was rejected with an error response for some reason.");
+-    LOG.info("Error Message: " + ase.getMessage());
+-    LOG.info("HTTP Status Code: " + ase.getStatusCode());
+-    LOG.info("AWS Error Code: " + ase.getErrorCode());
+-    LOG.info("Error Type: " + ase.getErrorType());
+-    LOG.info("Request ID: " + ase.getRequestId());
+-    LOG.info("Class Name: " + ase.getClass().getName());
++  private void printAmazonServiceException(String target,
++      AmazonServiceException ase) {
++    LOG.info("{}: caught an AmazonServiceException {}", target, ase);
++    LOG.info("This means your request made it to Amazon S3," +
++        " but was rejected with an error response for some reason.");
++    LOG.info("Error Message: {}", ase.getMessage());
++    LOG.info("HTTP Status Code: {}", ase.getStatusCode());
++    LOG.info("AWS Error Code: {}", ase.getErrorCode());
++    LOG.info("Error Type: {}", ase.getErrorType());
++    LOG.info("Request ID: {}", ase.getRequestId());
++    LOG.info("Class Name: {}", ase.getClass().getName());
++    LOG.info("Exception", ase);
+-  private void printAmazonClientException(AmazonClientException ace) {
+-    LOG.info("Caught an AmazonClientException, which means the client encountered " +
+-        "a serious internal problem while trying to communicate with S3, " +
+-        "such as not being able to access the network.");
+-    LOG.info("Error Message: {}" + ace, ace);
++  private void printAmazonClientException(String target,
++      AmazonClientException ace) {
++    LOG.info("{}: caught an AmazonClientException {}", target, ace);
++    LOG.info("This means the client encountered " +
++        "a problem while trying to communicate with S3, " +
++        "such as not being able to access the network.", ace);
++  }
++
++  @Override
++  public String toString() {
++    final StringBuilder sb = new StringBuilder(
++        "S3AFileSystem{");
++    sb.append("uri=").append(uri);
++    sb.append(", workingDir=").append(workingDir);
++    sb.append(", partSize=").append(partSize);
++    sb.append(", enableMultiObjectsDelete=").append(enableMultiObjectsDelete);
++    sb.append(", maxKeys=").append(maxKeys);
++    sb.append(", cannedACL=").append(cannedACL.toString());
++    sb.append(", readAhead=").append(readAhead);
++    sb.append(", blockSize=").append(getDefaultBlockSize());
++    sb.append(", multiPartThreshold=").append(multiPartThreshold);
++    if (serverSideEncryptionAlgorithm != null) {
++      sb.append(", serverSideEncryptionAlgorithm='")
++          .append(serverSideEncryptionAlgorithm)
++          .append('\'');
++    }
++    sb.append(", statistics {")
++        .append(statistics.toString())
++        .append("}");
++    sb.append(", metrics {")
++        .append(instrumentation.dump("{", "=", "} ", true))
++        .append("}");
++    sb.append('}');
++    return sb.toString();
++  }
++
++  /**
++   * Get the partition size for multipart operations.
++   * @return the value as set during initialization
++   */
++  public long getPartitionSize() {
++    return partSize;
++  }
++
++  /**
++   * Get the threshold for multipart files
++   * @return the value as set during initialization
++   */
++  public long getMultiPartThreshold() {
++    return multiPartThreshold;
++  }
++
++  /**
++   * Get a integer option >= the minimum allowed value.
++   * @param conf configuration
++   * @param key key to look up
++   * @param defVal default value
++   * @param min minimum value
++   * @return the value
++   * @throws IllegalArgumentException if the value is below the minimum
++   */
++  static int intOption(Configuration conf, String key, int defVal, int min) {
++    int v = conf.getInt(key, defVal);
++    Preconditions.checkArgument(v >= min,
++        String.format("Value of %s: %d is below the minimum value %d",
++            key, v, min));
++    return v;
++  }
++
++  /**
++   * Get a long option >= the minimum allowed value.
++   * @param conf configuration
++   * @param key key to look up
++   * @param defVal default value
++   * @param min minimum value
++   * @return the value
++   * @throws IllegalArgumentException if the value is below the minimum
++   */
++  static long longOption(Configuration conf,
++      String key,
++      long defVal,
++      long min) {
++    long v = conf.getLong(key, defVal);
++    Preconditions.checkArgument(v >= min,
++        String.format("Value of %s: %d is below the minimum value %d",
++            key, v, min));
++    return v;

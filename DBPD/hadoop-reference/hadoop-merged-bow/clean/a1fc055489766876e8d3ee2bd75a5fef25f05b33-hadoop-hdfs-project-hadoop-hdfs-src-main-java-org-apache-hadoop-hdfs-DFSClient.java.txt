@@ -1,0 +1,143 @@
+HDFS-1623. High Availability Framework for HDFS NN. Contributed by Todd Lipcon, Aaron T. Myers, Eli Collins, Uma Maheswara Rao G, Bikas Saha, Suresh Srinivas, Jitendra Nath Pandey, Hari Mankude, Brandon Li, Sanjay Radia, Mingjie Lai, and Gregory Chanan
+
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/trunk@1296534 13f79535-47bb-0310-9956-ffa450edef68
+
+-
++import java.net.URI;
++import java.net.URISyntaxException;
++
++import org.apache.hadoop.hdfs.security.token.block.InvalidBlockTokenException;
+-import org.apache.hadoop.hdfs.security.token.block.InvalidBlockTokenException;
++
++import com.google.common.base.Preconditions;
+-  private final InetSocketAddress nnAddress;
++  /* The service used for delegation tokens */
++  private Text dtService;
++
++    final int maxFailoverAttempts;
++    final int failoverSleepBaseMillis;
++    final int failoverSleepMaxMillis;
++      maxFailoverAttempts = conf.getInt(
++          DFS_CLIENT_FAILOVER_MAX_ATTEMPTS_KEY,
++          DFS_CLIENT_FAILOVER_MAX_ATTEMPTS_DEFAULT);
++      failoverSleepBaseMillis = conf.getInt(
++          DFS_CLIENT_FAILOVER_SLEEPTIME_BASE_KEY,
++          DFS_CLIENT_FAILOVER_SLEEPTIME_BASE_DEFAULT);
++      failoverSleepMaxMillis = conf.getInt(
++          DFS_CLIENT_FAILOVER_SLEEPTIME_MAX_KEY,
++          DFS_CLIENT_FAILOVER_SLEEPTIME_MAX_DEFAULT);
++
++
++  
++  public DFSClient(InetSocketAddress address, Configuration conf) throws IOException {
++    this(NameNode.getUri(address), conf);
++  }
+-   * Same as this(nameNodeAddr, conf, null);
++   * Same as this(nameNodeUri, conf, null);
+-  public DFSClient(InetSocketAddress nameNodeAddr, Configuration conf
++  public DFSClient(URI nameNodeUri, Configuration conf
+-    this(nameNodeAddr, conf, null);
++    this(nameNodeUri, conf, null);
+-   * Same as this(nameNodeAddr, null, conf, stats);
++   * Same as this(nameNodeUri, null, conf, stats);
+-  public DFSClient(InetSocketAddress nameNodeAddr, Configuration conf,
++  public DFSClient(URI nameNodeUri, Configuration conf,
+-    this(nameNodeAddr, null, conf, stats);
++    this(nameNodeUri, null, conf, stats);
+-
++  
+-   * Create a new DFSClient connected to the given nameNodeAddr or rpcNamenode.
+-   * Exactly one of nameNodeAddr or rpcNamenode must be null.
++   * Create a new DFSClient connected to the given nameNodeUri or rpcNamenode.
++   * Exactly one of nameNodeUri or rpcNamenode must be null.
+-  DFSClient(InetSocketAddress nameNodeAddr, ClientProtocol rpcNamenode,
++  DFSClient(URI nameNodeUri, ClientProtocol rpcNamenode,
+-    this.nnAddress = nameNodeAddr;
+-    final String authority = nameNodeAddr == null? "null":
+-        nameNodeAddr.getHostName() + ":" + nameNodeAddr.getPort();
++    
++    final String authority = nameNodeUri == null? "null": nameNodeUri.getAuthority();
++    
+-    if (nameNodeAddr != null && rpcNamenode == null) {
+-      this.namenode = DFSUtil.createNamenode(nameNodeAddr, conf, ugi);
+-    } else if (nameNodeAddr == null && rpcNamenode != null) {
+-      //This case is used for testing.
++    
++    
++    if (rpcNamenode != null) {
++      // This case is used for testing.
++      Preconditions.checkArgument(nameNodeUri == null);
++      dtService = null;
+-      throw new IllegalArgumentException(
+-          "Expecting exactly one of nameNodeAddr and rpcNamenode being null: "
+-          + "nameNodeAddr=" + nameNodeAddr + ", rpcNamenode=" + rpcNamenode);
++      Preconditions.checkArgument(nameNodeUri != null,
++          "null URI");
++      NameNodeProxies.ProxyAndInfo<ClientProtocol> proxyInfo =
++        NameNodeProxies.createProxy(conf, nameNodeUri, ClientProtocol.class);
++      this.dtService = proxyInfo.getDelegationTokenService();
++      this.namenode = proxyInfo.getProxy();
++
+-   * The namenode variable is either a rpcProxy passed by a test or 
+-   * created using the protocolTranslator which is closeable.
+-   * If closeable then call close, else close using RPC.stopProxy().
+-    if (namenode instanceof Closeable) {
+-      try {
+-        ((Closeable) namenode).close();
+-        return;
+-      } catch (IOException e) {
+-        // fall through - lets try the stopProxy
+-        LOG.warn("Exception closing namenode, stopping the proxy");
+-      }     
+-    }
+-    Token<DelegationTokenIdentifier> result =
++    assert dtService != null;
++    Token<DelegationTokenIdentifier> token =
+-    SecurityUtil.setTokenService(result, nnAddress);
+-    LOG.info("Created " + DelegationTokenIdentifier.stringifyToken(result));
+-    return result;
++    token.setService(this.dtService);
++
++    LOG.info("Created " + DelegationTokenIdentifier.stringifyToken(token));
++    return token;
+-          (Token<DelegationTokenIdentifier>) token;
+-      LOG.info("Renewing " + 
+-               DelegationTokenIdentifier.stringifyToken(delToken));
+-      ClientProtocol nn = 
+-        DFSUtil.createNamenode
+-           (SecurityUtil.getTokenServiceAddr(delToken),
+-            conf, UserGroupInformation.getCurrentUser());
++        (Token<DelegationTokenIdentifier>) token;
++      ClientProtocol nn = getNNProxy(delToken, conf);
+-      ClientProtocol nn = DFSUtil.createNamenode(
+-          SecurityUtil.getTokenServiceAddr(delToken), conf,
+-          UserGroupInformation.getCurrentUser());
++      ClientProtocol nn = getNNProxy(delToken, conf);
++    
++    private static ClientProtocol getNNProxy(
++        Token<DelegationTokenIdentifier> token, Configuration conf)
++        throws IOException {
++      URI uri = HAUtil.getServiceUriFromToken(token);
++      if (HAUtil.isTokenForLogicalUri(token) &&
++          !HAUtil.isLogicalUri(conf, uri)) {
++        // If the token is for a logical nameservice, but the configuration
++        // we have disagrees about that, we can't actually renew it.
++        // This can be the case in MR, for example, if the RM doesn't
++        // have all of the HA clusters configured in its configuration.
++        throw new IOException("Unable to map logical nameservice URI '" +
++            uri + "' to a NameNode. Local configuration does not have " +
++            "a failover proxy provider configured.");
++      }
++      
++      NameNodeProxies.ProxyAndInfo<ClientProtocol> info =
++        NameNodeProxies.createProxy(conf, uri, ClientProtocol.class);
++      assert info.getDelegationTokenService().equals(token.getService()) :
++        "Returned service '" + info.getDelegationTokenService().toString() +
++        "' doesn't match expected service '" +
++        token.getService().toString() + "'";
++        
++      return info.getProxy();
++    }
+
+MOV26 INS26 INS26 INS26 INS40 INS40 INS40 INS31 INS31 UPD43 INS23 INS23 INS23 INS83 INS42 MOV44 INS44 INS43 INS8 INS44 INS29 INS39 INS42 INS8 INS31 UPD42 UPD42 INS83 INS39 INS59 INS83 INS39 INS59 INS83 INS39 INS59 UPD42 INS43 INS42 UPD42 MOV42 INS17 UPD43 UPD42 INS43 INS42 UPD43 UPD42 INS65 MOV21 INS6 INS83 INS83 INS43 INS42 INS44 INS44 INS43 INS8 INS42 INS42 INS42 INS21 INS21 INS21 INS42 INS32 INS42 UPD66 UPD42 UPD42 UPD66 INS42 UPD42 UPD66 UPD66 UPD42 MOV27 MOV8 INS8 INS66 INS27 UPD42 INS42 INS74 INS42 INS43 INS42 INS42 INS60 INS25 INS60 INS6 INS41 INS7 INS7 INS7 INS42 INS42 UPD42 MOV42 INS21 INS21 INS21 INS60 INS21 INS21 INS42 INS33 UPD42 UPD42 UPD42 INS22 INS43 INS43 INS42 INS43 INS59 INS27 INS8 INS74 INS59 INS32 INS27 INS32 INS42 INS32 INS42 INS32 INS42 INS32 INS32 INS32 INS7 INS32 INS74 INS59 INS7 INS7 INS52 INS42 INS42 INS42 INS42 INS42 INS32 INS32 INS38 INS53 INS43 INS43 INS42 INS32 INS32 INS42 INS32 INS45 INS32 INS45 INS32 INS45 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 UPD42 UPD42 MOV42 UPD42 MOV42 INS42 INS42 INS27 INS42 INS33 INS42 INS42 INS27 INS45 INS43 INS43 INS42 INS32 INS22 INS32 MOV22 INS32 UPD42 UPD42 MOV42 MOV42 UPD42 MOV42 MOV42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS14 INS40 INS42 INS42 INS42 INS42 INS42 INS57 INS42 INS42 INS42 INS42 INS32 INS42 INS32 INS42 INS42 INS33 UPD42 MOV42 MOV33 INS40 INS42 UPD42 MOV42 UPD42 MOV42 MOV42 INS42 INS57 INS52 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 MOV43 INS27 INS43 INS42 INS42 INS42 INS42 INS43 INS45 INS42 INS45 INS45 INS42 UPD42 MOV42 DEL83 DEL52 DEL42 DEL22 DEL42 DEL7 DEL21 DEL42 DEL42 DEL32 DEL45 DEL32 DEL27 DEL27 DEL42 DEL33 DEL27 DEL27 DEL42 DEL42 DEL32 DEL7 DEL21 DEL8 DEL42 DEL33 DEL27 DEL27 DEL43 DEL45 DEL45 DEL27 DEL42 DEL45 DEL42 DEL27 DEL14 DEL53 DEL8 DEL25 DEL66 DEL66 DEL66 DEL66 DEL65 DEL29 DEL39 DEL42 DEL42 DEL43 DEL62 DEL42 DEL43 DEL42 DEL11 DEL36 DEL32 DEL21 DEL41 DEL8 DEL42 DEL44 DEL42 DEL42 DEL45 DEL32 DEL21 DEL8 DEL12 DEL54 DEL8 DEL25 DEL8 DEL31 DEL42 DEL42 DEL42 DEL42 DEL45 DEL42 DEL42 DEL42 DEL32 DEL27 DEL32 DEL21 DEL42 DEL42 DEL42 DEL32 DEL42 DEL42 DEL32 DEL42 DEL42 DEL42 DEL32 DEL42 DEL42 DEL32

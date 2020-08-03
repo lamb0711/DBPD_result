@@ -1,0 +1,145 @@
+HDFS-1975. Support for sharing the namenode state from active to standby. Contributed by Jitendra Nath Pandey, Aaron T Myers, and Todd Lipcon.
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/branches/HDFS-1623@1208813 13f79535-47bb-0310-9956-ffa450edef68
+
++import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_NAMENODE_SHARED_EDITS_DIR_KEY;
++import org.apache.hadoop.hdfs.HAUtil;
++import org.apache.hadoop.hdfs.server.namenode.PendingDataNodeMessages.BlockReceivedDeleteMessage;
++import org.apache.hadoop.hdfs.server.namenode.PendingDataNodeMessages.BlockReportMessage;
++import org.apache.hadoop.hdfs.server.namenode.PendingDataNodeMessages.CommitBlockSynchronizationMessage;
++import org.apache.hadoop.hdfs.server.namenode.PendingDataNodeMessages.DataNodeMessage;
++import org.apache.hadoop.hdfs.server.namenode.ha.EditLogTailer;
++import com.google.common.annotations.VisibleForTesting;
++  private PendingDataNodeMessages pendingDatanodeMessages = new PendingDataNodeMessages();
++  
++  /**
++   * Used when this NN is in standby state to read from the shared edit log.
++   */
++  private EditLogTailer editLogTailer = null;
++  
++  PendingDataNodeMessages getPendingDataNodeMessages() {
++    return pendingDatanodeMessages;
++  }
+-  public static FSNamesystem loadFromDisk(Configuration conf) throws IOException {
++  public static FSNamesystem loadFromDisk(Configuration conf)
++    throws IOException {
+-    namesystem.loadFSImage(startOpt, fsImage);
++    String nameserviceId = DFSUtil.getNamenodeNameServiceId(conf);
++    namesystem.loadFSImage(startOpt, fsImage,
++      HAUtil.isHAEnabled(conf, nameserviceId));
+-  void loadFSImage(StartupOption startOpt, FSImage fsImage)
++  void loadFSImage(StartupOption startOpt, FSImage fsImage, boolean haEnabled)
+-      if (fsImage.recoverTransitionRead(startOpt, this)) {
++      // We shouldn't be calling saveNamespace if we've come up in standby state.
++      if (fsImage.recoverTransitionRead(startOpt, this) && !haEnabled) {
+-      fsImage.openEditLog();
++      // This will start a new log segment and write to the seen_txid file, so
++      // we shouldn't do it when coming up in standby state
++      if (!haEnabled) {
++        fsImage.openEditLogForWrite();
++      }
++      if (!dir.fsImage.editLog.isOpenForWrite()) {
++        // During startup, we're already open for write during initialization.
++        // TODO(HA): consider adding a startup state?
++        dir.fsImage.editLog.initJournalsForWrite();
++        // May need to recover
++        dir.fsImage.editLog.recoverUnclosedStreams();
++        dir.fsImage.editLog.openForWrite();
++      }
+-   * Start services required in active state 
++   * Stop services required in active state
++      dir.fsImage.editLog.close();
++    if (!dir.fsImage.editLog.isOpenForRead()) {
++      // During startup, we're already open for read.
++      dir.fsImage.editLog.initSharedJournalsForRead();
++    }
++    editLogTailer = new EditLogTailer(this);
++    editLogTailer.start();
+-  void stopStandbyServices() {
++  void stopStandbyServices() throws IOException {
++    if (editLogTailer != null) {
++      editLogTailer.stop();
++    }
++    dir.fsImage.editLog.close();
+-    return getStorageDirs(conf, DFS_NAMENODE_EDITS_DIR_KEY);
++    Collection<URI> editsDirs = getStorageDirs(conf, DFS_NAMENODE_EDITS_DIR_KEY);
++    editsDirs.addAll(getSharedEditsDirs(conf));
++    return editsDirs;
++  }
++  
++  /**
++   * Returns edit directories that are shared between primary and secondary.
++   * @param conf
++   * @return Collection of edit directories.
++   */
++  public static Collection<URI> getSharedEditsDirs(Configuration conf) {
++    // don't use getStorageDirs here, because we want an empty default
++    // rather than the dir in /tmp
++    Collection<String> dirNames = conf.getTrimmedStringCollection(
++        DFS_NAMENODE_SHARED_EDITS_DIR_KEY);
++    return Util.stringCollectionAsURIs(dirNames);
++        // TODO: these lines spew lots of warnings about "already stopped" logs, etc
+-      DatanodeDescriptor targets[]) throws QuotaExceededException {
++      DatanodeDescriptor targets[]) throws QuotaExceededException,
++      SafeModeException {
++    // Increment the generation stamp for every new block.
++    nextGenerationStamp();
+-  FSImage getFSImage() {
++  public FSImage getFSImage() {
+-  FSEditLog getEditLog() {
++  public FSEditLog getEditLog() {
++
++    notifyGenStampUpdate(stamp);
++  
++  public boolean isGenStampInFuture(long genStamp) {
++    return (genStamp > getGenerationStamp());
++  }
++  
++  public void notifyGenStampUpdate(long gs) {
++    LOG.info("=> notified of genstamp update for: " + gs);
++    DataNodeMessage msg = pendingDatanodeMessages.take(gs);
++    while (msg != null) {
++      LOG.info("processing message: " + msg);
++      try {
++        switch (msg.getType()) {
++        case BLOCK_RECEIVED_DELETE:
++          BlockReceivedDeleteMessage m = (BlockReceivedDeleteMessage) msg;
++          if (NameNode.stateChangeLog.isDebugEnabled()) {
++            NameNode.stateChangeLog
++                .debug("*BLOCK* NameNode.blockReceivedAndDeleted: " + "from "
++                    + m.getNodeReg().getName() + " "
++                    + m.getReceivedAndDeletedBlocks().length + " blocks.");
++          }
++          this.getBlockManager().blockReceivedAndDeleted(m.getNodeReg(),
++              m.getPoolId(), m.getReceivedAndDeletedBlocks());
++          break;
++        case BLOCK_REPORT:
++          BlockReportMessage mbr = (BlockReportMessage) msg;
++          if (NameNode.stateChangeLog.isDebugEnabled()) {
++            NameNode.stateChangeLog.debug("*BLOCK* NameNode.blockReport: "
++                + "from " + mbr.getNodeReg().getName() + " "
++                + mbr.getBlockList().getNumberOfBlocks() + " blocks");
++          }
++          this.getBlockManager().processReport(mbr.getNodeReg(),
++              mbr.getPoolId(), mbr.getBlockList());
++          break;
++        case COMMIT_BLOCK_SYNCHRONIZATION:
++          CommitBlockSynchronizationMessage mcbm = (CommitBlockSynchronizationMessage) msg;
++          this.commitBlockSynchronization(mcbm.getBlock(),
++              mcbm.getNewgenerationstamp(), mcbm.getNewlength(),
++              mcbm.isCloseFile(), mcbm.isDeleteblock(), mcbm.getNewtargets());
++          break;
++        }
++      } catch (IOException ex) {
++        LOG.warn("Could not process the message " + msg.getType(), ex);
++      }
++      msg = pendingDatanodeMessages.take(gs);
++    }
++  }
++  
++  @VisibleForTesting
++  public EditLogTailer getEditLogTailer() {
++    return editLogTailer;
++  }
+
+INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS23 INS23 INS31 INS31 INS31 INS31 INS31 INS83 INS43 INS59 INS29 INS83 INS43 INS59 INS43 INS42 INS8 INS44 INS8 INS43 INS8 INS74 INS29 INS83 INS83 INS74 INS42 INS44 INS8 INS43 INS83 INS83 INS83 INS39 INS42 INS44 INS8 INS83 INS39 INS42 INS44 INS8 INS78 INS83 INS43 INS42 INS8 INS42 INS42 INS14 INS65 INS42 INS42 INS33 INS42 INS41 INS60 INS39 INS42 MOV21 INS25 INS21 INS21 INS42 MOV21 INS25 INS21 INS43 INS43 INS60 INS21 INS65 INS65 INS65 INS43 INS43 INS43 INS42 INS60 INS41 INS42 INS21 INS21 INS39 INS42 INS41 INS39 INS42 INS21 INS60 INS61 INS42 INS42 INS41 INS43 INS66 INS42 INS43 INS59 UPD66 INS38 INS8 INS7 INS32 INS27 INS8 INS32 INS42 INS42 MOV74 INS59 INS32 INS42 INS66 INS42 INS66 INS42 INS42 INS42 INS74 INS59 INS32 INS32 INS32 INS36 INS32 INS43 INS59 INS27 INS8 INS42 INS42 INS42 INS42 INS32 INS32 INS25 INS25 INS21 INS32 INS21 INS42 INS14 INS42 INS42 INS42 INS33 INS21 INS40 INS42 INS42 MOV32 INS42 INS42 INS32 INS43 INS43 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS27 INS42 INS42 INS27 INS42 INS42 INS32 INS42 INS33 INS21 INS54 INS21 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS27 INS38 INS8 INS38 INS8 INS32 INS40 INS42 INS32 INS43 INS52 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS45 INS42 INS42 INS42 INS42 INS32 INS8 INS12 INS7 MOV32 INS38 INS42 MOV21 INS32 INS21 INS21 INS21 INS40 INS42 INS40 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS27 INS50 INS44 INS8 INS42 INS32 INS42 INS40 INS42 INS32 INS32 INS32 INS45 INS42 INS32 INS49 INS60 INS25 INS21 INS10 INS49 INS60 INS25 INS21 INS10 INS49 INS60 INS21 INS10 INS43 INS42 INS21 INS42 INS42 INS42 UPD42 INS40 INS42 INS40 INS42 INS40 INS42 INS42 INS42 INS42 INS43 INS59 INS32 INS8 INS32 INS42 INS43 INS59 INS32 INS8 INS32 INS42 INS43 INS59 INS32 INS42 INS32 INS42 INS42 INS11 INS40 INS42 INS21 INS32 INS42 INS32 INS32 INS32 INS42 INS42 INS11 INS40 INS42 INS21 INS32 INS42 INS32 INS32 INS32 INS42 INS42 INS11 INS52 INS42 INS32 INS32 INS32 INS32 INS32 INS32 INS42 INS42 INS27 INS42 INS43 INS42 INS32 INS52 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS43 INS42 INS32 INS52 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS43 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS45 INS32 INS42 INS40 INS42 INS27 INS42 INS40 INS42 INS27 INS42 INS42 INS42 INS27 INS32 INS45 INS22 INS45 INS27 INS32 INS45 INS32 INS45 INS45 INS45 INS32 INS42 INS32 INS42 INS45 INS45 INS32 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 DEL8 DEL8

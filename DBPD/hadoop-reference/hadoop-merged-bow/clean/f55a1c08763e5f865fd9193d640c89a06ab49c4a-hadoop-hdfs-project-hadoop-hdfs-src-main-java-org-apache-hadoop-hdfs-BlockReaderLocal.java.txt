@@ -1,0 +1,379 @@
+HDFS-2834. Add a ByteBuffer-based read API to DFSInputStream. Contributed by Henry Robinson.
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/trunk@1303474 13f79535-47bb-0310-9956-ffa450edef68
+
+-  private FileInputStream checksumIn;   // reader for the checksum file
++  private final FileInputStream checksumIn;   // reader for the checksum file
++  /**
++   * Offset from the most recent chunk boundary at which the next read should
++   * take place. Is only set to non-zero at construction time, and is
++   * decremented (usually to 0) by subsequent reads. This avoids having to do a
++   * checksum read at construction to position the read cursor correctly.
++   */
+-  private ByteBuffer dataBuff = null;
++
++  /**
++   * Used for checksummed reads that need to be staged before copying to their
++   * output buffer because they are either a) smaller than the checksum chunk
++   * size or b) issued by the slower read(byte[]...) path
++   */
++  private ByteBuffer slowReadBuff = null;
+-  private int bytesPerChecksum;
+-  private int checksumSize;
++  private final int bytesPerChecksum;
++  private final int checksumSize;
+-            + length + " short circuit checksum " + skipChecksumCheck);
++            + length + " short circuit checksum " + !skipChecksumCheck);
++  private static int getSlowReadBufferNumChunks(Configuration conf, int bytesPerChecksum) {
++    int bufferSizeBytes = conf.getInt(DFSConfigKeys.DFS_CLIENT_READ_SHORTCIRCUIT_BUFFER_SIZE_KEY,
++        DFSConfigKeys.DFS_CLIENT_READ_SHORTCIRCUIT_BUFFER_SIZE_DEFAULT);
++
++    if (bufferSizeBytes < bytesPerChecksum) {
++      throw new IllegalArgumentException("Configured BlockReaderLocal buffer size (" + bufferSizeBytes + ") " +
++          "is not large enough to hold a single chunk (" + bytesPerChecksum +  "). Please configure " +
++          DFSConfigKeys.DFS_CLIENT_READ_SHORTCIRCUIT_BUFFER_SIZE_KEY + " appropriately");
++    }
++
++    // Round down to nearest chunk size
++    return bufferSizeBytes / bytesPerChecksum;
++  }
++
+-    dataBuff = bufferPool.getBuffer(bytesPerChecksum*64);
+-    checksumBuff = bufferPool.getBuffer(checksumSize*64);
+-    //Initially the buffers have nothing to read.
+-    dataBuff.flip();
++
++    int chunksPerChecksumRead = getSlowReadBufferNumChunks(conf, bytesPerChecksum);
++    slowReadBuff = bufferPool.getBuffer(bytesPerChecksum * chunksPerChecksumRead);
++    checksumBuff = bufferPool.getBuffer(checksumSize * chunksPerChecksumRead);
++    // Initially the buffers have nothing to read.
++    slowReadBuff.flip();
+-    long toSkip = firstChunkOffset;
+-    while (toSkip > 0) {
+-      long skipped = dataIn.skip(toSkip);
+-      if (skipped == 0) {
+-        throw new IOException("Couldn't initialize input stream");
+-      }
+-      toSkip -= skipped;
+-    }
+-    if (checksumIn != null) {
+-      long checkSumOffset = (firstChunkOffset / bytesPerChecksum)
+-          * checksumSize;
+-      while (checkSumOffset > 0) {
+-        long skipped = checksumIn.skip(checkSumOffset);
++    boolean success = false;
++    try {
++      // Skip both input streams to beginning of the chunk containing startOffset
++      long toSkip = firstChunkOffset;
++      while (toSkip > 0) {
++        long skipped = dataIn.skip(toSkip);
+-          throw new IOException("Couldn't initialize checksum input stream");
++          throw new IOException("Couldn't initialize input stream");
+-        checkSumOffset -= skipped;
++        toSkip -= skipped;
++      }
++      if (checksumIn != null) {
++        long checkSumOffset = (firstChunkOffset / bytesPerChecksum) * checksumSize;
++        while (checkSumOffset > 0) {
++          long skipped = checksumIn.skip(checkSumOffset);
++          if (skipped == 0) {
++            throw new IOException("Couldn't initialize checksum input stream");
++          }
++          checkSumOffset -= skipped;
++        }
++      }
++      success = true;
++    } finally {
++      if (!success) {
++        bufferPool.returnBuffer(slowReadBuff);
++        bufferPool.returnBuffer(checksumBuff);
+-  private int readIntoBuffer(FileInputStream stream, ByteBuffer buf)
++  /**
++   * Reads bytes into a buffer until EOF or the buffer's limit is reached
++   */
++  private int fillBuffer(FileInputStream stream, ByteBuffer buf)
++  /**
++   * Utility method used by read(ByteBuffer) to partially copy a ByteBuffer into
++   * another.
++   */
++  private void writeSlice(ByteBuffer from, ByteBuffer to, int length) {
++    int oldLimit = from.limit();
++    from.limit(from.position() + length);
++    try {
++      to.put(from);
++    } finally {
++      from.limit(oldLimit);
++    }
++  }
++
++  @Override
++  public synchronized int read(ByteBuffer buf) throws IOException {
++    int nRead = 0;
++    if (verifyChecksum) {
++      // A 'direct' read actually has three phases. The first drains any
++      // remaining bytes from the slow read buffer. After this the read is
++      // guaranteed to be on a checksum chunk boundary. If there are still bytes
++      // to read, the fast direct path is used for as many remaining bytes as
++      // possible, up to a multiple of the checksum chunk size. Finally, any
++      // 'odd' bytes remaining at the end of the read cause another slow read to
++      // be issued, which involves an extra copy.
++
++      // Every 'slow' read tries to fill the slow read buffer in one go for
++      // efficiency's sake. As described above, all non-checksum-chunk-aligned
++      // reads will be served from the slower read path.
++
++      if (slowReadBuff.hasRemaining()) {
++        // There are remaining bytes from a small read available. This usually
++        // means this read is unaligned, which falls back to the slow path.
++        int fromSlowReadBuff = Math.min(buf.remaining(), slowReadBuff.remaining());
++        writeSlice(slowReadBuff, buf, fromSlowReadBuff);
++        nRead += fromSlowReadBuff;
++      }
++
++      if (buf.remaining() >= bytesPerChecksum && offsetFromChunkBoundary == 0) {
++        // Since we have drained the 'small read' buffer, we are guaranteed to
++        // be chunk-aligned
++        int len = buf.remaining() - (buf.remaining() % bytesPerChecksum);
++
++        // There's only enough checksum buffer space available to checksum one
++        // entire slow read buffer. This saves keeping the number of checksum
++        // chunks around.
++        len = Math.min(len, slowReadBuff.capacity());
++        int oldlimit = buf.limit();
++        buf.limit(buf.position() + len);
++        int readResult = 0;
++        try {
++          readResult = doByteBufferRead(buf);
++        } finally {
++          buf.limit(oldlimit);
++        }
++        if (readResult == -1) {
++          return nRead;
++        } else {
++          nRead += readResult;
++          buf.position(buf.position() + readResult);
++        }
++      }
++
++      // offsetFromChunkBoundary > 0 => unaligned read, use slow path to read
++      // until chunk boundary
++      if ((buf.remaining() > 0 && buf.remaining() < bytesPerChecksum) || offsetFromChunkBoundary > 0) {
++        int toRead = Math.min(buf.remaining(), bytesPerChecksum - offsetFromChunkBoundary);
++        int readResult = fillSlowReadBuffer(toRead);
++        if (readResult == -1) {
++          return nRead;
++        } else {
++          int fromSlowReadBuff = Math.min(readResult, buf.remaining());
++          writeSlice(slowReadBuff, buf, fromSlowReadBuff);
++          nRead += fromSlowReadBuff;
++        }
++      }
++    } else {
++      // Non-checksummed reads are much easier; we can just fill the buffer directly.
++      nRead = doByteBufferRead(buf);
++      if (nRead > 0) {
++        buf.position(buf.position() + nRead);
++      }
++    }
++    return nRead;
++  }
++
++  /**
++   * Tries to read as many bytes as possible into supplied buffer, checksumming
++   * each chunk if needed.
++   *
++   * <b>Preconditions:</b>
++   * <ul>
++   * <li>
++   * If checksumming is enabled, buf.remaining must be a multiple of
++   * bytesPerChecksum. Note that this is not a requirement for clients of
++   * read(ByteBuffer) - in the case of non-checksum-sized read requests,
++   * read(ByteBuffer) will substitute a suitably sized buffer to pass to this
++   * method.
++   * </li>
++   * </ul>
++   * <b>Postconditions:</b>
++   * <ul>
++   * <li>buf.limit and buf.mark are unchanged.</li>
++   * <li>buf.position += min(offsetFromChunkBoundary, totalBytesRead) - so the
++   * requested bytes can be read straight from the buffer</li>
++   * </ul>
++   *
++   * @param buf
++   *          byte buffer to write bytes to. If checksums are not required, buf
++   *          can have any number of bytes remaining, otherwise there must be a
++   *          multiple of the checksum chunk size remaining.
++   * @return <tt>max(min(totalBytesRead, len) - offsetFromChunkBoundary, 0)</tt>
++   *         that is, the the number of useful bytes (up to the amount
++   *         requested) readable from the buffer by the client.
++   */
++  private synchronized int doByteBufferRead(ByteBuffer buf) throws IOException {
++    if (verifyChecksum) {
++      assert buf.remaining() % bytesPerChecksum == 0;
++    }
++    int dataRead = -1;
++
++    int oldpos = buf.position();
++    // Read as much as we can into the buffer.
++    dataRead = fillBuffer(dataIn, buf);
++
++    if (dataRead == -1) {
++      return -1;
++    }
++
++    if (verifyChecksum) {
++      ByteBuffer toChecksum = buf.duplicate();
++      toChecksum.position(oldpos);
++      toChecksum.limit(oldpos + dataRead);
++
++      checksumBuff.clear();
++      // Equivalent to (int)Math.ceil(toChecksum.remaining() * 1.0 / bytesPerChecksum );
++      int numChunks =
++        (toChecksum.remaining() + bytesPerChecksum - 1) / bytesPerChecksum;
++      checksumBuff.limit(checksumSize * numChunks);
++
++      fillBuffer(checksumIn, checksumBuff);
++      checksumBuff.flip();
++
++      checksum.verifyChunkedSums(toChecksum, checksumBuff, filename,
++          this.startOffset);
++    }
++
++    if (dataRead >= 0) {
++      buf.position(oldpos + Math.min(offsetFromChunkBoundary, dataRead));
++    }
++
++    if (dataRead < offsetFromChunkBoundary) {
++      // yikes, didn't even get enough bytes to honour offset. This can happen
++      // even if we are verifying checksums if we are at EOF.
++      offsetFromChunkBoundary -= dataRead;
++      dataRead = 0;
++    } else {
++      dataRead -= offsetFromChunkBoundary;
++      offsetFromChunkBoundary = 0;
++    }
++
++    return dataRead;
++  }
++
++  /**
++   * Ensures that up to len bytes are available and checksummed in the slow read
++   * buffer. The number of bytes available to read is returned. If the buffer is
++   * not already empty, the number of remaining bytes is returned and no actual
++   * read happens.
++   *
++   * @param len
++   *          the maximum number of bytes to make available. After len bytes
++   *          are read, the underlying bytestream <b>must</b> be at a checksum
++   *          boundary, or EOF. That is, (len + currentPosition) %
++   *          bytesPerChecksum == 0.
++   * @return the number of bytes available to read, or -1 if EOF.
++   */
++  private synchronized int fillSlowReadBuffer(int len) throws IOException {
++    int nRead = -1;
++    if (slowReadBuff.hasRemaining()) {
++      // Already got data, good to go.
++      nRead = Math.min(len, slowReadBuff.remaining());
++    } else {
++      // Round a complete read of len bytes (plus any implicit offset) to the
++      // next chunk boundary, since we try and read in multiples of a chunk
++      int nextChunk = len + offsetFromChunkBoundary +
++          (bytesPerChecksum - ((len + offsetFromChunkBoundary) % bytesPerChecksum));
++      int limit = Math.min(nextChunk, slowReadBuff.capacity());
++      assert limit % bytesPerChecksum == 0;
++
++      slowReadBuff.clear();
++      slowReadBuff.limit(limit);
++
++      nRead = doByteBufferRead(slowReadBuff);
++
++      if (nRead > 0) {
++        // So that next time we call slowReadBuff.hasRemaining(), we don't get a
++        // false positive.
++        slowReadBuff.limit(nRead + slowReadBuff.position());
++      }
++    }
++    return nRead;
++  }
++
+-    if (LOG.isDebugEnabled()) {
+-      LOG.info("read off " + off + " len " + len);
++    if (LOG.isTraceEnabled()) {
++      LOG.trace("read off " + off + " len " + len);
+-    } else {
+-      int dataRead = -1;
+-      if (dataBuff.remaining() == 0) {
+-        dataBuff.clear();
+-        checksumBuff.clear();
+-        dataRead = readIntoBuffer(dataIn, dataBuff);
+-        readIntoBuffer(checksumIn, checksumBuff);
+-        checksumBuff.flip();
+-        dataBuff.flip();
+-        checksum.verifyChunkedSums(dataBuff, checksumBuff, filename,
+-            this.startOffset);
+-      } else {
+-        dataRead = dataBuff.remaining();
+-      }
+-      if (dataRead > 0) {
+-        int nRead = Math.min(dataRead - offsetFromChunkBoundary, len);
+-        if (offsetFromChunkBoundary > 0) {
+-          dataBuff.position(offsetFromChunkBoundary);
+-          // Its either end of file or dataRead is greater than the
+-          // offsetFromChunkBoundary
+-          offsetFromChunkBoundary = 0;
+-        }
+-        if (nRead > 0) {
+-          dataBuff.get(buf, off, nRead);
+-          return nRead;
+-        } else {
+-          return 0;
+-        }
+-      } else {
+-        return -1;
+-      }
++
++    int nRead = fillSlowReadBuffer(slowReadBuff.capacity());
++
++    if (nRead > 0) {
++      // Possible that buffer is filled with a larger read than we need, since
++      // we tried to read as much as possible at once
++      nRead = Math.min(len, nRead);
++      slowReadBuff.get(buf, off, nRead);
++    }
++
++    return nRead;
+-    int remaining = dataBuff.remaining();
+-    int position = dataBuff.position();
++    int remaining = slowReadBuff.remaining();
++    int position = slowReadBuff.position();
+-      dataBuff.position(newPosition);
++      slowReadBuff.position(newPosition);
+-      dataBuff.position(position + remaining);
++      slowReadBuff.position(position + remaining);
+-    this.offsetFromChunkBoundary = newPosition % bytesPerChecksum;
+-    long toskip = n - remaining - this.offsetFromChunkBoundary;
+-    dataBuff.clear();
+-    checksumBuff.clear();
++    // We can't use this.offsetFromChunkBoundary because we need to know how
++    // many bytes of the offset were really read. Calling read(..) with a
++    // positive this.offsetFromChunkBoundary causes that many bytes to get
++    // silently skipped.
++    int myOffsetFromChunkBoundary = newPosition % bytesPerChecksum;
++    long toskip = n - remaining - myOffsetFromChunkBoundary;
++
++    slowReadBuff.position(slowReadBuff.limit());
++    checksumBuff.position(checksumBuff.limit());
+-    assert this.offsetFromChunkBoundary < bytesPerChecksum;
+-    int ret = read(skipBuf, 0, this.offsetFromChunkBoundary);
++    assert myOffsetFromChunkBoundary < bytesPerChecksum;
++
++    int ret = read(skipBuf, 0, myOffsetFromChunkBoundary);
++
+-    if (dataBuff != null) {
+-      bufferPool.returnBuffer(dataBuff);
+-      dataBuff = null;
++    if (slowReadBuff != null) {
++      bufferPool.returnBuffer(slowReadBuff);
++      slowReadBuff = null;
+
+INS31 INS31 INS31 INS31 INS31 INS31 INS83 INS29 INS29 INS83 INS83 INS83 INS83 INS39 INS42 INS44 INS44 INS8 INS29 UPD42 INS29 INS83 INS39 INS42 INS44 INS44 INS44 INS8 INS78 MOV83 MOV83 MOV39 MOV42 INS44 INS43 INS8 INS29 INS83 INS83 INS39 INS42 INS44 INS43 INS8 INS29 INS83 INS83 INS39 INS42 INS44 INS43 INS8 MOV78 INS83 INS83 INS39 INS42 MOV44 MOV44 MOV44 MOV43 INS8 INS65 INS65 UPD42 INS43 INS42 INS39 INS42 INS60 INS25 INS41 INS60 INS60 INS54 INS65 INS65 INS43 INS42 INS43 INS42 INS39 INS42 INS60 INS21 INS54 INS42 INS43 INS42 INS42 INS60 INS25 MOV41 INS65 INS65 INS65 INS43 INS42 INS42 INS25 MOV60 INS60 MOV21 INS25 INS25 INS25 INS25 INS41 INS65 INS65 INS65 INS39 INS42 INS42 INS60 INS25 INS41 MOV25 INS25 MOV60 INS25 MOV41 INS60 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS42 INS39 INS59 INS27 INS8 INS27 INS39 INS59 INS39 INS59 INS8 INS8 INS66 INS66 INS66 INS42 INS42 INS39 INS59 INS32 INS8 INS8 INS42 INS39 INS59 INS42 INS8 INS8 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS42 INS66 INS66 INS66 INS66 INS66 INS66 INS42 INS42 INS8 INS39 INS59 INS27 MOV8 INS42 INS8 INS27 INS8 INS27 INS8 MOV8 INS42 INS66 INS66 INS66 INS66 INS42 INS66 INS66 INS66 INS66 INS66 INS39 INS59 INS32 MOV8 INS8 INS42 MOV38 MOV8 INS27 MOV8 INS42 INS39 INS59 INS32 INS42 INS32 INS42 INS42 INS53 INS42 INS42 INS42 INS32 UPD42 UPD42 INS42 INS9 MOV60 MOV61 MOV25 INS21 INS25 INS42 INS32 INS42 INS42 INS27 INS21 INS21 INS42 INS34 INS25 INS25 INS25 INS21 INS25 INS6 INS42 INS32 INS42 INS38 INS60 INS21 INS21 MOV21 INS60 MOV21 MOV21 MOV21 MOV21 INS42 INS34 INS21 INS42 INS42 INS21 INS21 INS42 INS38 INS42 INS42 INS60 INS60 INS6 INS21 INS21 INS21 INS25 UPD42 INS42 INS34 INS21 INS42 MOV27 INS42 INS42 INS32 INS42 INS32 INS42 UPD42 INS42 INS42 INS40 INS40 INS14 INS42 INS42 INS42 INS7 INS38 INS8 INS42 INS42 INS32 INS42 INS32 INS32 INS32 INS8 UPD27 MOV27 INS8 INS27 INS8 INS7 MOV27 INS8 INS27 INS42 INS42 UPD42 UPD42 INS34 INS43 INS59 INS32 INS32 INS39 INS59 INS32 INS7 INS7 INS7 INS34 INS39 INS59 INS39 INS59 INS27 INS32 INS32 INS7 MOV27 INS8 UPD42 INS32 INS7 UPD42 UPD42 INS42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 INS42 INS42 INS43 INS27 INS42 INS42 INS42 INS9 INS42 INS21 INS21 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS60 INS21 INS21 INS27 INS27 INS60 MOV21 INS60 INS21 INS60 INS54 INS25 INS36 MOV27 INS60 INS60 INS25 INS42 INS32 INS21 INS27 INS34 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS27 INS42 INS27 UPD42 INS42 INS27 UPD42 UPD42 INS42 UPD42 INS42 INS42 INS27 INS42 INS42 INS42 INS34 INS42 INS42 UPD42 INS32 INS42 INS27 INS42 INS32 INS27 INS34 INS42 INS42 INS42 INS42 INS42 INS42 INS32 UPD42 INS21 UPD42 INS42 INS42 INS42 INS32 UPD42 UPD42 UPD42 UPD42 UPD42 INS42 INS45 INS42 INS45 INS45 INS42 INS45 INS40 INS45 INS32 INS32 INS39 INS59 INS32 INS7 MOV32 INS42 INS42 MOV34 INS39 INS59 INS7 INS39 INS59 INS32 INS39 INS59 INS8 INS8 INS27 INS8 INS8 INS27 INS39 INS59 INS39 INS59 INS27 INS8 INS8 INS42 INS42 INS32 INS32 INS42 INS42 INS42 INS42 INS42 INS36 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS32 INS42 INS42 INS36 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS42 UPD42 INS42 INS27 INS42 INS32 INS42 INS32 INS42 INS42 INS27 INS42 INS34 INS21 INS21 INS42 INS38 INS41 INS21 INS21 INS27 INS27 INS42 INS32 INS42 INS32 INS42 INS38 INS41 INS60 INS21 INS21 INS42 INS42 INS27 INS42 INS42 INS27 INS42 INS42 INS42 INS42 UPD42 MOV42 MOV42 INS27 INS42 INS42 INS42 INS42 INS27 INS38 INS42 INS42 INS32 INS32 INS32 INS36 INS42 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS7 INS32 INS34 INS42 INS7 INS32 INS32 INS34 INS32 INS42 INS42 INS42 INS32 INS27 INS42 INS42 INS34 INS42 INS39 INS59 INS32 INS7 INS32 INS42 INS27 INS34 INS42 INS36 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS27 UPD42 MOV42 UPD42 MOV42 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS27 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS27 INS42 INS42 INS32 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS36 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS27 INS42 INS42 DEL42 DEL34 DEL34 DEL32 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL32 DEL42 DEL42 DEL42 DEL27 DEL42 DEL34 DEL8 DEL25 DEL25 DEL8 DEL25 DEL8 DEL25 DEL8 DEL25 DEL8 DEL31 DEL52 DEL42 DEL22 DEL7 DEL21 DEL52 DEL42 DEL22 DEL32 DEL52 DEL42 DEL22 DEL52 DEL42 DEL22

@@ -1,0 +1,181 @@
+JCR-1819 : Add specific deep loading of Nodes and Properties
+JCR-1843 : wrong status change upon conflicting removal (CacheBehaviour.OBSERVATION)
+JCR-1293 : ReorderReferenceableSNSTest failure
+JCR-1811 : ExportSysViewTest#testExportSysView_handler_session_saveBinary_occasionally failing
+
+
+git-svn-id: https://svn.apache.org/repos/asf/jackrabbit/trunk@709211 13f79535-47bb-0310-9956-ffa450edef68
+
+-        ItemState state = internalGetItemState();
+-        if (state != null) {
+-            if (getStatus() == Status.EXISTING_MODIFIED) {
+-                state.setStatus(Status.STALE_DESTROYED);
+-            } else {
+-                state.setStatus(Status.REMOVED);
+-                parent.internalRemoveChildEntry(this);
+-            }
+-        } else {
+-            // unresolved: ignore.
+-            parent.internalRemoveChildEntry(this);
+-        }
+-
+-        // now remove all child-entries.
++        // handle this entry first
++        super.internalRemove(false);
++        boolean staleParent = (getStatus() == Status.STALE_DESTROYED);
++        // now remove all child-entries (or mark them accordingly)
+-            ce.remove();
++            ce.internalRemove(staleParent);
++        }
++    }
++
++    void internalRemove(boolean staleParent) {
++        // handle this entry first
++        super.internalRemove(staleParent);
++        staleParent = (staleParent || (getStatus() == Status.STALE_DESTROYED));
++
++        // now remove all child-entries (or mark them accordingly)
++        for (Iterator it = getAllChildEntries(true); it.hasNext();) {
++            HierarchyEntryImpl ce = (HierarchyEntryImpl) it.next();
++            ce.internalRemove(staleParent);
+-     * @see NodeEntry#getDeepEntry(Path)
++     * @see NodeEntry#getDeepNodeEntry(Path)
+-    public HierarchyEntry getDeepEntry(Path path) throws PathNotFoundException, RepositoryException {
++    public NodeEntry getDeepNodeEntry(Path path) throws PathNotFoundException, RepositoryException {
+-                if (getParent() != null) {
+-                    throw new RepositoryException("NodeEntry out of 'hierarchy'" + path.toString());
++                if (entry.getParent() != null) {
++                    throw new RepositoryException("NodeEntry out of 'hierarchy' " + path.toString());
+-            } else if (index == Path.INDEX_DEFAULT && i == path.getLength() - 1 && entry.properties.contains(name)) {
+-                // property must not have index && must be final path element
+-                return entry.properties.get(name);
++                // shortcut: entry is NEW and still unresolved remaining path
++                // elements -> hierarchy doesn't exist anyway.
++                if (entry.getStatus() == Status.NEW) {
++                    throw new PathNotFoundException(path.toString());
++                }
+-                // shortcut: entry is NEW and still unresolved remaining path
+-                // elements -> hierarchy doesn't exist anyway.
+-                if (entry.getStatus() == Status.NEW) {
+-                    throw new PathNotFoundException(path.toString());
+-                }
+-
+-                    if (index != Path.INDEX_DEFAULT) {
+-                        throw new PathNotFoundException(path.toString());
+-                    }
+-                    // maybe a property entry exists
+-                    parentId = (remainingPath.getLength() == 1) ? parentId : idFactory.createNodeId(parentId, remainingPath.getAncestor(1));
+-                    PropertyId propId = idFactory.createPropertyId(parentId, remainingPath.getNameElement().getName());
+-                    PropertyEntry pe = entry.loadPropertyEntry(propId);
+-                    if (pe != null) {
+-                        return pe;
+-                    } else {
+-                        throw new PathNotFoundException(path.toString());
+-                    }
++                    throw new PathNotFoundException(path.toString());
++     * @see NodeEntry#getDeepPropertyEntry(Path)
++     */
++    public PropertyEntry getDeepPropertyEntry(Path path) throws PathNotFoundException, RepositoryException {
++        NodeEntryImpl entry = this;
++        Path.Element[] elems = path.getElements();
++        int i = 0;
++        for (; i < elems.length-1; i++) {
++            Path.Element elem = (Path.Element) elems[i];
++            if (elems[i].denotesRoot()) {
++                if (entry.getParent() != null) {
++                    throw new RepositoryException("NodeEntry out of 'hierarchy' " + path.toString());
++                }
++                continue;
++            }
++
++            int index = elem.getNormalizedIndex();
++            Name name = elem.getName();
++
++            // first try to resolve to known node or property entry
++            NodeEntry cne = entry.getNodeEntry(name, index, false);
++            if (cne != null) {
++                entry = (NodeEntryImpl) cne;
++            } else {
++                // no valid ancestor node entry
++                // -> if cnes are complete -> assume that it doesn't exist.
++                //    refresh will bring up new entries added in the mean time
++                //    on the persistent layer.
++                if (entry.childNodeEntries.isComplete()) {
++                    throw new PathNotFoundException(path.toString());
++                }
++                // -> check for moved child entry in node-attic
++                // -> check if child points to a removed/moved sns
++                List siblings = entry.childNodeEntries.get(name);
++                if (entry.containsAtticChild(siblings, name, index)) {
++                    throw new PathNotFoundException(path.toString());
++                }
++                // break out of the loop and start deep loading the property
++                break;
++            }
++        }
++
++        int st = entry.getStatus();
++        PropertyEntry pe;
++        if (i == elems.length-1 && Status.INVALIDATED != st && Status._UNDEFINED_ != st) {
++            // all node entries present in the hierarchy and the direct ancestor
++            // has already been resolved and isn't invalidated -> no need to
++            // retrieve property entry from SPI
++            pe = entry.properties.get(path.getNameElement().getName());
++        } else {
++            /*
++            * Unknown parent entry (not-existing or not yet loaded) or a parent
++            * entry that has been invalidated:
++            * Skip all intermediate entries and directly try to load the
++            * PropertyState (including building the itermediate entries. If that
++            * fails ItemNotFoundException is thrown.
++            */
++            PathBuilder pb = new PathBuilder(factory.getPathFactory());
++            for (int j = i; j < elems.length; j++) {
++                pb.addLast(elems[j]);
++            }
++            Path remainingPath = pb.getPath();
++
++            IdFactory idFactory = factory.getIdFactory();
++            NodeId parentId = entry.getWorkspaceId();
++            parentId = (remainingPath.getLength() == 1) ? parentId : idFactory.createNodeId(parentId, remainingPath.getAncestor(1));
++            PropertyId propId = idFactory.createPropertyId(parentId, remainingPath.getNameElement().getName());
++            pe = entry.loadPropertyEntry(propId);
++        }
++
++        if (pe == null) {
++            throw new PathNotFoundException(path.toString());
++        }
++        return pe;
++    }
++
++    /**
+-            for (int i = index-1; i < entries.size() && cne == null; i++) {
++            int eIndex = 1;
++            for (int i = 0; i < entries.size() && cne == null; i++) {
+-                    cne = ne;
++                    if (eIndex == index) {
++                        cne = ne;
++                    }
++                    eIndex++;
+-                    if (Status.isTransient(status) || Status.isStale(status)) {
+-                        if (Status.EXISTING_REMOVED == status) {
+-                            // colliding item removal -> mark parent stale
+-                            internalGetItemState().setStatus(Status.MODIFIED);
+-                        }
+-                        // pending changes -> don't remove entry in the hierarchy
+-                        // but rather change status to 'STALE_DESTROYED'
+-                        ItemState childState = ((HierarchyEntryImpl) child).internalGetItemState();
+-                        childState.setStatus(Status.STALE_DESTROYED);
+-                    } else {
+-                        // no pending changes -> save to remove the entry.
+-                        child.remove();
++                    if (Status.EXISTING_REMOVED == status) {
++                        // colliding item removal -> mark parent stale
++                        internalGetItemState().setStatus(Status.MODIFIED);
++                    child.remove();
++        private final NodeEntryImpl oldPredecessor;
++            this.oldPredecessor = (NodeEntryImpl) ((ChildNodeEntriesImpl) parent.childNodeEntries).getPrevious(NodeEntryImpl.this);
+-                parentCNEs.reorder(ne, revertInfo.oldSuccessor);
++                parentCNEs.reorderAfter(ne, revertInfo.oldPredecessor);
+
+INS31 INS31 MOV29 INS83 INS39 INS42 INS8 UPD42 INS44 UPD43 UPD42 INS29 INS83 INS43 INS42 INS44 INS43 INS43 INS8 INS23 INS21 INS60 INS24 INS39 INS42 INS21 INS21 UPD42 INS65 INS42 INS43 INS42 INS42 INS42 INS60 INS60 INS60 INS24 INS60 INS60 INS25 MOV25 MOV41 INS83 INS83 INS43 INS59 INS48 INS39 INS59 INS58 INS32 INS8 INS48 INS7 INS68 INS42 INS43 INS59 INS5 INS59 INS39 INS59 INS27 INS37 INS8 INS39 INS59 MOV43 INS59 INS27 INS8 INS8 UPD27 INS42 INS42 INS21 INS42 INS9 INS42 INS36 INS43 INS59 INS42 INS42 INS60 INS21 INS42 INS42 INS42 INS36 UPD42 MOV25 INS42 INS42 INS69 INS42 INS42 INS52 INS43 INS85 INS42 INS32 INS42 INS34 INS42 INS27 INS42 INS60 INS25 INS60 INS60 INS60 INS25 INS42 INS32 INS42 INS27 INS27 INS21 INS60 INS24 INS60 INS60 INS60 MOV21 MOV60 INS21 UPD42 INS33 INS60 INS7 MOV27 INS42 INS42 INS32 INS43 INS59 INS32 INS27 MOV27 MOV8 MOV25 INS43 INS40 INS42 INS42 INS40 INS34 INS43 INS59 INS32 INS8 INS39 INS59 INS43 INS59 INS43 INS59 INS27 INS8 INS8 INS42 INS42 INS27 INS27 INS40 INS42 INS7 INS43 INS59 INS58 INS27 INS37 INS8 INS43 INS59 INS43 INS59 INS43 INS59 INS7 INS39 INS59 MOV25 MOV21 INS22 INS11 UPD40 INS42 INS9 INS42 INS42 INS11 INS42 INS42 INS42 UPD42 MOV42 INS36 UPD42 INS42 MOV25 INS42 INS40 INS42 INS11 INS2 INS42 INS25 INS18 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS33 INS21 INS25 INS60 INS25 INS10 INS42 INS27 INS40 INS42 INS42 INS32 INS42 INS42 INS14 INS39 INS59 INS42 INS40 INS42 INS21 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS32 INS42 MOV32 INS42 INS34 INS52 INS42 INS43 INS32 INS43 INS32 INS27 MOV27 MOV8 INS43 INS2 INS42 INS42 INS27 INS8 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS9 INS7 INS32 INS8 INS43 INS59 INS32 INS8 INS40 INS34 INS40 INS42 INS32 INS43 INS32 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS34 INS8 INS42 INS36 INS42 INS52 UPD42 UPD40 INS42 INS42 INS42 INS32 INS40 INS40 INS42 INS42 INS32 INS33 INS53 INS42 INS11 INS40 INS42 INS53 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS53 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS2 INS25 INS21 INS11 INS42 UPD42 MOV42 INS42 INS42 INS42 INS14 INS43 INS42 INS14 INS40 INS42 INS42 INS14 INS42 INS42 INS42 INS42 INS27 MOV8 INS37 INS43 INS40 INS43 INS27 INS42 INS43 INS32 INS43 INS32 INS42 INS42 INS42 INS42 UPD45 INS42 INS45 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 DEL83 DEL42 DEL43 DEL42 DEL42 DEL32 DEL59 DEL60 DEL33 DEL27 DEL42 DEL40 DEL32 DEL21 DEL8 DEL42 DEL42 DEL40 DEL32 DEL21 DEL42 DEL42 DEL52 DEL32 DEL21 DEL8 DEL25 DEL8 DEL42 DEL42 DEL52 DEL32 DEL21 DEL8 DEL25 DEL42 DEL40 DEL27 DEL42 DEL42 DEL42 DEL32 DEL34 DEL27 DEL27 DEL27 DEL40 DEL42 DEL42 DEL32 DEL27 DEL40 DEL42 DEL42 DEL32 DEL41 DEL8 DEL42 DEL33 DEL27 DEL8 DEL42 DEL59 DEL60 DEL8 DEL25 DEL25 DEL40 DEL42 DEL34 DEL27 DEL42 DEL42 DEL42 DEL32 DEL42 DEL42 DEL42 DEL32 DEL27 DEL42 DEL43 DEL42 DEL42 DEL43 DEL42 DEL11 DEL36 DEL42 DEL32 DEL59 DEL60 DEL42 DEL42 DEL40 DEL32 DEL21 DEL8 DEL8 DEL25

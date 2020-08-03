@@ -1,0 +1,168 @@
+Merge trunk into branch
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/branches/HDFS-3077@1373573 13f79535-47bb-0310-9956-ffa450edef68
+
+-import java.io.File;
+-import java.io.FileInputStream;
+-import java.io.FileNotFoundException;
+-import java.io.InputStream;
+-import java.io.OutputStream;
++import java.io.PrintStream;
+-import java.util.Iterator;
+-import org.apache.hadoop.fs.FileUtil;
++import static org.apache.hadoop.util.ExitUtil.terminate;
++import static org.apache.hadoop.util.ToolRunner.confirmPrompt;
++import org.apache.hadoop.hdfs.DFSConfigKeys;
+-import org.apache.hadoop.hdfs.server.common.Storage.StorageDirectory;
+-import org.apache.hadoop.hdfs.server.namenode.FileJournalManager.EditLogFile;
+-import org.apache.hadoop.hdfs.server.namenode.JournalSet.JournalAndStream;
+-import org.apache.hadoop.hdfs.util.AtomicFileOutputStream;
+-import org.apache.hadoop.io.IOUtils;
++import org.apache.hadoop.util.ExitUtil.ExitException;
+-import org.apache.hadoop.util.ExitUtil.ExitException;
+-
+-import static org.apache.hadoop.util.ExitUtil.terminate;
+-import static org.apache.hadoop.util.ToolRunner.confirmPrompt;
++import com.google.common.base.Preconditions;
++  private static final String USAGE = "Usage: java NameNode ["
++      + StartupOption.BACKUP.getName() + "] | ["
++      + StartupOption.CHECKPOINT.getName() + "] | ["
++      + StartupOption.FORMAT.getName() + " ["
++      + StartupOption.CLUSTERID.getName() + " cid ] ["
++      + StartupOption.FORCE.getName() + "] ["
++      + StartupOption.NONINTERACTIVE.getName() + "] ] | ["
++      + StartupOption.UPGRADE.getName() + "] | ["
++      + StartupOption.ROLLBACK.getName() + "] | ["
++      + StartupOption.FINALIZE.getName() + "] | ["
++      + StartupOption.IMPORT.getName() + "] | ["
++      + StartupOption.INITIALIZESHAREDEDITS.getName() + "] | ["
++      + StartupOption.BOOTSTRAPSTANDBY.getName() + "] | ["
++      + StartupOption.RECOVER.getName() + " [ " + StartupOption.FORCE.getName()
++      + " ] ]";
++  
++    
++    if (conf.get(DFSConfigKeys.DFS_NAMENODE_SHARED_EDITS_DIR_KEY) == null) {
++      LOG.fatal("No shared edits directory configured for namespace " +
++          nsId + " namenode " + namenodeId);
++      return false;
++    }
++
+-      FSNamesystem fsns = FSNamesystem.loadFromDisk(conf,
++      Configuration confWithoutShared = new Configuration(conf);
++      confWithoutShared.unset(DFSConfigKeys.DFS_NAMENODE_SHARED_EDITS_DIR_KEY);
++      FSNamesystem fsns = FSNamesystem.loadFromDisk(confWithoutShared,
+-      
+-      if (copyEditLogSegmentsToSharedDir(fsns, sharedEditsDirs,
+-          newSharedStorage, conf)) {
+-        return true; // aborted
+-      }
++
++      copyEditLogSegmentsToSharedDir(fsns, sharedEditsDirs, newSharedStorage,
++          conf);
+-  
+-  private static boolean copyEditLogSegmentsToSharedDir(FSNamesystem fsns,
++
++  private static void copyEditLogSegmentsToSharedDir(FSNamesystem fsns,
+-      Configuration conf) throws FileNotFoundException, IOException {
++      Configuration conf) throws IOException {
++    Preconditions.checkArgument(!sharedEditsDirs.isEmpty(),
++        "No shared edits specified");
+-    for (JournalAndStream jas : fsns.getFSImage().getEditLog().getJournals()) {
+-      FileJournalManager fjm = null;
+-      if (!(jas.getManager() instanceof FileJournalManager)) {
+-        LOG.error("Cannot populate shared edits dir from non-file " +
+-            "journal manager: " + jas.getManager());
+-        return true; // aborted
+-      } else {
+-        fjm = (FileJournalManager) jas.getManager();
+-      }
+-      for (EditLogFile elf : fjm.getLogFiles(fsns.getFSImage()
+-          .getMostRecentCheckpointTxId())) {
+-        File editLogSegment = elf.getFile();
+-        for (URI sharedEditsUri : sharedEditsDirs) {
+-          StorageDirectory sharedEditsDir = newSharedStorage
+-              .getStorageDirectory(sharedEditsUri);
+-          File targetFile = new File(sharedEditsDir.getCurrentDir(),
+-              editLogSegment.getName());
+-          if (!targetFile.exists()) {
+-            InputStream in = null;
+-            OutputStream out = null;
+-            try {
+-              in = new FileInputStream(editLogSegment);
+-              out = new AtomicFileOutputStream(targetFile);
+-              IOUtils.copyBytes(in, out, conf);
+-            } finally {
+-              IOUtils.cleanup(LOG, in, out);
+-            }
+-          }
++    List<URI> sharedEditsUris = new ArrayList<URI>(sharedEditsDirs);
++    FSEditLog newSharedEditLog = new FSEditLog(conf, newSharedStorage,
++        sharedEditsUris);
++    newSharedEditLog.initJournalsForWrite();
++    newSharedEditLog.recoverUnclosedStreams();
++    
++    FSEditLog sourceEditLog = fsns.getFSImage().editLog;
++    
++    long fromTxId = fsns.getFSImage().getMostRecentCheckpointTxId();
++    Collection<EditLogInputStream> streams = sourceEditLog.selectInputStreams(
++        fromTxId+1, 0);
++
++    // Set the nextTxid to the CheckpointTxId+1
++    newSharedEditLog.setNextTxId(fromTxId + 1);
++    
++    // Copy all edits after last CheckpointTxId to shared edits dir
++    for (EditLogInputStream stream : streams) {
++      LOG.debug("Beginning to copy stream " + stream + " to shared edits");
++      FSEditLogOp op;
++      boolean segmentOpen = false;
++      while ((op = stream.readOp()) != null) {
++        if (LOG.isTraceEnabled()) {
++          LOG.trace("copying op: " + op);
++        }
++        if (!segmentOpen) {
++          newSharedEditLog.startLogSegment(op.txid, false);
++          segmentOpen = true;
++        }
++        
++        newSharedEditLog.logEdit(op);
++
++        if (op.opCode == FSEditLogOpCodes.OP_END_LOG_SEGMENT) {
++          newSharedEditLog.logSync();
++          newSharedEditLog.endCurrentLogSegment(false);
++          LOG.debug("ending log segment because of END_LOG_SEGMENT op in " + stream);
++          segmentOpen = false;
++      
++      if (segmentOpen) {
++        LOG.debug("ending log segment because of end of stream in " + stream);
++        newSharedEditLog.logSync();
++        newSharedEditLog.endCurrentLogSegment(false);
++        segmentOpen = false;
++      }
+-    return false; // did not abort
+-  private static void printUsage() {
+-    System.err.println(
+-      "Usage: java NameNode [" +
+-      StartupOption.BACKUP.getName() + "] | [" +
+-      StartupOption.CHECKPOINT.getName() + "] | [" +
+-      StartupOption.FORMAT.getName() + " [" + StartupOption.CLUSTERID.getName() +  
+-      " cid ] [" + StartupOption.FORCE.getName() + "] [" +
+-      StartupOption.NONINTERACTIVE.getName() + "] ] | [" +
+-      StartupOption.UPGRADE.getName() + "] | [" +
+-      StartupOption.ROLLBACK.getName() + "] | [" +
+-      StartupOption.FINALIZE.getName() + "] | [" +
+-      StartupOption.IMPORT.getName() + "] | [" +
+-      StartupOption.INITIALIZESHAREDEDITS.getName() + 
+-        " [" + StartupOption.FORCE.getName() + "] [" +
+-             StartupOption.NONINTERACTIVE.getName() + "]" +
+-      "] | [" +
+-      StartupOption.BOOTSTRAPSTANDBY.getName() + "] | [" + 
+-      StartupOption.RECOVER.getName() + " [ " +
+-        StartupOption.FORCE.getName() + " ] ]");
++  private static void printUsage(PrintStream out) {
++    out.println(USAGE + "\n");
+-      printUsage();
++      printUsage(System.err);
++    if (DFSUtil.parseHelpArgument(argv, NameNode.USAGE, System.out, true)) {
++      System.exit(0);
++    }
++

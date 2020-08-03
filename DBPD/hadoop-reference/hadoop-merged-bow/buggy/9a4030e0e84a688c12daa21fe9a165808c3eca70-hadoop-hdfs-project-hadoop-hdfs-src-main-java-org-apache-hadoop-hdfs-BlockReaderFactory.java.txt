@@ -1,0 +1,154 @@
+HDFS-4356. BlockReaderLocal should use passed file descriptors rather than paths. Contributed by Colin Patrick McCabe.
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/branches/HDFS-347@1432335 13f79535-47bb-0310-9956-ffa450edef68
+
++import java.io.BufferedOutputStream;
++import java.io.DataInputStream;
++import java.io.DataOutputStream;
++import java.io.FileInputStream;
+-import java.net.Socket;
+-import org.apache.hadoop.hdfs.DFSClient.Conf;
+-import org.apache.hadoop.hdfs.protocol.datatransfer.DataTransferEncryptor;
+-import org.apache.hadoop.hdfs.protocol.datatransfer.IOStreamPair;
+-import org.apache.hadoop.hdfs.security.token.block.DataEncryptionKey;
++import org.apache.hadoop.hdfs.protocol.HdfsProtoUtil;
++import org.apache.hadoop.hdfs.protocol.datatransfer.Sender;
++import org.apache.hadoop.hdfs.protocol.proto.DataTransferProtos.BlockOpResponseProto;
++import org.apache.hadoop.hdfs.security.token.block.InvalidBlockTokenException;
+-import org.apache.hadoop.net.NetUtils;
++import org.apache.hadoop.io.IOUtils;
++import org.apache.hadoop.net.unix.DomainSocket;
++   * @param domainSocketFactory  The DomainSocketFactory to notify if the Peer
++   *                             is a DomainPeer which turns out to be faulty.
++   *                             If null, no factory will be notified in this
++   *                             case.
++   * @param allowShortCircuitLocalReads  True if short-circuit local reads
++   *                                     should be allowed.
+-                                     DatanodeID datanodeID)
+-                                     throws IOException {
++                                     DatanodeID datanodeID,
++                                     DomainSocketFactory domSockFactory,
++                                     boolean allowShortCircuitLocalReads)
++  throws IOException {
++
++    if (peer.getDomainSocket() != null) {
++      if (allowShortCircuitLocalReads) {
++        // If this is a domain socket, and short-circuit local reads are 
++        // enabled, try to set up a BlockReaderLocal.
++        BlockReader reader = newShortCircuitBlockReader(conf, file,
++            block, blockToken, startOffset, len, peer, datanodeID,
++            domSockFactory, verifyChecksum);
++        if (reader != null) {
++          // One we've constructed the short-circuit block reader, we don't
++          // need the socket any more.  So let's return it to the cache.
++          PeerCache peerCache = PeerCache.getInstance(
++              conf.getInt(DFSConfigKeys.DFS_CLIENT_SOCKET_CACHE_CAPACITY_KEY, 
++                DFSConfigKeys.DFS_CLIENT_SOCKET_CACHE_CAPACITY_DEFAULT),
++              conf.getLong(DFSConfigKeys.DFS_CLIENT_SOCKET_CACHE_EXPIRY_MSEC_KEY, 
++                DFSConfigKeys.DFS_CLIENT_SOCKET_CACHE_EXPIRY_MSEC_DEFAULT));
++          peerCache.put(datanodeID, peer);
++          return reader;
++        }
++      }
++      // If this is a domain socket and we couldn't (or didn't want to) set
++      // up a BlockReaderLocal, check that we are allowed to pass data traffic
++      // over the socket before proceeding.
++      if (!conf.getBoolean(DFSConfigKeys.DFS_CLIENT_DOMAIN_SOCKET_DATA_TRAFFIC,
++            DFSConfigKeys.DFS_CLIENT_DOMAIN_SOCKET_DATA_TRAFFIC_DEFAULT)) {
++        throw new IOException("Because we can't do short-circuit access, " +
++          "and data traffic over domain sockets is disabled, " +
++          "we cannot use this socket to talk to " + datanodeID);
++      }
++    }
++
+-  
++
++  /**
++   * Create a new short-circuit BlockReader.
++   * 
++   * Here, we ask the DataNode to pass us file descriptors over our
++   * DomainSocket.  If the DataNode declines to do so, we'll return null here;
++   * otherwise, we'll return the BlockReaderLocal.  If the DataNode declines,
++   * this function will inform the DomainSocketFactory that short-circuit local
++   * reads are disabled for this DataNode, so that we don't ask again.
++   * 
++   * @param conf               the configuration.
++   * @param file               the file name. Used in log messages.
++   * @param block              The block object.
++   * @param blockToken         The block token for security.
++   * @param startOffset        The read offset, relative to block head.
++   * @param len                The number of bytes to read, or -1 to read 
++   *                           as many as possible.
++   * @param peer               The peer to use.
++   * @param datanodeID         The datanode that the Peer is connected to.
++   * @param domSockFactory     The DomainSocketFactory to notify if the Peer
++   *                           is a DomainPeer which turns out to be faulty.
++   *                           If null, no factory will be notified in this
++   *                           case.
++   * @param verifyChecksum     True if we should verify the checksums.
++   *                           Note: even if this is true, when
++   *                           DFS_CLIENT_READ_CHECKSUM_SKIP_CHECKSUM_KEY is
++   *                           set, we will skip checksums.
++   *
++   * @return                   The BlockReaderLocal, or null if the
++   *                           DataNode declined to provide short-circuit
++   *                           access.
++   * @throws IOException       If there was a communication error.
++   */
++  private static BlockReaderLocal newShortCircuitBlockReader(
++      Configuration conf, String file, ExtendedBlock block,
++      Token<BlockTokenIdentifier> blockToken, long startOffset,
++      long len, Peer peer, DatanodeID datanodeID,
++      DomainSocketFactory domSockFactory, boolean verifyChecksum)
++          throws IOException {
++    final DataOutputStream out =
++        new DataOutputStream(new BufferedOutputStream(
++          peer.getOutputStream()));
++    new Sender(out).requestShortCircuitFds(block, blockToken, 1);
++    DataInputStream in =
++        new DataInputStream(peer.getInputStream());
++    BlockOpResponseProto resp = BlockOpResponseProto.parseFrom(
++        HdfsProtoUtil.vintPrefixed(in));
++    DomainSocket sock = peer.getDomainSocket();
++    switch (resp.getStatus()) {
++    case SUCCESS:
++      BlockReaderLocal reader = null;
++      byte buf[] = new byte[1];
++      FileInputStream fis[] = new FileInputStream[2];
++      sock.recvFileInputStreams(fis, buf, 0, buf.length);
++      try {
++        reader = new BlockReaderLocal(conf, file, block,
++            startOffset, len, fis[0], fis[1], datanodeID, verifyChecksum);
++      } finally {
++        if (reader == null) {
++          IOUtils.cleanup(DFSClient.LOG, fis[0], fis[1]);
++        }
++      }
++      return reader;
++    case ERROR_UNSUPPORTED:
++      if (!resp.hasShortCircuitAccessVersion()) {
++        DFSClient.LOG.warn("short-circuit read access is disabled for " +
++            "DataNode " + datanodeID + ".  reason: " + resp.getMessage());
++        domSockFactory.disableShortCircuitForPath(sock.getPath());
++      } else {
++        DFSClient.LOG.warn("short-circuit read access for the file " +
++            file + " is disabled for DataNode " + datanodeID +
++            ".  reason: " + resp.getMessage());
++      }
++      return null;
++    case ERROR_ACCESS_TOKEN:
++      String msg = "access control error while " +
++          "attempting to set up short-circuit access to " +
++          file + resp.getMessage();
++      DFSClient.LOG.debug(msg);
++      throw new InvalidBlockTokenException(msg);
++    default:
++      DFSClient.LOG.warn("error while attempting to set up short-circuit " +
++          "access to " + file + ": " + resp.getMessage());
++      domSockFactory.disableShortCircuitForPath(sock.getPath());
++      return null;
++    }
++  }
++
+
+MOV26 MOV26 MOV26 INS26 INS26 INS26 INS26 INS40 UPD40 INS40 INS40 UPD40 UPD40 UPD40 UPD40 UPD40 INS40 INS31 INS44 INS44 INS29 INS83 INS83 INS43 INS42 INS44 INS44 INS44 INS44 INS44 INS44 INS44 INS44 INS44 INS44 INS43 INS8 INS65 INS65 INS43 INS42 INS39 INS42 INS25 INS65 INS65 INS65 INS65 INS65 INS65 INS65 INS65 INS65 INS65 INS65 INS65 INS65 INS42 INS43 INS42 INS43 INS42 INS43 INS42 INS74 INS42 INS39 INS42 INS39 INS42 INS43 INS42 INS43 INS42 INS43 INS42 INS39 INS42 INS42 INS60 INS21 INS60 INS60 INS60 INS50 INS42 INS66 INS66 INS66 INS66 INS42 INS66 INS66 INS42 INS27 INS8 INS66 INS66 INS66 INS66 INS66 INS66 INS42 INS66 INS42 INS66 INS42 INS66 INS42 INS66 INS42 INS66 INS42 INS66 INS66 INS42 INS66 INS42 INS66 INS42 INS66 INS66 INS66 INS66 INS42 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS42 INS66 INS42 INS42 INS42 INS43 INS43 INS42 INS42 INS42 INS83 INS43 INS59 INS32 INS43 INS59 INS43 INS59 INS43 INS59 INS32 INS49 INS60 INS60 INS60 INS21 INS54 INS41 INS49 INS25 INS41 INS49 INS60 INS21 INS53 INS49 INS21 INS21 INS41 INS32 INS33 INS25 INS25 INS42 INS42 INS42 INS42 INS14 INS14 INS42 INS42 INS42 INS34 INS42 INS42 INS14 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS42 INS43 INS59 INS39 INS59 INS43 INS59 INS32 INS8 INS8 INS42 INS42 INS38 INS8 INS8 INS33 INS42 INS43 INS59 INS32 INS14 INS32 INS32 INS33 INS42 INS42 INS42 INS8 INS38 INS8 INS43 INS14 INS43 INS42 INS43 INS32 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS33 INS42 INS85 INS3 INS42 INS42 INS85 INS3 INS42 INS42 INS42 INS42 INS34 INS40 INS21 INS25 INS32 INS21 INS21 INS21 INS42 INS42 INS27 INS40 INS42 INS42 INS43 INS42 INS40 INS42 INS27 INS42 INS42 INS32 INS60 INS25 INS32 INS53 INS42 INS43 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS5 INS34 INS5 INS34 INS7 INS27 INS8 INS42 INS42 INS32 INS32 INS32 INS27 INS42 INS32 INS42 INS27 INS42 INS45 INS32 INS42 INS42 INS43 INS59 INS27 INS8 INS42 INS42 INS40 INS40 INS14 INS42 INS42 INS42 INS39 INS85 INS43 INS85 INS42 INS14 INS42 INS33 INS21 INS40 INS42 INS27 INS42 INS42 INS32 INS40 INS42 INS27 INS45 INS45 INS42 INS42 INS45 INS45 INS42 INS42 INS42 INS42 INS32 INS42 INS33 INS60 INS21 INS41 INS43 INS27 INS42 INS43 INS42 INS42 INS42 INS42 INS42 INS2 INS2 INS42 INS42 INS32 INS27 INS42 INS45 INS32 INS42 INS42 INS45 INS42 INS45 INS42 INS45 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS43 INS59 INS32 INS42 INS42 INS45 INS45 INS45 INS42 INS42 INS42 INS34 INS42 INS34 INS42 INS42 INS40 INS2 INS2 INS45 INS45 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS34 INS42 INS34 INS42 INS42 INS32 INS32 INS42 INS42 INS40 INS40 INS42 INS42 INS40 INS40

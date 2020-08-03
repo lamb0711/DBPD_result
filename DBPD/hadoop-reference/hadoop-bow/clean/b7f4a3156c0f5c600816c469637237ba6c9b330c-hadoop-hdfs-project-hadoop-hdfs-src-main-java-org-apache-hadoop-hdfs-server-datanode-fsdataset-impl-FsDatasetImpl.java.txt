@@ -1,0 +1,286 @@
+HDFS-7496. Fix FsVolume removal race conditions on the DataNode by reference-counting the volume instances (lei via cmccabe)
+
++import java.nio.channels.ClosedChannelException;
++import org.apache.hadoop.hdfs.server.datanode.ReplicaHandler;
++import org.apache.hadoop.hdfs.server.datanode.fsdataset.FsVolumeReference;
+-    StorageReport[] reports;
++    List<StorageReport> reports;
+-      reports = new StorageReport[curVolumes.size()];
+-      int i = 0;
++      reports = new ArrayList<>(curVolumes.size());
+-        reports[i++] = new StorageReport(volume.toDatanodeStorage(),
+-                                         false,
+-                                         volume.getCapacity(),
+-                                         volume.getDfsUsed(),
+-                                         volume.getAvailable(),
+-                                         volume.getBlockPoolUsed(bpid));
++        try (FsVolumeReference ref = volume.obtainReference()) {
++          StorageReport sr = new StorageReport(volume.toDatanodeStorage(),
++              false,
++              volume.getCapacity(),
++              volume.getDfsUsed(),
++              volume.getAvailable(),
++              volume.getBlockPoolUsed(bpid));
++          reports.add(sr);
++        } catch (ClosedChannelException e) {
++          continue;
++        }
+-    return reports;
++    return reports.toArray(new StorageReport[reports.size()]);
+-    File blockFile = info.getBlockFile();
+-    RandomAccessFile blockInFile = new RandomAccessFile(blockFile, "r");
+-    if (blkOffset > 0) {
+-      blockInFile.seek(blkOffset);
++    FsVolumeReference ref = info.getVolume().obtainReference();
++    try {
++      File blockFile = info.getBlockFile();
++      RandomAccessFile blockInFile = new RandomAccessFile(blockFile, "r");
++      if (blkOffset > 0) {
++        blockInFile.seek(blkOffset);
++      }
++      File metaFile = info.getMetaFile();
++      RandomAccessFile metaInFile = new RandomAccessFile(metaFile, "r");
++      if (ckoff > 0) {
++        metaInFile.seek(ckoff);
++      }
++      return new ReplicaInputStreams(
++          blockInFile.getFD(), metaInFile.getFD(), ref);
++    } catch (IOException e) {
++      IOUtils.cleanup(null, ref);
++      throw e;
+-    File metaFile = info.getMetaFile();
+-    RandomAccessFile metaInFile = new RandomAccessFile(metaFile, "r");
+-    if (ckoff > 0) {
+-      metaInFile.seek(ckoff);
+-    }
+-    return new ReplicaInputStreams(blockInFile.getFD(), metaInFile.getFD());
+-    FsVolumeImpl targetVolume = volumes.getNextVolume(targetStorageType,
+-        block.getNumBytes());
+-    File oldBlockFile = replicaInfo.getBlockFile();
+-    File oldMetaFile = replicaInfo.getMetaFile();
++    try (FsVolumeReference volumeRef = volumes.getNextVolume(
++        targetStorageType, block.getNumBytes())) {
++      File oldBlockFile = replicaInfo.getBlockFile();
++      File oldMetaFile = replicaInfo.getMetaFile();
++      FsVolumeImpl targetVolume = (FsVolumeImpl) volumeRef.getVolume();
++      // Copy files to temp dir first
++      File[] blockFiles = copyBlockFiles(block.getBlockId(),
++          block.getGenerationStamp(), oldMetaFile, oldBlockFile,
++          targetVolume.getTmpDir(block.getBlockPoolId()),
++          replicaInfo.isOnTransientStorage());
+-    // Copy files to temp dir first
+-    File[] blockFiles = copyBlockFiles(block.getBlockId(),
+-        block.getGenerationStamp(), oldMetaFile, oldBlockFile,
+-        targetVolume.getTmpDir(block.getBlockPoolId()),
+-        replicaInfo.isOnTransientStorage());
++      ReplicaInfo newReplicaInfo = new ReplicaInPipeline(
++          replicaInfo.getBlockId(), replicaInfo.getGenerationStamp(),
++          targetVolume, blockFiles[0].getParentFile(), 0);
++      newReplicaInfo.setNumBytes(blockFiles[1].length());
++      // Finalize the copied files
++      newReplicaInfo = finalizeReplica(block.getBlockPoolId(), newReplicaInfo);
+-    ReplicaInfo newReplicaInfo = new ReplicaInPipeline(
+-        replicaInfo.getBlockId(), replicaInfo.getGenerationStamp(),
+-        targetVolume, blockFiles[0].getParentFile(), 0);
+-    newReplicaInfo.setNumBytes(blockFiles[1].length());
+-    // Finalize the copied files
+-    newReplicaInfo = finalizeReplica(block.getBlockPoolId(), newReplicaInfo);
+-
+-    removeOldReplica(replicaInfo, newReplicaInfo, oldBlockFile, oldMetaFile,
+-        oldBlockFile.length(), oldMetaFile.length(), block.getBlockPoolId());
++      removeOldReplica(replicaInfo, newReplicaInfo, oldBlockFile, oldMetaFile,
++          oldBlockFile.length(), oldMetaFile.length(), block.getBlockPoolId());
++    }
+-  public synchronized ReplicaInPipeline append(ExtendedBlock b,
++  public synchronized ReplicaHandler append(ExtendedBlock b,
+-    return append(b.getBlockPoolId(), (FinalizedReplica)replicaInfo, newGS,
+-        b.getNumBytes());
++    FsVolumeReference ref = replicaInfo.getVolume().obtainReference();
++    ReplicaBeingWritten replica = null;
++    try {
++      replica = append(b.getBlockPoolId(), (FinalizedReplica)replicaInfo, newGS,
++          b.getNumBytes());
++    } catch (IOException e) {
++      IOUtils.cleanup(null, ref);
++      throw e;
++    }
++    return new ReplicaHandler(replica, ref);
+-  
++
+-  public synchronized ReplicaInPipeline recoverAppend(ExtendedBlock b,
+-      long newGS, long expectedBlockLen) throws IOException {
++  public synchronized ReplicaHandler recoverAppend(
++      ExtendedBlock b, long newGS, long expectedBlockLen) throws IOException {
+-    // change the replica's state/gs etc.
+-    if (replicaInfo.getState() == ReplicaState.FINALIZED ) {
+-      return append(b.getBlockPoolId(), (FinalizedReplica) replicaInfo, newGS, 
+-          b.getNumBytes());
+-    } else { //RBW
+-      bumpReplicaGS(replicaInfo, newGS);
+-      return (ReplicaBeingWritten)replicaInfo;
++    FsVolumeReference ref = replicaInfo.getVolume().obtainReference();
++    ReplicaBeingWritten replica;
++    try {
++      // change the replica's state/gs etc.
++      if (replicaInfo.getState() == ReplicaState.FINALIZED) {
++        replica = append(b.getBlockPoolId(), (FinalizedReplica) replicaInfo,
++                         newGS, b.getNumBytes());
++      } else { //RBW
++        bumpReplicaGS(replicaInfo, newGS);
++        replica = (ReplicaBeingWritten) replicaInfo;
++      }
++    } catch (IOException e) {
++      IOUtils.cleanup(null, ref);
++      throw e;
++    return new ReplicaHandler(replica, ref);
+-  public synchronized ReplicaInPipeline createRbw(StorageType storageType,
+-      ExtendedBlock b, boolean allowLazyPersist) throws IOException {
++  public synchronized ReplicaHandler createRbw(
++      StorageType storageType, ExtendedBlock b, boolean allowLazyPersist)
++      throws IOException {
+-    FsVolumeImpl v;
++    FsVolumeReference ref;
+-          v = volumes.getNextTransientVolume(b.getNumBytes());
++          ref = volumes.getNextTransientVolume(b.getNumBytes());
+-          v = volumes.getNextVolume(storageType, b.getNumBytes());
++          ref = volumes.getNextVolume(storageType, b.getNumBytes());
++    FsVolumeImpl v = (FsVolumeImpl) ref.getVolume();
+-    File f = v.createRbwFile(b.getBlockPoolId(), b.getLocalBlock());
++    File f;
++    try {
++      f = v.createRbwFile(b.getBlockPoolId(), b.getLocalBlock());
++    } catch (IOException e) {
++      IOUtils.cleanup(null, ref);
++      throw e;
++    }
++
+-
+-    return newReplicaInfo;
++    return new ReplicaHandler(newReplicaInfo, ref);
+-  
++
+-  public synchronized ReplicaInPipeline recoverRbw(ExtendedBlock b,
+-      long newGS, long minBytesRcvd, long maxBytesRcvd)
++  public synchronized ReplicaHandler recoverRbw(
++      ExtendedBlock b, long newGS, long minBytesRcvd, long maxBytesRcvd)
+-    // Truncate the potentially corrupt portion.
+-    // If the source was client and the last node in the pipeline was lost,
+-    // any corrupt data written after the acked length can go unnoticed. 
+-    if (numBytes > bytesAcked) {
+-      final File replicafile = rbw.getBlockFile();
+-      truncateBlock(replicafile, rbw.getMetaFile(), numBytes, bytesAcked);
+-      rbw.setNumBytes(bytesAcked);
+-      rbw.setLastChecksumAndDataLen(bytesAcked, null);
+-    }
++    FsVolumeReference ref = rbw.getVolume().obtainReference();
++    try {
++      // Truncate the potentially corrupt portion.
++      // If the source was client and the last node in the pipeline was lost,
++      // any corrupt data written after the acked length can go unnoticed.
++      if (numBytes > bytesAcked) {
++        final File replicafile = rbw.getBlockFile();
++        truncateBlock(replicafile, rbw.getMetaFile(), numBytes, bytesAcked);
++        rbw.setNumBytes(bytesAcked);
++        rbw.setLastChecksumAndDataLen(bytesAcked, null);
++      }
+-    // bump the replica's generation stamp to newGS
+-    bumpReplicaGS(rbw, newGS);
+-    
+-    return rbw;
++      // bump the replica's generation stamp to newGS
++      bumpReplicaGS(rbw, newGS);
++    } catch (IOException e) {
++      IOUtils.cleanup(null, ref);
++      throw e;
++    }
++    return new ReplicaHandler(rbw, ref);
+-  public synchronized ReplicaInPipeline createTemporary(StorageType storageType,
+-      ExtendedBlock b) throws IOException {
++  public synchronized ReplicaHandler createTemporary(
++      StorageType storageType, ExtendedBlock b) throws IOException {
+-    
+-    FsVolumeImpl v = volumes.getNextVolume(storageType, b.getNumBytes());
++
++    FsVolumeReference ref = volumes.getNextVolume(storageType, b.getNumBytes());
++    FsVolumeImpl v = (FsVolumeImpl) ref.getVolume();
+-    File f = v.createTmpFile(b.getBlockPoolId(), b.getLocalBlock());
++    File f;
++    try {
++      f = v.createTmpFile(b.getBlockPoolId(), b.getLocalBlock());
++    } catch (IOException e) {
++      IOUtils.cleanup(null, ref);
++      throw e;
++    }
++
+-    return newReplicaInfo;
++    return new ReplicaHandler(newReplicaInfo, ref);
+-      asyncDiskService.deleteAsync(v, f,
+-          FsDatasetUtil.getMetaFile(f, invalidBlks[i].getGenerationStamp()),
+-          new ExtendedBlock(bpid, invalidBlks[i]),
+-          dataStorage.getTrashDirectoryForBlockFile(bpid, f));
++      try {
++        asyncDiskService.deleteAsync(v.obtainReference(), f,
++            FsDatasetUtil.getMetaFile(f, invalidBlks[i].getGenerationStamp()),
++            new ExtendedBlock(bpid, invalidBlks[i]),
++            dataStorage.getTrashDirectoryForBlockFile(bpid, f));
++      } catch (ClosedChannelException e) {
++        LOG.warn("Volume " + v + " is closed, ignore the deletion task for " +
++            "block " + invalidBlks[i]);
++      }
+-    FsVolumeImpl v = volumes.getNextVolume(
+-        replicaInfo.getVolume().getStorageType(), replicaInfo.getNumBytes());
+-    final File tmpDir = v.getBlockPoolSlice(bpid).getTmpDir();
+-    final File destDir = DatanodeUtil.idToBlockDir(tmpDir, newBlkId);
+-    final File dstBlockFile = new File(destDir, blockFileName);
+-    final File dstMetaFile = FsDatasetUtil.getMetaFile(dstBlockFile, newGS);
+-    return copyBlockFiles(replicaInfo.getMetaFile(), replicaInfo.getBlockFile(),
+-        dstMetaFile, dstBlockFile, true);
++    try (FsVolumeReference ref = volumes.getNextVolume(
++        replicaInfo.getVolume().getStorageType(), replicaInfo.getNumBytes())) {
++      FsVolumeImpl v = (FsVolumeImpl) ref.getVolume();
++      final File tmpDir = v.getBlockPoolSlice(bpid).getTmpDir();
++      final File destDir = DatanodeUtil.idToBlockDir(tmpDir, newBlkId);
++      final File dstBlockFile = new File(destDir, blockFileName);
++      final File dstMetaFile = FsDatasetUtil.getMetaFile(dstBlockFile, newGS);
++      return copyBlockFiles(replicaInfo.getMetaFile(),
++          replicaInfo.getBlockFile(),
++          dstMetaFile, dstBlockFile, true);
++    }
+-      try {
++      try (FsVolumeReference ref = volume.obtainReference()) {
++      } catch (ClosedChannelException e) {
++        continue;
+-        if (!volume.isBPDirEmpty(bpid)) {
+-          LOG.warn(bpid + " has some block files, cannot delete unless forced");
+-          throw new IOException("Cannot delete block pool, "
+-              + "it contains some block files");
++        try (FsVolumeReference ref = volume.obtainReference()) {
++          if (!volume.isBPDirEmpty(bpid)) {
++            LOG.warn(bpid + " has some block files, cannot delete unless forced");
++            throw new IOException("Cannot delete block pool, "
++                + "it contains some block files");
++          }
++        } catch (ClosedChannelException e) {
++          // ignore.
+-      volume.deleteBPDirectories(bpid, force);
++      try (FsVolumeReference ref = volume.obtainReference()) {
++        volume.deleteBPDirectories(bpid, force);
++      } catch (ClosedChannelException e) {
++        // ignore.
++      }
++      FsVolumeReference targetReference;
+-              targetVolume = volumes.getNextVolume(
++              targetReference = volumes.getNextVolume(
++              targetVolume = (FsVolumeImpl) targetReference.getVolume();
+-                  targetVolume);
++                  targetReference);
+-        if (v.isTransientStorage()) {
+-          capacity += v.getCapacity();
+-          free += v.getAvailable();
++        try (FsVolumeReference ref = v.obtainReference()) {
++          if (v.isTransientStorage()) {
++            capacity += v.getCapacity();
++            free += v.getAvailable();
++          }
++        } catch (ClosedChannelException e) {
++          // ignore.

@@ -1,0 +1,111 @@
+Merge remote-tracking branch 'origin/trunk' into HDFS-6584
+
++import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_DATANODE_CACHE_REVOCATION_TIMEOUT_MS;
++import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_DATANODE_CACHE_REVOCATION_TIMEOUT_MS_DEFAULT;
++import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_DATANODE_CACHE_REVOCATION_POLLING_MS;
++import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_DATANODE_CACHE_REVOCATION_POLLING_MS_DEFAULT;
++
++import java.util.concurrent.ScheduledThreadPoolExecutor;
++import org.apache.commons.lang.time.DurationFormatUtils;
++import org.apache.hadoop.util.Time;
++  private final ScheduledThreadPoolExecutor deferredUncachingExecutor;
++
++  private final long revocationMs;
++
++  private final long revocationPollingMs;
++
++    this.deferredUncachingExecutor = new ScheduledThreadPoolExecutor(
++            1, workerFactory);
++    this.revocationMs = dataset.datanode.getConf().getLong(
++        DFS_DATANODE_CACHE_REVOCATION_TIMEOUT_MS,
++        DFS_DATANODE_CACHE_REVOCATION_TIMEOUT_MS_DEFAULT);
++    long confRevocationPollingMs = dataset.datanode.getConf().getLong(
++        DFS_DATANODE_CACHE_REVOCATION_POLLING_MS,
++        DFS_DATANODE_CACHE_REVOCATION_POLLING_MS_DEFAULT);
++    long minRevocationPollingMs = revocationMs / 2;
++    if (minRevocationPollingMs < confRevocationPollingMs) {
++      throw new RuntimeException("configured value " +
++              confRevocationPollingMs + "for " +
++              DFS_DATANODE_CACHE_REVOCATION_POLLING_MS +
++              " is too high.  It must not be more than half of the " +
++              "value of " +  DFS_DATANODE_CACHE_REVOCATION_TIMEOUT_MS +
++              ".  Reconfigure this to " + minRevocationPollingMs);
++    }
++    this.revocationPollingMs = confRevocationPollingMs;
++    boolean deferred = false;
+-      // TODO: we probably want to forcibly uncache the block (and close the 
+-      // shm) after a certain timeout has elapsed.
+-      LOG.debug("{} is anchored, and can't be uncached now.", key);
+-      return;
++      deferred = true;
+-      LOG.debug(
+-          "Block with id {}, pool {} has been scheduled for uncaching" + ".",
+-          blockId, bpid);
+-      uncachingExecutor.execute(new UncachingTask(key));
++      if (deferred) {
++        LOG.debug("{} is anchored, and can't be uncached now.  Scheduling it " +
++            "for uncaching in {} ",
++            key, DurationFormatUtils.formatDurationHMS(revocationPollingMs));
++        deferredUncachingExecutor.schedule(
++            new UncachingTask(key, revocationMs),
++            revocationPollingMs, TimeUnit.MILLISECONDS);
++      } else {
++        LOG.debug("{} has been scheduled for immediate uncaching.", key);
++        uncachingExecutor.execute(new UncachingTask(key, 0));
++      }
++    private final long revocationTimeMs;
+-    UncachingTask(ExtendedBlockId key) {
++    UncachingTask(ExtendedBlockId key, long revocationDelayMs) {
++      if (revocationDelayMs == 0) {
++        this.revocationTimeMs = 0;
++      } else {
++        this.revocationTimeMs = revocationDelayMs + Time.monotonicNow();
++      }
++    }
++
++    private boolean shouldDefer() {
++      /* If revocationTimeMs == 0, this is an immediate uncache request.
++       * No clients were anchored at the time we made the request. */
++      if (revocationTimeMs == 0) {
++        return false;
++      }
++      /* Let's check if any clients still have this block anchored. */
++      boolean anchored =
++        !dataset.datanode.getShortCircuitRegistry().
++            processBlockMunlockRequest(key);
++      if (!anchored) {
++        LOG.debug("Uncaching {} now that it is no longer in use " +
++            "by any clients.", key);
++        return false;
++      }
++      long delta = revocationTimeMs - Time.monotonicNow();
++      if (delta < 0) {
++        LOG.warn("Forcibly uncaching {} after {} " +
++            "because client(s) {} refused to stop using it.", key,
++            DurationFormatUtils.formatDurationHMS(revocationTimeMs),
++            dataset.datanode.getShortCircuitRegistry().getClientNames(key));
++        return false;
++      }
++      LOG.info("Replica {} still can't be uncached because some " +
++          "clients continue to use it.  Will wait for {}", key,
++          DurationFormatUtils.formatDurationHMS(delta));
++      return true;
+-      
++
++      if (shouldDefer()) {
++        deferredUncachingExecutor.schedule(
++            this, revocationPollingMs, TimeUnit.MILLISECONDS);
++        return;
++      }
++
+-      // TODO: we will eventually need to do revocation here if any clients
+-      // are reading via mmap with checksums enabled.  See HDFS-5182.
++
+-      LOG.debug("Uncaching of {} completed. usedBytes = {}", key, newUsedBytes);
++      if (revocationTimeMs != 0) {
++        LOG.debug("Uncaching of {} completed. usedBytes = {}",
++            key, newUsedBytes);
++      } else {
++        LOG.debug("Deferred uncaching of {} completed. usedBytes = {}",
++            key, newUsedBytes);
++      }

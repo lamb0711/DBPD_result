@@ -1,0 +1,202 @@
+YARN-230. RM Restart phase 1 - includes support for saving/restarting all applications on an RM bounce. Contributed by Bikas Saha.
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/trunk@1423758 13f79535-47bb-0310-9956-ffa450edef68
+
++import org.apache.hadoop.util.ExitUtil;
++import org.apache.hadoop.yarn.server.resourcemanager.recovery.RMStateStore.ApplicationAttemptState;
++import org.apache.hadoop.yarn.server.resourcemanager.recovery.RMStateStore.ApplicationState;
++import org.apache.hadoop.yarn.server.resourcemanager.recovery.RMStateStore.RMState;
++import org.apache.hadoop.yarn.server.resourcemanager.recovery.RMStateStore;
++import org.apache.hadoop.yarn.server.resourcemanager.recovery.Recoverable;
++import org.apache.hadoop.yarn.server.resourcemanager.rmapp.attempt.event.RMAppAttemptStoredEvent;
+-public class RMAppAttemptImpl implements RMAppAttempt {
++public class RMAppAttemptImpl implements RMAppAttempt, Recoverable {
++      .addTransition(RMAppAttemptState.NEW, RMAppAttemptState.RECOVERED, 
++          RMAppAttemptEventType.RECOVER)
+-          EnumSet.of(RMAppAttemptState.LAUNCHED, RMAppAttemptState.SCHEDULED),
++          EnumSet.of(RMAppAttemptState.LAUNCHED_UNMANAGED_SAVING,
++                     RMAppAttemptState.SCHEDULED),
+-          RMAppAttemptState.ALLOCATED,
++                     RMAppAttemptState.ALLOCATED_SAVING,
++          
++       // Transitions from ALLOCATED_SAVING State
++      .addTransition(RMAppAttemptState.ALLOCATED_SAVING, 
++          RMAppAttemptState.ALLOCATED,
++          RMAppAttemptEventType.ATTEMPT_SAVED, new AttemptStoredTransition())
++      .addTransition(RMAppAttemptState.ALLOCATED_SAVING, 
++          RMAppAttemptState.ALLOCATED_SAVING,
++          RMAppAttemptEventType.CONTAINER_ACQUIRED, 
++          new ContainerAcquiredTransition())
++       // App could be killed by the client. So need to handle this. 
++      .addTransition(RMAppAttemptState.ALLOCATED_SAVING, 
++          RMAppAttemptState.KILLED,
++          RMAppAttemptEventType.KILL,
++          new BaseFinalTransition(RMAppAttemptState.KILLED))
++      
++       // Transitions from LAUNCHED_UNMANAGED_SAVING State
++      .addTransition(RMAppAttemptState.LAUNCHED_UNMANAGED_SAVING, 
++          RMAppAttemptState.LAUNCHED,
++          RMAppAttemptEventType.ATTEMPT_SAVED, 
++          new UnmanagedAMAttemptSavedTransition())
++      // attempt should not try to register in this state
++      .addTransition(RMAppAttemptState.LAUNCHED_UNMANAGED_SAVING, 
++          RMAppAttemptState.FAILED,
++          RMAppAttemptEventType.REGISTERED,
++          new UnexpectedAMRegisteredTransition())
++      // App could be killed by the client. So need to handle this. 
++      .addTransition(RMAppAttemptState.LAUNCHED_UNMANAGED_SAVING, 
++          RMAppAttemptState.KILLED,
++          RMAppAttemptEventType.KILL,
++          new BaseFinalTransition(RMAppAttemptState.KILLED))
++              RMAppAttemptEventType.ATTEMPT_SAVED,
+-
++              
++      // Transitions from RECOVERED State
++      .addTransition(
++          RMAppAttemptState.RECOVERED,
++          RMAppAttemptState.RECOVERED,
++          EnumSet.of(RMAppAttemptEventType.START,
++              RMAppAttemptEventType.APP_ACCEPTED,
++              RMAppAttemptEventType.APP_REJECTED,
++              RMAppAttemptEventType.EXPIRE,
++              RMAppAttemptEventType.LAUNCHED,
++              RMAppAttemptEventType.LAUNCH_FAILED,
++              RMAppAttemptEventType.REGISTERED,
++              RMAppAttemptEventType.CONTAINER_ALLOCATED,
++              RMAppAttemptEventType.CONTAINER_ACQUIRED,
++              RMAppAttemptEventType.ATTEMPT_SAVED,
++              RMAppAttemptEventType.CONTAINER_FINISHED,
++              RMAppAttemptEventType.UNREGISTERED,
++              RMAppAttemptEventType.KILL,
++              RMAppAttemptEventType.STATUS_UPDATE))
+-  }
++  } 
++  private void setMasterContainer(Container container) {
++    masterContainer = container;
++  }
++
++  @Override
++  public void recover(RMState state) {
++    ApplicationState appState = 
++        state.getApplicationState().get(getAppAttemptId().getApplicationId());
++    ApplicationAttemptState attemptState = appState.getAttempt(getAppAttemptId());
++    assert attemptState != null;
++    setMasterContainer(attemptState.getMasterContainer());
++    LOG.info("Recovered attempt: AppId: " + getAppAttemptId().getApplicationId() 
++             + " AttemptId: " + getAppAttemptId()
++             + " MasterContainer: " + masterContainer);
++    setDiagnostics("Attempt recovered after RM restart");
++    handle(new RMAppAttemptEvent(getAppAttemptId(), 
++                                 RMAppAttemptEventType.RECOVER));
++  }
++  
+-
+-      // Send the acceptance to the app
+-      appAttempt.eventHandler.handle(new RMAppEvent(event
+-          .getApplicationAttemptId().getApplicationId(),
+-          RMAppEventType.APP_ACCEPTED));
+-
++        // Send the acceptance to the app
++        appAttempt.eventHandler.handle(new RMAppEvent(event
++            .getApplicationAttemptId().getApplicationId(),
++            RMAppEventType.APP_ACCEPTED));
++
+-        // Directly go to LAUNCHED state
+-        // Register with AMLivelinessMonitor
+-        appAttempt.rmContext.getAMLivelinessMonitor().register(
+-            appAttempt.applicationAttemptId);
+-        return RMAppAttemptState.LAUNCHED;
++        RMStateStore store = appAttempt.rmContext.getStateStore();
++        // save state and then go to LAUNCHED state
++        appAttempt.storeAttempt(store);
++        return RMAppAttemptState.LAUNCHED_UNMANAGED_SAVING;
+-  private static final class AMContainerAllocatedTransition extends BaseTransition {
++  private static final class AMContainerAllocatedTransition 
++                                                      extends BaseTransition {
+-        RMAppAttemptEvent event) {
+-
++                                                     RMAppAttemptEvent event) {
+-      appAttempt.masterContainer = amContainerAllocation.getContainers().get(
+-          0);
++      appAttempt.setMasterContainer(amContainerAllocation.getContainers().get(
++                                                                           0));
+-      // Send event to launch the AM Container
+-      appAttempt.eventHandler.handle(new AMLauncherEvent(
+-          AMLauncherEventType.LAUNCH, appAttempt));
++      RMStateStore store = appAttempt.rmContext.getStateStore();
++      appAttempt.storeAttempt(store);
+-
++  
++  private static final class AttemptStoredTransition extends BaseTransition {
++    @Override
++    public void transition(RMAppAttemptImpl appAttempt,
++                                                    RMAppAttemptEvent event) {
++      appAttempt.checkAttemptStoreError(event);
++      appAttempt.launchAttempt();
++    }
++  }
++  
+-  private static final class AMLaunchedTransition extends BaseTransition {
++  private static class AMLaunchedTransition extends BaseTransition {
+-        RMAppAttemptEvent event) {
+-
++                            RMAppAttemptEvent event) {
+-      appAttempt.rmContext.getAMLivelinessMonitor().register(
+-          appAttempt.applicationAttemptId);
+-
++      appAttempt.attemptLaunched();
++  
++  private static final class UnmanagedAMAttemptSavedTransition 
++                                                extends AMLaunchedTransition {
++    @Override
++    public void transition(RMAppAttemptImpl appAttempt,
++                            RMAppAttemptEvent event) {
++      appAttempt.checkAttemptStoreError(event);
++      // Send the acceptance to the app
++      // Ideally this should have been done when the scheduler accepted the app.
++      // But its here because until the attempt is saved the client should not
++      // launch the unmanaged AM. Client waits for the app status to be accepted
++      // before doing so. So we have to delay the accepted state until we have 
++      // completed storing the attempt
++      appAttempt.eventHandler.handle(new RMAppEvent(event
++          .getApplicationAttemptId().getApplicationId(),
++          RMAppEventType.APP_ACCEPTED));
++      
++      super.transition(appAttempt, event);
++    }    
++  }
++  
++  private void launchAttempt(){
++    // Send event to launch the AM Container
++    eventHandler.handle(new AMLauncherEvent(AMLauncherEventType.LAUNCH, this));
++  }
++  
++  private void attemptLaunched() {
++    // Register with AMLivelinessMonitor
++    rmContext.getAMLivelinessMonitor().register(getAppAttemptId());
++  }
++  
++  private void checkAttemptStoreError(RMAppAttemptEvent event) {
++    RMAppAttemptStoredEvent storeEvent = (RMAppAttemptStoredEvent) event;
++    if(storeEvent.getStoredException() != null)
++    {
++      // This needs to be handled for HA and give up master status if we got
++      // fenced
++      LOG.error("Failed to store attempt: " + getAppAttemptId(),
++                storeEvent.getStoredException());
++      ExitUtil.terminate(1, storeEvent.getStoredException());
++    }
++  }
++  
++  private void storeAttempt(RMStateStore store) {
++    // store attempt data in a non-blocking manner to prevent dispatcher
++    // thread starvation and wait for state to be saved
++    LOG.info("Storing attempt: AppId: " + 
++              getAppAttemptId().getApplicationId() 
++              + " AttemptId: " + 
++              getAppAttemptId()
++              + " MasterContainer: " + masterContainer);
++    store.storeApplicationAttempt(this);
++  }
+
+INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS43 INS31 INS31 INS55 INS55 INS31 INS31 INS31 INS31 INS42 INS83 INS39 INS42 INS44 INS8 INS78 INS83 INS39 INS42 INS44 INS8 INS83 INS83 INS83 INS42 MOV43 INS31 INS83 INS83 INS42 INS43 INS31 INS42 INS43 INS83 INS39 INS42 INS8 INS83 INS39 INS42 INS8 INS83 INS39 INS42 INS44 INS8 INS83 INS39 INS42 INS44 INS8 INS32 INS43 INS42 INS21 INS42 INS43 INS42 INS60 INS60 INS6 INS21 INS21 INS21 INS21 MOV78 INS83 INS39 INS42 MOV44 MOV44 INS8 INS42 INS78 INS83 INS39 INS42 INS44 INS44 INS8 INS42 INS78 INS44 INS44 MOV21 INS21 INS43 INS42 INS60 INS25 INS43 INS42 INS21 INS21 MOV32 INS42 INS42 INS7 INS42 INS43 INS59 INS43 INS59 INS27 INS32 INS32 INS32 INS32 INS60 INS21 INS21 INS21 INS42 INS43 INS42 INS43 INS42 INS21 INS42 INS43 INS42 INS43 INS42 INS21 INS21 INS32 INS42 INS43 INS59 INS27 INS8 INS42 INS32 INS32 INS42 INS40 INS40 INS32 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS33 INS42 INS32 INS42 INS42 INS27 INS42 INS45 INS42 INS14 INS32 INS43 INS59 INS32 INS32 INS32 INS42 INS42 INS32 INS42 INS42 INS32 INS48 INS42 INS32 INS42 INS32 INS42 INS42 INS11 INS32 INS33 INS21 INS21 INS42 INS42 INS27 INS42 INS42 INS52 UPD42 MOV42 INS42 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS32 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS45 INS32 INS45 INS32 INS45 INS42 INS43 INS32 INS40 MOV21 INS60 INS21 INS42 INS42 MOV32 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 UPD40 MOV40 INS42 INS14 INS42 INS42 INS42 INS52 INS42 INS42 INS42 INS43 INS42 INS42 INS42 INS32 INS32 INS45 INS32 INS45 INS32 INS45 INS42 INS40 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS43 INS59 INS32 UPD40 INS40 INS42 INS43 INS32 INS40 INS42 INS42 INS42 INS27 INS32 INS42 INS42 INS34 INS32 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS32 UPD42 MOV42 INS42 INS42 INS42 INS32 UPD42 MOV42 INS45 INS32 INS42 INS42 INS42 INS42 INS42 MOV40 UPD42 MOV42 INS42 UPD42 MOV42 INS42 INS32 INS42 INS40 INS32 INS42 INS40 INS40 INS40 MOV14 INS32 INS42 INS40 INS40 INS40 MOV14 INS32 INS42 INS40 INS40 INS40 MOV14 INS32 INS42 INS40 MOV40 INS40 MOV14 INS32 INS42 INS40 INS40 INS40 MOV14 MOV32 MOV42 INS40 INS40 INS40 MOV14 UPD40 UPD40 UPD40 MOV14 UPD40 UPD40 UPD40 INS14 UPD40 UPD40 UPD40 INS14 INS43 UPD40 UPD40 INS14 INS43 INS40 INS42 UPD40 UPD40 UPD40 INS14 INS43 INS42 UPD40 UPD40 UPD40 INS14 INS43 INS42 UPD40 UPD40 UPD40 MOV14 INS43 INS40 INS42 UPD40 UPD40 INS14 INS42 INS43 UPD40 INS42 INS32 INS42 INS40 MOV32 MOV42 MOV40 INS32 INS40 MOV14 UPD40 MOV40 UPD40 MOV14 INS42 INS42 INS40 INS40 UPD40 UPD40 UPD40 DEL42 DEL42 DEL40 DEL32 DEL32 DEL40 DEL32 DEL21 DEL40 DEL7 DEL42 DEL32 DEL40 DEL40 DEL42

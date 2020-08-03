@@ -1,0 +1,181 @@
+YARN-2709. Made timeline client getDelegationToken API retry if ConnectException happens. Contributed by Li Lu.
+
+-  private TimelineJerseyRetryFilter retryFilter;
++  @Private
++  @VisibleForTesting
++  TimelineClientConnectionRetry connectionRetry;
+-  static class TimelineJerseyRetryFilter extends ClientFilter {
++  // Abstract class for an operation that should be retried by timeline client
++  private static abstract class TimelineClientRetryOp {
++    // The operation that should be retried
++    public abstract Object run() throws IOException;
++    // The method to indicate if we should retry given the incoming exception
++    public abstract boolean shouldRetryOn(Exception e);
++  }
++
++  // Class to handle retry
++  // Outside this class, only visible to tests
++  @Private
++  @VisibleForTesting
++  static class TimelineClientConnectionRetry {
+-    // Indicates if retries happened last time
++    // Indicates if retries happened last time. Only tests should read it.
++    // In unit tests, retryOn() calls should _not_ be concurrent.
+-    public TimelineJerseyRetryFilter(Configuration conf) {
+-      super();
++    public TimelineClientConnectionRetry(Configuration conf) {
+-    @Override
+-    public ClientResponse handle(ClientRequest cr)
+-        throws ClientHandlerException {
++    public Object retryOn(TimelineClientRetryOp op)
++        throws RuntimeException, IOException {
++
+-          // try pass the request on, if fail, keep retrying
+-          return getNext().handle(cr);
+-        } catch (ClientHandlerException e) {
++          // try perform the op, if fail, keep retrying
++          return op.run();
++        }  catch (IOException e) {
++          // We may only throw runtime and IO exceptions. After switching to
++          // Java 1.7, we can merge these two catch blocks into one.
++
+-          if(e.getCause() instanceof ConnectException) {
+-            if (leftRetries > 0) {
+-              LOG.info("Connection Timeout (" + cr.getURI() + "), will try "
+-                  + leftRetries + " more time(s).");
+-            } else {
+-              // note that maxRetries may be -1 at the very beginning
+-              // maxRetries = -1 means keep trying
+-              LOG.info("Connection Timeout (" + cr.getURI()
+-                  + "), will keep retrying.");
+-            }
+-            retried = true;
++          if (op.shouldRetryOn(e)) {
++            logException(e, leftRetries);
++          } else {
++            throw e;
++          }
++        } catch (RuntimeException e) {
++          // break if there's no retries left
++          if (leftRetries == 0) {
++            break;
++          }
++          if (op.shouldRetryOn(e)) {
++            logException(e, leftRetries);
++        retried = true;
+-      throw new ClientHandlerException("Failed to connect to timeline server. "
++      throw new RuntimeException("Failed to connect to timeline server. "
++
++    private void logException(Exception e, int leftRetries) {
++      if (leftRetries > 0) {
++        LOG.info("Exception caught by TimelineClientConnectionRetry,"
++              + " will try " + leftRetries + " more time(s).\nMessage: "
++              + e.getMessage());
++      } else {
++        // note that maxRetries may be -1 at the very beginning
++        LOG.info("ConnectionException caught by TimelineClientConnectionRetry,"
++            + " will keep retrying.\nMessage: "
++            + e.getMessage());
++      }
++    }
++  }
++
++  private class TimelineJerseyRetryFilter extends ClientFilter {
++    @Override
++    public ClientResponse handle(final ClientRequest cr)
++        throws ClientHandlerException {
++      // Set up the retry operation
++      TimelineClientRetryOp jerseyRetryOp = new TimelineClientRetryOp() {
++        @Override
++        public Object run() {
++          // Try pass the request, if fail, keep retrying
++          return getNext().handle(cr);
++        }
++
++        @Override
++        public boolean shouldRetryOn(Exception e) {
++          // Only retry on connection exceptions
++          return (e instanceof ClientHandlerException)
++              && (e.getCause() instanceof ConnectException);
++        }
++      };
++      try {
++        return (ClientResponse) connectionRetry.retryOn(jerseyRetryOp);
++      } catch (IOException e) {
++        throw new ClientHandlerException("Jersey retry failed!\nMessage: "
++              + e.getMessage());
++      }
++    }
++      token = new DelegationTokenAuthenticatedURL.Token();
++
++      connectionRetry = new TimelineClientConnectionRetry(conf);
+-      token = new DelegationTokenAuthenticatedURL.Token();
+-      retryFilter = new TimelineJerseyRetryFilter(conf);
++      TimelineJerseyRetryFilter retryFilter = new TimelineJerseyRetryFilter();
+-    boolean isProxyAccess =
+-        UserGroupInformation.getCurrentUser().getAuthenticationMethod()
+-        == UserGroupInformation.AuthenticationMethod.PROXY;
+-    UserGroupInformation callerUGI = isProxyAccess ?
+-        UserGroupInformation.getCurrentUser().getRealUser()
+-        : UserGroupInformation.getCurrentUser();
+-    final String doAsUser = isProxyAccess ?
+-        UserGroupInformation.getCurrentUser().getShortUserName() : null;
+-    try {
+-      return callerUGI.doAs(
+-          new PrivilegedExceptionAction<Token<TimelineDelegationTokenIdentifier>>() {
+-        @Override
+-        public Token<TimelineDelegationTokenIdentifier> run() throws Exception {
+-          DelegationTokenAuthenticatedURL authUrl =
+-              new DelegationTokenAuthenticatedURL(authenticator, connConfigurator);
+-          return (Token) authUrl.getDelegationToken(
+-              resURI.toURL(), token, renewer, doAsUser);
++    // Set up the retry operation
++    TimelineClientRetryOp tokenRetryOp = new TimelineClientRetryOp() {
++      @Override
++      public Object run() throws IOException {
++        // Try pass the request, if fail, keep retrying
++        boolean isProxyAccess =
++            UserGroupInformation.getCurrentUser().getAuthenticationMethod()
++            == UserGroupInformation.AuthenticationMethod.PROXY;
++        UserGroupInformation callerUGI = isProxyAccess ?
++            UserGroupInformation.getCurrentUser().getRealUser()
++            : UserGroupInformation.getCurrentUser();
++        final String doAsUser = isProxyAccess ?
++            UserGroupInformation.getCurrentUser().getShortUserName() : null;
++        try {
++          return callerUGI.doAs(
++              new PrivilegedExceptionAction<Token<TimelineDelegationTokenIdentifier>>() {
++            @Override
++            public Token<TimelineDelegationTokenIdentifier> run() throws Exception {
++              DelegationTokenAuthenticatedURL authUrl =
++                  new DelegationTokenAuthenticatedURL(authenticator, connConfigurator);
++              return (Token) authUrl.getDelegationToken(
++                  resURI.toURL(), token, renewer, doAsUser);
++            }
++          });
++        } catch (UndeclaredThrowableException e) {
++          throw new IOException(e.getCause());
++        } catch (InterruptedException e) {
++          throw new IOException(e);
+-      });
+-    } catch (UndeclaredThrowableException e) {
+-      throw new IOException(e.getCause());
+-    } catch (InterruptedException e) {
+-      throw new IOException(e);
+-    }
+-  }
++      }
++      @Override
++      public boolean shouldRetryOn(Exception e) {
++        // Only retry on connection exceptions
++        return (e instanceof ConnectException);
++      }
++    };
+-  @Private
+-  @VisibleForTesting
+-  public TimelineJerseyRetryFilter getRetryFilter() {
+-    return retryFilter;
++    return (Token<TimelineDelegationTokenIdentifier>)
++        connectionRetry.retryOn(tokenRetryOp);
+
+INS23 INS55 INS55 INS78 INS78 INS43 INS59 INS83 INS83 INS83 INS42 INS31 INS31 INS78 INS78 UPD42 INS31 INS83 INS42 MOV43 INS31 MOV79 INS83 MOV74 INS42 MOV44 INS43 MOV43 INS8 INS42 INS42 INS42 INS42 INS83 INS83 INS43 INS42 INS43 INS83 INS83 INS39 INS42 INS44 INS42 INS42 UPD42 INS43 INS42 INS44 INS43 INS43 INS83 INS39 INS42 INS44 INS44 INS8 MOV78 INS83 MOV43 INS42 MOV44 MOV43 INS8 UPD42 INS42 INS60 INS41 INS42 INS42 INS43 INS42 INS42 INS43 INS42 INS42 INS42 INS43 INS42 INS39 INS42 INS25 INS83 INS60 INS54 MOV21 INS43 INS59 INS11 INS42 INS42 INS42 MOV27 INS8 INS8 INS43 INS59 INS8 INS12 INS60 INS42 INS42 INS14 INS74 INS32 MOV21 INS43 INS21 INS21 INS42 UPD42 MOV42 INS14 INS41 INS44 INS8 MOV43 INS59 INS43 INS1 INS43 INS43 INS42 INS42 INS42 INS8 INS12 INS12 INS42 INS32 INS32 INS43 INS1 INS11 INS43 INS42 INS53 UPD42 INS42 INS14 INS42 MOV31 INS31 INS42 INS42 INS41 MOV44 INS8 INS44 INS8 INS42 INS42 INS27 INS42 INS42 INS27 INS42 INS31 INS31 INS43 INS32 INS42 INS14 INS43 MOV43 INS43 UPD42 MOV78 MOV83 INS39 INS42 INS44 MOV8 INS32 INS43 MOV25 INS25 INS43 INS42 INS25 INS25 INS27 INS42 INS45 INS32 INS45 INS45 INS32 INS78 INS83 INS43 INS42 MOV8 INS78 INS83 INS39 INS42 INS44 INS8 INS42 INS42 INS42 INS42 MOV43 INS27 INS42 INS42 UPD42 INS43 INS42 INS42 INS42 INS42 INS32 INS8 MOV8 INS42 INS27 INS8 INS32 MOV8 INS8 INS45 INS45 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS43 INS42 INS41 INS45 INS32 UPD42 MOV42 INS36 UPD42 MOV42 UPD42 MOV42 INS42 INS21 MOV42 INS34 INS10 INS42 INS42 INS42 INS53 INS42 INS27 INS42 INS42 INS62 INS32 INS42 INS36 INS36 INS42 INS43 UPD42 MOV42 UPD42 MOV42 INS42 UPD42 UPD42 UPD42 MOV42 INS62 MOV62 INS42 INS42 MOV43 DEL83 DEL59 DEL23 DEL46 DEL42 DEL45 DEL42 DEL32 DEL45 DEL27 DEL45 DEL32 DEL45 DEL45 DEL27 DEL32 DEL21 DEL8 DEL25 DEL8 DEL25 DEL8 DEL12 DEL42 DEL43 DEL42

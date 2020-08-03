@@ -1,0 +1,126 @@
+HDFS-14740. Recover data blocks from persistent memory read cache during datanode restarts. Contributed by Feilong He.
+
++import org.apache.commons.io.filefilter.TrueFileFilter;
++import java.util.Collection;
+-    private final long maxBytes;
++    private long maxBytes;
++
++    void setMaxBytes(long maxBytes) {
++      this.maxBytes = maxBytes;
++    }
++  private boolean cacheRecoveryEnabled;
+-  private PmemVolumeManager(String[] pmemVolumesConfig) throws IOException {
++  private PmemVolumeManager(String[] pmemVolumesConfig,
++                            boolean cacheRecoveryEnabled) throws IOException {
+-          DFSConfigKeys.DFS_DATANODE_CACHE_PMEM_DIRS_KEY +
++          DFSConfigKeys.DFS_DATANODE_PMEM_CACHE_DIRS_KEY +
++    this.cacheRecoveryEnabled = cacheRecoveryEnabled;
+-  public synchronized static void init(String[] pmemVolumesConfig)
++  public synchronized static void init(
++      String[] pmemVolumesConfig, boolean cacheRecoveryEnabled)
+-      pmemVolumeManager = new PmemVolumeManager(pmemVolumesConfig);
++      pmemVolumeManager = new PmemVolumeManager(pmemVolumesConfig,
++          cacheRecoveryEnabled);
++  public static void reset() {
++    pmemVolumeManager = null;
++  }
++
++  @VisibleForTesting
+-        // Clean up the cache left before, if any.
+-        cleanup(realPmemDir);
++        if (!cacheRecoveryEnabled) {
++          // Clean up the cache left before, if any.
++          cleanup(realPmemDir);
++        }
++  /**
++   * Recover cache from the cached files in the configured pmem volumes.
++   */
++  public Map<ExtendedBlockId, MappableBlock> recoverCache(
++      String bpid, MappableBlockLoader cacheLoader) throws IOException {
++    final Map<ExtendedBlockId, MappableBlock> keyToMappableBlock
++        = new ConcurrentHashMap<>();
++    for (byte volumeIndex = 0; volumeIndex < pmemVolumes.size();
++         volumeIndex++) {
++      long maxBytes = usedBytesCounts.get(volumeIndex).getMaxBytes();
++      long usedBytes = 0;
++      File cacheDir = new File(pmemVolumes.get(volumeIndex), bpid);
++      Collection<File> cachedFileList = FileUtils.listFiles(cacheDir,
++          TrueFileFilter.INSTANCE, TrueFileFilter.INSTANCE);
++      // Scan the cached files in pmem volumes for cache recovery.
++      for (File cachedFile : cachedFileList) {
++        MappableBlock mappableBlock = cacheLoader.
++            getRecoveredMappableBlock(cachedFile, bpid, volumeIndex);
++        ExtendedBlockId key = mappableBlock.getKey();
++        keyToMappableBlock.put(key, mappableBlock);
++        usedBytes += cachedFile.length();
++      }
++      // Update maxBytes and cache capacity according to cache space
++      // used by recovered cached files.
++      usedBytesCounts.get(volumeIndex).setMaxBytes(maxBytes + usedBytes);
++      cacheCapacity += usedBytes;
++      usedBytesCounts.get(volumeIndex).reserve(usedBytes);
++    }
++    return keyToMappableBlock;
++  }
++
++  public void recoverBlockKeyToVolume(ExtendedBlockId key, byte volumeIndex) {
++    blockKeyToVolume.put(key, volumeIndex);
++  }
++
++  /**
++   * Create cache subdirectory specified with blockPoolId.
++   */
++  public void createBlockPoolDir(String bpid) throws IOException {
++    for (String volume : pmemVolumes) {
++      File cacheDir = new File(volume, bpid);
++      if (!cacheDir.exists() && !cacheDir.mkdir()) {
++        throw new IOException("Failed to create " + cacheDir.getPath());
++      }
++    }
++  }
++
+-  /**
+-   * The cache file is named as BlockPoolId-BlockId.
+-   * So its name can be inferred by BlockPoolId and BlockId.
+-   */
+-  public String getCacheFileName(ExtendedBlockId key) {
+-    return key.getBlockPoolId() + "-" + key.getBlockId();
++  ArrayList<String> getVolumes() {
++    return pmemVolumes;
+-   * Considering the pmem volume size is below TB level currently,
+-   * it is tolerable to keep cache files under one directory.
+-   * The strategy will be optimized, especially if one pmem volume
+-   * has huge cache capacity.
++   * A cache file is named after the corresponding BlockId.
++   * Thus, cache file name can be inferred according to BlockId.
++   */
++  public String idToCacheFileName(ExtendedBlockId key) {
++    return String.valueOf(key.getBlockId());
++  }
++
++  /**
++   * Create and get the directory where a cache file with this key and
++   * volumeIndex should be stored. Use hierarchical strategy of storing
++   * blocks to avoid keeping cache files under one directory.
+-  public String inferCacheFilePath(Byte volumeIndex, ExtendedBlockId key) {
+-    return pmemVolumes.get(volumeIndex) + "/" + getCacheFileName(key);
++  public String idToCacheFilePath(Byte volumeIndex, ExtendedBlockId key)
++      throws IOException {
++    final String cacheSubdirPrefix = "subdir";
++    long blockId = key.getBlockId();
++    String bpid = key.getBlockPoolId();
++    int d1 = (int) ((blockId >> 16) & 0x1F);
++    int d2 = (int) ((blockId >> 8) & 0x1F);
++    String parentDir = pmemVolumes.get(volumeIndex) + "/" + bpid;
++    String subDir = cacheSubdirPrefix + d1 + "/" + cacheSubdirPrefix + d2;
++    File filePath = new File(parentDir, subDir);
++    if (!filePath.exists() && !filePath.mkdirs()) {
++      throw new IOException("Failed to create " + filePath.getPath());
++    }
++    return filePath.getAbsolutePath() + "/" + idToCacheFileName(key);
+-   * The cache file path is pmemVolume/BlockPoolId-BlockId.
++   * The cache file path is pmemVolume/BlockPoolId/subdir#/subdir#/BlockId.
+-  public String getCachePath(ExtendedBlockId key) {
++  public String getCachePath(ExtendedBlockId key) throws IOException {
+-    return inferCacheFilePath(volumeIndex, key);
++    return idToCacheFilePath(volumeIndex, key);

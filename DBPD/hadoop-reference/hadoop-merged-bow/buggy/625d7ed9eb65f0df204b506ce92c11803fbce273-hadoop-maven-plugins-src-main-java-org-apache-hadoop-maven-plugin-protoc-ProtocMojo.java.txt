@@ -1,0 +1,194 @@
+HADOOP-12194. Support for incremental generation in the protoc plugin.
+
++import org.codehaus.jackson.map.ObjectMapper;
++import org.codehaus.jackson.type.TypeReference;
++import java.io.BufferedInputStream;
++import java.io.BufferedOutputStream;
++import java.io.FileInputStream;
++import java.io.FileNotFoundException;
++import java.io.FileOutputStream;
++import java.io.IOException;
++import java.util.HashMap;
+-
++import java.util.Map;
++import java.util.zip.CRC32;
++  @Parameter(defaultValue =
++      "${project.build.directory}/hadoop-maven-plugins-protoc-checksums.json")
++  private String checksumPath;
++
++  /**
++   * Compares include and source file checksums against previously computed
++   * checksums stored in a json file in the build directory.
++   */
++  public class ChecksumComparator {
++
++    private final Map<String, Long> storedChecksums;
++    private final Map<String, Long> computedChecksums;
++
++    private final File checksumFile;
++
++    ChecksumComparator(String checksumPath) throws IOException {
++      checksumFile = new File(checksumPath);
++      // Read in the checksums
++      if (checksumFile.exists()) {
++        ObjectMapper mapper = new ObjectMapper();
++        storedChecksums = mapper
++            .readValue(checksumFile, new TypeReference<Map<String, Long>>() {
++            });
++      } else {
++        storedChecksums = new HashMap<>(0);
++      }
++      computedChecksums = new HashMap<>();
++    }
++
++    public boolean hasChanged(File file) throws IOException {
++      if (!file.exists()) {
++        throw new FileNotFoundException(
++            "Specified protoc include or source does not exist: " + file);
++      }
++      if (file.isDirectory()) {
++        return hasDirectoryChanged(file);
++      } else if (file.isFile()) {
++        return hasFileChanged(file);
++      } else {
++        throw new IOException("Not a file or directory: " + file);
++      }
++    }
++
++    private boolean hasDirectoryChanged(File directory) throws IOException {
++      File[] listing = directory.listFiles();
++      boolean changed = false;
++      // Do not exit early, since we need to compute and save checksums
++      // for each file within the directory.
++      for (File f : listing) {
++        if (f.isDirectory()) {
++          if (hasDirectoryChanged(f)) {
++            changed = true;
++          }
++        } else if (f.isFile()) {
++          if (hasFileChanged(f)) {
++            changed = true;
++          }
++        } else {
++          getLog().debug("Skipping entry that is not a file or directory: "
++              + f);
++        }
++      }
++      return changed;
++    }
++
++    private boolean hasFileChanged(File file) throws IOException {
++      long computedCsum = computeChecksum(file);
++
++      // Return if the generated csum matches the stored csum
++      Long storedCsum = storedChecksums.get(file.getCanonicalPath());
++      if (storedCsum == null || storedCsum.longValue() != computedCsum) {
++        // It has changed.
++        return true;
++      }
++      return false;
++    }
++
++    private long computeChecksum(File file) throws IOException {
++      // If we've already computed the csum, reuse the computed value
++      final String canonicalPath = file.getCanonicalPath();
++      if (computedChecksums.containsKey(canonicalPath)) {
++        return computedChecksums.get(canonicalPath);
++      }
++      // Compute the csum for the file
++      CRC32 crc = new CRC32();
++      byte[] buffer = new byte[1024*64];
++      try (BufferedInputStream in =
++          new BufferedInputStream(new FileInputStream(file))) {
++        while (true) {
++          int read = in.read(buffer);
++          if (read <= 0) {
++            break;
++          }
++          crc.update(buffer, 0, read);
++        }
++      }
++      // Save it in the generated map and return
++      final long computedCsum = crc.getValue();
++      computedChecksums.put(canonicalPath, computedCsum);
++      return crc.getValue();
++    }
++
++    public void writeChecksums() throws IOException {
++      ObjectMapper mapper = new ObjectMapper();
++      try (BufferedOutputStream out = new BufferedOutputStream(
++          new FileOutputStream(checksumFile))) {
++        mapper.writeValue(out, computedChecksums);
++        getLog().info("Wrote protoc checksums to file " + checksumFile);
++      }
++    }
++  }
++
+-        throw new MojoExecutionException("protoc failure");        
++        throw new MojoExecutionException("protoc failure");
+-                "protoc version is '" + out.get(0) + "', expected version is '" 
+-                    + protocVersion + "'");            
++                "protoc version is '" + out.get(0) + "', expected version is '"
++                    + protocVersion + "'");
+-          throw new MojoExecutionException("Could not create directory: " + 
+-            output);
++          throw new MojoExecutionException(
++              "Could not create directory: " + output);
++
++      // Whether the import or source protoc files have changed.
++      ChecksumComparator comparator = new ChecksumComparator(checksumPath);
++      boolean importsChanged = false;
++
++          if (comparator.hasChanged(i)) {
++            importsChanged = true;
++          }
++      // Filter to generate classes for just the changed source files.
++      List<File> changedSources = new ArrayList<>();
++      boolean sourcesChanged = false;
+-        command.add(f.getCanonicalPath());
+-      }
+-      exec = new Exec(this);
+-      out = new ArrayList<String>();
+-      if (exec.run(command, out) != 0) {
+-        getLog().error("protoc compiler error");
+-        for (String s : out) {
+-          getLog().error(s);
++        // Need to recompile if the source has changed, or if any import has
++        // changed.
++        if (comparator.hasChanged(f) || importsChanged) {
++          sourcesChanged = true;
++          changedSources.add(f);
++          command.add(f.getCanonicalPath());
+-        throw new MojoExecutionException("protoc failure");
++      }
++
++      if (!sourcesChanged && !importsChanged) {
++        getLog().info("No changes detected in protoc files, skipping "
++            + "generation.");
++      } else {
++        if (getLog().isDebugEnabled()) {
++          StringBuilder b = new StringBuilder();
++          b.append("Generating classes for the following protoc files: [");
++          String prefix = "";
++          for (File f : changedSources) {
++            b.append(prefix);
++            b.append(f.toString());
++            prefix = ", ";
++          }
++          b.append("]");
++          getLog().debug(b.toString());
++        }
++
++        exec = new Exec(this);
++        out = new ArrayList<String>();
++        if (exec.run(command, out) != 0) {
++          getLog().error("protoc compiler error");
++          for (String s : out) {
++            getLog().error(s);
++          }
++          throw new MojoExecutionException("protoc failure");
++        }
++        // Write the new checksum file on success.
++        comparator.writeChecksums();
+
+INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS23 INS55 INS77 INS83 INS43 INS59 INS29 INS83 INS42 INS23 INS23 INS23 INS31 INS31 INS31 INS31 INS31 INS31 INS42 INS80 INS42 INS42 INS65 INS83 INS83 INS74 INS59 INS83 INS83 INS74 INS59 INS83 INS83 INS43 INS59 INS42 INS44 INS43 INS8 INS83 INS39 INS42 INS44 INS43 INS8 INS83 INS39 INS42 INS44 INS43 INS8 INS83 INS39 INS42 INS44 INS43 INS8 INS83 INS39 INS42 INS44 INS43 INS8 INS83 INS39 INS42 INS43 INS8 INS42 INS45 INS66 INS66 INS43 INS43 INS43 INS42 INS43 INS43 INS43 INS42 INS42 INS42 INS43 INS42 INS42 INS21 INS25 INS21 INS43 INS42 INS42 INS25 INS25 INS43 INS42 INS42 INS60 INS60 INS70 INS41 INS43 INS42 INS42 INS60 INS60 INS25 INS41 INS43 INS42 INS42 INS60 INS25 INS60 INS60 INS54 INS60 INS21 INS41 INS42 INS60 INS54 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS7 INS32 INS8 INS8 INS7 INS42 INS38 INS8 INS32 INS8 INS25 INS42 INS5 INS59 INS39 INS59 INS44 INS42 INS8 INS42 INS42 INS39 INS59 INS43 INS59 INS27 INS8 INS9 INS42 INS83 INS43 INS59 INS32 INS8 INS43 INS59 INS5 INS59 INS58 INS8 INS83 INS39 INS59 INS32 INS32 INS43 INS59 INS58 INS8 INS60 INS60 INS60 INS60 INS25 INS42 INS14 INS42 INS42 INS60 INS21 INS21 INS42 INS14 INS32 INS53 INS42 INS42 INS41 INS32 INS8 INS8 INS43 INS85 INS42 INS32 INS42 INS9 INS43 INS42 INS25 INS42 INS32 INS42 INS42 INS32 INS27 INS27 INS41 INS42 INS42 INS32 INS42 INS42 INS42 INS41 INS42 INS42 INS14 INS39 INS85 INS42 INS3 INS43 INS59 INS61 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS14 INS43 INS59 INS21 INS21 INS43 INS59 INS39 INS59 INS74 INS59 INS39 INS59 INS8 INS27 INS8 INS8 INS43 INS42 INS43 INS59 INS7 INS7 INS74 INS42 INS42 INS14 INS32 INS42 INS42 INS41 INS53 INS42 INS42 INS42 INS42 INS32 INS8 INS25 INS42 INS42 INS42 INS42 INS32 INS42 INS33 INS32 INS42 INS9 INS42 INS42 INS32 INS43 INS5 INS27 INS42 INS42 INS14 INS9 INS8 INS42 INS42 INS43 INS42 INS42 INS14 INS32 INS32 INS42 INS42 INS14 INS42 INS9 INS43 INS43 INS42 INS14 INS42 INS9 INS25 INS38 INS38 INS21 INS25 MOV21 MOV21 MOV25 INS21 INS42 INS42 INS42 INS14 INS42 INS32 INS42 INS14 INS43 INS43 INS27 INS42 INS42 INS32 INS14 INS42 INS42 INS25 INS32 INS8 INS8 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS39 INS85 INS34 INS34 INS43 INS14 INS60 INS25 INS21 INS42 INS43 INS14 INS42 INS42 INS42 INS42 INS32 INS42 INS27 INS43 INS42 INS42 INS42 INS74 INS27 MOV8 INS42 INS42 INS32 INS32 INS8 INS32 INS43 INS42 INS42 INS42 INS14 INS74 INS34 INS42 INS42 INS45 INS42 INS42 INS42 INS43 INS27 INS32 INS8 INS42 INS42 INS25 INS21 INS42 INS43 INS42 INS39 INS59 INS27 INS8 INS32 INS42 INS43 INS42 INS42 INS45 INS42 INS42 INS25 INS43 INS32 INS42 INS21 INS21 INS32 INS42 INS27 INS32 INS42 INS60 INS21 INS60 INS70 INS21 INS21 INS42 INS42 INS42 INS74 INS1 INS43 INS42 INS45 INS42 INS42 INS42 INS21 INS32 INS8 INS32 INS42 INS42 INS32 INS42 INS34 INS10 INS42 INS42 INS42 INS34 INS42 INS42 INS32 INS8 INS42 INS42 INS42 INS42 INS7 INS32 INS42 INS45 INS45 INS42 INS43 INS59 INS32 INS43 INS59 INS44 INS42 INS8 INS32 INS32 INS43 INS74 INS42 INS7 INS42 INS42 INS21 INS32 INS42 INS27 INS42 INS42 INS42 INS42 INS42 INS42 INS21 INS42 INS9 INS42 INS42 INS42 INS42 INS42 INS14 INS42 INS42 INS45 INS42 INS42 INS45 INS43 INS42 INS21 INS21 INS21 INS42 INS42 INS45 INS32 INS42 INS32 INS42 INS43 INS43 INS43 INS42 INS9 INS7 INS42 INS45 INS42 INS7 INS43 INS42 INS32 INS32 INS7 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS9 INS42 INS9 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS45 INS42 INS42

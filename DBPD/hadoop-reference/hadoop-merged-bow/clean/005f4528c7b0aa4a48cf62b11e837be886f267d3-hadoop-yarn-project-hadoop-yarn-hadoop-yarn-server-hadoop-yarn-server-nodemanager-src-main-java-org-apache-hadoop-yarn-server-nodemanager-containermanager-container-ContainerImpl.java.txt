@@ -1,0 +1,192 @@
+Merge branch 'trunk' into HADOOP-12756
+
+-  private final static class ReInitializationContext {
+-    private final ResourceSet resourceSet;
++  private static final class ReInitializationContext {
++    private final ResourceSet newResourceSet;
++
++    // Rollback state
++    private final ContainerLaunchContext oldLaunchContext;
++    private final ResourceSet oldResourceSet;
+-        ResourceSet resourceSet) {
++        ResourceSet newResourceSet,
++        ContainerLaunchContext oldLaunchContext,
++        ResourceSet oldResourceSet) {
+-      this.resourceSet = resourceSet;
++      this.newResourceSet = newResourceSet;
++      this.oldLaunchContext = oldLaunchContext;
++      this.oldResourceSet = oldResourceSet;
++    }
++
++    private boolean canRollback() {
++      return (oldLaunchContext != null);
++    }
++
++    private ResourceSet mergedResourceSet() {
++      if (oldLaunchContext == null) {
++        return newResourceSet;
++      }
++      return ResourceSet.merge(oldResourceSet, newResourceSet);
++    }
++
++    private ReInitializationContext createContextForRollback() {
++      if (oldLaunchContext == null) {
++        return null;
++      } else {
++        return new ReInitializationContext(
++            oldLaunchContext, oldResourceSet, null, null);
++      }
+-  private ReInitializationContext reInitContext;
++  private volatile ReInitializationContext reInitContext;
+-    this.containerRetryContext =
+-        configureRetryContext(conf, launchContext, this.containerId);
++    this.containerRetryContext = configureRetryContext(
++        conf, launchContext, this.containerId);
++            ContainerState.LOCALIZED,
++    .addTransition(ContainerState.RUNNING, ContainerState.REINITIALIZING,
++        ContainerEventType.ROLLBACK_REINIT,
++        new RollbackContainerTransition())
+-      container.reInitContext = createReInitContext(event);
++      container.reInitContext = createReInitContext(container, event);
+-            pendingResources =
+-            container.reInitContext.resourceSet.getAllResourcesByVisibility();
+-        if (!pendingResources.isEmpty()) {
++            resByVisibility = container.reInitContext.newResourceSet
++            .getAllResourcesByVisibility();
++        if (!resByVisibility.isEmpty()) {
+-                  container, pendingResources));
++                  container, resByVisibility));
+-        ContainerEvent event) {
+-      ContainerReInitEvent rEvent = (ContainerReInitEvent)event;
+-      return new ReInitializationContext(rEvent.getReInitLaunchContext(),
+-          rEvent.getResourceSet());
++        ContainerImpl container, ContainerEvent event) {
++      ContainerReInitEvent reInitEvent = (ContainerReInitEvent)event;
++      return new ReInitializationContext(
++          reInitEvent.getReInitLaunchContext(),
++          reInitEvent.getResourceSet(),
++          // If AutoCommit is turned on, then no rollback can happen...
++          // So don't need to store the previous context.
++          (reInitEvent.isAutoCommit() ? null : container.launchContext),
++          (reInitEvent.isAutoCommit() ? null : container.resourceSet));
++    }
++  }
++
++  /**
++   * Transition to start the Rollback process.
++   */
++  static class RollbackContainerTransition extends
++      ReInitializeContainerTransition {
++
++    @Override
++    protected ReInitializationContext createReInitContext(ContainerImpl
++        container, ContainerEvent event) {
++      LOG.warn("Container [" + container.getContainerId() + "]" +
++          " about to be explicitly Rolledback !!");
++      return container.reInitContext.createContextForRollback();
+-      container.reInitContext.resourceSet.resourceLocalized(
++      container.reInitContext.newResourceSet.resourceLocalized(
+-      if (container.reInitContext.resourceSet.getPendingResources()
++      if (container.reInitContext.newResourceSet.getPendingResources()
+-      if (container.reInitContext != null) {
++      container.setIsReInitializing(false);
++      // Check if this launch was due to a re-initialization.
++      // If autocommit == true, then wipe the re-init context. This ensures
++      // that any subsequent failures do not trigger a rollback.
++      if (container.reInitContext != null
++          && !container.reInitContext.canRollback()) {
+-        // Set rollback context here..
+-        container.setIsReInitializing(false);
+-        LOG.info("Relaunching Container " + container.getContainerId()
+-            + ". Remaining retry attempts(after relaunch) : "
+-            + container.remainingRetryAttempts
+-            + ". Interval between retries is "
+-            + container.containerRetryContext.getRetryInterval() + "ms");
+-        container.wasLaunched  = false;
+-        container.metrics.endRunningContainer();
+-        if (container.containerRetryContext.getRetryInterval() == 0) {
+-          container.sendRelaunchEvent();
+-        } else {
+-          // wait for some time, then send launch event
+-          new Thread() {
+-            @Override
+-            public void run() {
+-              try {
+-                Thread.sleep(
+-                    container.containerRetryContext.getRetryInterval());
+-                container.sendRelaunchEvent();
+-              } catch (InterruptedException e) {
+-                return;
+-              }
+-            }
+-          }.start();
+-        }
++        doRelaunch(container, container.remainingRetryAttempts,
++            container.containerRetryContext.getRetryInterval());
++      } else if (container.canRollback()) {
++        // Rollback is possible only if the previous launch context is
++        // available.
++        container.addDiagnostics("Container Re-init Auto Rolled-Back.");
++        LOG.info("Rolling back Container reInitialization for [" +
++            container.getContainerId() + "] !!");
++        container.reInitContext =
++            container.reInitContext.createContextForRollback();
++        new KilledForReInitializationTransition().transition(container, event);
++        return ContainerState.LOCALIZED;
++
++    private void doRelaunch(final ContainerImpl container,
++        int remainingRetryAttempts, final int retryInterval) {
++      LOG.info("Relaunching Container " + container.getContainerId()
++          + ". Remaining retry attempts(after relaunch) : "
++          + remainingRetryAttempts + ". Interval between retries is "
++          + retryInterval + "ms");
++      container.wasLaunched  = false;
++      container.metrics.endRunningContainer();
++      if (retryInterval == 0) {
++        container.sendRelaunchEvent();
++      } else {
++        // wait for some time, then send launch event
++        new Thread() {
++          @Override
++          public void run() {
++            try {
++              Thread.sleep(retryInterval);
++              container.sendRelaunchEvent();
++            } catch (InterruptedException e) {
++              return;
++            }
++          }
++        }.start();
++      }
++    }
++    return shouldRetry(errorCode, containerRetryContext,
++        remainingRetryAttempts);
++  }
++
++  public static boolean shouldRetry(int errorCode,
++      ContainerRetryContext retryContext, int remainingRetryAttempts) {
+-    ContainerRetryPolicy retryPolicy = containerRetryContext.getRetryPolicy();
++    ContainerRetryPolicy retryPolicy = retryContext.getRetryPolicy();
+-            && containerRetryContext.getErrorCodes() != null
+-            && containerRetryContext.getErrorCodes().contains(errorCode))) {
++        && retryContext.getErrorCodes() != null
++        && retryContext.getErrorCodes().contains(errorCode))) {
+-
+-          container.launchContext, container.containerId);
++              container.launchContext, container.containerId);
+-      container.resourceSet = ResourceSet.merge(
+-          container.resourceSet, container.reInitContext.resourceSet);
++      container.resourceSet = container.reInitContext.mergedResourceSet();
++
++  @Override
++  public boolean canRollback() {
++    return (this.reInitContext != null)
++        && (this.reInitContext.canRollback());
++  }
++
++  @Override
++  public void commitUpgrade() {
++    this.reInitContext = null;
++  }
+
+MOV23 INS55 INS31 INS31 INS31 INS83 INS42 INS23 INS23 INS31 INS31 INS31 INS83 INS29 INS83 INS42 INS43 INS31 INS31 MOV78 INS83 INS39 INS42 INS44 INS8 INS83 INS44 INS44 INS78 INS83 INS39 INS42 INS8 INS78 INS83 INS39 INS42 INS8 INS83 INS83 MOV43 INS59 INS83 INS83 INS43 INS59 INS43 INS44 INS44 INS83 INS39 INS42 INS8 INS83 INS43 INS42 INS8 INS83 INS43 INS42 INS8 INS44 INS65 INS42 INS78 INS83 INS43 INS42 INS44 INS44 INS8 INS83 INS39 INS42 INS44 INS44 INS44 INS8 INS39 INS42 INS41 INS43 INS42 INS39 INS42 INS42 INS41 INS42 INS21 INS42 INS42 INS42 INS42 UPD42 UPD42 INS43 INS42 INS43 INS42 INS21 INS21 INS41 INS42 INS25 INS41 INS42 INS25 INS43 INS42 INS66 INS42 INS42 INS43 INS42 INS43 INS42 INS21 INS41 MOV21 INS83 INS43 INS42 INS39 INS42 INS83 INS39 INS42 INS21 MOV21 MOV21 MOV25 INS32 INS42 INS27 INS7 INS42 INS42 INS7 INS7 INS36 INS27 INS8 INS32 INS27 INS8 INS8 INS42 INS42 INS42 INS32 INS32 INS27 INS25 INS42 INS32 INS42 INS42 INS42 INS42 INS36 INS36 INS22 INS33 UPD42 INS22 INS42 INS22 INS42 INS27 INS42 INS33 INS41 INS42 INS42 INS42 INS42 INS42 INS33 INS41 INS41 UPD42 INS36 INS36 INS42 INS42 INS27 INS40 INS42 UPD40 MOV27 INS38 MOV21 INS32 INS8 MOV8 INS42 INS42 INS27 INS42 UPD42 INS27 INS32 INS52 INS42 UPD42 INS52 INS42 INS52 INS42 INS42 INS33 INS42 INS33 INS14 INS42 UPD42 UPD42 INS16 INS16 INS45 INS32 INS45 INS45 UPD40 INS32 INS42 INS42 INS21 INS21 INS21 INS21 INS41 INS45 INS32 INS45 INS42 INS45 INS42 INS45 UPD40 INS42 INS22 INS33 INS22 INS42 INS43 INS42 INS42 INS33 INS33 UPD42 INS32 INS33 INS40 INS32 INS33 INS40 INS42 INS42 INS40 INS42 UPD42 UPD42 INS40 INS32 INS32 INS7 INS32 INS40 INS42 INS42 INS52 INS42 INS52 INS42 INS42 INS32 INS42 INS40 INS40 UPD40 UPD42 INS42 INS42 INS42 INS42 INS42 INS42 INS45 INS42 INS42 INS27 INS40 INS32 INS14 INS42 INS42 INS42 UPD42 MOV32 MOV42 MOV40 MOV40 INS40 INS42 INS45 MOV32 INS45 INS40 INS42 INS43 UPD42 UPD40 UPD40 MOV14 UPD42 INS42 UPD40 UPD40 UPD40 UPD40 UPD40 MOV14 UPD40 UPD40 MOV14 INS21 UPD40 UPD40 MOV14 INS32 UPD40 UPD40 INS42 INS42 INS42 UPD40 INS42 UPD40 UPD40 MOV14 UPD40 UPD40 MOV14 UPD40 UPD40 UPD40 UPD40 INS42 UPD40 UPD40 MOV14 UPD40 UPD40 UPD40 UPD40 INS42 UPD40 UPD40 MOV14 UPD40 UPD40 UPD40 MOV14 UPD40 UPD40 INS42 UPD40 UPD40 MOV14 UPD40 UPD40 MOV14 UPD40 UPD40 UPD40 MOV14 UPD40 UPD40 MOV14 UPD40 UPD40 INS42 UPD40 UPD40 MOV14 UPD40 UPD40 MOV14 UPD40 UPD40 MOV14 UPD40 UPD40 MOV14 UPD40 UPD40 UPD40 MOV14 UPD40 UPD40 MOV14 UPD40 UPD40 INS42 UPD40 MOV14 UPD40 MOV14 UPD40 UPD40 INS14 INS43 INS42 INS40 DEL83 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL45 DEL45 DEL40 DEL45 DEL40 DEL42 DEL32 DEL45 DEL27 DEL32 DEL21 DEL40 DEL42 DEL32 DEL42 DEL42 DEL40

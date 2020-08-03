@@ -1,0 +1,376 @@
+Merge r1360400 through r1399945 from trunk.
+
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/branches/HDFS-2802@1399950 13f79535-47bb-0310-9956-ffa450edef68
+
+-import java.util.List;
++import org.apache.hadoop.io.retry.RetryPolicy;
++import org.apache.hadoop.io.retry.RetryUtils;
++  private RetryPolicy retryPolicy = null;
++    this.retryPolicy = 
++        RetryUtils.getDefaultRetryPolicy(
++            conf, 
++            DFSConfigKeys.DFS_CLIENT_RETRY_POLICY_ENABLED_KEY, 
++            DFSConfigKeys.DFS_CLIENT_RETRY_POLICY_ENABLED_DEFAULT, 
++            DFSConfigKeys.DFS_CLIENT_RETRY_POLICY_SPEC_KEY,
++            DFSConfigKeys.DFS_CLIENT_RETRY_POLICY_SPEC_DEFAULT,
++            SafeModeException.class);
+-      final HttpURLConnection conn) throws IOException {
++      final HttpURLConnection conn, boolean unwrapException) throws IOException {
+-      } catch(IOException e) {
++      } catch(Exception e) {
+-      if (m.get(RemoteException.class.getSimpleName()) == null) {
++      if (m == null) {
++        throw new IOException("Unexpected HTTP response: code=" + code + " != "
++            + op.getExpectedHttpResponseCode() + ", " + op.toQueryString()
++            + ", message=" + conn.getResponseMessage());
++      } else if (m.get(RemoteException.class.getSimpleName()) == null) {
+-      throw re.unwrapRemoteException(AccessControlException.class,
+-          InvalidToken.class,
+-          AuthenticationException.class,
+-          AuthorizationException.class,
+-          FileAlreadyExistsException.class,
+-          FileNotFoundException.class,
+-          ParentNotDirectoryException.class,
+-          UnresolvedPathException.class,
+-          SafeModeException.class,
+-          DSQuotaExceededException.class,
+-          NSQuotaExceededException.class);
++      throw unwrapException? toIOException(re): re;
++   * Covert an exception to an IOException.
++   * 
++   * For a non-IOException, wrap it with IOException.
++   * For a RemoteException, unwrap it.
++   * For an IOException which is not a RemoteException, return it. 
++   */
++  private static IOException toIOException(Exception e) {
++    if (!(e instanceof IOException)) {
++      return new IOException(e);
++    }
++
++    final IOException ioe = (IOException)e;
++    if (!(ioe instanceof RemoteException)) {
++      return ioe;
++    }
++
++    final RemoteException re = (RemoteException)ioe;
++    return re.unwrapRemoteException(AccessControlException.class,
++        InvalidToken.class,
++        AuthenticationException.class,
++        AuthorizationException.class,
++        FileAlreadyExistsException.class,
++        FileNotFoundException.class,
++        ParentNotDirectoryException.class,
++        UnresolvedPathException.class,
++        SafeModeException.class,
++        DSQuotaExceededException.class,
++        NSQuotaExceededException.class);
++  }
++
++  /**
+-        || op == GetOpParam.Op.GETDELEGATIONTOKEN
+-        || op == GetOpParam.Op.GETDELEGATIONTOKENS) {
++        || op == GetOpParam.Op.GETDELEGATIONTOKEN) {
+-      throws IOException {
++      throws IOException, AuthenticationException {
+-    try {
+-      if (ugi.hasKerberosCredentials()) { 
+-        conn = new AuthenticatedURL(AUTH).openConnection(url, authToken);
+-      } else {
+-        conn = (HttpURLConnection)url.openConnection();
+-      }
+-    } catch (AuthenticationException e) {
+-      throw new IOException("Authentication failed, url=" + url, e);
++    if (ugi.hasKerberosCredentials()) { 
++      conn = new AuthenticatedURL(AUTH).openConnection(url, authToken);
++    } else {
++      conn = (HttpURLConnection)url.openConnection();
+-  
+-  private HttpURLConnection httpConnect(final HttpOpParam.Op op, final Path fspath,
+-      final Param<?,?>... parameters) throws IOException {
+-    final URL url = toUrl(op, fspath, parameters);
+-
+-    //connect and get response
+-    HttpURLConnection conn = getHttpUrlConnection(url);
+-    try {
+-      conn.setRequestMethod(op.getType().toString());
+-      if (op.getDoOutput()) {
+-        conn = twoStepWrite(conn, op);
+-        conn.setRequestProperty("Content-Type", "application/octet-stream");
+-      }
+-      conn.setDoOutput(op.getDoOutput());
+-      conn.connect();
+-      return conn;
+-    } catch (IOException e) {
+-      conn.disconnect();
+-      throw e;
+-    }
+-  }
+-  
+-  /**
+-   * Two-step Create/Append:
+-   * Step 1) Submit a Http request with neither auto-redirect nor data. 
+-   * Step 2) Submit another Http request with the URL from the Location header with data.
+-   * 
+-   * The reason of having two-step create/append is for preventing clients to
+-   * send out the data before the redirect. This issue is addressed by the
+-   * "Expect: 100-continue" header in HTTP/1.1; see RFC 2616, Section 8.2.3.
+-   * Unfortunately, there are software library bugs (e.g. Jetty 6 http server
+-   * and Java 6 http client), which do not correctly implement "Expect:
+-   * 100-continue". The two-step create/append is a temporary workaround for
+-   * the software library bugs.
+-   */
+-  static HttpURLConnection twoStepWrite(HttpURLConnection conn,
+-      final HttpOpParam.Op op) throws IOException {
+-    //Step 1) Submit a Http request with neither auto-redirect nor data. 
+-    conn.setInstanceFollowRedirects(false);
+-    conn.setDoOutput(false);
+-    conn.connect();
+-    validateResponse(HttpOpParam.TemporaryRedirectOp.valueOf(op), conn);
+-    final String redirect = conn.getHeaderField("Location");
+-    conn.disconnect();
+-
+-    //Step 2) Submit another Http request with the URL from the Location header with data.
+-    conn = (HttpURLConnection)new URL(redirect).openConnection();
+-    conn.setRequestMethod(op.getType().toString());
+-    return conn;
+-  }
+-    final HttpURLConnection conn = httpConnect(op, fspath, parameters);
+-    try {
+-      final Map<?, ?> m = validateResponse(op, conn);
+-      return m != null? m: jsonParse(conn, false);
+-    } finally {
+-      conn.disconnect();
++    return new Runner(op, fspath, parameters).run().json;
++  }
++
++  /**
++   * This class is for initialing a HTTP connection, connecting to server,
++   * obtaining a response, and also handling retry on failures.
++   */
++  class Runner {
++    private final HttpOpParam.Op op;
++    private final URL url;
++    private final boolean redirected;
++
++    private boolean checkRetry;
++    private HttpURLConnection conn = null;
++    private Map<?, ?> json = null;
++
++    Runner(final HttpOpParam.Op op, final URL url, final boolean redirected) {
++      this.op = op;
++      this.url = url;
++      this.redirected = redirected;
++    }
++
++    Runner(final HttpOpParam.Op op, final Path fspath,
++        final Param<?,?>... parameters) throws IOException {
++      this(op, toUrl(op, fspath, parameters), false);
++    }
++
++    Runner(final HttpOpParam.Op op, final HttpURLConnection conn) {
++      this(op, null, false);
++      this.conn = conn;
++    }
++
++    private void init() throws IOException {
++      checkRetry = !redirected;
++      try {
++        conn = getHttpUrlConnection(url);
++      } catch(AuthenticationException ae) {
++        checkRetry = false;
++        throw new IOException("Authentication failed, url=" + url, ae);
++      }
++    }
++    
++    private void connect() throws IOException {
++      connect(op.getDoOutput());
++    }
++
++    private void connect(boolean doOutput) throws IOException {
++      conn.setRequestMethod(op.getType().toString());
++      conn.setDoOutput(doOutput);
++      conn.setInstanceFollowRedirects(false);
++      conn.connect();
++    }
++
++    private void disconnect() {
++      if (conn != null) {
++        conn.disconnect();
++        conn = null;
++      }
++    }
++
++    Runner run() throws IOException {
++      for(int retry = 0; ; retry++) {
++        try {
++          init();
++          if (op.getDoOutput()) {
++            twoStepWrite();
++          } else {
++            getResponse(op != GetOpParam.Op.OPEN);
++          }
++          return this;
++        } catch(IOException ioe) {
++          shouldRetry(ioe, retry);
++        }
++      }
++    }
++
++    private void shouldRetry(final IOException ioe, final int retry
++        ) throws IOException {
++      if (checkRetry) {
++        try {
++          final RetryPolicy.RetryAction a = retryPolicy.shouldRetry(
++              ioe, retry, 0, true);
++          if (a.action == RetryPolicy.RetryAction.RetryDecision.RETRY) {
++            LOG.info("Retrying connect to namenode: " + nnAddr
++                + ". Already tried " + retry + " time(s); retry policy is "
++                + retryPolicy + ", delay " + a.delayMillis + "ms.");      
++            Thread.sleep(a.delayMillis);
++            return;
++          }
++        } catch(Exception e) {
++          LOG.warn("Original exception is ", ioe);
++          throw toIOException(e);
++        }
++      }
++      throw toIOException(ioe);
++    }
++
++    /**
++     * Two-step Create/Append:
++     * Step 1) Submit a Http request with neither auto-redirect nor data. 
++     * Step 2) Submit another Http request with the URL from the Location header with data.
++     * 
++     * The reason of having two-step create/append is for preventing clients to
++     * send out the data before the redirect. This issue is addressed by the
++     * "Expect: 100-continue" header in HTTP/1.1; see RFC 2616, Section 8.2.3.
++     * Unfortunately, there are software library bugs (e.g. Jetty 6 http server
++     * and Java 6 http client), which do not correctly implement "Expect:
++     * 100-continue". The two-step create/append is a temporary workaround for
++     * the software library bugs.
++     */
++    HttpURLConnection twoStepWrite() throws IOException {
++      //Step 1) Submit a Http request with neither auto-redirect nor data. 
++      connect(false);
++      validateResponse(HttpOpParam.TemporaryRedirectOp.valueOf(op), conn, false);
++      final String redirect = conn.getHeaderField("Location");
++      disconnect();
++      checkRetry = false;
++      
++      //Step 2) Submit another Http request with the URL from the Location header with data.
++      conn = (HttpURLConnection)new URL(redirect).openConnection();
++      conn.setRequestProperty("Content-Type", MediaType.APPLICATION_OCTET_STREAM);
++      conn.setChunkedStreamingMode(32 << 10); //32kB-chunk
++      connect();
++      return conn;
++    }
++
++    FSDataOutputStream write(final int bufferSize) throws IOException {
++      return WebHdfsFileSystem.this.write(op, conn, bufferSize);
++    }
++
++    void getResponse(boolean getJsonAndDisconnect) throws IOException {
++      try {
++        connect();
++        final int code = conn.getResponseCode();
++        if (!redirected && op.getRedirect()
++            && code != op.getExpectedHttpResponseCode()) {
++          final String redirect = conn.getHeaderField("Location");
++          json = validateResponse(HttpOpParam.TemporaryRedirectOp.valueOf(op),
++              conn, false);
++          disconnect();
++  
++          checkRetry = false;
++          conn = (HttpURLConnection)new URL(redirect).openConnection();
++          connect();
++        }
++
++        json = validateResponse(op, conn, false);
++        if (json == null && getJsonAndDisconnect) {
++          json = jsonParse(conn, false);
++        }
++      } finally {
++        if (getJsonAndDisconnect) {
++          disconnect();
++        }
++      }
+-            validateResponse(op, conn);
++            validateResponse(op, conn, true);
+-    final HttpURLConnection conn = httpConnect(op, f, 
++    return new Runner(op, f, 
+-        new BlockSizeParam(blockSize));
+-    return write(op, conn, bufferSize);
++        new BlockSizeParam(blockSize))
++      .run()
++      .write(bufferSize);
+-    final HttpURLConnection conn = httpConnect(op, f, 
+-        new BufferSizeParam(bufferSize));
+-    return write(op, conn, bufferSize);
++    return new Runner(op, f, new BufferSizeParam(bufferSize))
++      .run()
++      .write(bufferSize);
+-    /** The url with offset parameter */
+-    private URL offsetUrl;
+-  
+-    /** Open connection with offset url. */
++    /** Setup offset url and connect. */
+-    protected HttpURLConnection openConnection() throws IOException {
+-      return getHttpUrlConnection(offsetUrl);
+-    }
+-
+-    /** Setup offset url before open connection. */
+-    @Override
+-    protected HttpURLConnection openConnection(final long offset) throws IOException {
+-      offsetUrl = offset == 0L? url: new URL(url + "&" + new OffsetParam(offset));
+-      final HttpURLConnection conn = openConnection();
+-      conn.setRequestMethod("GET");
+-      return conn;
++    protected HttpURLConnection connect(final long offset,
++        final boolean resolved) throws IOException {
++      final URL offsetUrl = offset == 0L? url
++          : new URL(url + "&" + new OffsetParam(offset));
++      return new Runner(GetOpParam.Op.OPEN, offsetUrl, resolved).run().conn;
+-    
+-    @Override
+-    protected void checkResponseCode(final HttpURLConnection connection
+-        ) throws IOException {
+-      validateResponse(GetOpParam.Op.OPEN, connection);
+-    }
+-  @SuppressWarnings("deprecation")
+-  public Token<DelegationTokenIdentifier> getDelegationToken(final String renewer
+-      ) throws IOException {
++  public Token<DelegationTokenIdentifier> getDelegationToken(
++      final String renewer) throws IOException {
+-  public List<Token<?>> getDelegationTokens(final String renewer
+-      ) throws IOException {
+-    final HttpOpParam.Op op = GetOpParam.Op.GETDELEGATIONTOKENS;
+-    final Map<?, ?> m = run(op, null, new RenewerParam(renewer));
+-    final List<Token<?>> tokens = JsonUtil.toTokenList(m);
+-    for(Token<?> t : tokens) {
+-      SecurityUtil.setTokenService(t, nnAddr);
+-    }
+-    return tokens;
+-  }
+-
+-  @Override
+-        final Token<?> token, final Configuration conf
+-        ) throws IOException, InterruptedException, URISyntaxException {
++        final Token<?> token, final Configuration conf) throws IOException {
+-      try {
+-        WebHdfsFileSystem webhdfs = getWebHdfs(token, conf);
+-        return webhdfs.renewDelegationToken(token);
+-      } catch (URISyntaxException e) {
+-        throw new IOException(e);
+-      }
++      return getWebHdfs(token, conf).renewDelegationToken(token);
+-      try {
+-        final WebHdfsFileSystem webhdfs = getWebHdfs(token, conf);
+-        webhdfs.cancelDelegationToken(token);
+-      } catch (URISyntaxException e) {
+-        throw new IOException(e);
+-      }
++      getWebHdfs(token, conf).cancelDelegationToken(token);
+
+MOV26 INS26 INS40 UPD40 INS23 INS31 INS55 INS83 INS43 INS59 INS44 INS29 INS83 INS83 INS43 INS42 INS44 INS8 INS43 MOV8 INS29 INS42 INS23 INS23 INS23 INS23 INS23 INS23 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS31 MOV31 INS31 INS31 INS42 INS42 INS33 INS21 INS39 INS42 INS65 INS42 INS43 INS42 INS25 MOV60 INS25 MOV60 INS41 INS42 MOV60 MOV41 INS41 INS65 INS83 INS83 MOV43 INS59 INS83 INS83 MOV43 INS59 INS83 INS83 INS39 INS59 INS83 INS39 INS59 INS83 MOV43 INS59 INS83 MOV74 INS59 INS42 MOV44 INS44 INS44 INS8 INS42 MOV44 MOV44 MOV44 MOV43 INS8 INS42 INS44 INS44 INS8 INS83 INS39 INS42 INS43 INS8 INS83 INS39 INS42 INS43 INS8 INS83 INS39 INS42 INS44 MOV43 INS8 UPD83 MOV83 INS39 INS42 INS8 INS43 INS42 INS43 INS8 INS83 INS39 INS42 MOV44 INS44 MOV43 INS8 INS43 INS42 INS44 INS43 INS8 INS39 INS42 INS44 MOV43 INS8 UPD42 INS44 INS8 INS8 INS7 INS66 INS66 INS66 INS66 UPD42 MOV42 INS38 MOV8 INS43 INS38 INS8 INS83 UPD43 MOV32 MOV27 INS22 INS66 INS66 INS42 INS42 INS42 INS42 INS42 INS33 INS42 INS33 INS83 MOV43 INS42 INS83 INS39 INS42 MOV21 MOV21 INS21 INS17 INS83 INS43 INS42 INS83 INS43 INS42 INS17 MOV21 INS42 INS21 INS54 INS42 MOV21 INS39 UPD42 MOV42 MOV21 INS21 MOV21 MOV21 INS25 UPD42 MOV42 UPD42 MOV42 INS24 UPD43 UPD42 INS83 INS39 INS42 INS25 INS53 INS21 INS21 INS21 INS21 INS42 INS83 INS39 INS42 UPD42 MOV42 INS41 INS39 INS42 INS54 INS83 INS39 INS42 INS41 MOV60 MOV21 INS41 MOV60 MOV21 MOV21 INS22 INS32 INS25 INS53 INS36 INS41 INS42 UPD42 INS11 INS36 INS41 UPD42 INS42 INS11 INS32 INS42 INS7 INS7 INS42 MOV32 INS9 INS40 INS42 INS42 INS33 INS9 INS7 INS7 INS8 MOV12 INS32 INS27 MOV8 INS58 INS37 INS8 UPD42 INS42 INS8 INS32 INS7 INS32 INS32 INS32 INS32 INS8 INS8 MOV32 MOV32 UPD66 UPD43 INS22 INS32 INS52 INS42 INS42 INS42 INS42 INS40 INS40 INS40 INS40 INS57 INS27 INS8 MOV25 INS16 INS62 MOV14 MOV43 INS42 INS62 INS42 INS43 INS42 INS14 UPD42 MOV42 INS22 INS42 INS22 INS42 INS22 INS42 INS22 INS42 INS42 INS38 INS21 UPD42 INS42 INS42 INS42 INS42 INS33 INS21 INS39 INS59 INS42 INS54 INS54 INS42 INS42 UPD42 INS9 INS42 INS9 MOV42 UPD42 MOV42 INS45 INS40 UPD42 MOV42 UPD42 MOV42 INS27 UPD42 MOV42 INS52 UPD42 MOV42 MOV42 INS42 INS42 INS21 INS60 INS25 MOV21 INS25 INS25 INS14 INS42 INS14 INS42 UPD42 INS42 MOV16 INS32 INS42 MOV32 MOV42 MOV42 MOV32 INS43 INS42 INS33 MOV53 INS42 INS32 INS42 INS42 INS43 INS42 INS43 INS42 INS43 INS42 INS42 INS42 INS52 INS42 INS52 INS42 INS52 INS42 INS52 INS42 INS42 INS7 UPD42 INS21 INS7 INS42 INS34 INS8 INS12 INS8 INS12 INS34 INS34 INS42 INS32 INS83 INS39 INS59 INS27 INS8 INS7 INS27 INS8 INS42 INS8 INS43 INS42 INS42 MOV14 MOV14 MOV14 MOV14 MOV14 INS43 INS42 INS42 MOV14 INS14 INS42 UPD42 MOV42 INS42 INS43 INS14 INS42 INS42 INS42 INS42 INS42 INS42 MOV32 INS7 INS42 INS33 INS21 INS25 INS41 INS44 INS8 MOV60 INS25 INS44 INS8 INS42 INS42 INS32 INS38 INS32 INS27 INS60 INS21 INS21 INS21 INS21 INS21 INS42 INS32 INS27 INS42 INS21 INS21 INS42 INS42 INS43 INS40 INS42 INS42 INS42 MOV43 INS27 INS42 INS9 UPD42 INS32 MOV32 INS8 INS8 INS52 INS43 INS42 INS21 INS43 INS27 INS8 INS43 INS42 INS21 INS53 INS42 INS42 INS42 INS42 INS42 INS42 INS32 MOV83 INS43 INS59 INS7 INS32 INS7 INS7 INS32 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 INS9 INS42 INS33 INS7 INS32 INS42 INS45 INS42 INS45 INS32 INS45 INS32 INS45 INS32 INS42 INS21 INS21 INS42 INS32 INS40 UPD42 INS32 INS40 INS40 INS21 INS21 INS41 INS42 INS32 INS32 INS42 INS42 UPD42 MOV42 INS42 INS32 INS42 INS32 INS42 INS42 INS9 INS42 INS11 INS42 INS42 MOV32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS34 INS9 INS32 INS32 INS42 INS42 INS45 INS42 INS42 INS42 INS42 INS42 INS45 UPD42 MOV42 INS32 INS42 INS9 INS43 INS32 INS42 INS42 INS27 INS42 INS42 INS27 INS42 INS42 INS40 INS40 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 INS14 INS42 INS42 INS40 INS45 INS42 INS45 INS42 INS45 INS42 INS45 INS40 INS45 INS43 INS42 INS42 INS9 DEL53 DEL42 DEL42 DEL40 DEL27 DEL27 DEL54 DEL8 DEL83 DEL43 DEL42 DEL8 DEL25 DEL42 DEL41 DEL8 DEL44 DEL12 DEL54 DEL8 DEL31 DEL83 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL83 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL33 DEL27 DEL42 DEL16 DEL41 DEL8 DEL42 DEL42 DEL32 DEL21 DEL8 DEL54 DEL42 DEL42 DEL42 DEL42 DEL32 DEL42 DEL42 DEL45 DEL45 DEL32 DEL42 DEL42 DEL32 DEL42 DEL42 DEL53 DEL40 DEL83 DEL42 DEL43 DEL42 DEL44 DEL42 DEL42 DEL32 DEL32 DEL32 DEL21 DEL42 DEL32 DEL83 DEL42 DEL43 DEL42 DEL59 DEL60 DEL42 DEL42 DEL42 DEL42 DEL42 DEL83 DEL42 DEL43 DEL42 DEL59 DEL60 DEL42 DEL42 DEL42 DEL42 DEL42 DEL66 DEL65 DEL29 DEL83 DEL42 DEL59 DEL23 DEL66 DEL65 DEL29 DEL42 DEL78 DEL83 DEL42 DEL43 DEL42 DEL42 DEL42 DEL32 DEL41 DEL8 DEL31 DEL42 DEL7 DEL21 DEL42 DEL42 DEL32 DEL42 DEL42 DEL45 DEL32 DEL21 DEL42 DEL41 DEL42 DEL78 DEL83 DEL39 DEL42 DEL83 DEL42 DEL43 DEL42 DEL44 DEL42 DEL40 DEL42 DEL32 DEL21 DEL8 DEL31 DEL42 DEL45 DEL79 DEL42 DEL78 DEL43 DEL43 DEL76 DEL74 DEL74 DEL42 DEL83 DEL43 DEL76 DEL76 DEL74 DEL42 DEL33 DEL42 DEL43 DEL42 DEL14 DEL32 DEL59 DEL60 DEL43 DEL42 DEL43 DEL76 DEL74 DEL74 DEL42 DEL32 DEL59 DEL60 DEL43 DEL76 DEL74 DEL42 DEL44 DEL42 DEL8 DEL70 DEL42 DEL41 DEL8 DEL31 DEL42 DEL43 DEL42 DEL43 DEL42 DEL43 DEL42 DEL59 DEL60 DEL32 DEL41 DEL8 DEL42 DEL43 DEL42 DEL44 DEL12 DEL54 DEL8 DEL42 DEL83 DEL42 DEL43 DEL42 DEL59 DEL60 DEL8 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL14 DEL53 DEL8 DEL12 DEL54 DEL8

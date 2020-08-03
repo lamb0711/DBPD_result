@@ -1,0 +1,173 @@
+HDFS-14649. Add suspect probe for DeadNodeDetector. Contributed by Lisheng Sun.
+
++import com.google.common.annotations.VisibleForTesting;
++import static org.apache.hadoop.hdfs.client.HdfsClientConfigKeys.DFS_CLIENT_DEAD_NODE_DETECTION_PROBE_SUSPECT_NODE_INTERVAL_MS_DEFAULT;
++import static org.apache.hadoop.hdfs.client.HdfsClientConfigKeys.DFS_CLIENT_DEAD_NODE_DETECTION_PROBE_SUSPECT_NODE_INTERVAL_MS_KEY;
++import static org.apache.hadoop.hdfs.client.HdfsClientConfigKeys.DFS_CLIENT_DEAD_NODE_DETECTION_PROBE_SUSPECT_NODE_THREADS_DEFAULT;
++import static org.apache.hadoop.hdfs.client.HdfsClientConfigKeys.DFS_CLIENT_DEAD_NODE_DETECTION_PROBE_SUSPECT_NODE_THREADS_KEY;
++import static org.apache.hadoop.hdfs.client.HdfsClientConfigKeys.DFS_CLIENT_DEAD_NODE_DETECTION_SUSPECT_NODE_QUEUE_MAX_DEFAULT;
++import static org.apache.hadoop.hdfs.client.HdfsClientConfigKeys.DFS_CLIENT_DEAD_NODE_DETECTION_SUSPECT_NODE_QUEUE_MAX_KEY;
+-   * Record dead nodes by one DFSInputStream. When dead node is not used by one
+-   * DFSInputStream, remove it from dfsInputStreamNodes#DFSInputStream. If
+-   * DFSInputStream does not include any dead node, remove DFSInputStream from
+-   * dfsInputStreamNodes.
++   * Record suspect and dead nodes by one DFSInputStream. When node is not used
++   * by one DFSInputStream, remove it from suspectAndDeadNodes#DFSInputStream.
++   * If DFSInputStream does not include any node, remove DFSInputStream from
++   * suspectAndDeadNodes.
+-          dfsInputStreamNodes;
++          suspectAndDeadNodes;
++   * Interval time in milliseconds for probing suspect node behavior.
++   */
++  private long suspectNodeDetectInterval = 0;
++
++  /**
++   * The max queue size of probing suspect node.
++   */
++  private int maxSuspectNodesProbeQueueLen;
++
++  /**
++   * The suspect node probe queue.
++   */
++  private Queue<DatanodeInfo> suspectNodesProbeQueue;
++
++  /**
++   * The thread pool of probing suspect node.
++   */
++  private ExecutorService probeSuspectNodesThreadPool;
++
++  /**
++   * The scheduler thread of probing suspect node.
++   */
++  private Thread probeSuspectNodesSchedulerThr;
++
++  /**
+-    CHECK_DEAD
++    CHECK_DEAD, CHECK_SUSPECT
++  /**
++   * Disabled start probe suspect/dead thread for the testing.
++   */
++  private static volatile boolean disabledProbeThreadForTest = false;
++
+-    this.dfsInputStreamNodes =
++    this.suspectAndDeadNodes =
++    suspectNodeDetectInterval = conf.getLong(
++        DFS_CLIENT_DEAD_NODE_DETECTION_PROBE_SUSPECT_NODE_INTERVAL_MS_KEY,
++        DFS_CLIENT_DEAD_NODE_DETECTION_PROBE_SUSPECT_NODE_INTERVAL_MS_DEFAULT);
++    maxSuspectNodesProbeQueueLen =
++        conf.getInt(DFS_CLIENT_DEAD_NODE_DETECTION_SUSPECT_NODE_QUEUE_MAX_KEY,
++            DFS_CLIENT_DEAD_NODE_DETECTION_SUSPECT_NODE_QUEUE_MAX_DEFAULT);
++    this.suspectNodesProbeQueue =
++        new ArrayBlockingQueue<DatanodeInfo>(maxSuspectNodesProbeQueueLen);
++    int suspectNodeDetectDeadThreads = conf.getInt(
++        DFS_CLIENT_DEAD_NODE_DETECTION_PROBE_SUSPECT_NODE_THREADS_KEY,
++        DFS_CLIENT_DEAD_NODE_DETECTION_PROBE_SUSPECT_NODE_THREADS_DEFAULT);
++    probeSuspectNodesThreadPool = Executors.newFixedThreadPool(
++        suspectNodeDetectDeadThreads, new Daemon.DaemonFactory());
+-    startProbeScheduler();
++    if (!disabledProbeThreadForTest) {
++      startProbeScheduler();
++    }
++  @VisibleForTesting
++  static void disabledProbeThreadForTest() {
++    disabledProbeThreadForTest = true;
++  }
++
+-   * Start probe dead node thread.
++   * Start probe dead node and suspect node thread.
+-  private void startProbeScheduler() {
++  @VisibleForTesting
++  void startProbeScheduler() {
++
++    probeSuspectNodesSchedulerThr =
++            new Thread(new ProbeScheduler(this, ProbeType.CHECK_SUSPECT));
++    probeSuspectNodesSchedulerThr.setDaemon(true);
++    probeSuspectNodesSchedulerThr.start();
++    } else if (type == ProbeType.CHECK_SUSPECT) {
++      while ((datanodeInfo = suspectNodesProbeQueue.poll()) != null) {
++        if (probeInProg.containsKey(datanodeInfo.getDatanodeUuid())) {
++          continue;
++        }
++        probeInProg.put(datanodeInfo.getDatanodeUuid(), datanodeInfo);
++        Probe probe = new Probe(this, datanodeInfo, ProbeType.CHECK_SUSPECT);
++        probeSuspectNodesThreadPool.execute(probe);
++      }
+-        ProbeType type) {
++           ProbeType type) {
+-        LOG.info("Remove the node out from dead node list: {}. ",
++        LOG.info("Remove the node out from dead node list: {}.",
+-        removeNodeFromDeadNode(probe.getDatanodeInfo());
++        removeDeadNode(probe.getDatanodeInfo());
++      } else if (probe.getType() == ProbeType.CHECK_SUSPECT) {
++        LOG.debug("Remove the node out from suspect node list: {}.",
++            probe.getDatanodeInfo());
++        removeNodeFromDeadNodeDetector(probe.getDatanodeInfo());
++      }
++    } else {
++      if (probe.getType() == ProbeType.CHECK_SUSPECT) {
++        LOG.info("Add the node to dead node list: {}.",
++            probe.getDatanodeInfo());
++        addToDead(probe.getDatanodeInfo());
++  public Queue<DatanodeInfo> getSuspectNodesProbeQueue() {
++    return suspectNodesProbeQueue;
++  }
++
+-   * Add datanode in deadNodes and dfsInputStreamNodes. The node is considered
+-   * to dead node. The dead node is shared by all the DFSInputStreams in the
+-   * same client.
++   * Add datanode to suspectNodes and suspectAndDeadNodes.
+-        dfsInputStreamNodes.get(dfsInputStream);
++        suspectAndDeadNodes.get(dfsInputStream);
+-      dfsInputStreamNodes.putIfAbsent(dfsInputStream, datanodeInfos);
++      suspectAndDeadNodes.putIfAbsent(dfsInputStream, datanodeInfos);
+-    addToDead(datanodeInfo);
++    addSuspectNodeToDetect(datanodeInfo);
+-   * Remove dead node which is not used by any DFSInputStream from deadNodes.
+-   * @return new dead node shared by all DFSInputStreams.
++   * Add datanode to suspectNodes.
++  private boolean addSuspectNodeToDetect(DatanodeInfo datanodeInfo) {
++    return suspectNodesProbeQueue.offer(datanodeInfo);
++  }
++
++    /**
++     * Remove dead node which is not used by any DFSInputStream from deadNodes.
++     * @return new dead node shared by all DFSInputStreams.
++     */
+-    for (HashSet<DatanodeInfo> datanodeInfos : dfsInputStreamNodes.values()) {
++    for (HashSet<DatanodeInfo> datanodeInfos : suspectAndDeadNodes.values()) {
+-   * Remove dead node from dfsInputStreamNodes#dfsInputStream. If
+-   * dfsInputStreamNodes#dfsInputStream does not contain any dead node, remove
+-   * it from dfsInputStreamNodes.
++   * Remove suspect and dead node from suspectAndDeadNodes#dfsInputStream and
++   *  local deadNodes.
+-    Set<DatanodeInfo> datanodeInfos = dfsInputStreamNodes.get(dfsInputStream);
++    Set<DatanodeInfo> datanodeInfos = suspectAndDeadNodes.get(dfsInputStream);
++      dfsInputStream.removeFromLocalDeadNodes(datanodeInfo);
+-        dfsInputStreamNodes.remove(dfsInputStream);
++        suspectAndDeadNodes.remove(dfsInputStream);
+-   * Remove dead node from dfsInputStreamNodes#dfsInputStream and deadNodes.
++   * Remove suspect and dead node from suspectAndDeadNodes#dfsInputStream and
++   *  local deadNodes.
+-  public synchronized void removeNodeFromDeadNode(DatanodeInfo datanodeInfo) {
++  private synchronized void removeNodeFromDeadNodeDetector(
++      DatanodeInfo datanodeInfo) {
+-            dfsInputStreamNodes.entrySet()) {
++            suspectAndDeadNodes.entrySet()) {
++        if (datanodeInfos.isEmpty()) {
++          suspectAndDeadNodes.remove(dfsInputStream);
++        }
++  }
++  /**
++   * Remove suspect and dead node from suspectAndDeadNodes#dfsInputStream and
++   * deadNodes.
++   */
++  private void removeDeadNode(DatanodeInfo datanodeInfo) {
++    removeNodeFromDeadNodeDetector(datanodeInfo);
+-        probeSleep(deadNodeDetector.deadNodeDetectInterval);
++        if (type == ProbeType.CHECK_SUSPECT) {
++          probeSleep(deadNodeDetector.suspectNodeDetectInterval);
++        } else {
++          probeSleep(deadNodeDetector.deadNodeDetectInterval);
++        }
+
+INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS23 INS23 INS23 INS23 INS23 INS23 INS31 INS31 INS31 INS31 INS29 INS83 INS39 INS59 INS29 INS83 INS39 INS59 INS29 INS83 INS74 INS59 INS29 INS83 INS43 INS59 INS29 INS83 INS43 INS59 INS72 INS29 INS83 INS83 INS83 INS39 INS59 INS78 INS83 INS39 INS42 INS8 INS78 INS83 INS74 INS42 INS8 INS29 INS83 INS39 INS42 INS44 INS8 UPD83 UPD42 INS29 INS83 INS39 INS42 INS44 INS8 UPD42 INS65 INS42 INS34 INS65 INS42 INS65 INS43 INS43 INS42 INS65 INS42 INS42 INS65 INS42 INS42 INS42 INS65 INS42 INS9 INS21 INS21 INS21 INS60 INS21 INS25 INS42 INS21 INS42 INS21 INS21 INS21 INS43 INS43 INS41 INS65 INS43 INS42 INS41 INS65 INS43 INS42 INS21 MOV21 UPD66 UPD66 UPD66 UPD66 INS66 INS66 INS66 INS42 INS42 INS66 INS66 INS66 INS7 INS7 INS7 INS39 INS59 INS7 INS38 INS8 INS7 UPD66 INS7 INS32 INS32 INS25 INS8 INS42 INS42 INS42 UPD66 INS66 INS42 INS32 UPD66 UPD66 UPD66 INS66 INS66 INS66 INS42 INS32 INS42 INS32 INS42 INS32 INS22 INS14 INS42 INS32 INS42 INS32 INS42 MOV21 INS42 INS9 INS42 INS14 INS42 INS42 INS9 INS42 INS42 INS27 INS8 INS25 UPD42 INS42 INS42 INS42 UPD42 INS21 UPD42 INS42 INS42 UPD42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS52 INS42 INS74 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS14 INS43 INS14 INS42 INS40 INS61 INS25 INS27 INS8 UPD42 UPD42 INS32 INS25 INS43 INS43 INS43 INS42 INS43 INS52 INS40 INS27 INS8 INS27 INS8 INS32 INS40 INS21 INS21 UPD42 INS42 INS42 INS42 INS25 INS27 INS8 INS8 INS42 INS42 INS40 INS42 INS36 INS33 INS25 INS21 INS60 INS21 INS32 INS40 INS21 INS21 INS42 INS42 INS32 INS32 INS32 INS8 INS42 INS40 INS21 MOV21 INS7 INS32 INS8 INS32 INS43 INS59 INS32 UPD45 UPD42 INS42 INS42 INS32 INS32 INS42 INS42 INS45 INS32 INS42 INS32 UPD42 INS42 INS42 INS21 INS32 INS42 INS32 INS42 INS42 INS32 INS18 INS42 INS42 INS32 INS42 INS42 INS42 INS14 INS42 INS42 INS42 INS42 INS42 INS45 INS32 INS42 INS32 INS42 INS42 INS42 INS42 INS32 INS42 INS40 INS42 INS42 INS42 INS42 INS42 INS42 INS43 INS52 INS42 INS40 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 DEL83 DEL66 DEL66 DEL66

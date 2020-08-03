@@ -1,0 +1,271 @@
+YARN-4062. Add the flush and compaction functionality via coprocessors and scanners for flow run table (Vrushali C via sjlee)
+
++import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.hbase.coprocessor.RegionCoprocessorEnvironment;
++import org.apache.hadoop.yarn.conf.YarnConfiguration;
++import org.apache.hadoop.yarn.server.timelineservice.storage.common.TimestampGenerator;
++
++import com.google.common.annotations.VisibleForTesting;
++  /**
++   * use a special application id to represent the flow id this is needed since
++   * TimestampGenerator parses the app id to generate a cell timestamp.
++   */
++  private static final String FLOW_APP_ID = "application_00000000000_0000";
++
+-  private RegionScanner regionScanner;
++  private final long appFinalValueRetentionThreshold;
++  private RegionScanner regionScanner;
++  private FlowScannerOperation action = FlowScannerOperation.READ;
+-  FlowScanner(HRegion region, int limit, InternalScanner internalScanner) {
+-    this.region = region;
++  FlowScanner(RegionCoprocessorEnvironment env, int limit,
++      InternalScanner internalScanner, FlowScannerOperation action) {
+-    // TODO: note if it's compaction/flush
++    this.action = action;
++    if (env == null) {
++      this.appFinalValueRetentionThreshold =
++          YarnConfiguration.DEFAULT_APP_FINAL_VALUE_RETENTION_THRESHOLD;
++      this.region = null;
++    } else {
++      this.region = env.getRegion();
++      Configuration hbaseConf = env.getConfiguration();
++      this.appFinalValueRetentionThreshold = hbaseConf.getLong(
++          YarnConfiguration.APP_FINAL_VALUE_RETENTION_THRESHOLD,
++          YarnConfiguration.DEFAULT_APP_FINAL_VALUE_RETENTION_THRESHOLD);
++    }
+-  private String getAggregationCompactionDimension(List<Tag> tags) {
+-    String appId = null;
+-    for (Tag t : tags) {
+-      if (AggregationCompactionDimension.APPLICATION_ID.getTagType() == t
+-          .getType()) {
+-        appId = Bytes.toString(t.getValue());
+-      }
+-    }
+-    return appId;
+-  }
+-
++  @SuppressWarnings("deprecation")
++    long currentTimestamp = System.currentTimeMillis();
+-    while (((cell = peekAtNextCell(cellLimit)) != null)
+-        && (cellLimit <= 0 || addedCnt < cellLimit)) {
++    while (cellLimit <= 0 || addedCnt < cellLimit) {
++      cell = peekAtNextCell(cellLimit);
++      if (cell == null) {
++        break;
++      }
+-              (NumericValueConverter)converter);
++              (NumericValueConverter)converter, currentTimestamp);
+-      emitCells(cells, currentColumnCells, currentAggOp,
+-          (NumericValueConverter)converter);
++      addedCnt += emitCells(cells, currentColumnCells, currentAggOp,
++          (NumericValueConverter)converter, currentTimestamp);
++      if (LOG.isDebugEnabled()) {
++        if (addedCnt > 0) {
++          LOG.debug("emitted cells. " + addedCnt + " for " + this.action
++              + " rowKey="
++              + FlowRunRowKey.parseRowKey(cells.get(0).getRow()).toString());
++        } else {
++          LOG.debug("emitted no cells for " + this.action);
++        }
++      }
+-    case MIN:
++    case GLOBAL_MIN:
+-    case MAX:
++    case GLOBAL_MAX:
++      if (LOG.isTraceEnabled()) {
++        LOG.trace("In collect cells "
++            + " FlowSannerOperation="
++            + this.action
++            + " currentAggOp="
++            + currentAggOp
++            + " cell qualifier="
++            + Bytes.toString(CellUtil.cloneQualifier(cell))
++            + " cell value= "
++            + (Number) converter.decodeValue(CellUtil.cloneValue(cell))
++            + " timestamp=" + cell.getTimestamp());
++      }
++
+-      String aggDim = getAggregationCompactionDimension(tags);
+-
+-      // If this agg dimension has already been seen, since they show up in
+-      // sorted order, we drop the rest which are older. In other words, this
+-      // cell is older than previously seen cells for that agg dim.
++      String aggDim = TimelineStorageUtils
++          .getAggregationCompactionDimension(tags);
+-        // Not seen this agg dim, hence consider this cell in our working set
++        // if this agg dimension has already been seen,
++        // since they show up in sorted order
++        // we drop the rest which are older
++        // in other words, this cell is older than previously seen cells
++        // for that agg dim
++        // but when this agg dim is not seen,
++        // consider this cell in our working set
+-      AggregationOperation currentAggOp, NumericValueConverter converter)
+-      throws IOException {
++      AggregationOperation currentAggOp, NumericValueConverter converter,
++      long currentTimestamp) throws IOException {
++    if (LOG.isTraceEnabled()) {
++      LOG.trace("In emitCells " + this.action + " currentColumnCells size= "
++          + currentColumnCells.size() + " currentAggOp" + currentAggOp);
++    }
+-    case MIN:
+-    case MAX:
++    case GLOBAL_MIN:
++    case GLOBAL_MAX:
+-      Cell sumCell = processSummation(currentColumnCells, converter);
+-      cells.add(sumCell);
+-      return 1;
++      switch (action) {
++      case FLUSH:
++      case MINOR_COMPACTION:
++        cells.addAll(currentColumnCells);
++        return currentColumnCells.size();
++      case READ:
++        Cell sumCell = processSummation(currentColumnCells, converter);
++        cells.add(sumCell);
++        return 1;
++      case MAJOR_COMPACTION:
++        List<Cell> finalCells = processSummationMajorCompaction(
++            currentColumnCells, converter, currentTimestamp);
++        cells.addAll(finalCells);
++        return finalCells.size();
++      default:
++        cells.addAll(currentColumnCells);
++        return currentColumnCells.size();
++      }
+-    Cell sumCell = createNewCell(mostRecentCell, sumBytes);
++    Cell sumCell = TimelineStorageUtils.createNewCell(mostRecentCell, sumBytes);
++
++  /**
++   * Returns a list of cells that contains
++   *
++   * A) the latest cells for applications that haven't finished yet
++   * B) summation
++   * for the flow, based on applications that have completed and are older than
++   * a certain time
++   *
++   * The new cell created has the timestamp of the most recent metric cell. The
++   * sum of a metric for a flow run is the summation at the point of the last
++   * metric update in that flow till that time.
++   */
++  @VisibleForTesting
++  List<Cell> processSummationMajorCompaction(
++      SortedSet<Cell> currentColumnCells, NumericValueConverter converter,
++      long currentTimestamp)
++      throws IOException {
++    Number sum = 0;
++    Number currentValue = 0;
++    long ts = 0L;
++    boolean summationDone = false;
++    List<Cell> finalCells = new ArrayList<Cell>();
++    if (currentColumnCells == null) {
++      return finalCells;
++    }
++
++    if (LOG.isDebugEnabled()) {
++      LOG.debug("In processSummationMajorCompaction,"
++          + " will drop cells older than " + currentTimestamp
++          + " CurrentColumnCells size=" + currentColumnCells.size());
++    }
++
++    for (Cell cell : currentColumnCells) {
++      AggregationOperation cellAggOp = getCurrentAggOp(cell);
++      // if this is the existing flow sum cell
++      List<Tag> tags = Tag.asList(cell.getTagsArray(), cell.getTagsOffset(),
++          cell.getTagsLength());
++      String appId = TimelineStorageUtils
++          .getAggregationCompactionDimension(tags);
++      if (appId == FLOW_APP_ID) {
++        sum = converter.add(sum, currentValue);
++        summationDone = true;
++        if (LOG.isTraceEnabled()) {
++          LOG.trace("reading flow app id sum=" + sum);
++        }
++      } else {
++        currentValue = (Number) converter.decodeValue(CellUtil
++            .cloneValue(cell));
++        // read the timestamp truncated by the generator
++        ts =  TimestampGenerator.getTruncatedTimestamp(cell.getTimestamp());
++        if ((cellAggOp == AggregationOperation.SUM_FINAL)
++            && ((ts + this.appFinalValueRetentionThreshold)
++                < currentTimestamp)) {
++          sum = converter.add(sum, currentValue);
++          summationDone = true;
++          if (LOG.isTraceEnabled()) {
++            LOG.trace("MAJOR COMPACTION loop sum= " + sum
++                + " discarding now: " + " qualifier="
++                + Bytes.toString(CellUtil.cloneQualifier(cell)) + " value="
++                + (Number) converter.decodeValue(CellUtil.cloneValue(cell))
++                + " timestamp=" + cell.getTimestamp() + " " + this.action);
++          }
++        } else {
++          // not a final value but it's the latest cell for this app
++          // so include this cell in the list of cells to write back
++          finalCells.add(cell);
++        }
++      }
++    }
++    if (summationDone) {
++      Cell anyCell = currentColumnCells.first();
++      List<Tag> tags = new ArrayList<Tag>();
++      Tag t = new Tag(AggregationOperation.SUM_FINAL.getTagType(),
++          Bytes.toBytes(FLOW_APP_ID));
++      tags.add(t);
++      t = new Tag(AggregationCompactionDimension.APPLICATION_ID.getTagType(),
++          Bytes.toBytes(FLOW_APP_ID));
++      tags.add(t);
++      byte[] tagByteArray = Tag.fromList(tags);
++      Cell sumCell = TimelineStorageUtils.createNewCell(
++          CellUtil.cloneRow(anyCell),
++          CellUtil.cloneFamily(anyCell),
++          CellUtil.cloneQualifier(anyCell),
++          TimestampGenerator.getSupplementedTimestamp(
++              System.currentTimeMillis(), FLOW_APP_ID),
++              converter.encodeValue(sum), tagByteArray);
++      finalCells.add(sumCell);
++      if (LOG.isTraceEnabled()) {
++        LOG.trace("MAJOR COMPACTION final sum= " + sum + " for "
++            + Bytes.toString(CellUtil.cloneQualifier(sumCell))
++            + " " + this.action);
++      }
++      LOG.info("After major compaction for qualifier="
++          + Bytes.toString(CellUtil.cloneQualifier(sumCell))
++          + " with currentColumnCells.size="
++          + currentColumnCells.size()
++          + " returning finalCells.size=" + finalCells.size()
++          + " with sum=" + sum.longValue()
++          + " with cell timestamp " + sumCell.getTimestamp());
++    } else {
++      String qualifier = "";
++      LOG.info("After major compaction for qualifier=" + qualifier
++          + " with currentColumnCells.size="
++          + currentColumnCells.size()
++          + " returning finalCells.size=" + finalCells.size()
++          + " with zero sum="
++          + sum.longValue());
++    }
++    return finalCells;
++  }
++
+-      case MIN:
++      case GLOBAL_MIN:
+-      case MAX:
++      case GLOBAL_MAX:
+-  private Cell createNewCell(Cell origCell, byte[] newValue)
+-      throws IOException {
+-    return CellUtil.createCell(CellUtil.cloneRow(origCell),
+-        CellUtil.cloneFamily(origCell), CellUtil.cloneQualifier(origCell),
+-        origCell.getTimestamp(), KeyValue.Type.Put.getCode(), newValue);
+-  }
+-
+-    flowRunScanner.close();
++    if (flowRunScanner != null) {
++      flowRunScanner.close();
++    } else {
++      LOG.warn("scanner close called but scanner is null");
++    }
+-   *
+-   * @return true, if there are more cells to return, false otherwise.
+-   * @throws IOException if any problem is encountered while grabbing the next
+-   *     cell.
++   * @throws IOException

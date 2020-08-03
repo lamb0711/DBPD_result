@@ -1,0 +1,206 @@
+MAPREDUCE-5787. Added the ability to keep alive shuffle connections in the MapReduce shuffle-handler. Contributed by Rajesh Balamohan.
+
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/trunk@1580062 13f79535-47bb-0310-9956-ffa450edef68
+
+-import static org.jboss.netty.handler.codec.http.HttpResponseStatus.HTTP_VERSION_NOT_SUPPORTED;
++import java.util.HashMap;
++import org.mortbay.jetty.HttpHeaders;
++  public static final String SHUFFLE_CONNECTION_KEEP_ALIVE_ENABLED =
++      "mapreduce.shuffle.connection-keep-alive.enable";
++  public static final boolean DEFAULT_SHUFFLE_CONNECTION_KEEP_ALIVE_ENABLED = false;
++
++  public static final String SHUFFLE_CONNECTION_KEEP_ALIVE_TIME_OUT =
++      "mapreduce.shuffle.connection-keep-alive.timeout";
++  public static final int DEFAULT_SHUFFLE_CONNECTION_KEEP_ALIVE_TIME_OUT = 5; //seconds
++
++  public static final String SHUFFLE_MAPOUTPUT_META_INFO_CACHE_SIZE =
++      "mapreduce.shuffle.mapoutput-info.meta.cache.size";
++  public static final int DEFAULT_SHUFFLE_MAPOUTPUT_META_INFO_CACHE_SIZE =
++      1000;
++
++  public static final String CONNECTION_CLOSE = "close";
++
++  boolean connectionKeepAliveEnabled = false;
++  int connectionKeepAliveTimeOut;
++  int mapOutputMetaInfoCacheSize;
++    connectionKeepAliveEnabled =
++        conf.getBoolean(SHUFFLE_CONNECTION_KEEP_ALIVE_ENABLED,
++          DEFAULT_SHUFFLE_CONNECTION_KEEP_ALIVE_ENABLED);
++    connectionKeepAliveTimeOut =
++        Math.max(1, conf.getInt(SHUFFLE_CONNECTION_KEEP_ALIVE_TIME_OUT,
++          DEFAULT_SHUFFLE_CONNECTION_KEEP_ALIVE_TIME_OUT));
++    mapOutputMetaInfoCacheSize =
++        Math.max(1, conf.getInt(SHUFFLE_MAPOUTPUT_META_INFO_CACHE_SIZE,
++          DEFAULT_SHUFFLE_MAPOUTPUT_META_INFO_CACHE_SIZE));
++      final List<String> keepAliveList = q.get("keepAlive");
++      boolean keepAliveParam = false;
++      if (keepAliveList != null && keepAliveList.size() == 1) {
++        keepAliveParam = Boolean.valueOf(keepAliveList.get(0));
++        if (LOG.isDebugEnabled()) {
++          LOG.debug("KeepAliveParam : " + keepAliveList
++            + " : " + keepAliveParam);
++        }
++      }
+-            "\n  jobId: " + jobQ);
++            "\n  jobId: " + jobQ +
++            "\n  keepAlive: " + keepAliveParam);
++      Map<String, MapOutputInfo> mapOutputInfoMap =
++          new HashMap<String, MapOutputInfo>();
++      String user = userRsrc.get(jobId);
++
++      // $x/$user/appcache/$appId/output/$mapId
++      // TODO: Once Shuffle is out of NM, this can use MR APIs to convert
++      // between App and Job
++      String outputBasePathStr = getBaseLocation(jobId, user);
++
++      try {
++        populateHeaders(mapIds, outputBasePathStr, user, reduceId, request,
++          response, keepAliveParam, mapOutputInfoMap);
++      } catch(IOException e) {
++        ch.write(response);
++        LOG.error("Shuffle error in populating headers :", e);
++        String errorMessage = getErrorMessage(e);
++        sendError(ctx,errorMessage , INTERNAL_SERVER_ERROR);
++        return;
++      }
++          MapOutputInfo info = mapOutputInfoMap.get(mapId);
++          if (info == null) {
++            info = getMapOutputInfo(outputBasePathStr, mapId, reduceId, user);
++          }
+-            sendMapOutput(ctx, ch, userRsrc.get(jobId), jobId, mapId, reduceId);
++              sendMapOutput(ctx, ch, user, mapId,
++                reduceId, info);
+-          StringBuffer sb = new StringBuffer(e.getMessage());
+-          Throwable t = e;
+-          while (t.getCause() != null) {
+-            sb.append(t.getCause().getMessage());
+-            t = t.getCause();
+-          }
+-          sendError(ctx,sb.toString() , INTERNAL_SERVER_ERROR);
++          String errorMessage = getErrorMessage(e);
++          sendError(ctx,errorMessage , INTERNAL_SERVER_ERROR);
++    private String getErrorMessage(Throwable t) {
++      StringBuffer sb = new StringBuffer(t.getMessage());
++      while (t.getCause() != null) {
++        sb.append(t.getCause().getMessage());
++        t = t.getCause();
++      }
++      return sb.toString();
++    }
++
++    private String getBaseLocation(String jobId, String user) {
++      final JobID jobID = JobID.forName(jobId);
++      final ApplicationId appID =
++          ApplicationId.newInstance(Long.parseLong(jobID.getJtIdentifier()),
++            jobID.getId());
++      final String baseStr =
++          ContainerLocalizer.USERCACHE + "/" + user + "/"
++              + ContainerLocalizer.APPCACHE + "/"
++              + ConverterUtils.toString(appID) + "/output" + "/";
++      return baseStr;
++    }
++
++    protected MapOutputInfo getMapOutputInfo(String base, String mapId,
++        int reduce, String user) throws IOException {
++      // Index file
++      Path indexFileName =
++          lDirAlloc.getLocalPathToRead(base + "/file.out.index", conf);
++      IndexRecord info =
++          indexCache.getIndexInformation(mapId, reduce, indexFileName, user);
++
++      Path mapOutputFileName =
++          lDirAlloc.getLocalPathToRead(base + "/file.out", conf);
++      if (LOG.isDebugEnabled()) {
++        LOG.debug(base + " : " + mapOutputFileName + " : " + indexFileName);
++      }
++      MapOutputInfo outputInfo = new MapOutputInfo(mapOutputFileName, info);
++      return outputInfo;
++    }
++
++    protected void populateHeaders(List<String> mapIds, String outputBaseStr,
++        String user, int reduce, HttpRequest request, HttpResponse response,
++        boolean keepAliveParam, Map<String, MapOutputInfo> mapOutputInfoMap)
++        throws IOException {
++
++      long contentLength = 0;
++      for (String mapId : mapIds) {
++        String base = outputBaseStr + mapId;
++        MapOutputInfo outputInfo = getMapOutputInfo(base, mapId, reduce, user);
++        if (mapOutputInfoMap.size() < mapOutputMetaInfoCacheSize) {
++          mapOutputInfoMap.put(mapId, outputInfo);
++        }
++        // Index file
++        Path indexFileName =
++            lDirAlloc.getLocalPathToRead(base + "/file.out.index", conf);
++        IndexRecord info =
++            indexCache.getIndexInformation(mapId, reduce, indexFileName, user);
++        ShuffleHeader header =
++            new ShuffleHeader(mapId, info.partLength, info.rawLength, reduce);
++        DataOutputBuffer dob = new DataOutputBuffer();
++        header.write(dob);
++
++        contentLength += info.partLength;
++        contentLength += dob.getLength();
++      }
++
++      // Now set the response headers.
++      setResponseHeaders(response, keepAliveParam, contentLength);
++    }
++
++    protected void setResponseHeaders(HttpResponse response,
++        boolean keepAliveParam, long contentLength) {
++      if (!connectionKeepAliveEnabled && !keepAliveParam) {
++        LOG.info("Setting connection close header...");
++        response.setHeader(HttpHeaders.CONNECTION, CONNECTION_CLOSE);
++      } else {
++        response.setHeader(HttpHeaders.CONTENT_LENGTH,
++          String.valueOf(contentLength));
++        response.setHeader(HttpHeaders.CONNECTION, HttpHeaders.KEEP_ALIVE);
++        response.setHeader(HttpHeaders.KEEP_ALIVE, "timeout="
++            + connectionKeepAliveTimeOut);
++        LOG.info("Content Length in shuffle : " + contentLength);
++      }
++    }
++
++    class MapOutputInfo {
++      final Path mapOutputFileName;
++      final IndexRecord indexRecord;
++
++      MapOutputInfo(Path mapOutputFileName, IndexRecord indexRecord) {
++        this.mapOutputFileName = mapOutputFileName;
++        this.indexRecord = indexRecord;
++      }
++    }
++
+-        String user, String jobId, String mapId, int reduce)
++        String user, String mapId, int reduce, MapOutputInfo mapOutputInfo)
+-      // TODO replace w/ rsrc alloc
+-      // $x/$user/appcache/$appId/output/$mapId
+-      // TODO: Once Shuffle is out of NM, this can use MR APIs to convert between App and Job
+-      JobID jobID = JobID.forName(jobId);
+-      ApplicationId appID = ApplicationId.newInstance(
+-          Long.parseLong(jobID.getJtIdentifier()), jobID.getId());
+-      final String base =
+-          ContainerLocalizer.USERCACHE + "/" + user + "/"
+-              + ContainerLocalizer.APPCACHE + "/"
+-              + ConverterUtils.toString(appID) + "/output" + "/" + mapId;
+-      if (LOG.isDebugEnabled()) {
+-        LOG.debug("DEBUG0 " + base);
+-      }
+-      // Index file
+-      Path indexFileName = lDirAlloc.getLocalPathToRead(
+-          base + "/file.out.index", conf);
+-      // Map-output file
+-      Path mapOutputFileName = lDirAlloc.getLocalPathToRead(
+-          base + "/file.out", conf);
+-      if (LOG.isDebugEnabled()) {
+-        LOG.debug("DEBUG1 " + base + " : " + mapOutputFileName + " : "
+-            + indexFileName);
+-      }
+-      final IndexRecord info = 
+-        indexCache.getIndexInformation(mapId, reduce, indexFileName, user);
++      final IndexRecord info = mapOutputInfo.indexRecord;
+-      final File spillfile = new File(mapOutputFileName.toString());
++      final File spillfile =
++          new File(mapOutputInfo.mapOutputFileName.toString());

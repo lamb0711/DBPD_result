@@ -1,0 +1,208 @@
+YARN-4696. Improving EntityGroupFSTimelineStore on exception handling, test setup, and concurrency. (Steve Loughran via gtcarrera9)
+
+-import org.apache.hadoop.service.AbstractService;
++import org.apache.hadoop.service.CompositeService;
++import org.apache.hadoop.service.ServiceOperations;
++import java.lang.reflect.UndeclaredThrowableException;
++import java.util.concurrent.atomic.AtomicBoolean;
+-public class EntityGroupFSTimelineStore extends AbstractService
++public class EntityGroupFSTimelineStore extends CompositeService
++  private AtomicBoolean stopExecutors = new AtomicBoolean(false);
+-    summaryStore.init(conf);
++    addService(summaryStore);
++
+-    yarnClient = YarnClient.createYarnClient();
+-    yarnClient.init(conf);
++    yarnClient = createAndInitYarnClient(conf);
++    // if non-null, hook its lifecycle up
++    addIfService(yarnClient);
++    activeRootPath = new Path(conf.get(
++        YarnConfiguration.TIMELINE_SERVICE_ENTITYGROUP_FS_STORE_ACTIVE_DIR,
++        YarnConfiguration
++            .TIMELINE_SERVICE_ENTITYGROUP_FS_STORE_ACTIVE_DIR_DEFAULT));
++    doneRootPath = new Path(conf.get(
++        YarnConfiguration.TIMELINE_SERVICE_ENTITYGROUP_FS_STORE_DONE_DIR,
++        YarnConfiguration
++            .TIMELINE_SERVICE_ENTITYGROUP_FS_STORE_DONE_DIR_DEFAULT));
++    fs = activeRootPath.getFileSystem(conf);
+-    Collection<String> pluginNames = conf.getStringCollection(
++    Collection<String> pluginNames = conf.getTrimmedStringCollection(
++    Exception caught = null;
++        caught = e;
+-        throw new RuntimeException("No class defined for " + name);
++        throw new RuntimeException("No class defined for " + name, caught);
++
++    super.serviceStart();
+-    yarnClient.start();
+-    summaryTdm.start();
+-    activeRootPath = new Path(conf.get(
+-        YarnConfiguration.TIMELINE_SERVICE_ENTITYGROUP_FS_STORE_ACTIVE_DIR,
+-        YarnConfiguration
+-            .TIMELINE_SERVICE_ENTITYGROUP_FS_STORE_ACTIVE_DIR_DEFAULT));
+-    doneRootPath = new Path(conf.get(
+-        YarnConfiguration.TIMELINE_SERVICE_ENTITYGROUP_FS_STORE_DONE_DIR,
+-        YarnConfiguration
+-            .TIMELINE_SERVICE_ENTITYGROUP_FS_STORE_DONE_DIR_DEFAULT));
+-    fs = activeRootPath.getFileSystem(conf);
++    addService(summaryTdm);
++    // start child services that aren't already started
++    super.serviceStart();
++
+-    LOG.info("Scanning active directory every {} seconds", scanIntervalSecs);
++    LOG.info("Scanning active directory {} every {} seconds", activeRootPath,
++        scanIntervalSecs);
+-    super.serviceStart();
++    stopExecutors.set(true);
+-    if (summaryTdm != null) {
+-      summaryTdm.stop();
+-    }
+-    if (summaryStore != null) {
+-      summaryStore.stop();
+-    }
+-    if (yarnClient != null) {
+-      yarnClient.stop();
+-    }
+-        cacheItem.getStore().close();
++        ServiceOperations.stopQuietly(cacheItem.getStore());
+-  void scanActiveLogs() throws IOException {
+-    RemoteIterator<FileStatus> iter = fs.listStatusIterator(activeRootPath);
++  int scanActiveLogs() throws IOException {
++    RemoteIterator<FileStatus> iter = list(activeRootPath);
++    int logsToScanCount = 0;
+-      ApplicationId appId = parseApplicationId(stat.getPath().getName());
++      String name = stat.getPath().getName();
++      ApplicationId appId = parseApplicationId(name);
++        logsToScanCount++;
++      } else {
++        LOG.debug("Unable to parse entry {}", name);
++    return logsToScanCount;
++  }
++
++  /**
++   * List a directory, returning an iterator which will fail fast if this
++   * service has been stopped
++   * @param path path to list
++   * @return an iterator over the contents of the directory
++   * @throws IOException
++   */
++  private RemoteIterator<FileStatus> list(Path path) throws IOException {
++    return new StoppableRemoteIterator(fs.listStatusIterator(path));
+-  static void cleanLogs(Path dirpath, FileSystem fs, long retainMillis)
++  void cleanLogs(Path dirpath, FileSystem fs, long retainMillis)
+-    RemoteIterator<FileStatus> iter = fs.listStatusIterator(dirpath);
++    RemoteIterator<FileStatus> iter = list(dirpath);
+-  // This method has to be synchronized to control traffic to RM
++  /**
++   * Create and initialize the YARN Client. Tests may override/mock this.
++   * If they return null, then {@link #getAppState(ApplicationId)} MUST
++   * also be overridden
++   * @param conf configuration
++   * @return the yarn client, or null.
++   *
++   */
++  @VisibleForTesting
++  protected YarnClient createAndInitYarnClient(Configuration conf) {
++    YarnClient client = YarnClient.createYarnClient();
++    client.init(conf);
++    return client;
++  }
++
++  /**
++   * Get the application state.
++   * @param appId application ID
++   * @return the state or {@link AppState#UNKNOWN} if it could not
++   * be determined
++   * @throws IOException on IO problems
++   */
++  @VisibleForTesting
++  protected AppState getAppState(ApplicationId appId) throws IOException {
++    return getAppState(appId, yarnClient);
++  }
++
++  /**
++   * Ask the RM for the state of the application.
++   * This method has to be synchronized to control traffic to RM
++   * @param appId application ID
++   * @param yarnClient
++   * @return the state or {@link AppState#UNKNOWN} if it could not
++   * be determined
++   * @throws IOException
++   */
++  /**
++   * Application states,
++   */
+-  enum AppState {
++  public enum AppState {
+-        appState = EntityGroupFSTimelineStore.getAppState(appId, yarnClient);
++        appState = getAppState(appId);
+-      RemoteIterator<FileStatus> iterAttempt =
+-          fs.listStatusIterator(appDirPath);
++      RemoteIterator<FileStatus> iterAttempt = list(appDirPath);
+-        RemoteIterator<FileStatus> iterCache
+-            = fs.listStatusIterator(statAttempt.getPath());
++        RemoteIterator<FileStatus> iterCache = list(statAttempt.getPath());
++  /**
++   * Extract any nested throwable forwarded from IPC operations.
++   * @param e exception
++   * @return either the exception passed an an argument, or any nested
++   * exception which was wrapped inside an {@link UndeclaredThrowableException}
++   */
++  private Throwable extract(Exception e) {
++    Throwable t = e;
++    if (e instanceof UndeclaredThrowableException && e.getCause() != null) {
++      t = e.getCause();
++    }
++    return t;
++  }
++
+-        scanActiveLogs();
++        int scanned = scanActiveLogs();
++        LOG.debug("Scanned {} active applications", scanned);
+-        LOG.error("Error scanning active files", e);
++        Throwable t = extract(e);
++        if (t instanceof InterruptedException) {
++          LOG.info("File scanner interrupted");
++        } else {
++          LOG.error("Error scanning active files", t);
++        }
+-        LOG.error("Error processing logs for " + appLogs.getAppId(), e);
++        Throwable t = extract(e);
++        if (t instanceof InterruptedException) {
++          LOG.info("Log parser interrupted");
++        } else {
++          LOG.error("Error processing logs for " + appLogs.getAppId(), t);
++        }
+-        LOG.error("Error cleaning files", e);
++        Throwable t = extract(e);
++        if (t instanceof InterruptedException) {
++          LOG.info("Cleaner interrupted");
++        } else {
++          LOG.error("Error cleaning files", e);
++        }
++
++  /**
++   * This is a special remote iterator whose {@link #hasNext()} method
++   * returns false if {@link #stopExecutors} is true.
++   *
++   * This provides an implicit shutdown of all iterative file list and scan
++   * operations without needing to implement it in the while loops themselves.
++   */
++  private class StoppableRemoteIterator implements RemoteIterator<FileStatus> {
++    private final RemoteIterator<FileStatus> remote;
++
++    public StoppableRemoteIterator(RemoteIterator<FileStatus> remote) {
++      this.remote = remote;
++    }
++
++    @Override
++    public boolean hasNext() throws IOException {
++      return !stopExecutors.get() && remote.hasNext();
++    }
++
++    @Override
++    public FileStatus next() throws IOException {
++      return remote.next();
++    }
++  }
+
+INS26 INS26 INS26 UPD40 INS40 INS40 INS40 UPD43 INS23 INS31 INS31 INS31 INS31 INS55 UPD42 INS83 INS43 INS59 MOV21 MOV21 UPD39 INS29 INS83 INS74 INS42 INS44 INS43 INS8 INS29 INS78 INS83 INS43 INS42 INS44 INS8 INS29 INS78 INS83 INS43 INS42 INS44 INS43 INS8 INS29 INS29 INS83 INS29 INS83 INS43 INS42 INS44 INS8 INS29 INS83 INS42 INS74 INS23 INS31 INS31 INS31 INS42 INS42 INS14 INS21 INS21 INS21 MOV21 INS60 MOV21 INS60 INS41 INS65 INS65 INS65 INS65 INS43 INS43 INS43 INS42 INS42 INS41 INS65 INS65 INS65 INS42 INS42 INS43 INS42 INS60 INS21 INS41 INS65 INS65 INS65 INS65 INS42 INS42 INS43 INS42 INS42 INS41 INS65 INS65 INS65 INS65 INS65 INS65 INS65 INS65 INS65 INS42 INS43 INS42 INS60 INS25 INS41 INS65 INS43 INS43 INS83 INS83 INS74 INS59 INS83 INS42 INS44 INS8 INS78 INS83 INS39 INS42 INS43 INS8 INS78 INS83 INS43 INS42 INS43 INS8 INS43 INS9 INS32 INS7 INS32 MOV7 INS43 INS59 INS48 INS32 INS39 INS59 INS42 INS66 INS66 INS42 INS66 INS66 INS42 INS42 INS42 INS42 INS14 INS66 INS66 INS65 INS66 INS66 INS42 INS66 INS66 INS42 INS43 INS59 INS32 INS42 INS66 INS42 INS66 INS66 INS65 INS66 INS66 INS42 INS66 INS42 INS32 INS66 INS66 INS42 INS66 INS42 INS66 INS65 INS66 INS66 INS42 INS66 INS66 INS42 INS66 INS66 INS66 INS65 INS42 INS43 INS59 INS27 INS8 INS42 INS66 INS65 INS66 INS66 INS65 INS66 INS66 INS66 INS42 INS42 INS43 INS43 INS42 INS74 INS42 INS21 INS42 INS42 INS41 INS42 INS42 INS42 INS41 INS42 INS42 MOV42 INS42 INS32 INS42 INS42 MOV42 MOV14 INS42 INS42 INS33 INS42 UPD42 MOV42 UPD42 MOV42 UPD45 INS42 UPD42 UPD42 INS9 INS42 INS34 INS60 INS43 INS32 INS68 INS42 INS42 MOV32 INS42 INS42 INS42 INS67 INS42 INS42 INS42 INS67 INS42 INS42 INS42 INS42 INS62 INS27 INS21 INS68 INS67 INS42 INS42 INS43 INS43 INS7 INS27 INS32 UPD42 MOV42 MOV42 UPD42 MOV42 UPD42 MOV42 UPD42 UPD42 INS43 MOV43 INS59 INS8 INS42 INS42 INS42 INS42 UPD42 INS42 INS69 INS42 INS42 INS42 INS42 INS42 INS43 INS32 INS33 INS7 INS60 INS8 INS8 INS8 INS42 INS42 INS42 INS42 INS22 INS42 INS38 INS32 INS42 INS42 INS42 UPD42 MOV32 INS42 INS32 INS21 INS21 INS43 UPD42 INS42 INS42 INS42 INS42 INS32 INS39 INS59 INS32 INS60 INS25 INS60 INS25 INS60 INS25 INS52 INS42 INS32 INS42 INS42 INS21 MOV32 INS42 INS42 INS37 INS32 INS42 INS42 INS42 INS42 MOV32 INS42 INS42 INS45 INS42 INS43 INS59 INS62 INS8 INS8 INS43 INS59 INS62 INS8 MOV8 INS43 INS59 INS62 INS8 MOV8 INS42 INS42 INS7 INS42 UPD42 INS42 INS42 INS42 INS42 INS45 INS42 UPD42 INS42 INS42 INS32 INS42 INS43 INS21 MOV21 INS42 INS42 INS32 INS42 INS43 INS21 INS42 INS42 INS32 INS42 INS43 INS21 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS32 INS42 INS42 INS45 UPD42 INS42 INS42 INS45 UPD42 INS42 INS42 INS45 DEL32 DEL21 DEL42 DEL32 DEL42 DEL42 DEL32 DEL42 DEL42 DEL32 DEL21 DEL42 DEL33 DEL27 DEL42 DEL42 DEL32 DEL21 DEL8 DEL25 DEL42 DEL33 DEL27 DEL8 DEL25 DEL42 DEL33 DEL27 DEL42 DEL42 DEL32 DEL21 DEL8 DEL25 DEL42 DEL42 DEL32 DEL83 DEL42 DEL42 DEL42 DEL42 DEL42 DEL8

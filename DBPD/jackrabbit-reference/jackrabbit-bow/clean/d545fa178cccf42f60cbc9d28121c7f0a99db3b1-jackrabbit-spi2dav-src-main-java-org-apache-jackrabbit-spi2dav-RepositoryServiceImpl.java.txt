@@ -1,0 +1,128 @@
+JCR-4536: spi2dav: allow disabling cert and host name checks for TLS connections (also adds test coverage for proxy config)
+
+patch by Konrad Windszus (kwin)
+
+git-svn-id: https://svn.apache.org/repos/asf/jackrabbit/trunk@1879988 13f79535-47bb-0310-9956-ffa450edef68
+
++import java.security.KeyManagementException;
++import java.security.KeyStoreException;
++import java.security.NoSuchAlgorithmException;
++import javax.net.ssl.SSLContext;
++import org.apache.http.auth.AuthScope;
++import org.apache.http.auth.UsernamePasswordCredentials;
++import org.apache.http.client.config.RequestConfig;
++import org.apache.http.config.Registry;
++import org.apache.http.config.RegistryBuilder;
++import org.apache.http.conn.socket.ConnectionSocketFactory;
++import org.apache.http.conn.socket.PlainConnectionSocketFactory;
++import org.apache.http.conn.ssl.NoopHostnameVerifier;
++import org.apache.http.conn.ssl.SSLConnectionSocketFactory;
++import org.apache.http.conn.ssl.TrustSelfSignedStrategy;
++import org.apache.http.impl.client.ProxyAuthenticationStrategy;
++import org.apache.http.impl.conn.DefaultProxyRoutePlanner;
++import org.apache.http.ssl.SSLContextBuilder;
++    private final Map<AuthScope, org.apache.http.auth.Credentials> commonCredentials;
+-     * Same as {@link #RepositoryServiceImpl(String, IdFactory, NameFactory, PathFactory, QValueFactory, int, int)}
++     * Same as {@link #RepositoryServiceImpl(String, IdFactory, NameFactory, PathFactory, QValueFactory, int, int, ConnectionOptions)}
+-     * connections on the client.
++     * connections on the client and {@link ConnectionOptions.DEFAULT}.
+-     * Same as {@link #RepositoryServiceImpl(String, IdFactory, NameFactory, PathFactory, QValueFactory, int, int)}
++     * Same as {@link #RepositoryServiceImpl(String, IdFactory, NameFactory, PathFactory, QValueFactory, int, int, boolean)}
+-     * connections on the client.
++     * connections on the client and {@link ConnectionOptions.DEFAULT}..
+-        this(uri, idFactory, nameFactory, pathFactory, qValueFactory, itemInfoCacheSize, MAX_CONNECTIONS_DEFAULT);
++        this(uri, idFactory, nameFactory, pathFactory, qValueFactory, itemInfoCacheSize, ConnectionOptions.DEFAULT);
++     * @param connectionOptions The advanced connection options.
+-                                 int maximumHttpConnections ) throws RepositoryException {
++                                 ConnectionOptions connectionOptions) throws RepositoryException {
++        this.commonCredentials = new HashMap<>();
+-        PoolingHttpClientConnectionManager cmgr = new PoolingHttpClientConnectionManager();
+-        if (maximumHttpConnections > 0) {
+-            cmgr.setDefaultMaxPerRoute(maximumHttpConnections);
+-            cmgr.setMaxTotal(maximumHttpConnections);
+-        }
+-        HttpClientBuilder hcb = HttpClients.custom().setConnectionManager(cmgr);
+-        if (Boolean.getBoolean("jackrabbit.client.useSystemProperties")) {
++        
++        HttpClientBuilder hcb = HttpClients.custom();
++
++        // request config
++        RequestConfig requestConfig = RequestConfig.custom().
++                setConnectTimeout(connectionOptions.getConnectionTimeoutMs()).
++                setConnectionRequestTimeout(connectionOptions.getRequestTimeoutMs()).
++                setSocketTimeout(connectionOptions.getSocketTimeoutMs()).build();
++        hcb.setDefaultRequestConfig(requestConfig);
++        if (Boolean.getBoolean("jackrabbit.client.useSystemProperties") || connectionOptions.isUseSystemPropertes()) {
++            log.debug("Using system properties for establishing connection!");
+-            hcb = hcb.useSystemProperties();
++            hcb.useSystemProperties();
++        }
++        
++        // TLS settings (via connection manager)
++        final SSLContext sslContext;
++        try {
++            if (connectionOptions.isAllowSelfSignedCertificates()) {
++                log.warn("Nonsecure TLS setting: Accepting self-signed certificates!");
++                    sslContext = SSLContextBuilder.create().loadTrustMaterial(new TrustSelfSignedStrategy()).build();
++                    hcb.setSSLContext(sslContext);
++            } else {
++                sslContext = SSLContextBuilder.create().build();
++            }
++        } catch (KeyManagementException | NoSuchAlgorithmException | KeyStoreException e) {
++            throw new RepositoryException(e);
++        }
++        final SSLConnectionSocketFactory sslSocketFactory;
++        if (connectionOptions.isDisableHostnameVerification()) {
++            log.warn("Nonsecure TLS setting: Host name verification of TLS certificates disabled!");
++            // we can optionally disable hostname verification.
++            sslSocketFactory = new SSLConnectionSocketFactory(sslContext, NoopHostnameVerifier.INSTANCE);
++        } else {
++            sslSocketFactory = new SSLConnectionSocketFactory(sslContext);
++        }
++        
++        Registry<ConnectionSocketFactory> socketFactoryRegistry = RegistryBuilder.<ConnectionSocketFactory>create()
++            .register("http", PlainConnectionSocketFactory.getSocketFactory())
++            .register("https", sslSocketFactory)
++            .build();
++        
++        PoolingHttpClientConnectionManager cmgr = new PoolingHttpClientConnectionManager(socketFactoryRegistry);
++        int maxConnections = connectionOptions.getMaxConnections();
++        if (maxConnections > 0) {
++            cmgr.setDefaultMaxPerRoute(connectionOptions.getMaxConnections());
++            cmgr.setMaxTotal(connectionOptions.getMaxConnections());
++        } else {
++            maxConnections = ConnectionOptions.MAX_CONNECTIONS_DEFAULT;
++        }
++        hcb.setConnectionManager(cmgr);
++
++        if (connectionOptions.getProxyHost() != null) {
++            // https://hc.apache.org/httpcomponents-client-4.5.x/tutorial/html/connmgmt.html#d5e485
++            HttpHost proxy = new HttpHost(connectionOptions.getProxyHost(), connectionOptions.getProxyPort(), connectionOptions.getProxyProtocol());
++            DefaultProxyRoutePlanner routePlanner = new DefaultProxyRoutePlanner(proxy);
++            hcb.setRoutePlanner(routePlanner);
++            log.debug("Connection via proxy {}", proxy);
++            if (connectionOptions.getProxyUsername() != null) {
++                log.debug("Proxy connection with credentials {}", proxy);
++                commonCredentials.put(
++                        new AuthScope(proxy),
++                        new UsernamePasswordCredentials(connectionOptions.getProxyUsername(), connectionOptions.getProxyPassword()));
++                hcb.setProxyAuthenticationStrategy(new ProxyAuthenticationStrategy());
++            }
+-        int concurrencyLevel = MAX_CONNECTIONS_DEFAULT;
+-        int initialCapacity = MAX_CONNECTIONS_DEFAULT;
+-        if (maximumHttpConnections > 0) {
+-            concurrencyLevel = maximumHttpConnections;
+-            initialCapacity = maximumHttpConnections;
+-        }
+-        clients = new ConcurrentHashMap<Object, HttpClient>(concurrencyLevel, .75f, initialCapacity);
++        clients = new ConcurrentHashMap<Object, HttpClient>(maxConnections, .75f, maxConnections);
++        CredentialsProvider credsProvider = new BasicCredentialsProvider();
++        result.setCredentialsProvider(credsProvider);
++        // take over default credentials (e.g. for proxy)
++        for (Map.Entry<AuthScope, org.apache.http.auth.Credentials> entry : commonCredentials.entrySet()) {
++            credsProvider.setCredentials(entry.getKey(), entry.getValue());
++        }
+-                CredentialsProvider credsProvider = new BasicCredentialsProvider();
+-                result.setCredentialsProvider(credsProvider);
+-            throw new RepositoryException(e.getMessage());
++            throw new RepositoryException(e.getMessage(), e);

@@ -1,0 +1,345 @@
+merge from trunk r1602933
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/branches/fs-encryption@1602947 13f79535-47bb-0310-9956-ffa450edef68
+
++import org.apache.hadoop.hdfs.protocol.AclException;
++import org.apache.hadoop.hdfs.protocol.SnapshotAccessControlException;
++      getEditLog().logSetPermissions(src, permission);
++      getEditLog().logSetOwner(src, username, group);
++      // lastBlock is not part of getLocatedBlocks(), might need to sort it too
+-        ArrayList<LocatedBlock> lastBlockList = new ArrayList<LocatedBlock>();
++        ArrayList<LocatedBlock> lastBlockList =
++            Lists.newArrayListWithCapacity(1);
+-            dir.setTimes(src, inode, -1, now, false, iip.getLatestSnapshotId());
++            boolean changed = dir.setTimes(inode, -1, now, false,
++                    iip.getLatestSnapshotId());
++            if (changed) {
++              getEditLog().logTimes(src, -1, now);
++            }
+-    dir.concat(target,srcs, logRetryCache);
++    long timestamp = now();
++    dir.concat(target, srcs, timestamp);
++    getEditLog().logConcat(target, srcs, timestamp, logRetryCache);
+-        dir.setTimes(src, inode, mtime, atime, true, iip.getLatestSnapshotId());
++        boolean changed = dir.setTimes(inode, mtime, atime, true,
++                iip.getLatestSnapshotId());
++        if (changed) {
++          getEditLog().logTimes(src, mtime, atime);
++        }
+-      dir.addSymlink(link, target, dirPerms, createParent, logRetryCache);
++      addSymlink(link, target, dirPerms, createParent, logRetryCache);
++        getEditLog().logSetReplication(src, replication);
+-      INodeFile newNode = dir.addFile(src, permissions, replication, blockSize,
+-          holder, clientMachine, clientNode);
++      INodeFile newNode = null;
++
++      // Always do an implicit mkdirs for parent directory tree.
++      Path parent = new Path(src).getParent();
++      if (parent != null && mkdirsRecursively(parent.toString(),
++              permissions, true, now())) {
++        newNode = dir.addFile(src, permissions, replication, blockSize,
++                holder, clientMachine, clientNode);
++      }
++
+-      dir.persistNewBlock(src, pendingFile);
++      persistNewBlock(src, pendingFile);
+-      dir.persistBlocks(src, file, false);
++      persistBlocks(src, file, false);
+-    if (dir.renameTo(src, dst, logRetryCache)) {
++    long mtime = now();
++    if (dir.renameTo(src, dst, mtime)) {
++      getEditLog().logRename(src, dst, mtime, logRetryCache);
+-    dir.renameTo(src, dst, logRetryCache, options);
++    long mtime = now();
++    dir.renameTo(src, dst, mtime, options);
++    getEditLog().logRename(src, dst, mtime, logRetryCache, options);
++      long mtime = now();
+-      if (!dir.delete(src, collectedBlocks, removedINodes, logRetryCache)) {
++      long filesRemoved = dir.delete(src, collectedBlocks, removedINodes,
++              mtime);
++      if (filesRemoved < 0) {
++      getEditLog().logDelete(src, mtime, logRetryCache);
++      incrDeletedFileCount(filesRemoved);
++      // Blocks/INodes will be handled later
++      removePathAndBlocks(src, null, null);
+-    if (!dir.mkdirs(src, permissions, false, now())) {
++    if (!mkdirsRecursively(src, permissions, false, now())) {
++   * Create a directory
++   * If ancestor directories do not exist, automatically create them.
++
++   * @param src string representation of the path to the directory
++   * @param permissions the permission of the directory
++   * @param inheritPermission if the permission of the directory should inherit
++   *                          from its parent or not. u+wx is implicitly added to
++   *                          the automatically created directories, and to the
++   *                          given directory if inheritPermission is true
++   * @param now creation time
++   * @return true if the operation succeeds false otherwise
++   * @throws QuotaExceededException if directory creation violates
++   *                                any quota limit
++   * @throws UnresolvedLinkException if a symlink is encountered in src.
++   * @throws SnapshotAccessControlException if path is in RO snapshot
++   */
++  private boolean mkdirsRecursively(String src, PermissionStatus permissions,
++                 boolean inheritPermission, long now)
++          throws FileAlreadyExistsException, QuotaExceededException,
++                 UnresolvedLinkException, SnapshotAccessControlException,
++                 AclException {
++    src = FSDirectory.normalizePath(src);
++    String[] names = INode.getPathNames(src);
++    byte[][] components = INode.getPathComponents(names);
++    final int lastInodeIndex = components.length - 1;
++
++    dir.writeLock();
++    try {
++      INodesInPath iip = dir.getExistingPathINodes(components);
++      if (iip.isSnapshot()) {
++        throw new SnapshotAccessControlException(
++                "Modification on RO snapshot is disallowed");
++      }
++      INode[] inodes = iip.getINodes();
++
++      // find the index of the first null in inodes[]
++      StringBuilder pathbuilder = new StringBuilder();
++      int i = 1;
++      for(; i < inodes.length && inodes[i] != null; i++) {
++        pathbuilder.append(Path.SEPARATOR).append(names[i]);
++        if (!inodes[i].isDirectory()) {
++          throw new FileAlreadyExistsException(
++                  "Parent path is not a directory: "
++                  + pathbuilder + " "+inodes[i].getLocalName());
++        }
++      }
++
++      // default to creating parent dirs with the given perms
++      PermissionStatus parentPermissions = permissions;
++
++      // if not inheriting and it's the last inode, there's no use in
++      // computing perms that won't be used
++      if (inheritPermission || (i < lastInodeIndex)) {
++        // if inheriting (ie. creating a file or symlink), use the parent dir,
++        // else the supplied permissions
++        // NOTE: the permissions of the auto-created directories violate posix
++        FsPermission parentFsPerm = inheritPermission
++                ? inodes[i-1].getFsPermission() : permissions.getPermission();
++
++        // ensure that the permissions allow user write+execute
++        if (!parentFsPerm.getUserAction().implies(FsAction.WRITE_EXECUTE)) {
++          parentFsPerm = new FsPermission(
++                  parentFsPerm.getUserAction().or(FsAction.WRITE_EXECUTE),
++                  parentFsPerm.getGroupAction(),
++                  parentFsPerm.getOtherAction()
++          );
++        }
++
++        if (!parentPermissions.getPermission().equals(parentFsPerm)) {
++          parentPermissions = new PermissionStatus(
++                  parentPermissions.getUserName(),
++                  parentPermissions.getGroupName(),
++                  parentFsPerm
++          );
++          // when inheriting, use same perms for entire path
++          if (inheritPermission) permissions = parentPermissions;
++        }
++      }
++
++      // create directories beginning from the first null index
++      for(; i < inodes.length; i++) {
++        pathbuilder.append(Path.SEPARATOR).append(names[i]);
++        dir.unprotectedMkdir(allocateNewInodeId(), iip, i, components[i],
++                (i < lastInodeIndex) ? parentPermissions : permissions, null,
++                now);
++        if (inodes[i] == null) {
++          return false;
++        }
++        // Directory creation also count towards FilesCreated
++        // to match count of FilesDeleted metric.
++        NameNode.getNameNodeMetrics().incrFilesCreated();
++
++        final String cur = pathbuilder.toString();
++        getEditLog().logMkDir(cur, inodes[i]);
++        if(NameNode.stateChangeLog.isDebugEnabled()) {
++          NameNode.stateChangeLog.debug(
++                  "mkdirs: created directory " + cur);
++        }
++      }
++    } finally {
++      dir.writeUnlock();
++    }
++    return true;
++  }
++
++  /**
+-  void setQuota(String path, long nsQuota, long dsQuota) 
++  void setQuota(String path, long nsQuota, long dsQuota)
+-      dir.setQuota(path, nsQuota, dsQuota);
++      INodeDirectory changed = dir.setQuota(path, nsQuota, dsQuota);
++      if (changed != null) {
++        final Quota.Counts q = changed.getQuotaCounts();
++        getEditLog().logSetQuota(path,
++                q.get(Quota.NAMESPACE), q.get(Quota.DISKSPACE));
++      }
+-      dir.persistBlocks(src, pendingFile, false);
++      persistBlocks(src, pendingFile, false);
+-    dir.closeFile(src, newFile);
++    closeFile(src, newFile);
+-        src = persistBlocks(iFile, false);
++        src = iFile.getFullPathName();
++        persistBlocks(src, iFile, false);
+-   * Persist the block list for the given file.
+-   *
+-   * @param pendingFile
+-   * @return Path to the given file.
+-   * @throws IOException
+-   */
+-  @VisibleForTesting
+-  String persistBlocks(INodeFile pendingFile, boolean logRetryCache)
+-      throws IOException {
+-    String src = pendingFile.getFullPathName();
+-    dir.persistBlocks(src, pendingFile, logRetryCache);
+-    return src;
+-  }
+-
+-  /**
++   * Persist the block list for the inode.
++   * @param path
++   * @param file
++   * @param logRetryCache
++   */
++  private void persistBlocks(String path, INodeFile file,
++                             boolean logRetryCache) {
++    assert hasWriteLock();
++    Preconditions.checkArgument(file.isUnderConstruction());
++    getEditLog().logUpdateBlocks(path, file, logRetryCache);
++    if(NameNode.stateChangeLog.isDebugEnabled()) {
++      NameNode.stateChangeLog.debug("persistBlocks: " + path
++              + " with " + file.getBlocks().length + " blocks is persisted to" +
++              " the file system");
++    }
++  }
++
++  void incrDeletedFileCount(long count) {
++    NameNode.getNameNodeMetrics().incrFilesDeleted(count);
++  }
++
++  /**
++   * Close file.
++   * @param path
++   * @param file
++   */
++  private void closeFile(String path, INodeFile file) {
++    assert hasWriteLock();
++    dir.waitForReady();
++    // file is closed
++    getEditLog().logCloseFile(path, file);
++    if (NameNode.stateChangeLog.isDebugEnabled()) {
++      NameNode.stateChangeLog.debug("closeFile: "
++              +path+" with "+ file.getBlocks().length
++              +" blocks is persisted to the file system");
++    }
++  }
++
++  /**
++   * Add the given symbolic link to the fs. Record it in the edits log.
++   * @param path
++   * @param target
++   * @param dirPerms
++   * @param createParent
++   * @param logRetryCache
++   * @param dir
++   */
++  private INodeSymlink addSymlink(String path, String target,
++                                  PermissionStatus dirPerms,
++                                  boolean createParent, boolean logRetryCache)
++      throws UnresolvedLinkException, FileAlreadyExistsException,
++      QuotaExceededException, SnapshotAccessControlException, AclException {
++    dir.waitForReady();
++
++    final long modTime = now();
++    if (createParent) {
++      final String parent = new Path(path).getParent().toString();
++      if (!mkdirsRecursively(parent, dirPerms, true, modTime)) {
++        return null;
++      }
++    }
++    final String userName = dirPerms.getUserName();
++    long id = allocateNewInodeId();
++    INodeSymlink newNode = dir.addSymlink(id, path, target, modTime, modTime,
++            new PermissionStatus(userName, null, FsPermission.getDefault()));
++    if (newNode == null) {
++      NameNode.stateChangeLog.info("addSymlink: failed to add " + path);
++      return null;
++    }
++    getEditLog().logSymlink(path, target, modTime, modTime, newNode,
++        logRetryCache);
++
++    if(NameNode.stateChangeLog.isDebugEnabled()) {
++      NameNode.stateChangeLog.debug("addSymlink: " + path + " is added");
++    }
++    return newNode;
++  }
++
++  /**
++   * Persist the new block (the last block of the given file).
++   * @param path
++   * @param file
++   */
++  private void persistNewBlock(String path, INodeFile file) {
++    Preconditions.checkArgument(file.isUnderConstruction());
++    getEditLog().logAddBlock(path, file);
++    if (NameNode.stateChangeLog.isDebugEnabled()) {
++      NameNode.stateChangeLog.debug("persistNewBlock: "
++              + path + " with new block " + file.getLastBlock().toString()
++              + ", current total block count is " + file.getBlocks().length);
++    }
++  }
++
++  /**
+-    dir.persistBlocks(src, pendingFile, logRetryCache);
++    persistBlocks(src, pendingFile, logRetryCache);
+-      dir.modifyAclEntries(src, aclSpec);
++      List<AclEntry> newAcl = dir.modifyAclEntries(src, aclSpec);
++      getEditLog().logSetAcl(src, newAcl);
+-      dir.removeAclEntries(src, aclSpec);
++      List<AclEntry> newAcl = dir.removeAclEntries(src, aclSpec);
++      getEditLog().logSetAcl(src, newAcl);
+-      dir.removeDefaultAcl(src);
++      List<AclEntry> newAcl = dir.removeDefaultAcl(src);
++      getEditLog().logSetAcl(src, newAcl);
++      getEditLog().logSetAcl(src, AclFeature.EMPTY_ENTRY_LIST);
+-      dir.setAcl(src, aclSpec);
++      List<AclEntry> newAcl = dir.setAcl(src, aclSpec);
++      getEditLog().logSetAcl(src, newAcl);
+-      dir.setXAttr(src, xAttr, flag, logRetryCache);
++      dir.setXAttr(src, xAttr, flag);
++      getEditLog().logSetXAttr(src, xAttr, logRetryCache);
++
++  List<XAttr> listXAttrs(String src) throws IOException {
++    nnConf.checkXAttrsConfigFlag();
++    final FSPermissionChecker pc = getPermissionChecker();
++    checkOperation(OperationCategory.READ);
++    readLock();
++    try {
++      checkOperation(OperationCategory.READ);
++      if (isPermissionEnabled) {
++        /* To access xattr names, you need EXECUTE in the owning directory. */
++        checkParentAccess(pc, src, FsAction.EXECUTE);
++      }
++      final List<XAttr> all = dir.getXAttrs(src);
++      final List<XAttr> filteredAll = XAttrPermissionFilter.
++        filterXAttrsForApi(pc, all);
++      return filteredAll;
++    } catch (AccessControlException e) {
++      logAuditEvent(false, "listXAttrs", src);
++      throw e;
++    } finally {
++      readUnlock();
++    }
++  }
+-      dir.removeXAttr(src, xAttr);
++      XAttr removedXAttr = dir.removeXAttr(src, xAttr);
++      if (removedXAttr != null) {
++        getEditLog().logRemoveXAttr(src, removedXAttr);
++      }
+
+INS26 INS26 INS40 INS40 INS31 INS31 INS31 INS31 INS31 INS31 INS31 MOV29 INS83 INS39 INS42 INS44 INS44 INS44 INS44 INS43 INS43 INS43 INS43 INS43 INS8 INS29 INS83 INS39 MOV42 INS44 MOV44 MOV44 INS8 INS39 INS42 INS44 INS8 INS29 INS83 INS39 INS42 INS44 INS44 INS8 INS29 INS83 INS43 INS42 INS44 INS44 INS44 INS44 INS44 INS43 INS43 INS43 INS43 INS43 MOV8 INS29 INS83 INS39 INS42 INS44 INS44 INS8 INS74 INS42 INS44 MOV43 INS8 INS60 INS21 INS60 INS60 INS21 INS65 UPD65 INS65 INS65 INS65 INS65 INS43 INS42 INS43 INS42 INS39 INS42 INS39 INS42 INS42 INS42 INS42 INS42 INS42 INS21 INS60 INS60 INS60 INS21 INS54 INS41 INS65 INS65 INS65 INS65 INS43 INS42 UPD42 INS6 INS21 INS21 INS25 INS39 INS42 INS21 INS65 INS65 INS65 INS43 INS42 INS43 INS42 INS6 INS21 INS21 INS25 INS65 INS65 INS65 INS65 INS65 INS65 INS65 INS42 INS43 INS42 INS43 INS42 INS43 INS42 INS39 INS42 INS39 INS42 INS42 INS42 INS42 INS42 INS42 INS21 INS60 INS25 INS60 INS60 INS25 INS25 INS65 INS65 INS65 INS43 INS42 INS43 INS42 INS21 INS21 INS25 INS43 INS43 INS43 INS42 INS21 INS60 INS21 INS21 INS54 INS39 INS59 INS32 INS39 INS59 INS39 INS59 INS32 INS66 INS66 INS42 UPD66 UPD42 INS66 INS42 INS66 INS66 INS66 INS66 INS42 INS66 UPD66 UPD42 INS66 INS66 INS42 INS66 INS42 INS66 INS42 INS42 INS7 INS5 INS59 INS5 INS59 INS83 INS39 INS59 INS32 INS8 INS8 INS9 INS66 INS42 INS42 INS42 INS42 INS32 INS32 INS32 INS32 INS8 INS32 INS66 INS42 INS42 INS42 INS42 INS32 INS32 INS32 INS32 INS8 INS66 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS83 INS39 INS59 INS42 INS8 INS83 INS39 INS59 INS43 INS59 INS27 INS8 INS32 INS8 UPD42 INS66 INS42 INS42 INS42 INS42 INS32 INS32 INS32 INS8 INS42 INS42 INS42 INS32 INS83 INS43 INS59 INS32 INS32 INS8 INS12 INS8 INS21 INS21 INS42 INS32 UPD42 INS32 INS42 INS42 INS42 INS42 INS42 INS60 INS25 INS42 INS32 UPD42 INS21 INS42 INS32 UPD42 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS60 INS60 INS25 INS21 INS21 INS21 INS42 INS32 INS43 INS85 INS42 INS32 INS39 INS85 INS85 INS42 INS32 INS42 INS27 INS42 INS42 INS60 INS25 INS60 INS60 INS60 INS24 INS60 INS25 INS24 INS21 INS60 INS25 INS42 INS42 INS42 INS32 INS32 INS42 INS42 INS42 INS42 INS40 INS42 INS21 INS32 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS40 INS42 INS21 INS42 INS42 INS42 INS32 INS60 INS25 UPD42 INS42 INS32 INS42 INS42 INS32 INS42 INS33 INS21 INS41 INS32 INS42 UPD42 UPD42 UPD42 INS42 INS42 INS40 INS42 INS21 INS42 INS42 INS32 INS32 INS42 INS42 INS42 INS40 INS42 INS21 INS60 INS60 INS60 INS21 INS60 INS21 INS21 INS42 INS42 INS42 INS42 INS32 INS42 INS40 INS42 INS21 INS25 INS60 INS60 INS41 INS44 INS8 INS21 INS60 INS25 INS32 INS32 INS42 INS42 INS43 INS59 INS27 INS8 INS42 INS32 INS42 INS42 INS39 INS59 INS39 INS59 INS27 MOV8 INS32 INS32 INS32 UPD42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS40 INS34 INS43 INS59 INS32 INS8 INS5 INS59 INS43 INS59 INS39 INS59 INS27 INS37 INS8 INS43 INS59 INS27 INS8 INS27 INS37 INS8 INS32 INS43 INS59 INS27 INS8 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS32 INS42 INS83 INS43 INS59 INS38 INS8 UPD42 UPD42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS14 INS32 INS33 UPD42 MOV42 INS32 INS42 INS42 INS42 INS32 INS74 INS59 INS32 INS74 INS59 INS32 INS74 INS59 INS32 INS32 INS74 INS59 INS32 INS32 INS32 INS42 INS32 INS42 INS8 INS83 INS74 INS59 INS83 INS74 INS59 INS42 INS43 INS42 INS21 INS53 INS32 INS43 INS59 INS27 INS8 INS32 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS60 INS25 INS21 INS33 INS42 INS42 INS32 INS27 INS32 INS21 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS32 INS42 INS34 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS33 INS33 INS42 INS42 INS32 INS42 INS42 INS53 INS43 INS85 INS42 INS32 INS42 INS42 INS14 INS42 INS34 INS27 INS27 INS42 INS21 INS25 INS42 INS42 INS42 INS42 INS36 INS60 INS25 INS25 INS42 INS40 INS42 INS21 INS21 INS25 INS21 INS60 INS21 INS25 INS42 INS42 INS42 INS42 MOV32 INS42 INS33 INS60 MOV21 INS21 INS21 INS40 INS42 INS27 INS40 INS42 INS27 INS42 INS42 INS32 INS32 INS41 INS43 INS42 INS33 INS32 INS40 INS42 INS27 INS40 INS42 INS27 INS40 INS42 INS27 INS43 INS43 INS42 MOV32 INS32 INS42 INS42 INS42 INS43 INS43 INS42 MOV32 INS32 INS42 INS42 INS42 INS43 INS43 INS42 MOV32 INS32 INS42 INS42 INS42 INS32 INS42 INS42 INS40 INS43 INS43 INS42 MOV32 INS32 INS42 INS42 INS42 MOV42 MOV42 MOV42 MOV42 MOV42 INS32 INS42 INS42 INS42 MOV42 INS42 INS40 INS21 INS43 INS43 INS42 INS32 INS43 INS43 INS42 INS32 INS42 INS32 INS42 INS42 INS42 INS42 MOV32 INS42 INS33 MOV21 INS42 INS42 MOV74 INS59 INS39 INS59 INS42 INS8 INS32 INS14 INS42 INS42 INS33 INS42 INS32 INS42 INS9 INS32 INS7 INS42 INS42 MOV42 MOV42 MOV42 MOV42 MOV42 UPD42 MOV42 INS42 INS42 INS42 INS42 INS14 INS42 INS42 INS42 INS43 INS42 INS40 INS2 INS33 INS32 INS38 INS8 INS27 INS43 INS59 INS38 INS8 INS38 INS8 INS32 INS32 INS27 INS8 INS32 INS83 MOV43 INS59 INS32 INS32 INS8 INS83 INS43 INS59 INS32 INS7 INS32 INS45 INS42 INS45 INS22 INS45 INS45 INS45 INS42 INS45 INS22 INS45 INS32 INS42 INS42 INS42 INS42 INS9 INS42 INS33 INS42 INS42 INS42 INS45 INS42 INS45 INS42 INS45 INS45 INS42 INS45 INS32 INS45 INS22 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS9 INS45 INS42 INS32 INS42 INS32 INS42 INS32 INS21 INS32 INS42 INS42 INS42 INS43 INS42 INS42 INS42 INS42 INS42 MOV32 INS43 INS45 INS42 INS42 INS42 INS32 INS42 INS2 INS32 INS53 INS42 INS42 INS42 INS42 INS16 INS32 INS21 INS32 INS21 INS25 INS32 INS42 INS2 INS42 INS42 INS32 INS42 INS42 INS2 INS16 INS33 INS42 INS2 INS33 INS41 INS32 INS42 INS42 INS32 INS32 INS42 INS42 INS2 INS40 INS42 INS21 INS40 INS42 INS32 INS32 INS42 INS42 INS32 INS32 MOV42 INS32 MOV42 INS42 MOV42 MOV9 INS32 INS42 INS32 INS42 INS14 INS42 INS32 INS42 INS32 INS42 INS42 INS42 INS42 INS40 INS32 INS42 INS42 INS42 INS42 INS42 INS34 MOV42 MOV42 MOV42 MOV42 MOV42 MOV9 MOV32 INS32 INS42 INS42 INS42 INS42 INS42 INS40 INS42 INS42 INS2 INS42 INS14 INS42 INS32 INS32 INS32 INS42 INS40 INS7 INS32 INS42 INS42 INS7 INS42 INS21 INS42 INS42 INS40 INS42 INS42 INS42 INS42 INS42 INS36 INS42 INS42 INS42 INS42 INS9 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS40 INS42 INS42 INS40 INS42 INS42 INS42 INS42 INS42 INS42 INS43 INS42 INS42 INS42 INS42 INS42 INS42 INS60 INS25 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS43 INS27 INS2 INS42 INS42 INS42 INS42 INS42 INS42 INS14 INS42 INS42 INS42 INS14 INS7 INS27 INS40 INS42 INS27 INS42 INS39 INS59 INS42 INS8 INS42 INS42 INS45 INS42 INS45 INS32 INS42 INS27 INS43 INS32 INS32 INS32 INS43 INS32 INS32 INS42 INS42 INS42 INS42 INS42 INS45 INS42 INS42 MOV32 MOV21 INS2 INS42 INS42 INS34 INS42 INS32 INS42 INS40 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS38 INS42 INS42 INS34 DEL42 DEL43 DEL42 DEL43 DEL74 DEL42 DEL14 DEL59 DEL42 DEL42 DEL32 DEL21 DEL42 DEL42 DEL42 DEL32 DEL38 DEL25 DEL42 DEL42 DEL42 DEL32 DEL7 DEL21 DEL42 DEL78 DEL31 DEL42 DEL32 DEL21

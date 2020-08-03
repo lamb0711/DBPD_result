@@ -1,0 +1,332 @@
+Merging r1544666 through r1547120 from trunk to branch HDFS-2832
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/branches/HDFS-2832@1547122 13f79535-47bb-0310-9956-ffa450edef68
+
++import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_NAMENODE_CACHING_ENABLED_DEFAULT;
++import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_NAMENODE_CACHING_ENABLED_KEY;
++import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_NAMENODE_LIST_CACHE_DIRECTIVES_NUM_RESPONSES;
++import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_NAMENODE_LIST_CACHE_DIRECTIVES_NUM_RESPONSES_DEFAULT;
+-import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_NAMENODE_LIST_CACHE_DIRECTIVES_NUM_RESPONSES;
+-import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_NAMENODE_CACHING_ENABLED_KEY;
+-import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_NAMENODE_CACHING_ENABLED_DEFAULT;
+-import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_NAMENODE_LIST_CACHE_DIRECTIVES_NUM_RESPONSES_DEFAULT;
+-import org.apache.hadoop.fs.InvalidRequestException;
++import org.apache.hadoop.fs.InvalidRequestException;
++import org.apache.hadoop.hdfs.protocol.CacheDirective;
++import org.apache.hadoop.hdfs.protocol.CacheDirectiveInfo;
++import org.apache.hadoop.hdfs.protocol.CachePoolEntry;
+-import org.apache.hadoop.hdfs.protocol.CacheDirectiveInfo;
+-import org.apache.hadoop.hdfs.protocol.CacheDirective;
+-   * Cache entries, sorted by ID.
++   * Cache directives, sorted by ID.
+-  private final TreeMap<Long, CacheDirective> entriesById =
++  private final TreeMap<Long, CacheDirective> directivesById =
+-   * The entry ID to use for a new entry.  Entry IDs always increase, and are
++   * The directive ID to use for a new directive.  IDs always increase, and are
+-  private long nextEntryId;
++  private long nextDirectiveId;
+-   * Cache entries, sorted by path
++   * Cache directives, sorted by path
+-  private final TreeMap<String, List<CacheDirective>> entriesByPath =
++  private final TreeMap<String, List<CacheDirective>> directivesByPath =
+-    this.nextEntryId = 1;
++    this.nextDirectiveId = 1;
+-    return entriesById;
++    return directivesById;
+-  private long getNextEntryId() throws IOException {
++  private long getNextDirectiveId() throws IOException {
+-    if (nextEntryId >= Long.MAX_VALUE - 1) {
++    if (nextDirectiveId >= Long.MAX_VALUE - 1) {
+-    return nextEntryId++;
++    return nextDirectiveId++;
+-   * Get a CacheDirective by ID, validating the ID and that the entry
++   * Calculates the absolute expiry time of the directive from the
++   * {@link CacheDirectiveInfo.Expiration}. This converts a relative Expiration
++   * into an absolute time based on the local clock.
++   * 
++   * @param directive from which to get the expiry time
++   * @param defaultValue to use if Expiration is not set
++   * @return Absolute expiry time in milliseconds since Unix epoch
++   * @throws InvalidRequestException if the Expiration is invalid
++   */
++  private static long validateExpiryTime(CacheDirectiveInfo directive,
++      long defaultValue) throws InvalidRequestException {
++    long expiryTime;
++    CacheDirectiveInfo.Expiration expiration = directive.getExpiration();
++    if (expiration != null) {
++      if (expiration.getMillis() < 0) {
++        throw new InvalidRequestException("Cannot set a negative expiration: "
++            + expiration.getMillis());
++      }
++      // Converts a relative duration into an absolute time based on the local
++      // clock
++      expiryTime = expiration.getAbsoluteMillis();
++    } else {
++      expiryTime = defaultValue;
++    }
++    return expiryTime;
++  }
++
++  /**
++   * Get a CacheDirective by ID, validating the ID and that the directive
+-    // Find the entry.
+-    CacheDirective entry = entriesById.get(id);
+-    if (entry == null) {
++    // Find the directive.
++    CacheDirective directive = directivesById.get(id);
++    if (directive == null) {
+-    return entry;
++    return directive;
+-  private void addInternal(CacheDirective entry) {
+-    entriesById.put(entry.getEntryId(), entry);
+-    String path = entry.getPath();
+-    List<CacheDirective> entryList = entriesByPath.get(path);
+-    if (entryList == null) {
+-      entryList = new ArrayList<CacheDirective>(1);
+-      entriesByPath.put(path, entryList);
++  private void addInternal(CacheDirective directive, CachePool pool) {
++    boolean addedDirective = pool.getDirectiveList().add(directive);
++    assert addedDirective;
++    directivesById.put(directive.getId(), directive);
++    String path = directive.getPath();
++    List<CacheDirective> directives = directivesByPath.get(path);
++    if (directives == null) {
++      directives = new ArrayList<CacheDirective>(1);
++      directivesByPath.put(path, directives);
+-    entryList.add(entry);
++    directives.add(directive);
++  }
++
++  /**
++   * To be called only from the edit log loading code
++   */
++  CacheDirectiveInfo addDirectiveFromEditLog(CacheDirectiveInfo directive)
++      throws InvalidRequestException {
++    long id = directive.getId();
++    CacheDirective entry =
++        new CacheDirective(
++            directive.getId(),
++            directive.getPath().toUri().getPath(),
++            directive.getReplication(),
++            directive.getExpiration().getAbsoluteMillis());
++    CachePool pool = cachePools.get(directive.getPool());
++    addInternal(entry, pool);
++    if (nextDirectiveId <= id) {
++      nextDirectiveId = id + 1;
++    }
++    return entry.toInfo();
+-      CacheDirectiveInfo directive, FSPermissionChecker pc)
++      CacheDirectiveInfo info, FSPermissionChecker pc)
+-    CacheDirective entry;
++    CacheDirective directive;
+-      CachePool pool = getCachePool(validatePoolName(directive));
++      CachePool pool = getCachePool(validatePoolName(info));
+-      String path = validatePath(directive);
+-      short replication = validateReplication(directive, (short)1);
+-      long id;
+-      if (directive.getId() != null) {
+-        // We are loading an entry from the edit log.
+-        // Use the ID from the edit log.
+-        id = directive.getId();
+-        if (id <= 0) {
+-          throw new InvalidRequestException("can't add an ID " +
+-              "of " + id + ": it is not positive.");
+-        }
+-        if (id >= Long.MAX_VALUE) {
+-          throw new InvalidRequestException("can't add an ID " +
+-              "of " + id + ": it is too big.");
+-        }
+-        if (nextEntryId <= id) {
+-          nextEntryId = id + 1;
+-        }
+-      } else {
+-        // Add a new entry with the next available ID.
+-        id = getNextEntryId();
+-      }
+-      entry = new CacheDirective(id, path, replication, pool);
+-      addInternal(entry);
++      String path = validatePath(info);
++      short replication = validateReplication(info, (short)1);
++      long expiryTime = validateExpiryTime(info,
++          CacheDirectiveInfo.Expiration.EXPIRY_NEVER);
++      // All validation passed
++      // Add a new entry with the next available ID.
++      long id = getNextDirectiveId();
++      directive = new CacheDirective(id, path, replication, expiryTime);
++      addInternal(directive, pool);
+-      LOG.warn("addDirective of " + directive + " failed: ", e);
++      LOG.warn("addDirective of " + info + " failed: ", e);
+-    LOG.info("addDirective of " + directive + " successful.");
++    LOG.info("addDirective of " + info + " successful.");
+-    return entry.toDirective();
++    return directive.toInfo();
+-  public void modifyDirective(CacheDirectiveInfo directive,
++  public void modifyDirective(CacheDirectiveInfo info,
+-        (directive.getId() == null) ?
+-            "(null)" : directive.getId().toString();
++        (info.getId() == null) ?
++            "(null)" : info.getId().toString();
+-      Long id = directive.getId();
++      Long id = info.getId();
+-      if (directive.getPath() != null) {
+-        path = validatePath(directive);
++      if (info.getPath() != null) {
++        path = validatePath(info);
++
+-      if (directive.getReplication() != null) {
+-        replication = validateReplication(directive, replication);
+-      }
++      replication = validateReplication(info, replication);
++
++      long expiryTime = prevEntry.getExpiryTime();
++      expiryTime = validateExpiryTime(info, expiryTime);
++
+-      if (directive.getPool() != null) {
+-        pool = getCachePool(validatePoolName(directive));
++      if (info.getPool() != null) {
++        pool = getCachePool(validatePoolName(info));
+-          new CacheDirective(id, path, replication, pool);
+-      addInternal(newEntry);
++          new CacheDirective(id, path, replication, expiryTime);
++      addInternal(newEntry, pool);
+-        directive + ".");
++        info+ ".");
+-  public void removeInternal(CacheDirective existing)
++  public void removeInternal(CacheDirective directive)
+-    // Remove the corresponding entry in entriesByPath.
+-    String path = existing.getPath();
+-    List<CacheDirective> entries = entriesByPath.get(path);
+-    if (entries == null || !entries.remove(existing)) {
++    // Remove the corresponding entry in directivesByPath.
++    String path = directive.getPath();
++    List<CacheDirective> directives = directivesByPath.get(path);
++    if (directives == null || !directives.remove(directive)) {
+-          existing.getEntryId() + " by path " + existing.getPath());
++          directive.getId() + " by path " + directive.getPath());
+-    if (entries.size() == 0) {
+-      entriesByPath.remove(path);
++    if (directives.size() == 0) {
++      directivesByPath.remove(path);
+-    entriesById.remove(existing.getEntryId());
++    directivesById.remove(directive.getId());
++    directive.getPool().getDirectiveList().remove(directive);
++    assert directive.getPool() == null;
+-      CacheDirective existing = getById(id);
+-      checkWritePermission(pc, existing.getPool());
+-      removeInternal(existing);
++      CacheDirective directive = getById(id);
++      checkWritePermission(pc, directive.getPool());
++      removeInternal(directive);
+-      entriesById.tailMap(prevId + 1);
++      directivesById.tailMap(prevId + 1);
+-      CacheDirective curEntry = cur.getValue();
+-      CacheDirectiveInfo info = cur.getValue().toDirective();
++      CacheDirective curDirective = cur.getValue();
++      CacheDirectiveInfo info = cur.getValue().toInfo();
+-          pc.checkPermission(curEntry.getPool(), FsAction.READ);
++          pc.checkPermission(curDirective.getPool(), FsAction.READ);
+-    return pool.getInfo(null);
++    return pool.getInfo(true);
+-    
+-    // Remove entries using this pool
+-    // TODO: could optimize this somewhat to avoid the need to iterate
+-    // over all entries in entriesById
+-    Iterator<Entry<Long, CacheDirective>> iter = 
+-        entriesById.entrySet().iterator();
++    // Remove all directives in this pool.
++    Iterator<CacheDirective> iter = pool.getDirectiveList().iterator();
+-      Entry<Long, CacheDirective> entry = iter.next();
+-      if (entry.getValue().getPool() == pool) {
+-        entriesByPath.remove(entry.getValue().getPath());
+-        iter.remove();
+-      }
++      CacheDirective directive = iter.next();
++      directivesByPath.remove(directive.getPath());
++      directivesById.remove(directive.getId());
++      iter.remove();
+-  public BatchedListEntries<CachePoolInfo>
++  public BatchedListEntries<CachePoolEntry>
+-    ArrayList<CachePoolInfo> results = 
+-        new ArrayList<CachePoolInfo>(NUM_PRE_ALLOCATED_ENTRIES);
++    ArrayList<CachePoolEntry> results = 
++        new ArrayList<CachePoolEntry>(NUM_PRE_ALLOCATED_ENTRIES);
+-        return new BatchedListEntries<CachePoolInfo>(results, true);
++        return new BatchedListEntries<CachePoolEntry>(results, true);
+-      results.add(cur.getValue().getInfo(pc));
++      results.add(cur.getValue().getEntry(pc));
+-    return new BatchedListEntries<CachePoolInfo>(results, false);
++    return new BatchedListEntries<CachePoolEntry>(results, false);
+-      if (blockInfo.getGenerationStamp() < block.getGenerationStamp()) {
+-        // The NameNode will eventually remove or update the out-of-date block.
+-        // Until then, we pretend that it isn't cached.
+-        LOG.warn("Genstamp in cache report disagrees with our genstamp for " +
+-          block + ": expected genstamp " + blockInfo.getGenerationStamp());
+-        continue;
+-      }
+-    out.writeLong(nextEntryId);
++    out.writeLong(nextDirectiveId);
+-    saveEntries(out, sdPath);
++    saveDirectives(out, sdPath);
+-    nextEntryId = in.readLong();
+-    // pools need to be loaded first since entries point to their parent pool
++    nextDirectiveId = in.readLong();
++    // pools need to be loaded first since directives point to their parent pool
+-    loadEntries(in);
++    loadDirectives(in);
+-      pool.getInfo(null).writeTo(out);
++      pool.getInfo(true).writeTo(out);
+-  private void saveEntries(DataOutput out, String sdPath)
++  private void saveDirectives(DataOutput out, String sdPath)
+-    prog.setTotal(Phase.SAVING_CHECKPOINT, step, entriesById.size());
++    prog.setTotal(Phase.SAVING_CHECKPOINT, step, directivesById.size());
+-    out.writeInt(entriesById.size());
+-    for (CacheDirective entry: entriesById.values()) {
+-      out.writeLong(entry.getEntryId());
+-      Text.writeString(out, entry.getPath());
+-      out.writeShort(entry.getReplication());
+-      Text.writeString(out, entry.getPool().getPoolName());
++    out.writeInt(directivesById.size());
++    for (CacheDirective directive : directivesById.values()) {
++      out.writeLong(directive.getId());
++      Text.writeString(out, directive.getPath());
++      out.writeShort(directive.getReplication());
++      Text.writeString(out, directive.getPool().getPoolName());
++      out.writeLong(directive.getExpiryTime());
+-   * Load cache entries from the fsimage
++   * Load cache directives from the fsimage
+-  private void loadEntries(DataInput in) throws IOException {
++  private void loadDirectives(DataInput in) throws IOException {
+-    int numberOfEntries = in.readInt();
+-    prog.setTotal(Phase.LOADING_FSIMAGE, step, numberOfEntries);
++    int numDirectives = in.readInt();
++    prog.setTotal(Phase.LOADING_FSIMAGE, step, numDirectives);
+-    for (int i = 0; i < numberOfEntries; i++) {
+-      long entryId = in.readLong();
++    for (int i = 0; i < numDirectives; i++) {
++      long directiveId = in.readLong();
++      long expiryTime = in.readLong();
+-        throw new IOException("Entry refers to pool " + poolName +
++        throw new IOException("Directive refers to pool " + poolName +
+-      CacheDirective entry =
+-          new CacheDirective(entryId, path, replication, pool);
+-      if (entriesById.put(entry.getEntryId(), entry) != null) {
+-        throw new IOException("An entry with ID " + entry.getEntryId() +
++      CacheDirective directive =
++          new CacheDirective(directiveId, path, replication, expiryTime);
++      boolean addedDirective = pool.getDirectiveList().add(directive);
++      assert addedDirective;
++      if (directivesById.put(directive.getId(), directive) != null) {
++        throw new IOException("A directive with ID " + directive.getId() +
+-      List<CacheDirective> entries = entriesByPath.get(entry.getPath());
+-      if (entries == null) {
+-        entries = new LinkedList<CacheDirective>();
+-        entriesByPath.put(entry.getPath(), entries);
++      List<CacheDirective> directives =
++          directivesByPath.get(directive.getPath());
++      if (directives == null) {
++        directives = new LinkedList<CacheDirective>();
++        directivesByPath.put(directive.getPath(), directives);
+-      entries.add(entry);
++      directives.add(directive);
+
+MOV26 MOV26 MOV26 MOV26 MOV26 MOV26 MOV26 INS26 INS40 INS31 INS31 UPD42 INS29 INS83 INS83 INS39 INS42 MOV44 INS44 INS43 INS8 INS44 INS29 INS43 INS42 MOV44 MOV43 INS8 INS44 INS44 UPD74 MOV74 UPD42 UPD42 UPD42 UPD42 UPD42 INS65 INS65 INS65 INS65 INS65 INS39 INS42 INS42 INS60 INS60 INS25 INS41 MOV43 INS42 UPD43 UPD42 INS60 INS6 INS65 INS42 MOV60 INS60 INS60 INS21 MOV25 INS41 INS43 INS42 INS43 INS42 MOV43 INS42 INS21 INS6 UPD43 UPD66 UPD66 UPD66 UPD42 INS66 INS65 INS66 INS66 INS42 INS66 INS42 INS66 INS66 INS42 INS66 INS39 INS59 INS43 INS59 INS27 INS8 INS8 INS42 UPD66 INS43 UPD42 UPD42 INS39 INS59 INS42 MOV43 INS66 INS39 MOV43 INS59 MOV43 INS59 INS32 INS32 INS42 MOV43 INS42 MOV43 MOV43 INS32 INS27 UPD74 UPD42 UPD74 MOV74 UPD66 UPD42 UPD42 INS40 INS42 INS40 INS42 INS32 INS42 INS33 INS25 INS21 INS21 INS42 UPD42 UPD42 INS42 INS32 UPD42 MOV32 UPD42 MOV42 UPD42 UPD42 UPD42 UPD42 INS42 INS14 INS42 INS32 INS42 INS42 INS42 UPD42 INS42 INS42 UPD42 INS60 INS60 UPD42 UPD42 INS60 MOV21 INS60 INS21 UPD42 UPD42 INS32 INS42 INS42 INS32 INS33 INS9 MOV43 INS21 MOV21 MOV21 UPD43 UPD74 MOV74 UPD42 UPD42 UPD42 UPD42 UPD42 UPD42 INS21 UPD42 UPD42 UPD42 INS60 INS60 INS6 UPD42 INS42 INS42 INS27 INS8 INS7 INS7 UPD42 INS32 INS42 INS42 UPD42 UPD42 MOV43 MOV32 INS32 MOV32 INS32 INS42 INS42 INS32 INS43 MOV43 MOV39 INS59 INS39 INS59 UPD42 MOV43 INS59 INS39 INS59 INS7 MOV43 UPD42 UPD42 UPD42 UPD42 UPD42 UPD42 UPD42 MOV32 INS42 INS42 INS42 UPD42 INS43 INS43 INS32 UPD42 UPD74 MOV74 UPD43 UPD42 UPD42 INS32 INS39 INS59 MOV43 INS39 INS59 INS42 INS32 INS34 INS53 INS42 INS32 INS42 INS42 INS42 INS42 UPD42 UPD42 UPD42 INS32 INS42 INS32 INS42 INS42 INS42 UPD42 INS42 UPD42 MOV42 INS32 INS42 INS32 UPD42 UPD42 INS42 INS27 INS32 INS42 INS32 INS32 INS42 INS32 INS42 INS32 INS32 INS42 UPD42 UPD42 UPD42 UPD42 UPD42 INS42 UPD42 UPD42 UPD42 UPD42 MOV42 UPD42 UPD42 MOV42 UPD42 MOV42 INS32 UPD42 UPD43 UPD42 INS42 INS42 INS32 UPD42 INS42 INS32 UPD42 INS42 INS32 UPD42 UPD42 UPD42 UPD42 INS42 INS42 INS14 INS42 INS42 MOV32 INS42 INS42 INS42 UPD42 UPD42 INS42 INS42 INS40 UPD42 MOV42 MOV43 UPD42 INS32 INS33 INS42 INS42 INS42 INS42 INS42 INS42 UPD42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 MOV43 UPD42 MOV32 UPD42 UPD42 INS42 UPD42 MOV42 UPD42 MOV42 UPD42 UPD42 UPD42 INS9 UPD42 UPD42 UPD42 UPD42 INS42 INS42 INS42 INS42 MOV43 UPD42 UPD42 INS32 INS42 INS42 UPD42 UPD42 UPD42 MOV43 INS27 UPD42 UPD42 INS42 INS42 UPD42 UPD74 UPD42 MOV43 INS42 INS42 UPD42 UPD42 MOV43 UPD27 MOV27 UPD42 UPD42 UPD42 UPD42 INS45 INS32 UPD42 UPD43 UPD45 INS45 INS45 UPD42 INS42 INS42 UPD42 UPD42 UPD42 DEL42 DEL32 DEL42 DEL59 DEL60 DEL33 DEL27 DEL42 DEL7 DEL21 DEL42 DEL34 DEL27 DEL45 DEL45 DEL27 DEL42 DEL45 DEL27 DEL14 DEL53 DEL8 DEL25 DEL42 DEL40 DEL27 DEL45 DEL45 DEL27 DEL42 DEL45 DEL27 DEL14 DEL53 DEL8 DEL25 DEL8 DEL42 DEL32 DEL7 DEL21 DEL8 DEL25 DEL33 DEL27 DEL8 DEL25 DEL42 DEL42 DEL42 DEL32 DEL33 DEL42 DEL43 DEL42 DEL43 DEL74 DEL43 DEL42 DEL43 DEL74 DEL42 DEL32 DEL32 DEL32 DEL42 DEL27 DEL8 DEL25 DEL42 DEL42 DEL32 DEL42 DEL42 DEL32 DEL27 DEL42 DEL42 DEL45 DEL42 DEL45 DEL42 DEL42 DEL32 DEL27 DEL32 DEL21 DEL18 DEL8 DEL25 DEL33 DEL33 DEL45 DEL42 DEL42 DEL32 DEL45 DEL27

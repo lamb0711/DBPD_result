@@ -1,0 +1,243 @@
+HADOOP-13403. AzureNativeFileSystem rename/delete performance improvements. Contributed by Subramanyam Pattipaka.
+
+-import org.apache.hadoop.fs.azure.AzureException;
++import org.apache.hadoop.io.IOUtils;
+-import org.slf4j.Logger;
+-import org.slf4j.LoggerFactory;
++import org.apache.hadoop.util.Time;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
+-
+-import org.apache.hadoop.io.IOUtils;
+-
++
++      long start = Time.monotonicNow();
++      long end = Time.monotonicNow();
++      LOG.debug("Time taken to list {} blobs for rename operation is: {} ms", fileMetadata.length, (end - start));
++
+-      for (FileMetadata file : this.getFiles()) {
+-
+-        // Rename all materialized entries under the folder to point to the
+-        // final destination.
+-        if (file.getBlobMaterialization() == BlobMaterialization.Explicit) {
+-          String srcName = file.getKey();
+-          String suffix  = srcName.substring((this.getSrcKey()).length());
+-          String dstName = this.getDstKey() + suffix;
+-
+-          // Rename gets exclusive access (via a lease) for files
+-          // designated for atomic rename.
+-          // The main use case is for HBase write-ahead log (WAL) and data
+-          // folder processing correctness.  See the rename code for details.
+-          boolean acquireLease = fs.getStoreInterface().isAtomicRenameKey(srcName);
+-          fs.getStoreInterface().rename(srcName, dstName, acquireLease, null);
++      AzureFileSystemThreadTask task = new AzureFileSystemThreadTask() {
++        @Override
++        public boolean execute(FileMetadata file) throws IOException{
++          renameFile(file);
++          return true;
+-      }
++      };
++
++      AzureFileSystemThreadPoolExecutor executor = this.fs.getThreadPoolExecutor(this.fs.renameThreadCount,
++          "AzureBlobRenameThread", "Rename", getSrcKey(), AZURE_RENAME_THREADS);
++
++      executor.executeParallel(this.getFiles(), task);
++    // Rename a single file
++    @VisibleForTesting
++    void renameFile(FileMetadata file) throws IOException{
++      // Rename all materialized entries under the folder to point to the
++      // final destination.
++      if (file.getBlobMaterialization() == BlobMaterialization.Explicit) {
++        String srcName = file.getKey();
++        String suffix  = srcName.substring((this.getSrcKey()).length());
++        String dstName = this.getDstKey() + suffix;
++
++        // Rename gets exclusive access (via a lease) for files
++        // designated for atomic rename.
++        // The main use case is for HBase write-ahead log (WAL) and data
++        // folder processing correctness.  See the rename code for details.
++        boolean acquireLease = this.fs.getStoreInterface().isAtomicRenameKey(srcName);
++        this.fs.getStoreInterface().rename(srcName, dstName, acquireLease, null);
++      }
++    }
++
++  /**
++   * The configuration property to set number of threads to be used for rename operation.
++   */
++  public static final String AZURE_RENAME_THREADS = "fs.azure.rename.threads";
++
++  /**
++   * The default number of threads to be used for rename operation.
++   */
++  public static final int DEFAULT_AZURE_RENAME_THREADS = 0;
++
++  /**
++   * The configuration property to set number of threads to be used for delete operation.
++   */
++  public static final String AZURE_DELETE_THREADS = "fs.azure.delete.threads";
++
++  /**
++   * The default number of threads to be used for delete operation.
++   */
++  public static final int DEFAULT_AZURE_DELETE_THREADS = 0;
++
++  /**
++   * The number of threads to be used for delete operation after reading user configuration.
++   */
++  private int deleteThreadCount = 0;
++
++  /**
++   * The number of threads to be used for rename operation after reading user configuration.
++   */
++  private int renameThreadCount = 0;
++
++    // Initialize thread counts from user configuration
++    deleteThreadCount = conf.getInt(AZURE_DELETE_THREADS, DEFAULT_AZURE_DELETE_THREADS);
++    renameThreadCount = conf.getInt(AZURE_RENAME_THREADS, DEFAULT_AZURE_RENAME_THREADS);
+-      PartialListing listing = null;
+-      try {
+-        listing = store.listAll(key, AZURE_LIST_ALL, 1,
+-            priorLastKey);
+-      } catch(IOException e) {
+-        Throwable innerException = NativeAzureFileSystemHelper.checkForAzureStorageException(e);
++      // Start time for list operation
++      long start = Time.monotonicNow();
++      ArrayList<FileMetadata> fileMetadataList = new ArrayList<FileMetadata>();
+-        if (innerException instanceof StorageException
+-            && NativeAzureFileSystemHelper.isFileNotFoundException((StorageException) innerException)) {
+-          return false;
++      // List all the files in the folder with AZURE_UNBOUNDED_DEPTH depth.
++      do {
++        try {
++          PartialListing listing = store.listAll(key, AZURE_LIST_ALL,
++            AZURE_UNBOUNDED_DEPTH, priorLastKey);
++          for(FileMetadata file : listing.getFiles()) {
++            fileMetadataList.add(file);
++          }
++          priorLastKey = listing.getPriorLastKey();
++        } catch (IOException e) {
++          Throwable innerException = NativeAzureFileSystemHelper.checkForAzureStorageException(e);
++
++          if (innerException instanceof StorageException
++              && NativeAzureFileSystemHelper.isFileNotFoundException((StorageException) innerException)) {
++            return false;
++          }
++
++          throw e;
++      } while (priorLastKey != null);
+-        throw e;
++      long end = Time.monotonicNow();
++      LOG.debug("Time taken to list {} blobs for delete operation: {} ms", fileMetadataList.size(), (end - start));
++
++      final FileMetadata[] contents = fileMetadataList.toArray(new FileMetadata[fileMetadataList.size()]);
++
++      if (!recursive && contents.length > 0) {
++          // The folder is non-empty and recursive delete was not specified.
++          // Throw an exception indicating that a non-recursive delete was
++          // specified for a non-empty folder.
++          throw new IOException("Non-recursive delete of non-empty directory "
++              + f.toString());
+-      if (listing == null) {
++      // Delete all files / folders in current directory stored as list in 'contents'.
++      AzureFileSystemThreadTask task = new AzureFileSystemThreadTask() {
++        @Override
++        public boolean execute(FileMetadata file) throws IOException{
++          return deleteFile(file.getKey(), file.isDir());
++        }
++      };
++
++      AzureFileSystemThreadPoolExecutor executor = getThreadPoolExecutor(this.deleteThreadCount,
++          "AzureBlobDeleteThread", "Delete", key, AZURE_DELETE_THREADS);
++
++      if (!executor.executeParallel(contents, task)) {
++        LOG.error("Failed to delete files / subfolders in blob {}", key);
+-      FileMetadata[] contents = listing.getFiles();
+-      if (!recursive && contents.length > 0) {
+-        // The folder is non-empty and recursive delete was not specified.
+-        // Throw an exception indicating that a non-recursive delete was
+-        // specified for a non-empty folder.
+-        throw new IOException("Non-recursive delete of non-empty directory "
+-            + f.toString());
+-      }
+-
+-      // Delete all the files in the folder.
+-      for (FileMetadata p : contents) {
+-        // Tag on the directory name found as the suffix of the suffix of the
+-        // parent directory to get the new absolute path.
+-        String suffix = p.getKey().substring(
+-            p.getKey().lastIndexOf(PATH_DELIMITER));
+-        if (!p.isDir()) {
+-          try {
+-            store.delete(key + suffix);
+-            instrumentation.fileDeleted();
+-          } catch(IOException e) {
+-
+-            Throwable innerException = NativeAzureFileSystemHelper.checkForAzureStorageException(e);
+-
+-            if (innerException instanceof StorageException
+-                && NativeAzureFileSystemHelper.isFileNotFoundException((StorageException) innerException)) {
+-              return false;
+-            }
+-
+-            throw e;
+-          }
+-        } else {
+-          // Recursively delete contents of the sub-folders. Notice this also
+-          // deletes the blob for the directory.
+-          if (!delete(new Path(f.toString() + suffix), true)) {
+-            return false;
+-          }
+-        }
+-      }
+-
+-      try {
+-        store.delete(key);
+-      } catch(IOException e) {
+-
+-        Throwable innerException = NativeAzureFileSystemHelper.checkForAzureStorageException(e);
+-
+-        if (innerException instanceof StorageException
+-            && NativeAzureFileSystemHelper.isFileNotFoundException((StorageException) innerException)) {
+-          return false;
+-        }
+-
+-        throw e;
++      // Delete the current directory
++      if (!deleteFile(metaFile.getKey(), metaFile.isDir())) {
++        LOG.error("Failed delete directory {}", f.toString());
++        return false;
+-      instrumentation.directoryDeleted();
++  public AzureFileSystemThreadPoolExecutor getThreadPoolExecutor(int threadCount,
++      String threadNamePrefix, String operation, String key, String config) {
++    return new AzureFileSystemThreadPoolExecutor(threadCount, threadNamePrefix, operation, key, config);
++  }
++
++  // Delete single file / directory from key.
++  @VisibleForTesting
++  boolean deleteFile(String key, boolean isDir) throws IOException {
++    try {
++      store.delete(key);
++      if (isDir) {
++        instrumentation.directoryDeleted();
++      } else {
++        instrumentation.fileDeleted();
++      }
++    } catch(IOException e) {
++      Throwable innerException = NativeAzureFileSystemHelper.checkForAzureStorageException(e);
++
++      if (innerException instanceof StorageException
++          && NativeAzureFileSystemHelper.isFileNotFoundException((StorageException) innerException)) {
++        return false;
++      }
++
++      throw e;
++    }
++
++    return true;
++  }
++
+-  private FolderRenamePending prepareAtomicFolderRename(
++  @VisibleForTesting
++  FolderRenamePending prepareAtomicFolderRename(
+
+MOV26 MOV26 MOV26 MOV26 UPD40 INS23 INS23 INS23 INS23 INS23 INS23 INS31 INS31 INS31 INS29 INS83 INS83 INS83 INS43 INS59 INS29 INS83 INS83 INS83 INS39 INS59 INS29 INS83 INS83 INS83 INS43 INS59 INS29 INS83 INS83 INS83 INS39 INS59 INS29 INS83 INS39 INS59 INS29 INS83 INS39 INS59 INS83 INS43 INS42 INS44 INS44 INS44 INS44 INS44 INS8 INS78 INS39 INS42 INS44 INS44 INS43 INS8 INS78 MOV29 INS83 INS39 INS42 MOV43 INS8 INS78 UPD42 MOV44 INS43 MOV8 INS65 INS42 INS42 INS45 INS65 INS42 INS34 INS65 INS42 INS42 INS45 INS65 INS42 INS34 INS65 INS42 INS34 INS65 INS42 INS34 INS21 INS21 INS42 INS39 INS42 MOV43 INS42 INS43 INS42 INS43 INS42 INS43 INS42 INS41 INS42 INS43 INS42 INS39 INS42 INS42 MOV54 INS41 INS42 INS60 INS60 INS21 INS60 INS60 INS21 MOV60 MOV25 MOV21 MOV21 INS42 INS42 INS66 INS66 INS66 INS66 INS66 INS66 INS7 INS7 INS42 INS42 INS42 INS14 INS42 INS8 INS9 INS39 INS59 INS39 INS59 INS32 INS43 INS59 INS43 INS59 INS32 INS42 INS32 INS42 INS32 INS60 INS19 INS60 INS21 MOV60 INS60 INS60 INS25 INS25 INS43 INS42 INS42 INS42 INS42 INS42 MOV21 INS25 INS42 INS32 INS42 INS32 INS42 INS42 INS45 INS40 INS36 INS42 INS42 INS14 INS42 INS42 INS32 INS42 INS42 MOV32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS39 INS74 INS59 MOV8 INS27 INS39 INS59 INS32 INS83 INS5 INS43 INS59 INS43 INS59 MOV38 INS8 MOV38 INS8 INS42 INS42 INS8 MOV8 INS42 INS42 INS42 INS42 INS27 INS43 INS1 INS22 INS42 INS22 INS45 INS45 INS32 INS42 UPD42 INS32 INS43 INS43 INS42 INS14 INS42 INS33 INS42 INS32 INS42 INS42 INS45 INS32 INS36 INS43 INS85 UPD42 UPD42 MOV42 INS42 INS14 INS42 INS42 INS32 INS21 MOV41 MOV21 MOV41 INS21 INS42 INS42 INS42 INS31 INS52 INS42 INS22 INS42 INS42 INS42 INS42 INS42 INS42 INS74 INS8 INS42 INS42 INS42 INS42 INS27 UPD42 MOV42 UPD42 UPD42 INS3 INS43 INS1 UPD42 MOV42 INS22 INS45 INS45 UPD42 MOV42 UPD42 MOV42 UPD42 UPD42 INS42 INS42 INS32 UPD42 INS32 INS32 INS32 INS78 INS83 INS39 INS42 INS44 INS43 INS8 INS52 INS42 INS22 INS43 INS43 INS60 INS70 INS21 INS42 INS42 MOV5 INS32 UPD42 MOV42 INS31 INS52 INS42 INS42 INS42 INS45 INS42 INS42 INS42 INS42 INS42 UPD42 UPD42 INS45 MOV32 INS42 INS42 INS42 INS43 INS42 INS42 INS21 INS41 INS22 INS52 INS42 INS42 INS42 MOV43 INS59 INS44 MOV32 INS8 INS7 INS42 UPD42 MOV42 INS78 INS83 INS39 INS42 INS44 INS43 INS8 INS42 INS32 INS9 INS52 INS42 INS42 INS32 INS43 INS42 INS21 INS42 INS32 INS42 MOV43 UPD42 MOV42 INS42 INS41 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS42 INS42 MOV32 INS32 UPD42 UPD42 MOV42 INS42 DEL83 DEL42 DEL42 DEL70 DEL8 DEL33 DEL43 DEL42 DEL42 DEL42 DEL42 DEL42 DEL34 DEL42 DEL32 DEL7 DEL21 DEL8 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL62 DEL42 DEL42 DEL43 DEL42 DEL11 DEL32 DEL27 DEL9 DEL41 DEL8 DEL25 DEL42 DEL53 DEL8 DEL12 DEL54 DEL42 DEL33 DEL27 DEL8 DEL25 DEL42 DEL59 DEL60 DEL42 DEL43 DEL42 DEL27 DEL14 DEL9 DEL44 DEL42 DEL42 DEL42 DEL32 DEL32 DEL32 DEL59 DEL60 DEL8 DEL25 DEL8 DEL25 DEL8 DEL70 DEL42 DEL42 DEL42 DEL42 DEL27 DEL32 DEL21 DEL8 DEL83

@@ -1,0 +1,166 @@
+HDFS-7678. Erasure coding: DFSInputStream with decode functionality (pread). Contributed by Zhe Zhang.
+
+-import org.apache.hadoop.hdfs.protocol.*;
++import org.apache.hadoop.hdfs.protocol.DatanodeInfo;
++import org.apache.hadoop.hdfs.protocol.ExtendedBlock;
++import org.apache.hadoop.hdfs.protocol.HdfsConstants;
++import org.apache.hadoop.hdfs.protocol.LocatedBlock;
++import org.apache.hadoop.hdfs.protocol.LocatedStripedBlock;
+-import static org.apache.hadoop.hdfs.util.StripedBlockUtil.ReadPortion;
++import static org.apache.hadoop.hdfs.util.StripedBlockUtil.divideByteRangeIntoStripes;
++import static org.apache.hadoop.hdfs.util.StripedBlockUtil.initDecodeInputs;
++import static org.apache.hadoop.hdfs.util.StripedBlockUtil.decodeAndFillBuffer;
++import static org.apache.hadoop.hdfs.util.StripedBlockUtil.getNextCompletedStripedRead;
++import static org.apache.hadoop.hdfs.util.StripedBlockUtil.ReadPortion;
++import static org.apache.hadoop.hdfs.util.StripedBlockUtil.AlignedStripe;
++import static org.apache.hadoop.hdfs.util.StripedBlockUtil.StripingChunk;
++import static org.apache.hadoop.hdfs.util.StripedBlockUtil.StripingChunkReadResult;
++
++import java.io.InterruptedIOException;
++import java.util.Collection;
+-
++  private final ECSchema schema;
++    this.schema = schema;
+-    LocatedBlock lb = super.getBlockAt(blkStartOffset);
+-    assert lb instanceof LocatedStripedBlock : "NameNode should return a " +
+-        "LocatedStripedBlock for a striped file";
++    LocatedBlock lb = getBlockGroupAt(blkStartOffset);
+-    int idx = (int) (((blkStartOffset - lb.getStartOffset()) / cellSize)
+-        % dataBlkNum);
++    int idx = (int) ((blkStartOffset - lb.getStartOffset())
++        % (dataBlkNum + parityBlkNum));
+-    Map<Future<Void>, Integer> futures = new HashMap<>();
+-    CompletionService<Void> stripedReadsService =
+-        new ExecutorCompletionService<>(dfsClient.getStripedReadsThreadPool());
+-    int len = (int) (end - start + 1);
+-
++    AlignedStripe[] stripes = divideByteRangeIntoStripes(schema, blockGroup,
++        start, end, buf, offset);
++    for (AlignedStripe stripe : stripes) {
++      fetchOneStripe(blockGroup, buf, stripe, corruptedBlockMap);
++    }
++  }
+-    // Planning the portion of I/O for each shard
+-    ReadPortion[] readPortions = planReadPortions(dataBlkNum, cellSize, start,
+-        len, offset);
+-
++  private void fetchOneStripe(LocatedStripedBlock blockGroup,
++      byte[] buf, AlignedStripe alignedStripe, Map<ExtendedBlock,
++      Set<DatanodeInfo>> corruptedBlockMap) throws IOException {
++    Map<Future<Void>, Integer> futures = new HashMap<>();
++    CompletionService<Void> service =
++        new ExecutorCompletionService<>(dfsClient.getStripedReadsThreadPool());
++    if (alignedStripe.getSpanInBlock() == 0) {
++      DFSClient.LOG.warn("Trying to read an empty stripe from" + blockGroup);
++      return;
++    }
+-
+-      ReadPortion rp = readPortions[i];
+-      if (rp.getReadLength() <= 0) {
+-        continue;
++      if (alignedStripe.chunks[i] != null
++          && alignedStripe.chunks[i].state != StripingChunk.ALLZERO) {
++        fetchOneStripingChunk(futures, service, blks[i], alignedStripe, i,
++            corruptedBlockMap);
+-      DatanodeInfo loc = blks[i].getLocations()[0];
+-      StorageType type = blks[i].getStorageTypes()[0];
+-      DNAddrPair dnAddr = new DNAddrPair(loc, NetUtils.createSocketAddr(
+-          loc.getXferAddr(dfsClient.getConf().isConnectToDnViaHostname())),
+-          type);
+-      Callable<Void> readCallable = getFromOneDataNode(dnAddr,
+-          blks[i].getStartOffset(), rp.getStartOffsetInBlock(),
+-          rp.getStartOffsetInBlock() + rp.getReadLength() - 1, buf,
+-          rp.getOffsets(), rp.getLengths(), corruptedBlockMap, i);
+-      Future<Void> getFromDNRequest = stripedReadsService.submit(readCallable);
+-      DFSClient.LOG.debug("Submitting striped read request for " + blks[i]);
+-      futures.put(getFromDNRequest, (int) i);
++    // Input buffers for potential decode operation, which remains null until
++    // first read failure
++    byte[][] decodeInputs = null;
+-        waitNextCompletion(stripedReadsService, futures);
++        StripingChunkReadResult r = getNextCompletedStripedRead(
++            service, futures, 0);
++        if (DFSClient.LOG.isDebugEnabled()) {
++          DFSClient.LOG.debug("Read task returned: " + r + ", for stripe " + alignedStripe);
++        }
++        StripingChunk returnedChunk = alignedStripe.chunks[r.index];
++        Preconditions.checkNotNull(returnedChunk);
++        Preconditions.checkState(returnedChunk.state == StripingChunk.PENDING);
++        if (r.state == StripingChunkReadResult.SUCCESSFUL) {
++          returnedChunk.state = StripingChunk.FETCHED;
++          alignedStripe.fetchedChunksNum++;
++          if (alignedStripe.fetchedChunksNum == dataBlkNum) {
++            clearFutures(futures.keySet());
++            break;
++          }
++        } else {
++          returnedChunk.state = StripingChunk.MISSING;
++          alignedStripe.missingChunksNum++;
++          if (alignedStripe.missingChunksNum > parityBlkNum) {
++            clearFutures(futures.keySet());
++            throw new IOException("Too many blocks are missing: " + alignedStripe);
++          }
++          // When seeing first missing block, initialize decode input buffers
++          if (decodeInputs == null) {
++            decodeInputs = initDecodeInputs(alignedStripe, dataBlkNum, parityBlkNum);
++          }
++          for (int i = 0; i < alignedStripe.chunks.length; i++) {
++            StripingChunk chunk = alignedStripe.chunks[i];
++            Preconditions.checkNotNull(chunk);
++            if (chunk.state == StripingChunk.REQUESTED && i <= dataBlkNum) {
++              fetchOneStripingChunk(futures, service, blks[i], alignedStripe, i,
++                  corruptedBlockMap);
++            }
++          }
++        }
+-        // Ignore and retry
++        String err = "Read request interrupted";
++        DFSClient.LOG.error(err);
++        clearFutures(futures.keySet());
++        // Don't decode if read interrupted
++        throw new InterruptedIOException(err);
++
++    if (alignedStripe.missingChunksNum > 0) {
++      decodeAndFillBuffer(decodeInputs, buf, alignedStripe,
++          dataBlkNum, parityBlkNum);
++    }
++  }
++
++  /**
++   * Schedule a single read request to an internal block
++   * @param block The internal block
++   * @param index Index of the internal block in the group
++   * @param corruptedBlockMap Map of corrupted blocks
++   */
++  private void fetchOneStripingChunk(Map<Future<Void>, Integer> futures,
++      final CompletionService<Void> service, final LocatedBlock block,
++      final AlignedStripe alignedStripe, final int index,
++      Map<ExtendedBlock, Set<DatanodeInfo>> corruptedBlockMap) {
++    DatanodeInfo loc = block.getLocations()[0];
++    StorageType type = block.getStorageTypes()[0];
++    DNAddrPair dnAddr = new DNAddrPair(loc, NetUtils.createSocketAddr(
++        loc.getXferAddr(dfsClient.getConf().isConnectToDnViaHostname())),
++        type);
++    StripingChunk chunk = alignedStripe.chunks[index];
++    chunk.state = StripingChunk.PENDING;
++    Callable<Void> readCallable = getFromOneDataNode(dnAddr,
++        block.getStartOffset(), alignedStripe.getOffsetInBlock(),
++        alignedStripe.getOffsetInBlock() + alignedStripe.getSpanInBlock() - 1, chunk.buf,
++        chunk.getOffsets(), chunk.getLengths(),
++        corruptedBlockMap, index);
++    Future<Void> getFromDNRequest = service.submit(readCallable);
++    if (DFSClient.LOG.isDebugEnabled()) {
++      DFSClient.LOG.debug("Submitting striped read request for " + index +
++          ". Info of the block: " + block + ", offset in block is " +
++          alignedStripe.getOffsetInBlock() + ", end is " +
++          (alignedStripe.getOffsetInBlock() + alignedStripe.getSpanInBlock() - 1));
++    }
++    futures.put(getFromDNRequest, index);
++
++  /** A variation to {@link DFSInputStream#cancelAll} */
++  private void clearFutures(Collection<Future<Void>> futures) {
++    for (Future<Void> future : futures) {
++      future.cancel(false);
++    }
++    futures.clear();
++  }

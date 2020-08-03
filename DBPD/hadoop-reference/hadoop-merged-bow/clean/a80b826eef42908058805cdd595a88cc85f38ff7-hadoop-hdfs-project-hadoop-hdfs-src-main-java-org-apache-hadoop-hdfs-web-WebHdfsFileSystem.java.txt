@@ -1,0 +1,179 @@
+Merging r1523878 through r1524586 from trunk to branch HDFS-2832
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/branches/HDFS-2832@1524590 13f79535-47bb-0310-9956-ffa450edef68
+
++import org.apache.hadoop.hdfs.HAUtil;
++import org.apache.hadoop.io.retry.RetryPolicies;
+-  /** Default connection factory may be overriden in tests to use smaller timeout values */
++  /** Default connection factory may be overridden in tests to use smaller timeout values */
+-  private InetSocketAddress nnAddr;
++  private InetSocketAddress nnAddrs[];
++  private int currentNNAddrIndex;
+-    return "webhdfs";
++    return SCHEME;
++
+-      this.uri = new URI(uri.getScheme(), uri.getAuthority(), null, null, null);
++      this.uri = new URI(uri.getScheme(), uri.getAuthority(), null,
++          null, null);
++      this.nnAddrs = DFSUtil.resolve(this.uri, getDefaultPort(), conf);
+-    this.nnAddr = NetUtils.createSocketAddr(uri.getAuthority(), getDefaultPort());
+-    this.retryPolicy = 
+-        RetryUtils.getDefaultRetryPolicy(
+-            conf, 
+-            DFSConfigKeys.DFS_CLIENT_RETRY_POLICY_ENABLED_KEY, 
+-            DFSConfigKeys.DFS_CLIENT_RETRY_POLICY_ENABLED_DEFAULT, 
+-            DFSConfigKeys.DFS_CLIENT_RETRY_POLICY_SPEC_KEY,
+-            DFSConfigKeys.DFS_CLIENT_RETRY_POLICY_SPEC_DEFAULT,
+-            SafeModeException.class);
++
++    if (!HAUtil.isLogicalUri(conf, this.uri)) {
++      this.retryPolicy =
++          RetryUtils.getDefaultRetryPolicy(
++              conf,
++              DFSConfigKeys.DFS_HTTP_CLIENT_RETRY_POLICY_ENABLED_KEY,
++              DFSConfigKeys.DFS_HTTP_CLIENT_RETRY_POLICY_ENABLED_DEFAULT,
++              DFSConfigKeys.DFS_HTTP_CLIENT_RETRY_POLICY_SPEC_KEY,
++              DFSConfigKeys.DFS_HTTP_CLIENT_RETRY_POLICY_SPEC_DEFAULT,
++              SafeModeException.class);
++    } else {
++
++      int maxFailoverAttempts = conf.getInt(
++          DFSConfigKeys.DFS_HTTP_CLIENT_FAILOVER_MAX_ATTEMPTS_KEY,
++          DFSConfigKeys.DFS_HTTP_CLIENT_FAILOVER_MAX_ATTEMPTS_DEFAULT);
++      int failoverSleepBaseMillis = conf.getInt(
++          DFSConfigKeys.DFS_HTTP_CLIENT_FAILOVER_SLEEPTIME_BASE_KEY,
++          DFSConfigKeys.DFS_HTTP_CLIENT_FAILOVER_SLEEPTIME_BASE_DEFAULT);
++      int failoverSleepMaxMillis = conf.getInt(
++          DFSConfigKeys.DFS_HTTP_CLIENT_FAILOVER_SLEEPTIME_MAX_KEY,
++          DFSConfigKeys.DFS_HTTP_CLIENT_FAILOVER_SLEEPTIME_MAX_DEFAULT);
++
++      this.retryPolicy = RetryPolicies
++          .failoverOnNetworkException(RetryPolicies.TRY_ONCE_THEN_FAIL,
++              maxFailoverAttempts, failoverSleepBaseMillis,
++              failoverSleepMaxMillis);
++    }
++
++  private synchronized InetSocketAddress getCurrentNNAddr() {
++    return nnAddrs[currentNNAddrIndex];
++  }
++
++  /**
++   * Reset the appropriate state to gracefully fail over to another name node
++   */
++  private synchronized void resetStateToFailOver() {
++    currentNNAddrIndex = (currentNNAddrIndex + 1) % nnAddrs.length;
++    delegationToken = null;
++    hasInitedToken = false;
++  }
++
++    InetSocketAddress nnAddr = getCurrentNNAddr();
+-    return new Runner(op, fspath, parameters).run().json;
++    return new FsPathRunner(op, fspath, parameters).run().json;
+-  class Runner {
+-    private final HttpOpParam.Op op;
+-    private final URL url;
++  abstract class AbstractRunner {
++    abstract protected URL getUrl() throws IOException;
++
++    protected final HttpOpParam.Op op;
+-    private HttpURLConnection conn = null;
++    protected HttpURLConnection conn = null;
+-    Runner(final HttpOpParam.Op op, final URL url, final boolean redirected) {
++    protected AbstractRunner(final HttpOpParam.Op op, boolean redirected) {
+-      this.url = url;
+-    Runner(final HttpOpParam.Op op, final Path fspath,
+-        final Param<?,?>... parameters) throws IOException {
+-      this(op, toUrl(op, fspath, parameters), false);
+-    }
+-
+-    Runner(final HttpOpParam.Op op, final HttpURLConnection conn) {
+-      this(op, null, false);
+-      this.conn = conn;
+-    }
+-
++      URL url = getUrl();
+-    Runner run() throws IOException {
++    AbstractRunner run() throws IOException {
++      /**
++       * Do the real work.
++       *
++       * There are three cases that the code inside the loop can throw an
++       * IOException:
++       *
++       * <ul>
++       * <li>The connection has failed (e.g., ConnectException,
++       * @see FailoverOnNetworkExceptionRetry for more details)</li>
++       * <li>The namenode enters the standby state (i.e., StandbyException).</li>
++       * <li>The server returns errors for the command (i.e., RemoteException)</li>
++       * </ul>
++       *
++       * The call to shouldRetry() will conduct the retry policy. The policy
++       * examines the exception and swallows it if it decides to rerun the work.
++       */
++      InetSocketAddress nnAddr = getCurrentNNAddr();
+-          if (a.action == RetryPolicy.RetryAction.RetryDecision.RETRY) {
++
++          boolean isRetry = a.action == RetryPolicy.RetryAction.RetryDecision.RETRY;
++          boolean isFailoverAndRetry =
++              a.action == RetryPolicy.RetryAction.RetryDecision.FAILOVER_AND_RETRY;
++
++          if (isRetry || isFailoverAndRetry) {
+-                + retryPolicy + ", delay " + a.delayMillis + "ms.");      
++                + retryPolicy + ", delay " + a.delayMillis + "ms.");
++
++            if (isFailoverAndRetry) {
++              resetStateToFailOver();
++            }
++
++  final class FsPathRunner extends AbstractRunner {
++    private final Path fspath;
++    private final Param<?, ?>[] parameters;
++
++    FsPathRunner(final HttpOpParam.Op op, final Path fspath, final Param<?,?>... parameters) {
++      super(op, false);
++      this.fspath = fspath;
++      this.parameters = parameters;
++    }
++
++    @Override
++    protected URL getUrl() throws IOException {
++      return toUrl(op, fspath, parameters);
++    }
++  }
++
++  final class URLRunner extends AbstractRunner {
++    private final URL url;
++    @Override
++    protected URL getUrl() {
++      return url;
++    }
++
++    protected URLRunner(final HttpOpParam.Op op, final URL url, boolean redirected) {
++      super(op, redirected);
++      this.url = url;
++    }
++  }
++
++  @VisibleForTesting
++  final class ConnRunner extends AbstractRunner {
++    protected ConnRunner(final HttpOpParam.Op op, HttpURLConnection conn) {
++      super(op, false);
++      this.conn = conn;
++    }
++
++    @Override
++    protected URL getUrl() {
++      return null;
++    }
++  }
++
+-    return new Runner(op, f, 
++    return new FsPathRunner(op, f,
+-    return new Runner(op, f, new BufferSizeParam(bufferSize))
++    return new FsPathRunner(op, f, new BufferSizeParam(bufferSize))
+-      return new Runner(GetOpParam.Op.OPEN, offsetUrl, resolved).run().conn;
++      return new URLRunner(GetOpParam.Op.OPEN, offsetUrl, resolved).run().conn;
+-    SecurityUtil.setTokenService(token, nnAddr);
++    SecurityUtil.setTokenService(token, getCurrentNNAddr());
+
+INS26 INS26 MOV23 INS40 INS40 INS23 INS31 INS31 INS55 INS55 INS55 INS83 INS39 INS59 INS83 INS83 INS43 INS42 INS8 INS29 INS83 INS83 INS39 INS42 INS8 INS83 UPD42 INS31 INS83 INS42 INS43 INS23 INS23 MOV31 INS31 INS83 INS42 INS43 MOV23 INS31 INS31 INS78 INS83 INS42 INS43 MOV31 INS31 UPD42 INS85 INS42 INS25 INS42 INS41 INS65 INS21 INS21 INS21 INS60 INS83 INS83 INS43 INS42 INS43 UPD83 UPD83 INS83 UPD42 UPD43 INS42 INS83 INS83 INS43 INS59 INS83 INS83 INS5 INS59 UPD42 INS8 INS78 INS83 INS43 INS42 MOV43 MOV8 INS42 INS78 INS83 INS43 INS42 INS8 INS83 INS42 INS44 MOV44 INS44 INS8 INS42 INS42 INS83 UPD42 INS78 INS83 INS43 INS42 INS8 UPD66 INS42 INS38 INS8 INS8 INS2 INS66 INS7 INS7 INS7 INS43 INS59 INS42 INS42 INS60 UPD42 INS60 INS42 INS42 INS74 INS85 INS42 INS46 INS21 INS21 INS42 INS42 INS41 INS42 INS42 INS41 INS83 INS43 INS42 INS39 INS42 INS46 MOV21 INS46 INS42 INS42 INS41 INS21 INS32 MOV21 INS60 INS60 INS60 INS21 INS42 INS42 INS42 INS27 INS42 INS33 INS42 INS9 INS42 INS42 INS32 INS43 INS59 INS43 INS59 INS43 INS76 INS76 INS42 INS9 INS7 INS7 MOV32 INS42 INS40 INS42 INS42 INS42 INS9 INS33 INS32 INS7 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 INS22 INS39 INS59 INS39 INS59 INS39 INS59 INS7 INS36 INS40 INS42 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS22 INS42 INS22 INS42 UPD42 MOV42 INS22 INS32 INS52 INS42 INS42 INS32 INS42 INS32 INS42 INS32 INS22 INS32 INS27 UPD43 INS42 INS42 INS52 INS42 INS52 INS42 UPD43 UPD43 INS52 INS42 INS42 INS42 INS22 MOV32 INS42 UPD40 UPD40 UPD40 UPD40 INS42 INS42 INS40 INS40 INS42 INS42 INS40 INS40 INS42 INS42 INS40 INS40 INS52 INS42 INS42 INS42 INS40 INS42 INS42 INS42 INS42 INS34 UPD42 INS60 INS60 UPD42 UPD42 UPD43 INS52 INS42 INS39 INS59 INS39 INS59 INS27 UPD42 INS42 MOV27 INS42 INS27 INS42 INS42 INS25 INS40 INS40 INS42 INS8 INS21 INS32 INS42 DEL45 DEL52 DEL42 DEL22 DEL42 DEL32 DEL32 DEL7 DEL21 DEL83 DEL42 DEL9 DEL17 DEL83 DEL42 DEL33 DEL9 DEL17

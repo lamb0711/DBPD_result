@@ -1,0 +1,348 @@
+Merge trunk into HA branch
+
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/branches/HDFS-1623@1196458 13f79535-47bb-0310-9956-ffa450edef68
+
++import java.net.InetSocketAddress;
++import org.apache.commons.logging.Log;
++import org.apache.commons.logging.LogFactory;
++import org.apache.hadoop.fs.FileSystem;
++import org.apache.hadoop.hdfs.DFSConfigKeys;
+-import org.apache.hadoop.hdfs.HftpFileSystem;
++import org.apache.hadoop.hdfs.security.token.delegation.DelegationTokenRenewer;
++import org.apache.hadoop.hdfs.security.token.delegation.DelegationTokenSelector;
++import org.apache.hadoop.hdfs.server.common.JspHelper;
++import org.apache.hadoop.hdfs.web.resources.TokenArgumentParam;
+-import org.apache.hadoop.hdfs.web.resources.DstPathParam;
++import org.apache.hadoop.hdfs.web.resources.DestinationParam;
++import org.apache.hadoop.net.NetUtils;
++import org.apache.hadoop.security.SecurityUtil;
++import org.apache.hadoop.security.token.TokenIdentifier;
++import org.apache.hadoop.security.token.TokenRenewer;
++import org.apache.hadoop.security.token.delegation.AbstractDelegationTokenSelector;
+-public class WebHdfsFileSystem extends HftpFileSystem {
++public class WebHdfsFileSystem extends FileSystem
++    implements DelegationTokenRenewer.Renewable {
++  public static final Log LOG = LogFactory.getLog(WebHdfsFileSystem.class);
++  /** WebHdfs version. */
++  public static final int VERSION = 1;
+-  public static final String PATH_PREFIX = SCHEME;
++  public static final String PATH_PREFIX = "/" + SCHEME + "/v" + VERSION;
++  /** SPNEGO authenticator */
++  /** Delegation token kind */
++  public static final Text TOKEN_KIND = new Text("WEBHDFS delegation");
++
++  private static final DelegationTokenRenewer<WebHdfsFileSystem> dtRenewer
++      = new DelegationTokenRenewer<WebHdfsFileSystem>(WebHdfsFileSystem.class);
++  static {
++    dtRenewer.start();
++  }
++  private InetSocketAddress nnAddr;
++  private Token<?> delegationToken;
++  private Token<?> renewToken;
+-  protected Path workingDir;
++  private Path workingDir;
++    this.nnAddr = NetUtils.createSocketAddr(uri.toString());
++
++    if (UserGroupInformation.isSecurityEnabled()) {
++      initDelegationToken();
++    }
++  }
++
++  protected void initDelegationToken() throws IOException {
++    // look for webhdfs token, then try hdfs
++    final Text serviceName = SecurityUtil.buildTokenService(nnAddr);
++    Token<?> token = webhdfspTokenSelector.selectToken(
++        serviceName, ugi.getTokens());      
++    if (token == null) {
++      token = DelegationTokenSelector.selectHdfsDelegationToken(
++          nnAddr, ugi, getConf());
++    }
++
++    //since we don't already have a token, go get one
++    boolean createdToken = false;
++    if (token == null) {
++      token = getDelegationToken(null);
++      createdToken = (token != null);
++    }
++
++    // security might be disabled
++    if (token != null) {
++      setDelegationToken(token);
++      if (createdToken) {
++        dtRenewer.addRenewAction(this);
++        LOG.debug("Created new DT for " + token.getService());
++      } else {
++        LOG.debug("Found existing DT for " + token.getService());        
++      }
++    }
++  }
++
++  @Override
++  protected int getDefaultPort() {
++    return getConf().getInt(DFSConfigKeys.DFS_NAMENODE_HTTP_PORT_KEY,
++        DFSConfigKeys.DFS_NAMENODE_HTTP_PORT_DEFAULT);
+-  @SuppressWarnings("unchecked")
+-  private static <T> T jsonParse(final InputStream in) throws IOException {
++  private static Map<?, ?> jsonParse(final InputStream in) throws IOException {
+-    return (T)JSON.parse(new InputStreamReader(in));
++    return (Map<?, ?>)JSON.parse(new InputStreamReader(in));
+-  private static void validateResponse(final HttpOpParam.Op op,
++  private static Map<?, ?> validateResponse(final HttpOpParam.Op op,
+-      final Map<String, Object> m;
++      final Map<?, ?> m;
++      if (m.get(RemoteException.class.getSimpleName()) == null) {
++        return m;
++      }
++
++    return null;
++  }
++
++  /**
++   * Return a URL pointing to given path on the namenode.
++   *
++   * @param path to obtain the URL for
++   * @param query string to append to the path
++   * @return namenode URL referring to the given path
++   * @throws IOException on error constructing the URL
++   */
++  private URL getNamenodeURL(String path, String query) throws IOException {
++    final URL url = new URL("http", nnAddr.getHostName(),
++          nnAddr.getPort(), path + '?' + query);
++    if (LOG.isTraceEnabled()) {
++      LOG.trace("url=" + url);
++    }
++    return url;
++  }
++  
++  private String addDt2Query(String query) throws IOException {
++    if (UserGroupInformation.isSecurityEnabled()) {
++      synchronized (this) {
++        if (delegationToken != null) {
++          final String encoded = delegationToken.encodeToUrlString();
++          return query + JspHelper.getDelegationTokenUrlParam(encoded);
++        } // else we are talking to an insecure cluster
++      }
++    }
++    return query;
+-    final String path = "/" + PATH_PREFIX
++    final String path = PATH_PREFIX
+-    final URL url = getNamenodeURL(path, addDelegationTokenParam(query));
++    final URL url;
++    if (op.equals(PutOpParam.Op.RENEWDELEGATIONTOKEN)
++        || op.equals(GetOpParam.Op.GETDELEGATIONTOKEN)) {
++      // Skip adding delegation token for getting or renewing delegation token,
++      // because these operations require kerberos authentication.
++      url = getNamenodeURL(path, query);
++    } else {
++      url = getNamenodeURL(path, addDt2Query(query));
++    }
++  private HttpURLConnection getHttpUrlConnection(URL url)
++      throws IOException {
++    final HttpURLConnection conn;
++    try {
++      if (ugi.hasKerberosCredentials()) { 
++        conn = new AuthenticatedURL(AUTH).openConnection(url, authToken);
++      } else {
++        conn = (HttpURLConnection)url.openConnection();
++      }
++    } catch (AuthenticationException e) {
++      throw new IOException("Authentication failed, url=" + url, e);
++    }
++    return conn;
++  }
++  
+-    final HttpURLConnection conn;
+-    try {
+-      conn = new AuthenticatedURL(AUTH).openConnection(url, authToken);
+-    } catch(AuthenticationException e) {
+-      throw new IOException("Authentication failed, url=" + url, e);
+-    }
++    final HttpURLConnection conn = getHttpUrlConnection(url);
+-    } catch(IOException e) {
++    } catch (IOException e) {
+-   * @return a JSON object, e.g. Object[], Map<String, Object>, etc.
++   * @return a JSON object, e.g. Object[], Map<?, ?>, etc.
+-  private <T> T run(final HttpOpParam.Op op, final Path fspath,
++  private Map<?, ?> run(final HttpOpParam.Op op, final Path fspath,
+-    validateResponse(op, conn);
+-      return WebHdfsFileSystem.<T>jsonParse(conn.getInputStream());
++      final Map<?, ?> m = validateResponse(op, conn);
++      return m != null? m: jsonParse(conn.getInputStream());
+-    final Map<String, Object> json = run(op, f);
+-    final HdfsFileStatus status = JsonUtil.toFileStatus(json);
++    final Map<?, ?> json = run(op, f);
++    final HdfsFileStatus status = JsonUtil.toFileStatus(json, true);
+-    final Map<String, Object> json = run(op, f,
++    final Map<?, ?> json = run(op, f,
+-    final Map<String, Object> json = run(op, src,
+-        new DstPathParam(makeQualified(dst).toUri().getPath()));
++    final Map<?, ?> json = run(op, src,
++        new DestinationParam(makeQualified(dst).toUri().getPath()));
+-    run(op, src, new DstPathParam(makeQualified(dst).toUri().getPath()),
++    run(op, src, new DestinationParam(makeQualified(dst).toUri().getPath()),
+-    final Map<String, Object> json = run(op, p,
+-        new ReplicationParam(replication));
++    final Map<?, ?> json = run(op, p, new ReplicationParam(replication));
++  @Override
++  public long getDefaultBlockSize() {
++    return getConf().getLong(DFSConfigKeys.DFS_BLOCK_SIZE_KEY,
++        DFSConfigKeys.DFS_BLOCK_SIZE_DEFAULT);
++  }
++
++  @Override
++  public short getDefaultReplication() {
++    return (short)getConf().getInt(DFSConfigKeys.DFS_REPLICATION_KEY,
++        DFSConfigKeys.DFS_REPLICATION_DEFAULT);
++  }
++
++  @SuppressWarnings("deprecation")
++  @Override
++  public boolean delete(final Path f) throws IOException {
++    return delete(f, true);
++  }
++
+-    final Map<String, Object> json = run(op, f, new RecursiveParam(recursive));
++    final Map<?, ?> json = run(op, f, new RecursiveParam(recursive));
+-    return new FSDataInputStream(new ByteRangeInputStream(url));
++    ByteRangeInputStream str = getByteRangeInputStream(url);
++    return new FSDataInputStream(str);
++  }
++
++  private class URLOpener extends ByteRangeInputStream.URLOpener {
++
++    public URLOpener(URL u) {
++      super(u);
++    }
++
++    @Override
++    public HttpURLConnection openConnection() throws IOException {
++      return getHttpUrlConnection(offsetUrl);
++    }
++  }
++  
++  private ByteRangeInputStream getByteRangeInputStream(URL url) {
++    return new ByteRangeInputStream(new URLOpener(url), new URLOpener(null));
+-    final Object[] array = (Object[])json.get(
+-        HdfsFileStatus[].class.getSimpleName());
++    final Map<?, ?> rootmap = (Map<?, ?>)json.get(HdfsFileStatus.class.getSimpleName() + "es");
++    final Object[] array = (Object[])rootmap.get(HdfsFileStatus.class.getSimpleName());
+-      @SuppressWarnings("unchecked")
+-      final Map<String, Object> m = (Map<String, Object>)array[i];
+-      statuses[i] = makeQualified(JsonUtil.toFileStatus(m), f);
++      final Map<?, ?> m = (Map<?, ?>)array[i];
++      statuses[i] = makeQualified(JsonUtil.toFileStatus(m, false), f);
++  @SuppressWarnings("deprecation")
+-    final Map<String, Object> m = run(op, null, new RenewerParam(renewer));
++    final Map<?, ?> m = run(op, null, new RenewerParam(renewer));
++  public Token<?> getRenewToken() {
++    return renewToken;
++  }
++
++  @Override
++  public <T extends TokenIdentifier> void setDelegationToken(
++      final Token<T> token) {
++    synchronized(this) {
++      renewToken = token;
++      // emulate the 203 usage of the tokens
++      // by setting the kind and service as if they were hdfs tokens
++      delegationToken = new Token<T>(token);
++      // NOTE: the remote nn must be configured to use hdfs
++      delegationToken.setKind(DelegationTokenIdentifier.HDFS_DELEGATION_KIND);
++      // no need to change service because we aren't exactly sure what it
++      // should be.  we can guess, but it might be wrong if the local conf
++      // value is incorrect.  the service is a client side field, so the remote
++      // end does not care about the value
++    }
++  }
++
++  private synchronized long renewDelegationToken(final Token<?> token
++      ) throws IOException {
++    final HttpOpParam.Op op = PutOpParam.Op.RENEWDELEGATIONTOKEN;
++    TokenArgumentParam dtargParam = new TokenArgumentParam(
++        token.encodeToUrlString());
++    final Map<?, ?> m = run(op, null, dtargParam);
++    return (Long) m.get("long");
++  }
++
++  private synchronized void cancelDelegationToken(final Token<?> token
++      ) throws IOException {
++    final HttpOpParam.Op op = PutOpParam.Op.CANCELDELEGATIONTOKEN;
++    TokenArgumentParam dtargParam = new TokenArgumentParam(
++        token.encodeToUrlString());
++    run(op, null, dtargParam);
++  }
++  
++  @Override
+-    final Map<String, Object> m = run(op, p, new OffsetParam(offset),
++    final Map<?, ?> m = run(op, p, new OffsetParam(offset),
+-    final Map<String, Object> m = run(op, p);
++    final Map<?, ?> m = run(op, p);
+-    final Map<String, Object> m = run(op, p);
++    final Map<?, ?> m = run(op, p);
+-}
++
++  private static final DtSelector webhdfspTokenSelector = new DtSelector();
++
++  private static class DtSelector
++      extends AbstractDelegationTokenSelector<DelegationTokenIdentifier> {
++    private DtSelector() {
++      super(TOKEN_KIND);
++    }
++  }
++
++  /** Delegation token renewer. */
++  public static class DtRenewer extends TokenRenewer {
++    @Override
++    public boolean handleKind(Text kind) {
++      return kind.equals(TOKEN_KIND);
++    }
++  
++    @Override
++    public boolean isManaged(Token<?> token) throws IOException {
++      return true;
++    }
++
++    private static WebHdfsFileSystem getWebHdfs(
++        final Token<?> token, final Configuration conf
++        ) throws IOException, InterruptedException, URISyntaxException {
++      
++      final InetSocketAddress nnAddr =  NetUtils.createSocketAddr(
++          token.getService().toString());
++      final URI uri = DFSUtil.createUri(WebHdfsFileSystem.SCHEME, nnAddr);
++      return (WebHdfsFileSystem)FileSystem.get(uri, conf);
++    }
++
++    @Override
++    public long renew(final Token<?> token, final Configuration conf
++        ) throws IOException, InterruptedException {
++      final UserGroupInformation ugi = UserGroupInformation.getLoginUser();
++      // update the kerberos credentials, if they are coming from a keytab
++      ugi.checkTGTAndReloginFromKeytab();
++
++      try {
++        WebHdfsFileSystem webhdfs = getWebHdfs(token, conf);
++        return webhdfs.renewDelegationToken(token);
++      } catch (URISyntaxException e) {
++        throw new IOException(e);
++      }
++    }
++  
++    @Override
++    public void cancel(final Token<?> token, final Configuration conf
++        ) throws IOException, InterruptedException {
++      final UserGroupInformation ugi = UserGroupInformation.getLoginUser();
++      // update the kerberos credentials, if they are coming from a keytab
++      ugi.checkTGTAndReloginFromKeytab();
++
++      try {
++        final WebHdfsFileSystem webhdfs = getWebHdfs(token, conf);
++        webhdfs.cancelDelegationToken(token);
++      } catch (URISyntaxException e) {
++        throw new IOException(e);
++      }
++    }
++  }
++}
+
+MOV26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS40 INS40 INS40 UPD40 INS40 INS40 INS40 INS40 INS40 UPD40 INS40 INS40 INS40 INS40 INS40 UPD43 INS43 INS23 INS23 INS23 INS23 INS28 INS23 INS23 INS23 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS55 INS31 INS31 INS31 INS31 INS31 INS23 INS55 INS55 UPD42 INS40 INS83 INS83 INS83 INS43 INS59 INS29 INS83 INS83 INS83 INS39 INS59 INS29 INS29 INS83 INS83 INS83 INS43 INS59 INS83 INS83 INS83 INS74 INS59 INS83 INS8 INS83 INS43 INS59 INS83 INS74 INS59 INS83 INS74 INS59 UPD83 INS83 INS39 INS42 INS43 INS8 INS78 INS83 INS39 INS42 INS8 INS74 INS74 INS29 INS83 INS43 INS42 INS44 INS44 MOV43 INS8 INS83 MOV43 INS42 INS44 INS43 INS8 INS83 INS43 INS42 INS44 INS43 INS8 INS74 INS43 INS78 INS83 INS39 INS42 INS8 INS78 INS83 INS39 INS42 INS8 INS79 INS78 INS83 INS39 INS42 INS44 INS43 INS8 INS83 INS42 INS43 INS31 INS31 INS83 INS43 INS42 INS44 INS8 INS79 INS78 INS83 INS74 INS42 INS8 INS78 INS83 INS73 INS39 INS42 INS44 INS8 INS83 INS83 INS39 INS42 INS44 INS43 INS8 INS83 INS83 INS39 INS42 INS44 INS43 INS8 INS83 INS83 INS83 INS43 INS59 INS83 INS83 INS42 INS74 INS31 INS29 INS83 INS83 INS42 INS43 INS31 INS31 INS31 INS31 INS31 INS42 INS42 INS32 INS65 INS42 INS34 INS27 INS65 INS65 INS42 INS42 INS14 INS43 INS43 INS42 INS14 INS21 INS42 INS42 INS43 INS76 INS42 INS43 INS76 INS42 INS21 INS25 INS42 INS60 INS60 INS25 INS60 INS25 INS25 INS42 INS41 INS43 INS76 INS76 INS43 INS76 INS76 INS41 INS65 INS65 INS65 INS65 INS65 INS42 MOV43 INS42 MOV43 INS42 INS60 INS25 INS41 MOV43 INS42 INS42 INS25 INS41 INS60 INS25 INS42 INS43 INS42 INS42 MOV60 MOV54 INS41 INS60 INS43 INS76 INS76 INS42 INS42 INS41 INS42 INS41 INS42 INS45 INS42 INS83 INS43 INS42 INS42 INS41 INS60 INS40 INS83 INS42 INS44 INS8 INS78 INS83 INS43 INS42 INS43 INS8 INS42 INS43 INS42 INS41 INS60 INS42 INS45 INS42 INS43 INS76 INS41 INS42 INS42 INS43 INS83 INS74 INS42 INS51 INS83 INS74 INS42 INS42 INS60 INS60 INS60 INS41 INS83 INS74 INS42 INS42 INS60 INS60 INS21 INS60 MOV60 INS42 INS42 INS14 INS43 INS43 INS83 INS42 INS8 INS65 INS42 INS78 INS83 INS39 INS42 INS44 INS8 INS78 INS83 INS39 INS42 INS44 INS43 INS8 INS83 INS83 INS43 INS42 INS44 INS44 INS43 INS43 INS43 INS8 INS78 INS83 INS39 INS42 INS44 INS44 INS43 INS43 INS8 INS78 INS83 INS39 INS42 INS44 INS44 INS43 INS43 INS8 INS42 INS42 INS57 INS66 INS45 INS42 INS45 INS42 INS66 INS66 INS43 INS45 INS42 INS42 INS74 INS57 INS32 INS42 INS42 INS7 INS32 INS8 INS83 INS43 INS59 INS74 INS59 INS27 INS8 INS39 INS59 INS27 INS8 INS27 INS8 INS32 UPD42 MOV42 INS42 INS33 INS66 INS42 INS66 INS42 INS66 INS66 INS42 INS66 INS83 MOV43 INS59 INS32 INS8 INS42 INS32 INS8 INS42 MOV83 INS43 INS59 INS27 INS8 INS8 INS42 INS8 INS42 INS83 INS43 INS59 UPD66 INS42 UPD74 UPD74 UPD74 MOV32 UPD74 INS32 INS11 INS42 INS32 UPD74 MOV43 INS59 INS14 INS43 INS42 INS46 INS42 INS42 INS42 INS41 INS42 INS14 INS74 INS83 MOV5 INS59 UPD74 INS42 INS42 INS42 INS43 MOV43 INS52 INS8 INS43 INS76 INS83 INS43 INS59 INS43 INS59 INS83 INS74 INS59 INS11 INS43 INS76 INS83 INS43 INS59 INS43 INS59 INS32 UPD74 INS83 INS74 MOV59 UPD74 INS43 INS42 INS42 INS46 INS66 INS42 INS43 INS42 INS41 INS42 INS74 INS42 INS42 INS41 INS42 INS83 INS74 INS42 INS83 INS43 INS42 INS42 INS42 INS42 INS60 INS60 INS41 INS42 INS83 INS74 INS42 INS83 INS43 INS42 INS42 INS42 INS60 INS21 INS54 INS42 INS83 INS74 INS42 INS83 INS43 INS42 INS42 INS42 INS60 INS21 INS54 INS43 INS42 INS43 INS43 INS43 INS42 INS42 INS22 INS32 INS42 INS42 INS21 INS42 INS42 INS32 INS43 INS76 INS42 INS32 INS42 INS33 INS21 INS42 INS9 INS42 INS33 INS21 INS21 INS42 INS33 INS21 INS25 INS32 INS42 INS40 INS40 INS74 INS25 INS42 INS14 INS42 INS42 INS21 INS42 INS42 INS51 INS42 MOV42 INS32 INS32 INS21 INS21 INS25 INS42 INS42 INS32 INS60 INS76 INS76 INS76 INS76 INS76 INS76 INS32 MOV14 INS76 INS76 INS32 INS42 INS40 INS40 INS39 INS32 INS42 INS42 INS9 MOV43 INS76 INS76 INS42 INS32 MOV43 UPD42 MOV42 INS42 INS42 INS32 INS43 INS14 INS14 INS43 INS76 INS76 UPD42 INS42 INS11 INS76 INS76 INS42 INS21 INS21 INS21 INS42 INS40 INS42 INS40 INS42 INS42 INS14 INS43 INS76 INS76 INS42 INS32 INS43 INS32 INS42 INS40 INS42 INS40 INS42 INS42 INS14 INS42 INS42 INS33 INS42 INS76 INS76 INS43 INS76 INS76 INS76 INS76 INS42 INS42 INS42 INS32 INS43 INS76 INS9 INS43 INS76 INS42 INS83 INS43 INS59 INS83 INS43 INS59 INS11 INS43 INS76 INS42 INS83 INS43 INS59 INS32 INS8 INS12 INS43 INS76 INS42 INS83 INS43 INS59 INS32 INS8 INS12 INS42 INS42 INS42 INS42 INS52 INS42 INS42 INS42 INS32 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS7 INS7 INS7 INS32 INS42 INS8 INS8 INS42 INS43 INS76 INS76 UPD74 INS27 INS8 INS43 INS45 INS32 INS32 INS27 INS32 INS52 INS8 INS42 INS42 INS40 INS42 INS42 INS40 INS7 INS7 INS32 MOV8 INS8 INS42 INS42 INS83 INS74 INS59 INS16 INS9 INS42 INS42 INS42 INS14 UPD43 INS42 INS32 INS42 INS40 INS40 MOV42 INS42 INS42 INS42 INS42 INS42 INS43 INS42 INS43 INS33 INS42 INS74 MOV5 INS32 UPD74 INS7 INS7 INS32 INS43 INS32 INS42 INS42 INS42 INS33 INS42 INS42 INS42 INS42 INS45 INS43 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS32 INS43 INS32 INS42 INS42 INS42 INS32 INS42 INS42 INS60 INS41 INS44 INS8 INS42 INS42 INS42 INS32 INS42 INS42 INS60 INS21 INS44 INS8 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS32 INS42 INS36 INS42 INS42 INS21 INS21 INS21 UPD42 MOV42 INS76 INS76 INS32 INS33 INS41 INS42 INS42 INS42 INS42 INS42 INS42 INS13 INS42 INS42 INS42 INS27 INS25 INS42 INS32 INS42 INS32 INS42 INS42 INS21 INS43 INS76 INS76 INS42 MOV32 INS27 INS42 MOV32 INS43 MOV32 UPD42 INS42 INS42 INS42 INS43 INS76 INS76 INS27 INS42 INS42 INS32 INS76 INS76 INS42 INS42 INS42 INS14 INS42 INS42 INS40 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS40 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS43 INS59 INS32 INS43 INS42 INS53 INS42 INS42 INS83 INS43 INS59 INS32 INS43 INS42 INS53 INS42 INS42 INS42 INS42 INS32 INS42 INS33 INS27 INS32 INS32 INS32 INS42 INS42 INS32 INS42 INS45 INS42 INS27 INS8 INS42 INS42 INS42 MOV42 MOV42 MOV32 INS7 INS42 INS42 INS33 INS42 INS42 MOV32 INS45 INS57 INS42 UPD74 INS74 INS42 INS32 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS14 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS14 INS42 INS42 INS33 INS42 INS42 INS52 INS42 INS42 INS27 INS42 INS42 INS27 INS57 INS42 INS42 INS33 INS60 INS41 UPD42 INS42 INS11 INS43 INS76 INS76 INS9 INS43 MOV43 INS42 INS42 INS42 INS42 INS42 INS43 INS42 INS42 INS42 INS42 INS43 INS42 INS45 INS32 INS45 INS32 INS43 INS83 MOV43 INS59 INS27 INS43 INS32 MOV43 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 DEL42 DEL42 DEL45 DEL79 DEL42 DEL73 DEL43 DEL43 DEL39 DEL42 DEL43 DEL45 DEL32 DEL59 DEL60 DEL42 DEL73 DEL21 DEL42 DEL42 DEL43 DEL42 DEL43 DEL42 DEL43 DEL42 DEL42 DEL42 DEL42 DEL43 DEL14 DEL32 DEL42 DEL43 DEL42 DEL43 DEL42 DEL43 DEL14 DEL14 DEL85 DEL5 DEL42 DEL45 DEL79 DEL42 DEL43 DEL42 DEL43 DEL42 DEL43 DEL42 DEL43 DEL42 DEL43 DEL42 DEL43 DEL42 DEL43 DEL42 DEL43 DEL42 DEL43 DEL42 DEL43 DEL83 DEL42 DEL43 DEL42 DEL43 DEL74 DEL60

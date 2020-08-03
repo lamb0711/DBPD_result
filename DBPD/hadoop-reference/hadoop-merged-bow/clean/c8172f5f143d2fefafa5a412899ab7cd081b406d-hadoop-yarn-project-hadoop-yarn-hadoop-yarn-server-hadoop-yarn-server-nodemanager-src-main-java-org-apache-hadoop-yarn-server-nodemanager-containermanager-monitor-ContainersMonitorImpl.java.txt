@@ -1,0 +1,164 @@
+YARN-2883. Queuing of container requests in the NM. (Konstantinos Karanasos and Arun Suresh via kasha)
+
+-  private final Context context;
++  protected final Context context;
++  // Tracks the aggregated allocation of the currently allocated containers
++  // when queuing of containers at the NMs is enabled.
++  private ResourceUtilization containersAllocation;
++    this.containersAllocation = ResourceUtilization.newInstance(0, 0, 0.0f);
+-        NodeManagerHardwareUtils.getContainerMemoryMB(conf) * 1024 * 1024L;
++        NodeManagerHardwareUtils.getContainerMemoryMB(
++            this.resourceCalculatorPlugin, conf) * 1024 * 1024L;
+-        NodeManagerHardwareUtils.getVCores(conf);
++        NodeManagerHardwareUtils.getVCores(this.resourceCalculatorPlugin, conf);
+-  @VisibleForTesting
+-  static class ProcessTreeInfo {
++  public static class ProcessTreeInfo {
++  public ResourceUtilization getContainersAllocation() {
++    return this.containersAllocation;
++  }
++
++  /**
++   * @return true if there are available allocated resources for the given
++   *         container to start.
++   */
++  @Override
++  public boolean hasResourcesAvailable(ProcessTreeInfo pti) {
++    synchronized (this.containersAllocation) {
++      // Check physical memory.
++      if (this.containersAllocation.getPhysicalMemory() +
++          (int) (pti.getPmemLimit() >> 20) >
++          (int) (getPmemAllocatedForContainers() >> 20)) {
++        return false;
++      }
++      // Check virtual memory.
++      if (isVmemCheckEnabled() &&
++          this.containersAllocation.getVirtualMemory() +
++          (int) (pti.getVmemLimit() >> 20) >
++          (int) (getVmemAllocatedForContainers() >> 20)) {
++        return false;
++      }
++      // Check CPU.
++      if (this.containersAllocation.getCPU()
++          + allocatedCpuUsage(pti) > 1.0f) {
++        return false;
++      }
++    }
++    return true;
++  }
++
++  @Override
++  public void increaseContainersAllocation(ProcessTreeInfo pti) {
++    synchronized (this.containersAllocation) {
++      increaseResourceUtilization(this.containersAllocation, pti);
++    }
++  }
++
++  @Override
++  public void decreaseContainersAllocation(ProcessTreeInfo pti) {
++    synchronized (this.containersAllocation) {
++      decreaseResourceUtilization(this.containersAllocation, pti);
++    }
++  }
++
++  @Override
++  public void increaseResourceUtilization(ResourceUtilization resourceUtil,
++      ProcessTreeInfo pti) {
++    resourceUtil.addTo((int) (pti.getPmemLimit() >> 20),
++        (int) (pti.getVmemLimit() >> 20), allocatedCpuUsage(pti));
++  }
++
++  @Override
++  public void decreaseResourceUtilization(ResourceUtilization resourceUtil,
++      ProcessTreeInfo pti) {
++    resourceUtil.subtractFrom((int) (pti.getPmemLimit() >> 20),
++        (int) (pti.getVmemLimit() >> 20), allocatedCpuUsage(pti));
++  }
++
++  @Override
++  public void subtractNodeResourcesFromResourceUtilization(
++      ResourceUtilization resourceUtil) {
++    resourceUtil.subtractFrom((int) (getPmemAllocatedForContainers() >> 20),
++        (int) (getVmemAllocatedForContainers() >> 20), 1.0f);
++  }
++
++  private float allocatedCpuUsage(ProcessTreeInfo pti) {
++    float cpuUsagePercentPerCore = pti.getCpuVcores() * 100.0f;
++    float cpuUsageTotalCoresPercentage = cpuUsagePercentPerCore
++        / resourceCalculatorPlugin.getNumProcessors();
++    return (cpuUsageTotalCoresPercentage * 1000 *
++        maxVCoresAllottedForContainers / nodeCpuPercentageForYARN) / 1000.0f;
++  }
++
+-      ContainerStartMonitoringEvent startEvent =
+-          (ContainerStartMonitoringEvent) monitoringEvent;
+-      LOG.info("Starting resource-monitoring for " + containerId);
+-      updateContainerMetrics(monitoringEvent);
+-      trackingContainers.put(containerId,
+-          new ProcessTreeInfo(containerId, null, null,
+-              startEvent.getVmemLimit(), startEvent.getPmemLimit(),
+-              startEvent.getCpuVcores()));
++      onStartMonitoringContainer(monitoringEvent, containerId);
+-      LOG.info("Stopping resource-monitoring for " + containerId);
+-      updateContainerMetrics(monitoringEvent);
+-      trackingContainers.remove(containerId);
++      onStopMonitoringContainer(monitoringEvent, containerId);
+-      ChangeMonitoringContainerResourceEvent changeEvent =
+-          (ChangeMonitoringContainerResourceEvent) monitoringEvent;
+-      ProcessTreeInfo processTreeInfo = trackingContainers.get(containerId);
+-      if (processTreeInfo == null) {
+-        LOG.warn("Failed to track container "
+-            + containerId.toString()
+-            + ". It may have already completed.");
+-        break;
+-      }
+-      LOG.info("Changing resource-monitoring for " + containerId);
+-      updateContainerMetrics(monitoringEvent);
+-      long pmemLimit = changeEvent.getResource().getMemory() * 1024L * 1024L;
+-      long vmemLimit = (long) (pmemLimit * vmemRatio);
+-      int cpuVcores = changeEvent.getResource().getVirtualCores();
+-      processTreeInfo.setResourceLimit(pmemLimit, vmemLimit, cpuVcores);
+-      changeContainerResource(containerId, changeEvent.getResource());
++      onChangeMonitoringContainerResource(monitoringEvent, containerId);
++
++  protected void onChangeMonitoringContainerResource(
++      ContainersMonitorEvent monitoringEvent, ContainerId containerId) {
++    ChangeMonitoringContainerResourceEvent changeEvent =
++        (ChangeMonitoringContainerResourceEvent) monitoringEvent;
++    ProcessTreeInfo processTreeInfo = trackingContainers.get(containerId);
++    if (processTreeInfo == null) {
++      LOG.warn("Failed to track container "
++          + containerId.toString()
++          + ". It may have already completed.");
++      return;
++    }
++    LOG.info("Changing resource-monitoring for " + containerId);
++    updateContainerMetrics(monitoringEvent);
++    long pmemLimit = changeEvent.getResource().getMemory() * 1024L * 1024L;
++    long vmemLimit = (long) (pmemLimit * vmemRatio);
++    int cpuVcores = changeEvent.getResource().getVirtualCores();
++    processTreeInfo.setResourceLimit(pmemLimit, vmemLimit, cpuVcores);
++    changeContainerResource(containerId, changeEvent.getResource());
++  }
++
++  protected void onStopMonitoringContainer(
++      ContainersMonitorEvent monitoringEvent, ContainerId containerId) {
++    LOG.info("Stopping resource-monitoring for " + containerId);
++    updateContainerMetrics(monitoringEvent);
++    trackingContainers.remove(containerId);
++  }
++
++  protected void onStartMonitoringContainer(
++      ContainersMonitorEvent monitoringEvent, ContainerId containerId) {
++    ContainerStartMonitoringEvent startEvent =
++        (ContainerStartMonitoringEvent) monitoringEvent;
++    LOG.info("Starting resource-monitoring for " + containerId);
++    updateContainerMetrics(monitoringEvent);
++    trackingContainers.put(containerId,
++        new ProcessTreeInfo(containerId, null, null,
++            startEvent.getVmemLimit(), startEvent.getPmemLimit(),
++            startEvent.getCpuVcores()));
++  }
++
+
+INS23 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS31 UPD83 INS83 INS43 INS59 INS83 INS83 INS43 INS42 INS8 INS29 INS78 INS83 INS39 INS42 INS44 INS8 INS78 INS83 INS39 INS42 INS44 INS8 INS78 INS83 INS39 INS42 INS44 INS8 INS78 INS83 INS39 INS42 INS44 INS44 INS8 INS78 INS83 INS39 INS42 INS44 INS44 INS8 INS78 INS83 INS39 INS42 INS44 INS8 INS83 INS39 INS42 INS44 INS8 MOV78 MOV79 INS83 INS39 INS42 INS44 INS8 UPD83 UPD42 INS44 INS83 INS39 INS42 INS44 INS44 INS8 INS83 INS39 INS42 INS44 INS44 INS8 INS42 INS42 INS21 INS42 INS41 INS65 INS42 INS43 INS42 INS51 INS41 INS42 INS43 INS42 INS51 INS42 INS43 INS42 INS51 INS42 INS43 INS42 INS43 INS42 INS21 INS42 INS43 INS42 INS43 INS42 INS21 INS42 INS43 INS42 INS21 INS43 INS42 INS60 INS60 INS41 INS43 INS42 MOV60 MOV25 INS50 INS43 INS42 MOV60 MOV60 MOV25 MOV21 MOV21 MOV60 MOV60 MOV60 MOV21 MOV21 INS43 INS42 INS43 INS42 MOV21 MOV21 MOV21 INS43 INS42 INS43 INS42 MOV60 MOV21 MOV21 MOV21 INS7 INS22 INS66 INS66 INS42 INS22 INS8 INS9 INS42 INS22 INS8 INS42 INS22 INS8 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS32 INS42 INS39 INS59 INS39 INS59 INS27 INS42 MOV32 MOV49 INS21 INS10 MOV49 INS21 INS10 MOV49 INS21 INS10 INS49 INS42 INS42 INS42 INS42 INS42 INS22 INS32 INS52 INS42 INS52 INS42 INS25 INS25 INS25 INS52 INS42 INS21 INS52 INS42 INS21 INS42 INS42 INS11 INS11 INS32 INS42 INS42 INS11 INS11 INS32 INS42 INS42 INS11 INS11 INS34 INS42 INS27 INS42 INS27 INS36 INS34 INS32 INS32 INS32 INS41 INS52 INS42 INS42 INS42 INS34 INS34 INS34 INS22 INS27 INS8 INS27 INS8 INS27 INS8 INS32 INS32 INS39 INS36 INS39 INS36 INS42 INS42 INS39 INS36 INS39 INS36 INS42 INS42 INS39 INS36 INS39 INS36 INS32 INS34 INS42 INS32 INS27 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS22 INS52 INS42 INS27 INS11 INS41 INS32 INS27 INS41 INS27 INS34 INS41 INS42 INS22 INS42 INS42 INS22 INS42 INS27 INS27 INS27 INS27 INS27 INS27 INS42 INS42 INS42 INS42 INS27 INS42 INS52 INS42 INS32 INS11 INS39 INS36 INS9 INS42 INS27 INS11 INS9 INS32 INS32 INS9 INS52 INS42 INS52 INS42 INS32 INS34 INS32 INS34 INS32 INS34 INS32 INS34 INS32 INS34 INS32 INS34 INS42 INS34 INS42 INS22 INS42 INS39 INS36 INS27 INS32 INS11 INS39 INS36 INS22 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS52 INS42 INS27 INS32 INS34 INS22 INS42 INS39 INS36 INS27 INS52 INS42 INS32 INS34 INS42 INS52 INS42 INS27 INS32 INS34 INS42 INS42 INS32 INS34 INS42 INS42 INS42 DEL42 DEL78 DEL10 DEL10 DEL10 DEL10 DEL49 DEL50

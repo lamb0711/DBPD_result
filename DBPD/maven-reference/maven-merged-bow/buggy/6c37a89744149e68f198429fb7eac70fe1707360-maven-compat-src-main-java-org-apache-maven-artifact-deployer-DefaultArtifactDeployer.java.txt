@@ -1,0 +1,154 @@
+[MNG-4756] Aether integration
+
+
+git-svn-id: https://svn.apache.org/repos/asf/maven/maven-3/trunk@988749 13f79535-47bb-0310-9956-ffa450edef68
+
+-import java.io.IOException;
+-import java.util.Arrays;
+-import java.util.List;
++import java.util.Map;
++import java.util.concurrent.ConcurrentHashMap;
++import org.apache.maven.RepositoryUtils;
+-import org.apache.maven.artifact.repository.metadata.RepositoryMetadataDeploymentException;
+-import org.apache.maven.artifact.repository.metadata.RepositoryMetadataManager;
+-import org.apache.maven.execution.MavenExecutionRequest;
+-import org.apache.maven.execution.MavenSession;
++import org.apache.maven.artifact.repository.metadata.ArtifactRepositoryMetadata;
++import org.apache.maven.artifact.repository.metadata.MetadataBridge;
++import org.apache.maven.artifact.repository.metadata.SnapshotArtifactRepositoryMetadata;
+-import org.apache.maven.repository.RepositorySystem;
+-import org.apache.maven.repository.legacy.TransferListenerAdapter;
+-import org.apache.maven.repository.legacy.WagonManager;
+-import org.apache.maven.repository.legacy.resolver.transform.ArtifactTransformationManager;
+-import org.apache.maven.wagon.TransferFailedException;
+-import org.apache.maven.wagon.events.TransferListener;
++import org.apache.maven.project.artifact.ProjectArtifactMetadata;
+-import org.codehaus.plexus.util.FileUtils;
++import org.sonatype.aether.RepositorySystem;
++import org.sonatype.aether.deployment.DeployRequest;
++import org.sonatype.aether.deployment.DeployResult;
++import org.sonatype.aether.deployment.DeploymentException;
++import org.sonatype.aether.metadata.MergeableMetadata;
++import org.sonatype.aether.repository.LocalRepository;
++import org.sonatype.aether.repository.RemoteRepository;
++import org.sonatype.aether.util.DefaultRepositorySystemSession;
++import org.sonatype.aether.util.artifact.SubArtifact;
+-@Component( role = ArtifactDeployer.class )
++@Component( role = ArtifactDeployer.class, instantiationStrategy = "per-lookup" )
+-    @Requirement
+-    private WagonManager wagonManager;
+-    private ArtifactTransformationManager transformationManager;
+-
+-    @Requirement
+-    private RepositoryMetadataManager repositoryMetadataManager;
+-
+-    @Requirement
+-    private RepositorySystem repositorySystem;
++    private RepositorySystem repoSystem;
++    private Map<Object, MergeableMetadata> snapshots = new ConcurrentHashMap<Object, MergeableMetadata>();
++
+-        deploymentRepository = injectSession( deploymentRepository );
++        DefaultRepositorySystemSession session =
++            new DefaultRepositorySystemSession( legacySupport.getRepositorySession() );
++        LocalRepository localRepo = new LocalRepository( localRepository.getBasedir() );
++        session.setLocalRepositoryManager( repoSystem.newLocalRepositoryManager( localRepo ) );
+-        try
++        DeployRequest request = new DeployRequest();
++
++        org.sonatype.aether.artifact.Artifact mainArtifact = RepositoryUtils.toArtifact( artifact );
++        mainArtifact = mainArtifact.setFile( source );
++        request.addArtifact( mainArtifact );
++
++        String snapshotKey = null;
++        if ( artifact.isSnapshot() )
+-            transformationManager.transformForDeployment( artifact, deploymentRepository, localRepository );
++            snapshotKey = artifact.getGroupId() + ':' + artifact.getArtifactId() + ':' + artifact.getBaseVersion();
++            request.addMetadata( snapshots.get( snapshotKey ) );
++        }
+-            // Copy the original file to the new one if it was transformed
+-            File artifactFile = new File( localRepository.getBasedir(), localRepository.pathOf( artifact ) );
+-            if ( !artifactFile.equals( source ) )
++        for ( ArtifactMetadata metadata : artifact.getMetadataList() )
++        {
++            if ( metadata instanceof ProjectArtifactMetadata )
+-                FileUtils.copyFile( source, artifactFile );
++                org.sonatype.aether.artifact.Artifact pomArtifact = new SubArtifact( mainArtifact, "", "pom" );
++                pomArtifact = pomArtifact.setFile( ( (ProjectArtifactMetadata) metadata ).getFile() );
++                request.addArtifact( pomArtifact );
+-
+-            wagonManager.putArtifact( source, artifact, deploymentRepository, getTransferListener() );
+-
+-            // must be after the artifact is installed
+-            for ( ArtifactMetadata metadata : artifact.getMetadataList() )
++            else if ( metadata instanceof SnapshotArtifactRepositoryMetadata
++                || metadata instanceof ArtifactRepositoryMetadata )
+-                repositoryMetadataManager.deploy( metadata, localRepository, deploymentRepository );
++                // eaten, handled by repo system
++            }
++            else
++            {
++                request.addMetadata( new MetadataBridge( metadata ) );
+-        catch ( TransferFailedException e )
+-        {
+-            throw new ArtifactDeploymentException( "Error deploying artifact: " + e.getMessage(), e );
+-        }
+-        catch ( IOException e )
+-        {
+-            throw new ArtifactDeploymentException( "Error deploying artifact: " + e.getMessage(), e );
+-        }
+-        catch ( RepositoryMetadataDeploymentException e )
+-        {
+-            throw new ArtifactDeploymentException( "Error installing artifact's metadata: " + e.getMessage(), e );
+-        }
+-    }
+-    private TransferListener getTransferListener()
+-    {
+-        MavenSession session = legacySupport.getSession();
+-
+-        if ( session == null )
+-        {
+-            return null;
+-        }
+-
+-        return TransferListenerAdapter.newAdapter( session.getRequest().getTransferListener() );
+-    }
+-
+-    private ArtifactRepository injectSession( ArtifactRepository repository )
+-    {
++        RemoteRepository remoteRepo = RepositoryUtils.toRepo( deploymentRepository );
+-        if ( repository instanceof DefaultArtifactRepository && repository.getAuthentication() == null )
++        if ( deploymentRepository instanceof DefaultArtifactRepository
++            && deploymentRepository.getAuthentication() == null )
+-            MavenSession session = legacySupport.getSession();
++            remoteRepo.setAuthentication( session.getAuthenticationSelector().getAuthentication( remoteRepo ) );
++            remoteRepo.setProxy( session.getProxySelector().getProxy( remoteRepo ) );
++        }
++        request.setRepository( remoteRepo );
+-            if ( session != null )
++        DeployResult result;
++        try
++        {
++            result = repoSystem.deploy( session, request );
++        }
++        catch ( DeploymentException e )
++        {
++            throw new ArtifactDeploymentException( e.getMessage(), e );
++        }
++
++        if ( snapshotKey != null )
++        {
++            for ( Object metadata : result.getMetadata() )
+-                MavenExecutionRequest request = session.getRequest();
+-
+-                if ( request != null )
++                if ( metadata.getClass().getName().endsWith( ".internal.RemoteSnapshotMetadata" ) )
+-                    List<ArtifactRepository> repositories = Arrays.asList( repository );
+-
+-                    repositorySystem.injectProxy( repositories, request.getProxies() );
+-
+-                    repositorySystem.injectAuthentication( repositories, request.getServers() );
++                    snapshots.put( snapshotKey, (MergeableMetadata) metadata );
+-        return repository;
++        artifact.setResolvedVersion( result.getArtifacts().iterator().next().getVersion() );
+
+MOV26 MOV26 MOV26 MOV26 INS26 INS26 UPD40 UPD40 UPD40 UPD40 UPD40 UPD40 UPD40 UPD40 UPD40 UPD40 INS40 INS40 UPD40 UPD40 UPD40 UPD40 INS23 INS31 INS80 MOV83 INS74 INS59 MOV83 MOV39 MOV42 MOV44 MOV44 MOV44 MOV44 MOV43 INS8 INS42 INS45 UPD42 INS43 INS43 INS43 UPD42 MOV42 INS14 INS60 INS60 MOV21 INS60 INS60 INS21 MOV21 INS60 INS25 INS70 MOV60 INS25 INS21 MOV60 INS54 INS25 MOV21 UPD42 MOV42 INS42 UPD42 MOV42 INS74 INS43 INS59 INS43 INS59 UPD43 MOV43 INS59 INS43 INS59 INS7 INS43 INS59 INS32 INS8 MOV44 MOV32 INS8 UPD43 INS27 INS8 INS32 UPD43 INS8 MOV12 MOV27 INS8 INS43 INS43 INS43 INS42 INS42 INS14 INS42 INS42 INS14 UPD42 UPD42 INS32 UPD42 UPD42 MOV42 INS14 INS40 INS42 INS32 INS42 INS32 UPD42 UPD42 UPD42 INS42 INS42 INS33 INS42 INS42 MOV21 MOV21 INS25 UPD42 UPD42 MOV62 INS27 INS21 INS21 INS42 UPD42 MOV42 UPD42 MOV42 UPD42 INS42 INS21 UPD42 INS70 UPD42 UPD42 INS42 UPD42 MOV42 INS42 INS43 INS32 INS43 MOV32 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 UPD43 MOV43 UPD42 MOV42 UPD42 MOV42 MOV42 UPD42 MOV42 UPD42 MOV42 MOV42 INS7 INS62 INS8 INS25 UPD42 UPD42 INS42 UPD42 INS32 MOV33 INS32 INS32 INS7 UPD43 INS44 INS32 INS8 INS32 UPD42 INS42 UPD42 MOV42 UPD42 MOV42 INS42 UPD42 INS42 INS27 UPD42 UPD42 INS32 INS42 INS43 INS60 INS21 INS21 INS27 INS8 INS8 INS42 INS42 UPD42 MOV42 UPD42 MOV42 MOV32 INS42 INS42 INS32 INS42 INS32 UPD42 INS43 INS42 INS42 INS42 INS25 INS32 INS42 INS32 INS13 INS32 INS13 INS32 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 INS43 INS59 INS7 INS32 INS62 INS62 INS21 UPD42 INS42 INS32 INS42 INS42 INS42 INS42 MOV42 UPD42 MOV42 MOV32 UPD42 MOV42 INS32 INS8 INS32 INS42 UPD42 MOV42 UPD42 MOV42 MOV42 UPD42 MOV42 INS42 UPD42 MOV42 INS40 INS42 INS14 INS42 INS32 INS42 INS42 INS42 INS42 INS43 INS42 INS43 INS32 UPD42 INS42 INS42 INS32 UPD42 MOV42 INS45 MOV21 UPD42 MOV42 INS42 UPD43 MOV43 INS42 INS45 INS45 INS42 UPD42 MOV42 INS32 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 INS14 INS32 UPD42 MOV42 UPD42 INS36 UPD42 MOV42 INS43 INS42 INS42 UPD42 MOV42 UPD42 UPD42 UPD42 INS11 INS11 UPD42 MOV42 INS43 INS42 INS43 INS42 INS42 INS42 DEL42 DEL78 DEL43 DEL42 DEL59 DEL23 DEL42 DEL78 DEL83 DEL43 DEL59 DEL23 DEL42 DEL78 DEL83 DEL43 DEL42 DEL59 DEL23 DEL42 DEL42 DEL32 DEL32 DEL42 DEL42 DEL42 DEL32 DEL45 DEL27 DEL42 DEL42 DEL32 DEL42 DEL42 DEL32 DEL7 DEL21 DEL32 DEL14 DEL59 DEL60 DEL32 DEL38 DEL8 DEL25 DEL8 DEL70 DEL8 DEL43 DEL42 DEL44 DEL45 DEL32 DEL27 DEL42 DEL14 DEL53 DEL8 DEL12 DEL43 DEL42 DEL44 DEL43 DEL45 DEL32 DEL27 DEL42 DEL14 DEL53 DEL8 DEL12 DEL54 DEL8 DEL31 DEL83 DEL43 DEL42 DEL42 DEL27 DEL33 DEL41 DEL8 DEL25 DEL32 DEL41 DEL8 DEL31 DEL83 DEL42 DEL43 DEL42 DEL42 DEL43 DEL42 DEL44 DEL32 DEL33 DEL27 DEL27 DEL42 DEL33 DEL27 DEL42 DEL43 DEL42 DEL32 DEL59 DEL60 DEL43 DEL42 DEL43 DEL74 DEL42 DEL32 DEL59 DEL60 DEL8 DEL25 DEL8 DEL25 DEL8 DEL25 DEL42 DEL41 DEL8 DEL31

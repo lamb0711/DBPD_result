@@ -1,0 +1,150 @@
+merge from trunk r1598783
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/branches/fs-encryption@1598785 13f79535-47bb-0310-9956-ffa450edef68
+
++import org.apache.hadoop.yarn.api.records.impl.pb.LocalResourcePBImpl;
++import org.apache.hadoop.yarn.proto.YarnProtos.LocalResourceProto;
++import org.apache.hadoop.yarn.proto.YarnServerNodemanagerRecoveryProtos.LocalizedResourceProto;
++import org.apache.hadoop.yarn.server.nodemanager.containermanager.localizer.event.ResourceRecoveredEvent;
++import org.apache.hadoop.yarn.server.nodemanager.recovery.NMStateStoreService;
++import org.apache.hadoop.yarn.server.nodemanager.recovery.NMStateStoreService.LocalResourceTrackerState;
++import org.apache.hadoop.yarn.server.nodemanager.recovery.NMStateStoreService.RecoveredLocalizationState;
++import org.apache.hadoop.yarn.server.nodemanager.recovery.NMStateStoreService.RecoveredUserResources;
++  private NMStateStoreService stateStore;
+-      LocalDirsHandlerService dirsHandler) {
++      LocalDirsHandlerService dirsHandler, NMStateStoreService stateStore) {
++    this.stateStore = stateStore;
+-    this.publicRsrc =
+-        new LocalResourcesTrackerImpl(null, dispatcher, true, conf);
++    this.publicRsrc = new LocalResourcesTrackerImpl(null, null, dispatcher,
++        true, conf, stateStore);
+-      cleanUpLocalDir(lfs,delService);
++      if (!stateStore.canRecover()) {
++        cleanUpLocalDir(lfs,delService);
++      }
++  //Recover localized resources after an NM restart
++  public void recoverLocalizedResources(RecoveredLocalizationState state)
++      throws URISyntaxException {
++    LocalResourceTrackerState trackerState = state.getPublicTrackerState();
++    recoverTrackerResources(publicRsrc, trackerState);
++
++    for (Map.Entry<String, RecoveredUserResources> userEntry :
++         state.getUserResources().entrySet()) {
++      String user = userEntry.getKey();
++      RecoveredUserResources userResources = userEntry.getValue();
++      trackerState = userResources.getPrivateTrackerState();
++      if (!trackerState.isEmpty()) {
++        LocalResourcesTracker tracker = new LocalResourcesTrackerImpl(user,
++            null, dispatcher, true, super.getConfig(), stateStore);
++        LocalResourcesTracker oldTracker = privateRsrc.putIfAbsent(user,
++            tracker);
++        if (oldTracker != null) {
++          tracker = oldTracker;
++        }
++        recoverTrackerResources(tracker, trackerState);
++      }
++
++      for (Map.Entry<ApplicationId, LocalResourceTrackerState> appEntry :
++           userResources.getAppTrackerStates().entrySet()) {
++        trackerState = appEntry.getValue();
++        if (!trackerState.isEmpty()) {
++          ApplicationId appId = appEntry.getKey();
++          String appIdStr = ConverterUtils.toString(appId);
++          LocalResourcesTracker tracker = new LocalResourcesTrackerImpl(user,
++              appId, dispatcher, false, super.getConfig(), stateStore);
++          LocalResourcesTracker oldTracker = appRsrc.putIfAbsent(appIdStr,
++              tracker);
++          if (oldTracker != null) {
++            tracker = oldTracker;
++          }
++          recoverTrackerResources(tracker, trackerState);
++        }
++      }
++    }
++  }
++
++  private void recoverTrackerResources(LocalResourcesTracker tracker,
++      LocalResourceTrackerState state) throws URISyntaxException {
++    for (LocalizedResourceProto proto : state.getLocalizedResources()) {
++      LocalResource rsrc = new LocalResourcePBImpl(proto.getResource());
++      LocalResourceRequest req = new LocalResourceRequest(rsrc);
++      LOG.info("Recovering localized resource " + req + " at "
++          + proto.getLocalPath());
++      tracker.handle(new ResourceRecoveredEvent(req,
++          new Path(proto.getLocalPath()), proto.getSize()));
++    }
++
++    for (Map.Entry<LocalResourceProto, Path> entry :
++         state.getInProgressResources().entrySet()) {
++      LocalResource rsrc = new LocalResourcePBImpl(entry.getKey());
++      LocalResourceRequest req = new LocalResourceRequest(rsrc);
++      Path localPath = entry.getValue();
++      tracker.handle(new ResourceRecoveredEvent(req, localPath, 0));
++
++      // delete any in-progress localizations, containers will request again
++      LOG.info("Deleting in-progress localization for " + req + " at "
++          + localPath);
++      tracker.remove(tracker.getLocalizedResource(req), delService);
++    }
++
++    // TODO: remove untracked directories in local filesystem
++  }
++
+-      dispatcher, true, super.getConfig()));
+-    if (null != appRsrc.putIfAbsent(
+-      ConverterUtils.toString(app.getAppId()),
+-      new LocalResourcesTrackerImpl(app.getUser(), dispatcher, false, super
+-        .getConfig()))) {
+-      LOG.warn("Initializing application " + app + " already present");
+-      assert false; // TODO: FIXME assert doesn't help
+-                    // ^ The condition is benign. Tests should fail and it
+-                    // should appear in logs, but it's an internal error
+-                    // that should have no effect on applications
+-    }
++        null, dispatcher, true, super.getConfig(), stateStore));
++    String appIdStr = ConverterUtils.toString(app.getAppId());
++    appRsrc.putIfAbsent(appIdStr, new LocalResourcesTrackerImpl(app.getUser(),
++        app.getAppId(), dispatcher, false, super.getConfig(), stateStore));
+-    String userName;
+-    String appIDStr;
++    String userName = application.getUser();
++    ApplicationId appId = application.getAppId();
++    String appIDStr = application.toString();
+-      appRsrc.remove(ConverterUtils.toString(application.getAppId()));
+-    if (null == appLocalRsrcsTracker) {
++      appRsrc.remove(ConverterUtils.toString(appId));
++    if (appLocalRsrcsTracker != null) {
++      for (LocalizedResource rsrc : appLocalRsrcsTracker ) {
++        Path localPath = rsrc.getLocalPath();
++        if (localPath != null) {
++          try {
++            stateStore.removeLocalizedResource(userName, appId, localPath);
++          } catch (IOException e) {
++            LOG.error("Unable to remove resource " + rsrc + " for " + appIDStr
++                + " from state store", e);
++          }
++        }
++      }
++    } else {
+-    // TODO: What to do with appLocalRsrcsTracker?
+-    userName = application.getUser();
+-    appIDStr = application.toString();
+-            Path publicDirDestPath =
++            Path publicRootPath =
+-            Path hierarchicalPath =
+-                publicRsrc.getPathForLocalization(key, publicDirDestPath);
+-            if (!hierarchicalPath.equals(publicDirDestPath)) {
+-              publicDirDestPath = hierarchicalPath;
++            Path publicDirDestPath =
++                publicRsrc.getPathForLocalization(key, publicRootPath);
++            if (!publicDirDestPath.getParent().equals(publicRootPath)) {
+-            publicDirDestPath =
+-                new Path(publicDirDestPath, Long.toString(publicRsrc
+-                  .nextUniqueNumber()));
+-      dirPath = tracker.getPathForLocalization(new LocalResourceRequest(rsrc),
+-        dirPath);
+-      return new Path (dirPath, Long.toString(tracker.nextUniqueNumber()));
++      return tracker.getPathForLocalization(new LocalResourceRequest(rsrc),
++          dirPath);
+
+INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS23 INS31 INS31 INS83 INS43 INS59 INS44 INS83 INS39 INS42 INS44 INS43 INS8 INS83 INS39 INS42 INS44 INS44 INS43 INS8 INS42 INS42 INS43 INS42 INS21 INS43 INS42 INS42 INS60 INS21 INS70 INS43 INS42 INS43 INS42 INS42 INS70 INS70 INS60 INS21 INS60 INS25 INS42 INS7 INS42 INS43 INS59 INS32 INS44 INS32 INS8 INS42 INS42 INS44 INS32 INS8 INS44 INS32 INS8 INS43 INS59 MOV32 MOV43 INS59 UPD43 INS43 UPD27 MOV27 INS8 MOV8 INS22 INS42 INS25 INS42 INS42 INS32 INS42 INS42 INS42 INS74 INS42 INS32 INS42 INS60 INS60 INS21 INS25 INS70 INS43 INS42 INS42 INS42 INS60 INS60 INS21 INS21 INS74 INS42 INS32 INS42 INS60 INS60 INS60 INS21 INS21 INS21 INS14 INS42 INS42 MOV32 INS42 INS42 MOV32 UPD42 UPD42 MOV32 INS42 MOV32 INS33 INS70 MOV32 INS52 INS42 INS33 INS42 INS38 INS8 INS42 INS42 INS43 INS43 INS43 INS42 INS42 INS43 INS59 INS43 INS59 INS7 INS38 INS8 INS44 INS32 INS8 INS42 INS43 INS59 INS43 INS59 INS32 INS32 INS43 INS43 INS43 INS42 INS42 INS43 INS59 INS43 INS59 MOV43 INS59 INS32 INS32 INS32 INS43 INS42 INS33 INS42 INS9 INS48 INS42 INS32 INS42 INS44 INS42 INS8 INS32 MOV21 INS40 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS32 INS32 INS60 INS60 INS25 INS21 INS74 INS42 INS32 INS42 INS21 INS25 INS42 INS42 INS14 INS42 INS42 INS14 INS42 INS42 INS27 INS42 INS42 INS14 INS40 INS42 INS42 INS42 INS42 INS14 INS42 INS42 INS14 INS42 INS32 INS42 INS42 INS14 INS42 INS42 INS27 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS43 INS42 INS60 INS25 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS43 INS59 INS43 INS59 INS27 INS8 INS32 INS43 INS43 INS43 INS42 INS42 INS7 INS38 INS8 INS43 INS32 INS43 INS42 INS45 INS42 INS45 INS32 INS43 INS42 INS14 INS32 INS43 INS32 INS43 INS42 INS42 INS42 INS43 INS42 INS42 INS34 INS45 INS42 INS45 INS42 INS42 INS42 INS42 INS42 MOV43 INS59 INS27 INS8 INS42 INS42 INS14 INS42 INS42 INS32 INS42 INS33 INS21 INS42 INS42 INS42 INS40 INS42 INS42 INS42 INS32 INS32 INS60 INS60 INS60 INS60 INS25 INS21 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS43 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS33 INS54 INS43 INS42 INS33 INS42 INS9 INS48 INS42 INS42 INS42 INS42 INS42 INS7 INS42 INS42 INS42 INS42 INS43 INS59 INS43 INS59 INS43 INS59 INS43 INS59 INS27 INS8 INS32 INS42 INS42 INS42 INS42 INS42 INS8 INS12 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS42 MOV14 INS42 INS42 INS32 INS42 INS33 INS21 INS42 INS42 INS42 MOV21 INS44 INS8 MOV43 INS42 INS42 INS42 INS42 INS42 UPD42 INS42 UPD9 INS42 INS42 INS42 INS42 INS42 INS7 INS32 INS43 INS42 MOV21 UPD42 UPD42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 UPD42 INS32 UPD42 INS42 INS42 INS27 INS42 UPD42 MOV42 INS42 INS45 INS42 INS45 INS42 INS45 DEL33 DEL27 DEL42 DEL42 DEL45 DEL42 DEL45 DEL27 DEL32 DEL21 DEL9 DEL6 DEL8 DEL25 DEL33 DEL42 DEL7 DEL42 DEL7 DEL25 DEL42 DEL42 DEL7 DEL21 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL32 DEL14 DEL7 DEL21 DEL42 DEL7 DEL21 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL32 DEL14

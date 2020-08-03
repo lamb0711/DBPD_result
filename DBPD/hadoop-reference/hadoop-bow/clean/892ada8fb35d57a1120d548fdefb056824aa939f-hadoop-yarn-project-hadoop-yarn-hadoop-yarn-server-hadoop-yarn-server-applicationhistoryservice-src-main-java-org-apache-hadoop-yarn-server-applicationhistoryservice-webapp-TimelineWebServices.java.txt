@@ -1,0 +1,188 @@
+YARN-1937. Added owner-only ACLs support for Timeline Client and server. Contributed by Zhijie Shen.
+
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/trunk@1597186 13f79535-47bb-0310-9956-ffa450edef68
+
++import java.util.Iterator;
++import org.apache.hadoop.security.UserGroupInformation;
++import org.apache.hadoop.yarn.exceptions.YarnException;
++import org.apache.hadoop.yarn.server.applicationhistoryservice.timeline.security.TimelineACLsManager;
++import org.apache.hadoop.yarn.webapp.NotFoundException;
++  private TimelineACLsManager timelineACLsManager;
+-  public TimelineWebServices(TimelineStore store) {
++  public TimelineWebServices(TimelineStore store,
++      TimelineACLsManager timelineACLsManager) {
++    this.timelineACLsManager = timelineACLsManager;
++      EnumSet<Field> fieldEnums = parseFieldsStr(fields, ",");
++      boolean modified = extendFields(fieldEnums);
++      UserGroupInformation callerUGI = getUser(req);
+-          parseFieldsStr(fields, ","));
++          fieldEnums);
++      if (entities != null) {
++        Iterator<TimelineEntity> entitiesItr =
++            entities.getEntities().iterator();
++        while (entitiesItr.hasNext()) {
++          TimelineEntity entity = entitiesItr.next();
++          try {
++            // check ACLs
++            if (!timelineACLsManager.checkAccess(callerUGI, entity)) {
++              entitiesItr.remove();
++            } else {
++              // clean up system data
++              if (modified) {
++                entity.setPrimaryFilters(null);
++              } else {
++                cleanupOwnerInfo(entity);
++              }
++            }
++          } catch (YarnException e) {
++            LOG.error("Error when verifying access for user " + callerUGI
++                + " on the events of the timeline entity "
++                + new EntityIdentifier(entity.getEntityId(),
++                    entity.getEntityType()), e);
++            entitiesItr.remove();
++          }
++        }
++      }
++      EnumSet<Field> fieldEnums = parseFieldsStr(fields, ",");
++      boolean modified = extendFields(fieldEnums);
+-              parseFieldsStr(fields, ","));
++              fieldEnums);
++      if (entity != null) {
++        // check ACLs
++        UserGroupInformation callerUGI = getUser(req);
++        if (!timelineACLsManager.checkAccess(callerUGI, entity)) {
++          entity = null;
++        } else {
++          // clean up the system data
++          if (modified) {
++            entity.setPrimaryFilters(null);
++          } else {
++            cleanupOwnerInfo(entity);
++          }
++        }
++      }
++    } catch (YarnException e) {
++      LOG.error("Error getting entity", e);
++      throw new WebApplicationException(e,
++          Response.Status.INTERNAL_SERVER_ERROR);
+-      throw new WebApplicationException(Response.Status.NOT_FOUND);
++      throw new NotFoundException("Timeline entity "
++          + new EntityIdentifier(parseStr(entityId), parseStr(entityType))
++          + " is not found");
++      UserGroupInformation callerUGI = getUser(req);
++      if (events != null) {
++        Iterator<TimelineEvents.EventsOfOneEntity> eventsItr =
++            events.getAllEvents().iterator();
++        while (eventsItr.hasNext()) {
++          TimelineEvents.EventsOfOneEntity eventsOfOneEntity = eventsItr.next();
++          try {
++            TimelineEntity entity = store.getEntity(
++                eventsOfOneEntity.getEntityId(),
++                eventsOfOneEntity.getEntityType(),
++                EnumSet.of(Field.PRIMARY_FILTERS));
++            // check ACLs
++            if (!timelineACLsManager.checkAccess(callerUGI, entity)) {
++              eventsItr.remove();
++            }
++          } catch (Exception e) {
++            LOG.error("Error when verifying access for user " + callerUGI
++                + " on the events of the timeline entity "
++                + new EntityIdentifier(eventsOfOneEntity.getEntityId(),
++                    eventsOfOneEntity.getEntityType()), e);
++            eventsItr.remove();
++          }
++        }
++      }
++    UserGroupInformation callerUGI = getUser(req);
++      TimelineEntities entitiesToPut = new TimelineEntities();
++      List<TimelinePutResponse.TimelinePutError> errors =
++          new ArrayList<TimelinePutResponse.TimelinePutError>();
++
++        // check if there is existing entity
++        try {
++          TimelineEntity existingEntity =
++              store.getEntity(entityID.getId(), entityID.getType(),
++                  EnumSet.of(Field.PRIMARY_FILTERS));
++          if (existingEntity != null
++              && !timelineACLsManager.checkAccess(callerUGI, existingEntity)) {
++            throw new YarnException("The timeline entity " + entityID
++                + " was not put by " + callerUGI + " before");
++          }
++        } catch (Exception e) {
++          // Skip the entity which already exists and was put by others
++          LOG.warn("Skip the timeline entity: " + entityID + ", because "
++              + e.getMessage());
++          TimelinePutResponse.TimelinePutError error =
++              new TimelinePutResponse.TimelinePutError();
++          error.setEntityId(entityID.getId());
++          error.setEntityType(entityID.getType());
++          error.setErrorCode(
++              TimelinePutResponse.TimelinePutError.ACCESS_DENIED);
++          errors.add(error);
++          continue;
++        }
++
++        // inject owner information for the access check
++        try {
++          injectOwnerInfo(entity,
++              callerUGI == null ? "" : callerUGI.getShortUserName());
++        } catch (YarnException e) {
++          // Skip the entity which messes up the primary filter and record the
++          // error
++          LOG.warn("Skip the timeline entity: " + entityID + ", because "
++              + e.getMessage());
++          TimelinePutResponse.TimelinePutError error =
++              new TimelinePutResponse.TimelinePutError();
++          error.setEntityId(entityID.getId());
++          error.setEntityType(entityID.getType());
++          error.setErrorCode(
++              TimelinePutResponse.TimelinePutError.SYSTEM_FILTER_CONFLICT);
++          errors.add(error);
++          continue;
++        }
++
++        entitiesToPut.addEntity(entity);
+-      return store.put(entities);
++      TimelinePutResponse response =  store.put(entitiesToPut);
++      // add the errors of timeline system filter key conflict
++      response.addErrors(errors);
++      return response;
++  private static boolean extendFields(EnumSet<Field> fieldEnums) {
++    boolean modified = false;
++    if (fieldEnums != null && !fieldEnums.contains(Field.PRIMARY_FILTERS)) {
++      fieldEnums.add(Field.PRIMARY_FILTERS);
++      modified = true;
++    }
++    return modified;
++  }
++  private static UserGroupInformation getUser(HttpServletRequest req) {
++    String remoteUser = req.getRemoteUser();
++    UserGroupInformation callerUGI = null;
++    if (remoteUser != null) {
++      callerUGI = UserGroupInformation.createRemoteUser(remoteUser);
++    }
++    return callerUGI;
++  }
++
++  private static void injectOwnerInfo(TimelineEntity timelineEntity,
++      String owner) throws YarnException {
++    if (timelineEntity.getPrimaryFilters() != null &&
++        timelineEntity.getPrimaryFilters().containsKey(
++            TimelineStore.SystemFilter.ENTITY_OWNER)) {
++      throw new YarnException(
++          "User should not use the timeline system filter key: "
++              + TimelineStore.SystemFilter.ENTITY_OWNER);
++    }
++    timelineEntity.addPrimaryFilter(
++        TimelineStore.SystemFilter.ENTITY_OWNER
++            .toString(), owner);
++  }
++
++  private static void cleanupOwnerInfo(TimelineEntity timelineEntity) {
++    if (timelineEntity.getPrimaryFilters() != null) {
++      timelineEntity.getPrimaryFilters().remove(
++          TimelineStore.SystemFilter.ENTITY_OWNER.toString());
++    }
++  }
++

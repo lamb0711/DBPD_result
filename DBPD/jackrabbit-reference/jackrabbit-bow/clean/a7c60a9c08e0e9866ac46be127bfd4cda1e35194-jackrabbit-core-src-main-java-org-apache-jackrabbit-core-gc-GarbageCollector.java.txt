@@ -1,0 +1,184 @@
+JCR-3983 Possibility to parallelize the Garbage Collection
+
+git-svn-id: https://svn.apache.org/repos/asf/jackrabbit/trunk@1746083 13f79535-47bb-0310-9956-ffa450edef68
+
+-import org.apache.jackrabbit.api.management.DataStoreGarbageCollector;
+-import org.apache.jackrabbit.api.management.MarkEventListener;
+-import org.apache.jackrabbit.core.RepositoryContext;
+-import org.apache.jackrabbit.core.SessionImpl;
+-import org.apache.jackrabbit.core.data.DataStore;
+-import org.apache.jackrabbit.core.id.NodeId;
+-import org.apache.jackrabbit.core.id.PropertyId;
+-import org.apache.jackrabbit.core.observation.SynchronousEventListener;
+-import org.apache.jackrabbit.core.persistence.IterablePersistenceManager;
+-import org.apache.jackrabbit.core.persistence.util.NodeInfo;
+-import org.apache.jackrabbit.core.state.ItemStateException;
+-import org.apache.jackrabbit.core.state.NoSuchItemStateException;
+-import org.apache.jackrabbit.core.state.NodeState;
+-import org.apache.jackrabbit.core.state.PropertyState;
+-import org.apache.jackrabbit.core.value.InternalValue;
+-import org.apache.jackrabbit.spi.Name;
+-import org.slf4j.Logger;
+-import org.slf4j.LoggerFactory;
+-
++import java.util.HashSet;
++import java.util.concurrent.Callable;
++import java.util.concurrent.ExecutorService;
++import java.util.concurrent.Executors;
++import java.util.concurrent.Future;
++import org.apache.jackrabbit.api.management.DataStoreGarbageCollector;
++import org.apache.jackrabbit.api.management.MarkEventListener;
++import org.apache.jackrabbit.core.RepositoryContext;
++import org.apache.jackrabbit.core.SessionImpl;
++import org.apache.jackrabbit.core.data.DataStore;
++import org.apache.jackrabbit.core.id.NodeId;
++import org.apache.jackrabbit.core.id.PropertyId;
++import org.apache.jackrabbit.core.observation.SynchronousEventListener;
++import org.apache.jackrabbit.core.persistence.IterablePersistenceManager;
++import org.apache.jackrabbit.core.persistence.PersistenceManager;
++import org.apache.jackrabbit.core.persistence.util.NodeInfo;
++import org.apache.jackrabbit.core.state.ItemStateException;
++import org.apache.jackrabbit.core.state.NoSuchItemStateException;
++import org.apache.jackrabbit.core.state.NodeState;
++import org.apache.jackrabbit.core.state.PropertyState;
++import org.apache.jackrabbit.core.value.InternalValue;
++import org.apache.jackrabbit.spi.Name;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
++    
++	private class ScanNodeIdListTask implements Callable<Void> {
++
++        private int split;
++        private List<NodeId> nodeList;
++        private PersistenceManager pm;
++        private int pmCount;
++
++        public ScanNodeIdListTask(int split, List<NodeId> nodeList, PersistenceManager pm, int pmCount) {
++            this.split = split;
++            this.nodeList = nodeList;
++            this.pm = pm;
++            this.pmCount = pmCount;
++        }
++
++        public Void call() throws Exception {
++            scanNodeIdList(split, nodeList, pm, pmCount);
++            return null;
++        }
++
++    }
++    private long minSplitSize = 100000;
++
++    private int concurrentThreadSize = 3;
++
++    public long getMinSplitSize() {
++        return minSplitSize;
++    }
++
++    public void setMinSplitSize(long minSplitSize) {
++        this.minSplitSize = minSplitSize;
++    }
++
++    public int getConcurrentThreadSize() {
++        return concurrentThreadSize;
++    }
++
++    public void setConcurrentThreadSize(int concurrentThreadSize) {
++        this.concurrentThreadSize = concurrentThreadSize;
++    }
++
+-            int count = 0;
+-            for (NodeId id : allNodeIds) {
+-                count++;
+-                if (count % 1000 == 0) {
+-                    LOG.debug(pm.toString() + " ("+pmCount + "/" + pmList.length + "): analyzed " + count + " nodes [" + overAllCount + "]...");
+-                }
+-                if (callback != null) {
+-                    callback.beforeScanning(null);
+-                }
++            if (overAllCount > minSplitSize) {
++                final int splits = getConcurrentThreadSize();
++                ExecutorService executorService = Executors.newFixedThreadPool(splits);
+-                    NodeState state = pm.load(id);
+-                    Set<Name> propertyNames = state.getPropertyNames();
+-                    for (Name name : propertyNames) {
+-                        PropertyId pid = new PropertyId(id, name);
+-                        PropertyState ps = pm.load(pid);
+-                        if (ps.getType() == PropertyType.BINARY) {
+-                            for (InternalValue v : ps.getValues()) {
+-                                // getLength will update the last modified date
+-                                // if the persistence manager scan is running
+-                                v.getLength();
+-                            }
+-                        }
++                    Set<Future<Void>> futures = new HashSet<Future<Void>>();
++                    List<List<NodeId>> lists = splitIntoParts(allNodeIds, splits);
++                    LOG.debug(splits + " concurrent Threads will be started. Split Size: " + lists.get(0).size()+" Total Size: " + overAllCount);
++                    for (int i = 0; i < splits; i++) {
++                        List<NodeId> subList = lists.get(i);
++                        futures.add(executorService.submit(new ScanNodeIdListTask(i + 1, subList, pm, pmCount)));
+-                } catch (NoSuchItemStateException e) {
+-                    // the node may have been deleted or moved in the meantime
+-                    // ignore it
++                    for (Future<Void> future : futures) {
++                        future.get();
++                    }
++                } catch (Exception e) {
++                    throw new RepositoryException(e);
++                } finally {
++                    executorService.shutdown();
++            } else {
++                scanNodeIdList(0, allNodeIds, pm, pmCount);
++    
++    private void scanNodeIdList(int split, List<NodeId> nodeList, PersistenceManager pm, int pmCount) throws RepositoryException, ItemStateException {
++        int count = 0;
++        for (NodeId id : nodeList) {
++            count++;
++            if (count % 1000 == 0) {
++                if (split > 0) {
++                    LOG.debug("[Split " + split + "] " + pm.toString() + " (" + pmCount + "/" + pmList.length + "): analyzed " + count + " nodes [" + nodeList.size() + "]...");
++                } else {
++                    LOG.debug(pm.toString() + " (" + pmCount + "/" + pmList.length + "): analyzed " + count + " nodes [" + nodeList.size() + "]...");
++                }
++            }
++            if (callback != null) {
++                callback.beforeScanning(null);
++            }
++            try {
++                NodeState state = pm.load(id);
++                Set<Name> propertyNames = state.getPropertyNames();
++                for (Name name : propertyNames) {
++                    PropertyId pid = new PropertyId(id, name);
++                    PropertyState ps = pm.load(pid);
++                    if (ps.getType() == PropertyType.BINARY) {
++                        for (InternalValue v : ps.getValues()) {
++                            // getLength will update the last modified date
++                            // if the persistence manager scan is running
++                            v.getLength();
++                        }
++                    }
++                }
++            } catch (NoSuchItemStateException e) {
++                // the node may have been deleted or moved in the meantime
++                // ignore it
++            }
++        }
++    }
++
++    private <T> List<List<T>> splitIntoParts(List<T> ls, int parts) {
++        final List<List<T>> listParts = new ArrayList<List<T>>();
++        final int chunkSize = ls.size() / parts;
++        int leftOver = ls.size() % parts;
++        int iTake = chunkSize;
++
++        for (int i = 0, iT = ls.size(); i < iT; i += iTake) {
++            if (leftOver > 0) {
++                leftOver--;
++                iTake = chunkSize + 1;
++            } else {
++                iTake = chunkSize;
++            }
++            listParts.add(new ArrayList<T>(ls.subList(i, Math.min(iT, i + iTake))));
++        }
++        return listParts;
++    }

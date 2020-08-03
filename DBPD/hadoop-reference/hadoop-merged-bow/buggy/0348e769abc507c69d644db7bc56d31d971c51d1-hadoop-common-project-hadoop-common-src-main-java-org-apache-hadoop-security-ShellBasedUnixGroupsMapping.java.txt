@@ -1,0 +1,185 @@
+HADOOP-12468. Partial group resolution failure should not result in user lockout. (Wei-Chiu Chuang via Yongjun Zhang)
+
++import org.apache.commons.lang.StringUtils;
++import org.apache.hadoop.util.Shell.ShellCommandExecutor;
+-  
++
++  @SuppressWarnings("serial")
++  private static class PartialGroupNameException extends IOException {
++    public PartialGroupNameException(String message) {
++      super(message);
++    }
++
++    public PartialGroupNameException(String message, Throwable err) {
++      super(message, err);
++    }
++
++    @Override
++    public String toString() {
++      final StringBuilder sb =
++          new StringBuilder("PartialGroupNameException ");
++      sb.append(super.getMessage());
++      return sb.toString();
++    }
++  }
+-   * @param user get groups for this user
++   * @param userName get groups for this user
+-  public List<String> getGroups(String user) throws IOException {
+-    return getUnixGroups(user);
++  public List<String> getGroups(String userName) throws IOException {
++    return getUnixGroups(userName);
+-  /** 
++  /**
++   * Create a ShellCommandExecutor object using the user's name.
++   *
++   * @param userName user's name
++   * @return a ShellCommandExecutor object
++   */
++  protected ShellCommandExecutor createGroupExecutor(String userName) {
++    return new ShellCommandExecutor(
++        Shell.getGroupsForUserCommand(userName), null, null, 0L);
++  }
++
++  /**
++   * Create a ShellCommandExecutor object for fetch a user's group id list.
++   *
++   * @param userName the user's name
++   * @return a ShellCommandExecutor object
++   */
++  protected ShellCommandExecutor createGroupIDExecutor(String userName) {
++    return new ShellCommandExecutor(
++        Shell.getGroupsIDForUserCommand(userName), null, null, 0L);
++  }
++
++  /**
+-   * NOTE. For non-existing user it will return EMPTY list
+-   * @param user user name
++   * NOTE. For non-existing user it will return EMPTY list.
++   *
++   * @param user get groups for this user
+-  private static List<String> getUnixGroups(final String user) throws IOException {
+-    String result = "";
++  private List<String> getUnixGroups(String user) throws IOException {
++    ShellCommandExecutor executor = createGroupExecutor(user);
++
++    List<String> groups;
+-      result = Shell.execCommand(Shell.getGroupsForUserCommand(user));
++      executor.execute();
++      groups = resolveFullGroupNames(executor.getOutput());
+-      // if we didn't get the group - just return empty list;
+-      LOG.warn("got exception trying to get groups for user " + user + ": "
+-          + e.getMessage());
+-      return new LinkedList<String>();
+-    }
+-    
+-    StringTokenizer tokenizer =
+-        new StringTokenizer(result, Shell.TOKEN_SEPARATOR_REGEX);
+-    List<String> groups = new LinkedList<String>();
+-    while (tokenizer.hasMoreTokens()) {
+-      groups.add(tokenizer.nextToken());
++      try {
++        groups = resolvePartialGroupNames(user, e.getMessage(),
++            executor.getOutput());
++      } catch (PartialGroupNameException pge) {
++        LOG.warn("unable to return groups for user " + user, pge);
++        return new LinkedList<>();
++      }
++
++  /**
++   * Attempt to parse group names given that some names are not resolvable.
++   * Use the group id list to identify those that are not resolved.
++   *
++   * @param groupNames a string representing a list of group names
++   * @param groupIDs a string representing a list of group ids
++   * @return a linked list of group names
++   * @throws PartialGroupNameException
++   */
++  private List<String> parsePartialGroupNames(String groupNames,
++      String groupIDs) throws PartialGroupNameException {
++    StringTokenizer nameTokenizer =
++        new StringTokenizer(groupNames, Shell.TOKEN_SEPARATOR_REGEX);
++    StringTokenizer idTokenizer =
++        new StringTokenizer(groupIDs, Shell.TOKEN_SEPARATOR_REGEX);
++    List<String> groups = new LinkedList<String>();
++    while (nameTokenizer.hasMoreTokens()) {
++      // check for unresolvable group names.
++      if (!idTokenizer.hasMoreTokens()) {
++        throw new PartialGroupNameException("Number of group names and ids do"
++        + " not match. group name =" + groupNames + ", group id = " + groupIDs);
++      }
++      String groupName = nameTokenizer.nextToken();
++      String groupID = idTokenizer.nextToken();
++      if (!StringUtils.isNumeric(groupName) ||
++          !groupName.equals(groupID)) {
++        // if the group name is non-numeric, it is resolved.
++        // if the group name is numeric, but is not the same as group id,
++        // regard it as a group name.
++        // if unfortunately, some group names are not resolvable, and
++        // the group name is the same as the group id, regard it as not
++        // resolved.
++        groups.add(groupName);
++      }
++    }
++    return groups;
++  }
++
++  /**
++   * Attempt to partially resolve group names.
++   *
++   * @param userName the user's name
++   * @param errMessage error message from the shell command
++   * @param groupNames the incomplete list of group names
++   * @return a list of resolved group names
++   * @throws PartialGroupNameException
++   */
++  private List<String> resolvePartialGroupNames(String userName,
++      String errMessage, String groupNames) throws PartialGroupNameException {
++    // Exception may indicate that some group names are not resolvable.
++    // Shell-based implementation should tolerate unresolvable groups names,
++    // and return resolvable ones, similar to what JNI-based implementation
++    // does.
++    if (Shell.WINDOWS) {
++      throw new PartialGroupNameException("Does not support partial group"
++      + " name resolution on Windows. " + errMessage);
++    }
++    if (groupNames.isEmpty()) {
++      throw new PartialGroupNameException("The user name '" + userName
++          + "' is not found. " + errMessage);
++    } else {
++      LOG.warn("Some group names for '" + userName + "' are not resolvable. "
++          + errMessage);
++      // attempt to partially resolve group names
++      try {
++        ShellCommandExecutor exec2 = createGroupIDExecutor(userName);
++        exec2.execute();
++        return parsePartialGroupNames(groupNames, exec2.getOutput());
++      } catch (ExitCodeException ece) {
++        // If exception is thrown trying to get group id list,
++        // something is terribly wrong, so give up.
++        throw new PartialGroupNameException("failed to get group id list for " +
++        "user '" + userName + "'", ece);
++      } catch (IOException ioe) {
++        throw new PartialGroupNameException("can't execute the shell command to"
++        + " get the list of group id for user '" + userName + "'", ioe);
++      }
++    }
++  }
++
++  /**
++   * Split group names into a linked list.
++   *
++   * @param groupNames a string representing the user's group names
++   * @return a linked list of group names
++   */
++  private List<String> resolveFullGroupNames(String groupNames) {
++    StringTokenizer tokenizer =
++        new StringTokenizer(groupNames, Shell.TOKEN_SEPARATOR_REGEX);
++    List<String> groups = new LinkedList<String>();
++    while (tokenizer.hasMoreTokens()) {
++      groups.add(tokenizer.nextToken());
++    }
++
++    return groups;
++  }
+
+INS26 INS26 INS40 INS40 INS55 INS31 INS31 INS31 INS31 INS31 INS79 INS83 INS83 INS42 INS43 INS31 INS31 INS31 INS44 INS29 INS83 INS43 INS42 INS44 INS8 INS29 INS83 INS43 INS42 INS44 INS8 MOV44 INS8 INS29 INS83 INS74 INS42 INS44 INS44 INS43 INS8 INS29 INS83 INS74 INS42 INS44 INS44 INS44 INS43 INS8 INS29 INS83 INS74 INS42 INS44 INS8 INS42 INS45 INS42 INS83 INS42 INS44 INS8 INS83 INS42 INS44 INS44 INS8 INS78 INS83 MOV43 INS42 INS8 INS65 MOV43 INS42 INS65 INS65 INS65 INS42 MOV43 INS42 INS41 INS65 INS65 INS65 INS42 INS43 INS42 INS41 MOV65 INS60 MOV60 INS54 MOV25 MOV41 INS65 INS65 INS65 INS65 INS65 INS43 INS43 INS43 INS42 INS43 INS42 INS42 INS60 INS60 INS60 INS61 INS41 INS65 INS65 INS65 INS65 INS65 INS65 INS43 INS43 INS43 INS42 INS43 INS42 INS43 INS42 INS42 INS25 INS25 INS65 INS65 INS65 INS43 INS43 INS43 INS42 INS60 MOV60 MOV61 INS41 INS43 INS42 INS46 INS43 INS42 INS43 INS42 INS46 INS42 INS60 INS21 INS41 INS42 INS66 INS42 INS66 INS42 INS66 INS66 INS14 INS66 INS42 INS66 INS66 INS42 INS14 UPD66 INS43 INS59 INS74 INS8 INS12 INS66 INS66 INS42 INS66 INS42 INS66 INS66 INS42 INS42 INS42 INS42 INS42 MOV43 INS59 INS43 INS59 INS74 INS59 INS32 INS8 INS42 INS66 INS42 INS66 INS42 INS66 INS42 INS66 INS66 INS42 INS42 INS42 INS42 INS42 INS42 INS40 INS8 INS32 INS8 INS8 INS66 INS42 INS66 INS66 INS42 INS42 INS42 INS43 INS59 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS83 INS43 INS59 INS32 INS32 UPD42 INS43 INS32 INS33 INS33 INS34 INS43 INS32 INS33 INS33 INS34 INS42 INS42 INS32 INS43 INS43 UPD42 INS21 INS21 MOV44 INS8 INS42 INS14 INS42 INS42 INS14 INS43 INS43 INS42 INS14 INS42 INS42 INS25 INS60 INS60 INS25 INS53 INS42 INS42 INS53 INS21 INS54 INS42 INS42 INS14 INS42 INS42 INS14 INS42 INS42 INS48 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 MOV42 INS32 INS7 MOV54 MOV43 INS42 INS40 INS43 INS42 INS40 INS42 INS42 INS74 INS38 INS8 INS43 INS59 INS43 INS59 INS27 INS8 INS14 INS14 INS32 INS8 INS12 INS12 INS43 INS42 INS40 INS43 INS45 INS42 INS42 INS42 INS42 INS32 INS42 INS43 INS43 INS32 INS53 INS42 INS42 INS32 INS42 INS42 INS32 INS38 INS38 INS21 INS43 INS27 INS43 INS27 INS42 INS42 INS27 INS60 INS21 INS41 INS44 INS8 INS44 INS8 INS42 INS42 INS42 INS32 INS44 INS42 INS42 INS42 INS42 INS14 INS42 INS42 INS42 INS42 INS32 INS32 INS32 INS42 INS45 INS45 INS42 INS42 INS45 INS42 INS45 INS42 INS45 INS42 INS45 INS42 INS43 INS59 INS32 INS32 INS43 INS42 INS53 INS43 INS42 INS53 INS42 INS42 INS43 INS42 INS43 INS27 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS32 INS42 INS14 INS42 INS14 UPD42 INS42 INS42 INS27 INS42 INS45 INS42 INS42 INS42 INS42 INS42 INS43 INS27 INS42 INS43 INS27 INS42 UPD42 UPD42 MOV32 INS42 UPD74 INS45 INS45 INS42 INS27 INS42 INS45 INS42 INS27 INS42 INS45 UPD42 UPD42 UPD45 INS45 INS45 INS45 INS45 DEL42 DEL66 DEL65 DEL83 DEL83 DEL42 DEL44 DEL45 DEL42 DEL45 DEL42 DEL42 DEL40 DEL14 DEL59 DEL60 DEL8

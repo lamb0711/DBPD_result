@@ -1,0 +1,135 @@
+HDFS-14316. RBF: Support unavailable subclusters for mount points with multiple destinations. Contributed by Inigo Goiri.
+
++import org.apache.hadoop.net.ConnectTimeoutException;
++import java.net.ConnectException;
++import java.util.ArrayList;
++import java.util.concurrent.TimeUnit;
++  /** Time out when getting the mount statistics. */
++  private long mountStatusTimeOut;
++    this.mountStatusTimeOut = conf.getTimeDuration(
++        RBFConfigKeys.DFS_ROUTER_CLIENT_MOUNT_TIME_OUT,
++        RBFConfigKeys.DFS_ROUTER_CLIENT_MOUNT_TIME_OUT_DEFAULT,
++        TimeUnit.SECONDS);
+-    RemoteLocation createLocation = rpcServer.getCreateLocation(src);
+-        createLocation.getDest(), masked, clientName, flag, createParent,
++        new RemoteParam(), masked, clientName, flag, createParent,
+-    return (HdfsFileStatus) rpcClient.invokeSingle(createLocation, method);
++    final List<RemoteLocation> locations =
++        rpcServer.getLocationsForPath(src, true);
++    RemoteLocation createLocation = null;
++    try {
++      createLocation = rpcServer.getCreateLocation(src);
++      return (HdfsFileStatus) rpcClient.invokeSingle(createLocation, method);
++    } catch (IOException ioe) {
++      final List<RemoteLocation> newLocations = checkFaultTolerantRetry(
++          method, src, ioe, createLocation, locations);
++      return rpcClient.invokeSequential(
++          newLocations, method, HdfsFileStatus.class, null);
++    }
++  }
++
++  /**
++   * Check if an exception is caused by an unavailable subcluster or not. It
++   * also checks the causes.
++   * @param ioe IOException to check.
++   * @return If caused by an unavailable subcluster. False if the should not be
++   *         retried (e.g., NSQuotaExceededException).
++   */
++  private static boolean isUnavailableSubclusterException(
++      final IOException ioe) {
++    if (ioe instanceof ConnectException ||
++        ioe instanceof ConnectTimeoutException ||
++        ioe instanceof NoNamenodesAvailableException) {
++      return true;
++    }
++    if (ioe.getCause() instanceof IOException) {
++      IOException cause = (IOException)ioe.getCause();
++      return isUnavailableSubclusterException(cause);
++    }
++    return false;
++  }
++
++  /**
++   * Check if a remote method can be retried in other subclusters when it
++   * failed in the original destination. This method returns the list of
++   * locations to retry in. This is used by fault tolerant mount points.
++   * @param method Method that failed and might be retried.
++   * @param src Path where the method was invoked.
++   * @param e Exception that was triggered.
++   * @param excludeLoc Location that failed and should be excluded.
++   * @param locations All the locations to retry.
++   * @return The locations where we should retry (excluding the failed ones).
++   * @throws IOException If this path is not fault tolerant or the exception
++   *                     should not be retried (e.g., NSQuotaExceededException).
++   */
++  private List<RemoteLocation> checkFaultTolerantRetry(
++      final RemoteMethod method, final String src, final IOException ioe,
++      final RemoteLocation excludeLoc, final List<RemoteLocation> locations)
++          throws IOException {
++
++    if (!isUnavailableSubclusterException(ioe)) {
++      LOG.debug("{} exception cannot be retried",
++          ioe.getClass().getSimpleName());
++      throw ioe;
++    }
++    if (!rpcServer.isPathFaultTolerant(src)) {
++      LOG.debug("{} does not allow retrying a failed subcluster", src);
++      throw ioe;
++    }
++
++    final List<RemoteLocation> newLocations;
++    if (excludeLoc == null) {
++      LOG.error("Cannot invoke {} for {}: {}", method, src, ioe.getMessage());
++      newLocations = locations;
++    } else {
++      LOG.error("Cannot invoke {} for {} in {}: {}",
++          method, src, excludeLoc, ioe.getMessage());
++      newLocations = new ArrayList<>();
++      for (final RemoteLocation loc : locations) {
++        if (!loc.equals(excludeLoc)) {
++          newLocations.add(loc);
++        }
++      }
++    }
++    LOG.info("{} allows retrying failed subclusters in {}", src, newLocations);
++    return newLocations;
+-        LOG.error("Error requesting file info for path {} while proxing mkdirs",
+-            src, ioe);
++        LOG.error("Error getting file info for {} while proxying mkdirs: {}",
++            src, ioe.getMessage());
+-    RemoteLocation firstLocation = locations.get(0);
+-    return (boolean) rpcClient.invokeSingle(firstLocation, method);
++    final RemoteLocation firstLocation = locations.get(0);
++    try {
++      return (boolean) rpcClient.invokeSingle(firstLocation, method);
++    } catch (IOException ioe) {
++      final List<RemoteLocation> newLocations = checkFaultTolerantRetry(
++          method, src, ioe, firstLocation, locations);
++      return rpcClient.invokeSequential(
++          newLocations, method, Boolean.class, Boolean.TRUE);
++    }
++    return getFileInfoAll(locations, method, -1);
++  }
++
++  /**
++   * Get the file info from all the locations.
++   *
++   * @param locations Locations to check.
++   * @param method The file information method to run.
++   * @param timeOutMs Time out for the operation in milliseconds.
++   * @return The first file info if it's a file, the directory if it's
++   *         everywhere.
++   * @throws IOException If all the locations throw an exception.
++   */
++  private HdfsFileStatus getFileInfoAll(final List<RemoteLocation> locations,
++      final RemoteMethod method, long timeOutMs) throws IOException {
+-        rpcClient.invokeConcurrent(locations, method, HdfsFileStatus.class);
++        rpcClient.invokeConcurrent(locations, method, false, false, timeOutMs,
++            HdfsFileStatus.class);
+-          HdfsFileStatus fInfo = getFileInfoAll(entry.getDestinations(),
+-              new RemoteMethod("getFileInfo", new Class<?>[] {String.class},
+-                  new RemoteParam()));
++          RemoteMethod method = new RemoteMethod("getFileInfo",
++              new Class<?>[] {String.class}, new RemoteParam());
++          HdfsFileStatus fInfo = getFileInfoAll(
++              entry.getDestinations(), method, mountStatusTimeOut);

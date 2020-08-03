@@ -1,0 +1,208 @@
+JCR-2195 Provide possibility to import protected items using Session/Workspace import functionality
+
+git-svn-id: https://svn.apache.org/repos/asf/jackrabbit/trunk@808923 13f79535-47bb-0310-9956-ffa450edef68
+
+-import org.apache.jackrabbit.core.id.NodeId;
+-import org.apache.jackrabbit.core.NodeImpl;
+-import org.apache.jackrabbit.core.SessionImpl;
+-import org.apache.jackrabbit.core.security.authorization.Permission;
+-import org.apache.jackrabbit.core.util.ReferenceChangeTracker;
+-import org.apache.jackrabbit.spi.Name;
+-import org.apache.jackrabbit.spi.commons.name.NameConstants;
+-import org.slf4j.Logger;
+-import org.slf4j.LoggerFactory;
++import java.util.Iterator;
++import java.util.List;
++import java.util.Stack;
++import javax.jcr.ValueFormatException;
+-import java.util.Iterator;
+-import java.util.List;
+-import java.util.Stack;
++
++import org.apache.jackrabbit.core.NodeImpl;
++import org.apache.jackrabbit.core.SessionImpl;
++import org.apache.jackrabbit.core.id.NodeId;
++import org.apache.jackrabbit.core.nodetype.PropDef;
++import org.apache.jackrabbit.core.security.authorization.Permission;
++import org.apache.jackrabbit.core.util.ReferenceChangeTracker;
++import org.apache.jackrabbit.spi.Name;
++import org.apache.jackrabbit.spi.commons.name.NameConstants;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
+-    private Stack parents;
++    private Stack<NodeImpl> parents;
++     * Importer for protected nodes.
++     */
++    private ProtectedNodeImporter currentNodeImporter;
++
++    /**
++     * Importer for protected items.
++     */
++    private final ProtectedItemHandling protectedItemHandling;
++
++    /**
+-     * @param importTargetNode
+-     * @param session
++     * @param importTargetNode the target node
++     * @param session          session
++        this(importTargetNode, session, uuidBehavior, null);
++    }
++
++    /**
++     * Creates a new <code>SessionImporter</code> instance.
++     *
++     * @param importTargetNode the target node
++     * @param session session
++     * @param uuidBehavior the uuid behaviro
++     * @param protectedItemHandling protected item handling
++     */
++    public SessionImporter(NodeImpl importTargetNode, SessionImpl session,
++                           int uuidBehavior,
++                           ProtectedItemHandling protectedItemHandling) {
++        this.protectedItemHandling = protectedItemHandling == null
++                ? new ProtectedItemHandling()
++                : protectedItemHandling;
+-        parents = new Stack();
++        parents = new Stack<NodeImpl>();
++    /**
++     * make sure the editing session is allowed create nodes with a
++     * specified node type (and ev. mixins),<br>
++     * NOTE: this check is not executed in a single place as the parent
++     * may change in case of
++     * {@link javax.jcr.ImportUUIDBehavior#IMPORT_UUID_COLLISION_REPLACE_EXISTING IMPORT_UUID_COLLISION_REPLACE_EXISTING}.
++     *  
++     * @param parent parent node
++     * @param nodeName the name
++     * @throws RepositoryException if an error occurs
++     */
++    protected void checkPermission(NodeImpl parent, Name nodeName)
++            throws RepositoryException {
++        if (!session.getAccessManager().isGranted(session.getQPath(parent.getPath()), nodeName, Permission.NODE_TYPE_MNGMT)) {
++            throw new AccessDeniedException("Insufficient permission.");
++        }
++    }
++
+-            for (int i = 0; i < mixinNames.length; i++) {
+-                node.addMixin(mixinNames[i]);
++            for (Name mixinName : mixinNames) {
++                node.addMixin(mixinName);
++
++    protected void createProperty(NodeImpl node, PropInfo pInfo, PropDef def) throws RepositoryException {
++        // convert serialized values to Value objects
++        Value[] va = pInfo.getValues(pInfo.getTargetType(def), session);
++
++        // multi- or single-valued property?
++        Name name = pInfo.getName();
++        int type = pInfo.getType();
++        if (va.length == 1 && !def.isMultiple()) {
++            Exception e = null;
++            try {
++                // set single-value
++                node.setProperty(name, va[0]);
++            } catch (ValueFormatException vfe) {
++                e = vfe;
++            } catch (ConstraintViolationException cve) {
++                e = cve;
++            }
++            if (e != null) {
++                // setting single-value failed, try setting value array
++                // as a last resort (in case there are ambiguous property
++                // definitions)
++                node.setProperty(name, va, type);
++            }
++        } else {
++            // can only be multi-valued (n == 0 || n > 1)
++            node.setProperty(name, va, type);
++        }
++        if (type == PropertyType.REFERENCE || type == PropertyType.WEAKREFERENCE) {
++            // store reference for later resolution
++            refTracker.processedReference(node.getProperty(name));
++        }
++    }
++
++            checkPermission(parent, nodeInfo.getName());
++            checkPermission(parent, nodeInfo.getName());
++            checkPermission(parent, nodeInfo.getName());
+-    public void startNode(NodeInfo nodeInfo, List propInfos)
++    public void startNode(NodeInfo nodeInfo, List<PropInfo> propInfos)
+-        NodeImpl parent = (NodeImpl) parents.peek();
++        NodeImpl parent = parents.peek();
++            log.debug("Skipping node: " + nodeName);
+-            log.debug("Skipping node: " + nodeName);
++            // notify the p-i-importer
++            if (currentNodeImporter != null) {
++                currentNodeImporter.startChildInfo(nodeInfo, propInfos);
++            }
+-        // make sure the editing session is allowed create nodes with a
+-        // specified node type (and ev. mixins)
+-        if (!session.getAccessManager().isGranted(session.getQPath(parent.getPath()), nodeName, Permission.NODE_TYPE_MNGMT)) {
+-            throw new AccessDeniedException("Insufficient permission.");
++        if (parent.getDefinition().isProtected()) {
++            // skip protected node
++            parents.push(null);
++            log.debug("Skipping protected node: " + nodeName);
++
++            // Notify the ProtectedNodeImporter about the start of a item
++            // tree that is protected by this parent. If it potentially is
++            // able to deal with it, notify it about the child node.
++            currentNodeImporter = protectedItemHandling.accept(parent);
++            if (currentNodeImporter != null) {
++                log.debug("Protected node -> delegated to ProtectedPropertyImporter");
++                currentNodeImporter.startChildInfo(nodeInfo, propInfos);
++            } /* else: p-i-Importer isn't able to deal with the protected tree.
++                 skip the tree below the protected parent */
++            return;
+-                    // skip protected node
+-                    parents.push(null); // push null onto stack for skipped node
++                    /*
++                     use the existing node as parent for the possible subsequent
++                     import of a protected tree, that the protected node importer
++                     may or may not be able to deal with.
++                     -> upon the next 'startNode' the check for the parent being
++                        protected will notify the protected node importer.
++                     -> if the importer is able to deal with that node it needs
++                        to care of the complete subtree until it is notified
++                        during the 'endNode' call.
++                     -> if the import can't deal with that node or if that node
++                        is the a leaf in the tree to be imported 'end' will
++                        not have an effect on the importer, that was never started.
++                    */
++                    parents.push(existing);
++                checkPermission(parent, nodeName);
+-                        log.debug("skipping existing node " + nodeInfo.getName());
++                        log.debug("Skipping existing node " + nodeInfo.getName());
++                    checkPermission(parent, nodeName);
+-        Iterator iter = propInfos.iterator();
+-        while (iter.hasNext()) {
+-            PropInfo pi = (PropInfo) iter.next();
+-            pi.apply(node, session, refTracker);
++        for (PropInfo pi : propInfos) {
++            // find applicable definition
++            PropDef def = pi.getApplicablePropertyDef(node.getEffectiveNodeType());
++            if (def.isProtected()) {
++                // skip protected property
++                log.debug("Skipping protected property " + pi.getName());
++
++                // notify the ProtectedPropertyImporter.
++                if (protectedItemHandling.handlePropInfo(node, pi, def)) {
++                    // TODO: deal with reference props within the imported tree?                    
++                    log.debug("Protected property -> delegated to ProtectedPropertyImporter");
++                } // else: p-i-Importer isn't able to deal with this property
++            } else {
++                // regular property -> create the property
++                createProperty(node, pi, def);
++            }
++
+-        parents.pop();
++        NodeImpl parent = parents.pop();
++        if (parent == null) {
++            if (currentNodeImporter != null) {
++                currentNodeImporter.endChildInfo();
++            }
++        } else if (parent.getDefinition().isProtected()) {
++            if (currentNodeImporter != null) {
++                currentNodeImporter.end(parent);
++                currentNodeImporter = null;
++            }
++            // TODO: deal with reference props within the imported tree?
++        }

@@ -1,0 +1,210 @@
+Merge trunk into HDFS-1623 branch.
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/branches/HDFS-1623@1158072 13f79535-47bb-0310-9956-ffa450edef68
+
+-import java.io.BufferedInputStream;
+-import java.io.DataInputStream;
+-import java.io.FileInputStream;
+-import java.util.zip.Checksum;
++import java.util.EnumMap;
+-import org.apache.hadoop.hdfs.server.namenode.FSEditLogOp.LogHeader;
+-import org.apache.hadoop.hdfs.server.namenode.FSEditLogOp.Reader;
++import org.apache.hadoop.hdfs.server.namenode.EditLogFileInputStream.LogHeaderCorruptException;
++import org.apache.hadoop.hdfs.util.Holder;
++import org.apache.hadoop.io.IOUtils;
++
++import com.google.common.base.Joiner;
+-      long expectedStartingTxId)
+-  throws IOException {
+-    BufferedInputStream bin = new BufferedInputStream(edits);
+-    DataInputStream in = new DataInputStream(bin);
+-
++                  long expectedStartingTxId)
++      throws IOException {
++    int logVersion = edits.getVersion();
+-      LogHeader header = LogHeader.read(in);
+-      numEdits = loadEditRecords(
+-          header.logVersion, in, header.checksum, false,
+-          expectedStartingTxId);
++      numEdits = loadEditRecords(logVersion, edits, false, 
++                                 expectedStartingTxId);
+-      if(closeOnExit)
+-        in.close();
++      if(closeOnExit) {
++        edits.close();
++      }
+-  int loadEditRecords(int logVersion, DataInputStream in,
+-                      Checksum checksum, boolean closeOnExit,
++  int loadEditRecords(int logVersion, EditLogInputStream in, boolean closeOnExit,
+-    int numOpAdd = 0, numOpClose = 0, numOpDelete = 0,
+-        numOpRenameOld = 0, numOpSetRepl = 0, numOpMkDir = 0,
+-        numOpSetPerm = 0, numOpSetOwner = 0, numOpSetGenStamp = 0,
+-        numOpTimes = 0, numOpRename = 0, numOpConcatDelete = 0, 
+-        numOpSymlink = 0, numOpGetDelegationToken = 0,
+-        numOpRenewDelegationToken = 0, numOpCancelDelegationToken = 0, 
+-        numOpUpdateMasterKey = 0, numOpReassignLease = 0, numOpOther = 0;
++    EnumMap<FSEditLogOpCodes, Holder<Integer>> opCounts =
++      new EnumMap<FSEditLogOpCodes, Holder<Integer>>(FSEditLogOpCodes.class);
+-    // Keep track of the file offsets of the last several opcodes.
+-    // This is handy when manually recovering corrupted edits files.
+-    PositionTrackingInputStream tracker = new PositionTrackingInputStream(in);
+-    in = new DataInputStream(tracker);
+-        FSEditLogOp.Reader reader = new FSEditLogOp.Reader(in, logVersion,
+-                                                           checksum);
+-        while ((op = reader.readOp()) != null) {
++        while ((op = in.readOp()) != null) {
+-              tracker.getPos();
++            in.getPosition();
++          incrOpCount(op.opCode, opCounts);
+-            short replication
+-              = fsNamesys.adjustReplication(addCloseOp.replication);
++            final short replication  = fsNamesys.getBlockManager(
++                ).adjustReplication(addCloseOp.replication);
+-              numOpAdd++;
+-            numOpSetRepl++;
+-            short replication
+-              = fsNamesys.adjustReplication(setReplicationOp.replication);
++            short replication = fsNamesys.getBlockManager().adjustReplication(
++                setReplicationOp.replication);
+-            numOpConcatDelete++;
+-
+-            numOpRenameOld++;
+-            numOpDelete++;
+-
+-            numOpMkDir++;
+-            numOpSetGenStamp++;
+-            numOpSetPerm++;
+-
+-            numOpSetOwner++;
+-
+-            numOpTimes++;
+-            numOpSymlink++;
+-
+-            numOpRename++;
+-            numOpGetDelegationToken++;
+-            numOpRenewDelegationToken++;
+-
+-            numOpCancelDelegationToken++;
+-
+-            numOpUpdateMasterKey++;
+-            numOpReassignLease++;
+-            numOpOther++;
+-            numOpOther++;
++
+-      sb.append("Error replaying edit log at offset " + tracker.getPos());
++      sb.append("Error replaying edit log at offset " + in.getPosition());
+-      FSImage.LOG.debug("numOpAdd = " + numOpAdd + " numOpClose = " + numOpClose 
+-          + " numOpDelete = " + numOpDelete 
+-          + " numOpRenameOld = " + numOpRenameOld 
+-          + " numOpSetRepl = " + numOpSetRepl + " numOpMkDir = " + numOpMkDir
+-          + " numOpSetPerm = " + numOpSetPerm 
+-          + " numOpSetOwner = " + numOpSetOwner
+-          + " numOpSetGenStamp = " + numOpSetGenStamp 
+-          + " numOpTimes = " + numOpTimes
+-          + " numOpConcatDelete  = " + numOpConcatDelete
+-          + " numOpRename = " + numOpRename
+-          + " numOpGetDelegationToken = " + numOpGetDelegationToken
+-          + " numOpRenewDelegationToken = " + numOpRenewDelegationToken
+-          + " numOpCancelDelegationToken = " + numOpCancelDelegationToken
+-          + " numOpUpdateMasterKey = " + numOpUpdateMasterKey
+-          + " numOpReassignLease = " + numOpReassignLease
+-          + " numOpOther = " + numOpOther);
++      dumpOpCounts(opCounts);
++
++  private static void dumpOpCounts(
++      EnumMap<FSEditLogOpCodes, Holder<Integer>> opCounts) {
++    StringBuilder sb = new StringBuilder();
++    sb.append("Summary of operations loaded from edit log:\n  ");
++    Joiner.on("\n  ").withKeyValueSeparator("=").appendTo(sb, opCounts);
++    FSImage.LOG.debug(sb.toString());
++  }
++
++  private void incrOpCount(FSEditLogOpCodes opCode,
++      EnumMap<FSEditLogOpCodes, Holder<Integer>> opCounts) {
++    Holder<Integer> holder = opCounts.get(opCode);
++    if (holder == null) {
++      holder = new Holder<Integer>(1);
++      opCounts.put(opCode, holder);
++    } else {
++      holder.held++;
++    }
++  }
++
++  static EditLogValidation validateEditLog(File file) throws IOException {
++    EditLogFileInputStream in;
++    try {
++      in = new EditLogFileInputStream(file);
++    } catch (LogHeaderCorruptException corrupt) {
++      // If it's missing its header, this is equivalent to no transactions
++      FSImage.LOG.warn("Log at " + file + " has no valid header",
++          corrupt);
++      return new EditLogValidation(0, 0);
++    }
++    
++    try {
++      return validateEditLog(in);
++    } finally {
++      IOUtils.closeStream(in);
++    }
++  }
++
+-   * Return the number of valid transactions in the file. If the file is
++   * Return the number of valid transactions in the stream. If the stream is
+-   * 0 valid transactions.
+-   * @throws IOException if the file cannot be read due to an IO error (eg
++   * 0 valid transactions. This reads through the stream but does not close
++   * it.
++   * @throws IOException if the stream cannot be read due to an IO error (eg
+-  static EditLogValidation validateEditLog(File f) throws IOException {
+-    FileInputStream fis = new FileInputStream(f);
++  static EditLogValidation validateEditLog(EditLogInputStream in) {
++    long numValid = 0;
++    long lastPos = 0;
+-      PositionTrackingInputStream tracker = new PositionTrackingInputStream(
+-          new BufferedInputStream(fis));
+-      DataInputStream dis = new DataInputStream(tracker);
+-      LogHeader header; 
+-      try {
+-        header = LogHeader.read(dis);
+-      } catch (Throwable t) {
+-        FSImage.LOG.debug("Unable to read header from " + f +
+-            " -> no valid transactions in this file.");
+-        return new EditLogValidation(0, 0);
+-      }
+-      
+-      Reader reader = new FSEditLogOp.Reader(dis, header.logVersion, header.checksum);
+-      long numValid = 0;
+-      long lastPos = 0;
+-      try {
+-        while (true) {
+-          lastPos = tracker.getPos();
+-          if (reader.readOp() == null) {
+-            break;
+-          }
+-          numValid++;
++      while (true) {
++        lastPos = in.getPosition();
++        if (in.readOp() == null) {
++          break;
+-      } catch (Throwable t) {
+-        // Catch Throwable and not just IOE, since bad edits may generate
+-        // NumberFormatExceptions, AssertionErrors, OutOfMemoryErrors, etc.
+-        FSImage.LOG.debug("Caught exception after reading " + numValid +
+-            " ops from " + f + " while determining its valid length.", t);
++        numValid++;
+-      return new EditLogValidation(lastPos, numValid);
+-    } finally {
+-      fis.close();
++    } catch (Throwable t) {
++      // Catch Throwable and not just IOE, since bad edits may generate
++      // NumberFormatExceptions, AssertionErrors, OutOfMemoryErrors, etc.
++      FSImage.LOG.debug("Caught exception after reading " + numValid +
++          " ops from " + in + " while determining its valid length.", t);
++    return new EditLogValidation(lastPos, numValid);
+-   * Stream wrapper that keeps track of the current file position.
++   * Stream wrapper that keeps track of the current stream position.
+-  private static class PositionTrackingInputStream extends FilterInputStream {
++  static class PositionTrackingInputStream extends FilterInputStream {
++
+
+MOV26 MOV26 MOV26 MOV26 MOV26 UPD40 UPD40 UPD40 UPD40 UPD40 INS31 INS31 INS31 INS31 MOV60 INS83 MOV83 INS39 INS42 INS44 INS8 INS83 INS39 INS42 INS44 INS44 INS8 INS83 INS43 INS42 MOV44 MOV43 INS8 INS29 INS83 MOV43 INS42 INS44 INS8 UPD43 INS60 INS74 INS42 MOV60 INS21 INS21 INS21 INS43 INS42 INS74 INS42 INS60 INS25 INS42 UPD42 MOV60 MOV54 INS54 INS65 INS65 INS43 INS42 MOV60 MOV60 MOV54 MOV41 INS39 UPD42 INS74 INS59 INS43 INS43 INS74 UPD43 INS32 INS32 INS32 UPD42 MOV42 INS43 INS43 INS74 INS74 INS59 INS27 INS8 INS8 UPD43 INS8 INS8 INS66 INS66 INS66 INS66 INS42 INS66 INS66 INS42 UPD66 UPD42 INS32 INS43 INS43 INS74 UPD42 MOV42 INS14 INS42 INS42 INS43 INS43 UPD42 UPD42 INS42 INS42 INS45 INS32 INS42 INS42 INS42 INS40 INS42 INS32 UPD42 MOV42 UPD42 MOV42 INS43 INS43 INS43 INS43 INS42 INS32 INS42 INS33 INS21 INS21 INS21 UPD42 UPD42 INS44 INS41 INS21 MOV44 INS42 INS42 INS8 INS42 INS42 INS43 INS43 INS74 INS57 INS42 INS42 UPD43 INS32 INS42 INS45 INS42 INS42 INS42 INS42 UPD42 MOV42 INS42 INS42 INS42 INS42 INS7 INS32 INS37 INS43 INS42 INS32 INS32 INS21 INS42 INS42 INS43 INS43 INS74 INS43 UPD42 INS42 UPD42 INS42 INS42 INS45 INS42 INS14 INS42 INS42 INS42 INS42 INS40 UPD42 INS14 INS42 INS42 INS42 INS42 INS42 INS42 UPD42 INS42 MOV32 INS42 UPD42 MOV42 INS43 INS43 UPD42 MOV42 INS74 INS34 INS43 INS42 UPD42 INS42 UPD42 INS42 UPD42 MOV42 INS21 INS43 INS43 INS42 UPD45 UPD42 UPD45 UPD42 INS32 UPD42 UPD42 UPD42 MOV42 INS42 UPD42 UPD42 UPD42 INS42 INS40 INS42 UPD42 UPD42 UPD42 INS83 INS32 INS32 MOV42 INS42 MOV42 INS42 DEL40 DEL26 DEL42 DEL43 DEL42 DEL42 DEL43 DEL42 DEL14 DEL59 DEL60 DEL42 DEL43 DEL42 DEL43 DEL42 DEL14 DEL42 DEL43 DEL42 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL40 DEL40 DEL21 DEL42 DEL43 DEL42 DEL44 DEL39 DEL42 DEL34 DEL59 DEL42 DEL34 DEL59 DEL42 DEL34 DEL59 DEL42 DEL34 DEL59 DEL42 DEL34 DEL59 DEL42 DEL34 DEL59 DEL42 DEL34 DEL59 DEL42 DEL34 DEL59 DEL42 DEL34 DEL59 DEL34 DEL59 DEL42 DEL34 DEL59 DEL42 DEL34 DEL59 DEL42 DEL34 DEL59 DEL42 DEL34 DEL59 DEL42 DEL34 DEL59 DEL42 DEL34 DEL59 DEL42 DEL34 DEL59 DEL42 DEL34 DEL59 DEL42 DEL34 DEL59 DEL60 DEL43 DEL42 DEL43 DEL42 DEL14 DEL59 DEL60 DEL42 DEL43 DEL42 DEL14 DEL7 DEL21 DEL40 DEL43 DEL42 DEL40 DEL43 DEL42 DEL42 DEL42 DEL14 DEL59 DEL60 DEL42 DEL37 DEL21 DEL42 DEL37 DEL21 DEL42 DEL37 DEL21 DEL42 DEL37 DEL21 DEL42 DEL37 DEL21 DEL42 DEL37 DEL21 DEL42 DEL37 DEL21 DEL42 DEL37 DEL21 DEL42 DEL37 DEL21 DEL42 DEL37 DEL21 DEL42 DEL37 DEL21 DEL42 DEL37 DEL21 DEL42 DEL37 DEL21 DEL42 DEL37 DEL21 DEL42 DEL37 DEL21 DEL42 DEL37 DEL21 DEL42 DEL37 DEL21 DEL42 DEL37 DEL21 DEL42 DEL37 DEL21 DEL40 DEL45 DEL42 DEL45 DEL42 DEL45 DEL42 DEL45 DEL42 DEL45 DEL42 DEL45 DEL42 DEL45 DEL42 DEL45 DEL42 DEL45 DEL42 DEL45 DEL42 DEL45 DEL42 DEL45 DEL42 DEL45 DEL42 DEL45 DEL42 DEL45 DEL42 DEL45 DEL42 DEL45 DEL42 DEL45 DEL42 DEL27 DEL42 DEL42 DEL42 DEL42 DEL32 DEL42 DEL43 DEL42 DEL44 DEL66 DEL66 DEL66 DEL65 DEL42 DEL66 DEL66 DEL65 DEL29 DEL42 DEL43 DEL42 DEL43 DEL43 DEL42 DEL14 DEL14 DEL59 DEL60 DEL43 DEL42 DEL43 DEL42 DEL14 DEL59 DEL60 DEL42 DEL43 DEL42 DEL40 DEL43 DEL42 DEL40 DEL40 DEL14 DEL59 DEL60 DEL8 DEL42 DEL42 DEL32 DEL21 DEL8 DEL54 DEL8 DEL31 DEL83

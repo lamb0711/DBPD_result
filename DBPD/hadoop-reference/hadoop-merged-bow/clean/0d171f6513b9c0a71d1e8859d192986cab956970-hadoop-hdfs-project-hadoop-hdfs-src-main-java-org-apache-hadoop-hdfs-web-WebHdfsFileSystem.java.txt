@@ -1,0 +1,211 @@
+Merge trunk into HA branch
+
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/branches/HDFS-1623@1202013 13f79535-47bb-0310-9956-ffa450edef68
+
++import java.net.MalformedURLException;
++import java.util.StringTokenizer;
+-import org.apache.hadoop.hdfs.web.resources.TokenArgumentParam;
++import org.apache.hadoop.hdfs.web.resources.TokenArgumentParam;
++import org.apache.hadoop.security.authorize.AuthorizationException;
++import org.apache.hadoop.security.token.SecretManager.InvalidToken;
++  /** Token selector */
++  public static final AbstractDelegationTokenSelector<DelegationTokenIdentifier> DT_SELECTOR
++      = new AbstractDelegationTokenSelector<DelegationTokenIdentifier>(TOKEN_KIND) {};
+-  private static final DelegationTokenRenewer<WebHdfsFileSystem> dtRenewer
+-      = new DelegationTokenRenewer<WebHdfsFileSystem>(WebHdfsFileSystem.class);
+-  static {
+-    dtRenewer.start();
++  private static DelegationTokenRenewer<WebHdfsFileSystem> DT_RENEWER = null;
++
++  private static synchronized void addRenewAction(final WebHdfsFileSystem webhdfs) {
++    if (DT_RENEWER == null) {
++      DT_RENEWER = new DelegationTokenRenewer<WebHdfsFileSystem>(WebHdfsFileSystem.class);
++      DT_RENEWER.start();
++    }
++
++    DT_RENEWER.addRenewAction(webhdfs);
+-  private Token<?> renewToken;
+-    Token<?> token = webhdfspTokenSelector.selectToken(
+-        serviceName, ugi.getTokens());      
++    Token<?> token = DT_SELECTOR.selectToken(serviceName, ugi.getTokens());      
+-        dtRenewer.addRenewAction(this);
++        addRenewAction(this);
++  /** @return the home directory. */
++  public static String getHomeDirectoryString(final UserGroupInformation ugi) {
++    return "/user/" + ugi.getShortUserName();
++  }
++
+-    return makeQualified(new Path("/user/" + ugi.getShortUserName()));
++    return makeQualified(new Path(getHomeDirectoryString(ugi)));
+-  private static Map<?, ?> jsonParse(final InputStream in) throws IOException {
++  static Map<?, ?> jsonParse(final InputStream in) throws IOException {
+-          DSQuotaExceededException.class,
++          InvalidToken.class,
++          AuthenticationException.class,
++          AuthorizationException.class,
++          UnresolvedPathException.class,
+-          NSQuotaExceededException.class,
+-          UnresolvedPathException.class);
++          DSQuotaExceededException.class,
++          NSQuotaExceededException.class);
+-    final HttpURLConnection conn = getHttpUrlConnection(url);
++    HttpURLConnection conn = getHttpUrlConnection(url);
+-      conn.setDoOutput(op.getDoOutput());
+-        conn.setRequestProperty("Expect", "100-Continue");
+-        conn.setInstanceFollowRedirects(true);
++        conn = twoStepWrite(conn, op);
++      conn.setDoOutput(op.getDoOutput());
++  
++  /**
++   * Two-step Create/Append:
++   * Step 1) Submit a Http request with neither auto-redirect nor data. 
++   * Step 2) Submit another Http request with the URL from the Location header with data.
++   * 
++   * The reason of having two-step create/append is for preventing clients to
++   * send out the data before the redirect. This issue is addressed by the
++   * "Expect: 100-continue" header in HTTP/1.1; see RFC 2616, Section 8.2.3.
++   * Unfortunately, there are software library bugs (e.g. Jetty 6 http server
++   * and Java 6 http client), which do not correctly implement "Expect:
++   * 100-continue". The two-step create/append is a temporary workaround for
++   * the software library bugs.
++   */
++  static HttpURLConnection twoStepWrite(HttpURLConnection conn,
++      final HttpOpParam.Op op) throws IOException {
++    //Step 1) Submit a Http request with neither auto-redirect nor data. 
++    conn.setInstanceFollowRedirects(false);
++    conn.setDoOutput(false);
++    conn.connect();
++    validateResponse(HttpOpParam.TemporaryRedirectOp.valueOf(op), conn);
++    final String redirect = conn.getHeaderField("Location");
++    conn.disconnect();
++
++    //Step 2) Submit another Http request with the URL from the Location header with data.
++    conn = (HttpURLConnection)new URL(redirect).openConnection();
++    conn.setRequestMethod(op.getType().toString());
++    return conn;
++  }
+-        f.getBlockSize(), f.getModificationTime(),
+-        f.getAccessTime(),
++        f.getBlockSize(), f.getModificationTime(), f.getAccessTime(),
++        f.isSymlink() ? new Path(f.getSymlink()) : null,
+-  private FSDataOutputStream write(final HttpOpParam.Op op,
++  FSDataOutputStream write(final HttpOpParam.Op op,
+-          validateResponse(op, conn);
++          try {
++            validateResponse(op, conn);
++          } finally {
++            conn.disconnect();
++          }
+-    ByteRangeInputStream str = getByteRangeInputStream(url);
+-    return new FSDataInputStream(str);
++    return new FSDataInputStream(new OffsetUrlInputStream(
++        new OffsetUrlOpener(url), new OffsetUrlOpener(null)));
+-  private class URLOpener extends ByteRangeInputStream.URLOpener {
+-
+-    public URLOpener(URL u) {
+-      super(u);
++  class OffsetUrlOpener extends ByteRangeInputStream.URLOpener {
++    /** The url with offset parameter */
++    private URL offsetUrl;
++  
++    OffsetUrlOpener(final URL url) {
++      super(url);
++    /** Open connection with offset url. */
+-    public HttpURLConnection openConnection() throws IOException {
++    protected HttpURLConnection openConnection() throws IOException {
++
++    /** Setup offset url before open connection. */
++    @Override
++    protected HttpURLConnection openConnection(final long offset) throws IOException {
++      offsetUrl = offset == 0L? url: new URL(url + "&" + new OffsetParam(offset));
++      final HttpURLConnection conn = openConnection();
++      conn.setRequestMethod("GET");
++      return conn;
++    }  
+-  
+-  private ByteRangeInputStream getByteRangeInputStream(URL url) {
+-    return new ByteRangeInputStream(new URLOpener(url), new URLOpener(null));
++
++  private static final String OFFSET_PARAM_PREFIX = OffsetParam.NAME + "=";
++
++  /** Remove offset parameter, if there is any, from the url */
++  static URL removeOffsetParam(final URL url) throws MalformedURLException {
++    String query = url.getQuery();
++    if (query == null) {
++      return url;
++    }
++    final String lower = query.toLowerCase();
++    if (!lower.startsWith(OFFSET_PARAM_PREFIX)
++        && !lower.contains("&" + OFFSET_PARAM_PREFIX)) {
++      return url;
++    }
++
++    //rebuild query
++    StringBuilder b = null;
++    for(final StringTokenizer st = new StringTokenizer(query, "&");
++        st.hasMoreTokens();) {
++      final String token = st.nextToken();
++      if (!token.toLowerCase().startsWith(OFFSET_PARAM_PREFIX)) {
++        if (b == null) {
++          b = new StringBuilder("?").append(token);
++        } else {
++          b.append('&').append(token);
++        }
++      }
++    }
++    query = b == null? "": b.toString();
++
++    final String urlStr = url.toString();
++    return new URL(urlStr.substring(0, urlStr.indexOf('?')) + query);
++  }
++
++  static class OffsetUrlInputStream extends ByteRangeInputStream {
++    OffsetUrlInputStream(OffsetUrlOpener o, OffsetUrlOpener r) {
++      super(o, r);
++    }
++    
++    @Override
++    protected void checkResponseCode(final HttpURLConnection connection
++        ) throws IOException {
++      validateResponse(GetOpParam.Op.OPEN, connection);
++    }
++
++    /** Remove offset parameter before returning the resolved url. */
++    @Override
++    protected URL getResolvedUrl(final HttpURLConnection connection
++        ) throws MalformedURLException {
++      return removeOffsetParam(connection.getURL());
++    }
+-    final Map<?, ?> rootmap = (Map<?, ?>)json.get(HdfsFileStatus.class.getSimpleName() + "es");
+-    final Object[] array = (Object[])rootmap.get(HdfsFileStatus.class.getSimpleName());
++    final Map<?, ?> rootmap = (Map<?, ?>)json.get(FileStatus.class.getSimpleName() + "es");
++    final Object[] array = (Object[])rootmap.get(FileStatus.class.getSimpleName());
+-    token.setService(new Text(getCanonicalServiceName()));
++    SecurityUtil.setTokenService(token, nnAddr);
+-    return renewToken;
++    return delegationToken;
+-      renewToken = token;
+-      // emulate the 203 usage of the tokens
+-      // by setting the kind and service as if they were hdfs tokens
+-      delegationToken = new Token<T>(token);
+-      // NOTE: the remote nn must be configured to use hdfs
+-      delegationToken.setKind(DelegationTokenIdentifier.HDFS_DELEGATION_KIND);
+-      // no need to change service because we aren't exactly sure what it
+-      // should be.  we can guess, but it might be wrong if the local conf
+-      // value is incorrect.  the service is a client side field, so the remote
+-      // end does not care about the value
++      delegationToken = token;
+-    final HttpOpParam.Op op = GetOpParam.Op.GETFILEBLOCKLOCATIONS;
++    final HttpOpParam.Op op = GetOpParam.Op.GET_BLOCK_LOCATIONS;
+-  private static final DtSelector webhdfspTokenSelector = new DtSelector();
+-
+-  private static class DtSelector
+-      extends AbstractDelegationTokenSelector<DelegationTokenIdentifier> {
+-    private DtSelector() {
+-      super(TOKEN_KIND);
+-    }
+-  }
+-
+
+MOV26 INS26 INS26 INS26 INS26 INS40 INS40 INS40 INS40 INS23 INS31 INS31 INS31 INS23 INS31 INS55 INS31 MOV31 INS29 UPD83 MOV74 INS83 INS83 MOV74 INS59 INS83 INS83 INS83 INS39 INS42 INS44 INS8 INS29 INS83 INS83 INS43 INS42 INS44 MOV8 INS8 INS29 INS83 INS43 INS42 INS44 INS44 INS43 INS8 INS42 INS23 INS31 INS83 INS83 INS83 INS43 INS59 INS29 INS83 INS43 UPD42 MOV42 MOV44 INS43 INS8 INS83 INS42 MOV43 INS31 INS31 INS31 INS78 INS83 MOV74 INS42 INS8 MOV78 UPD83 MOV73 INS39 UPD42 MOV44 INS8 INS65 INS42 INS14 INS42 INS33 INS83 INS43 INS42 INS25 INS21 INS65 INS42 INS83 INS43 INS42 INS41 INS65 INS42 INS43 INS42 INS83 INS43 INS42 INS42 INS21 INS21 INS21 INS21 INS60 INS21 INS21 INS21 INS41 INS41 INS29 INS83 INS43 INS59 UPD42 INS29 UPD83 INS29 INS78 INS83 INS43 INS42 INS44 INS43 INS8 INS42 INS42 INS27 INS65 INS42 INS83 INS43 UPD42 MOV42 INS60 INS25 INS60 INS25 INS60 INS24 INS21 INS60 INS41 INS42 INS44 INS44 INS8 MOV78 INS83 INS39 INS42 INS44 INS43 INS8 INS29 INS78 INS83 INS43 INS42 INS44 INS43 INS8 INS42 INS41 INS51 INS66 INS74 INS42 INS1 INS42 INS27 INS8 INS32 INS66 UPD42 MOV42 MOV27 INS32 MOV21 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS42 INS40 INS32 INS32 INS32 INS32 INS83 INS43 INS59 INS32 INS7 INS32 INS42 INS14 INS65 INS42 INS42 INS83 INS43 UPD42 INS65 INS65 INS42 INS42 INS83 INS39 INS42 INS42 INS21 INS60 INS21 INS41 INS40 INS45 INS66 INS42 INS43 INS59 INS27 INS8 INS83 INS43 INS59 INS27 INS8 INS43 INS59 INS58 INS32 INS8 INS7 INS83 INS43 INS59 INS14 INS43 INS42 INS43 INS42 INS46 INS83 INS43 INS42 UPD42 MOV42 INS21 INS65 INS42 INS42 INS83 INS43 INS42 INS42 INS41 INS42 INS52 INS8 INS43 INS43 INS42 INS33 INS21 MOV21 INS42 INS42 INS42 INS42 INS14 INS42 INS42 INS9 INS42 INS42 INS9 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS11 INS42 INS42 INS32 INS16 MOV43 INS14 INS66 INS42 UPD42 INS66 INS66 INS7 INS83 INS43 INS59 INS32 INS42 UPD42 MOV42 INS42 INS32 INS42 INS33 INS41 INS42 INS42 INS32 INS38 INS38 MOV41 INS42 INS42 INS33 INS83 INS43 INS59 INS42 INS42 INS60 INS25 INS42 INS16 INS42 INS42 INS32 MOV43 INS27 INS42 INS42 INS42 INS42 UPD42 MOV42 INS32 INS66 INS42 INS32 UPD42 UPD42 INS42 UPD42 MOV42 INS21 UPD40 INS42 INS42 INS7 UPD42 MOV43 INS32 MOV57 MOV57 INS40 INS42 INS42 INS42 INS42 INS45 INS43 INS32 INS32 INS42 INS32 INS14 INS33 INS43 INS14 INS14 INS42 INS16 INS42 INS42 INS32 INS42 INS42 INS45 INS42 INS42 INS42 INS42 INS42 INS32 INS32 UPD42 INS42 INS42 INS14 INS83 INS43 INS59 INS38 INS8 INS27 INS45 INS32 INS42 INS42 INS32 INS42 INS42 INS40 INS42 INS42 INS32 INS7 INS42 MOV14 UPD42 INS42 INS42 INS57 INS57 INS57 INS21 INS42 INS14 INS42 INS42 INS42 INS42 INS42 INS43 INS32 UPD42 MOV42 INS43 INS42 INS43 INS33 INS27 INS42 INS14 INS42 INS42 INS42 INS42 INS42 INS42 INS27 INS43 INS42 INS45 INS42 INS42 INS32 INS32 INS25 INS42 INS33 INS42 INS42 INS42 INS42 INS34 INS32 INS42 INS42 INS42 INS42 INS43 INS43 INS43 INS7 INS43 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS34 MOV43 INS27 INS45 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS27 INS8 INS8 INS42 INS42 INS13 INS42 INS42 INS42 INS42 INS32 INS42 INS8 INS42 INS45 INS14 INS42 INS42 INS42 INS33 MOV21 MOV21 UPD43 UPD42 MOV42 MOV42 UPD42 MOV42 INS54 INS43 INS42 INS32 UPD43 UPD42 MOV8 INS8 INS42 UPD42 INS32 INS32 INS42 INS42 UPD42 INS21 INS14 INS42 INS42 UPD42 MOV42 UPD42 MOV42 INS13 INS32 INS43 INS45 INS42 INS42 UPD42 MOV42 DEL42 DEL83 DEL8 DEL28 DEL83 DEL43 DEL76 DEL74 DEL42 DEL59 DEL23 DEL42 DEL42 DEL14 DEL32 DEL83 DEL83 DEL42 DEL45 DEL45 DEL32 DEL21 DEL9 DEL32 DEL21 DEL83 DEL43 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL14 DEL41 DEL83 DEL42 DEL83 DEL43 DEL42 DEL43 DEL74 DEL42 DEL14 DEL40 DEL32 DEL83 DEL43 DEL43 DEL42 DEL14 DEL42 DEL43 DEL33 DEL14 DEL14 DEL41 DEL8 DEL31 DEL42 DEL43 DEL32 DEL14 DEL42 DEL46 DEL8 DEL83 DEL42 DEL8 DEL31 DEL83 DEL39 DEL42 DEL52 DEL42 DEL42 DEL7 DEL21 DEL8 DEL51 DEL8 DEL31 DEL83 DEL83 DEL83 DEL43 DEL42 DEL43 DEL14 DEL59 DEL23 DEL83 DEL83 DEL42 DEL55

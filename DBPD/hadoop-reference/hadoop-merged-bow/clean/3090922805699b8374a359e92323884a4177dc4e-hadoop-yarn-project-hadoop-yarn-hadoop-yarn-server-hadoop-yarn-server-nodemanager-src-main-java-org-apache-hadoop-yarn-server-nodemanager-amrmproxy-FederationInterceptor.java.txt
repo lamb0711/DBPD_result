@@ -1,0 +1,378 @@
+YARN-8696. [AMRMProxy] FederationInterceptor upgrade: home sub-cluster heartbeat async. Contributed by Botong Huang.
+
++import java.io.ByteArrayInputStream;
++import java.io.DataInputStream;
++import org.apache.hadoop.yarn.client.AMRMClientUtils;
++import org.apache.hadoop.yarn.factories.RecordFactory;
++import org.apache.hadoop.yarn.factory.providers.RecordFactoryProvider;
++import org.apache.hadoop.yarn.server.AMHeartbeatRequestHandler;
+-import org.apache.hadoop.yarn.server.utils.YarnServerSecurityUtils;
++import org.apache.hadoop.yarn.util.MonotonicClock;
++  private static final RecordFactory RECORD_FACTORY =
++      RecordFactoryProvider.getRecordFactory(null);
++
++  /**
++   * From AM's perspective, FederationInterceptor behaves exactly the same as
++   * YarnRM (ApplicationMasterService). This is to remember the last heart beat
++   * response, used to handle duplicate heart beat and responseId from AM.
++   */
++  private AllocateResponse lastAllocateResponse;
++  private final Object lastAllocateResponseLock = new Object();
++
+-  private volatile int lastHomeResponseId;
++  private AMHeartbeatRequestHandler homeHeartbeartHandler;
+-   * sub-cluster resource managers except the home RM.
++   * sub-cluster resource managers, including home RM.
+-  /**
+-   * The proxy ugi used to talk to home RM, loaded with the up-to-date AMRMToken
+-   * issued by home RM.
+-   */
+-  private UserGroupInformation appOwner;
+-
++  // the maximum wait time for the first async heart beat response
++  private long heartbeatMaxWaitTimeMs;
++
++  private MonotonicClock clock = new MonotonicClock();
++
+-    this.lastHomeResponseId = Integer.MAX_VALUE;
++    // The proxy ugi used to talk to home RM as well as Yarn Registry, loaded
++    // with the up-to-date AMRMToken issued by home RM.
++    UserGroupInformation appOwner;
+-      this.appOwner = UserGroupInformation.createProxyUser(appContext.getUser(),
++      appOwner = UserGroupInformation.createProxyUser(appContext.getUser(),
+-          appContext.getRegistryClient(), this.appOwner);
++          appContext.getRegistryClient(), appOwner);
+-        this.appOwner.addCredentials(appContext.getCredentials());
++        appOwner.addCredentials(appContext.getCredentials());
+-        ApplicationMasterProtocol.class, this.appOwner), appId,
++        ApplicationMasterProtocol.class, appOwner), appId,
++    this.homeHeartbeartHandler = createHomeHeartbeartHandler(conf, appId);
++    this.homeHeartbeartHandler.setAMRMClientRelayer(this.homeRMRelayer);
++    this.homeHeartbeartHandler.setUGI(appOwner);
++    this.homeHeartbeartHandler.setDaemon(true);
++    this.homeHeartbeartHandler.start();
++
++    // set lastResponseId to -1 before application master registers
++    this.lastAllocateResponse =
++        RECORD_FACTORY.newRecordInstance(AllocateResponse.class);
++    this.lastAllocateResponse
++        .setResponseId(AMRMClientUtils.PRE_REGISTER_RESPONSE_ID);
++
++
++    this.heartbeatMaxWaitTimeMs =
++        conf.getLong(YarnConfiguration.FEDERATION_AMRMPROXY_HB_MAX_WAIT_MS,
++            YarnConfiguration.DEFAULT_FEDERATION_AMRMPROXY_HB_MAX_WAIT_MS);
++    this.justRecovered = true;
++
+-        // Trigger re-register and full pending re-send only if we have a
+-        // saved register response. This should always be true though.
+-        this.justRecovered = true;
++            LOG.debug("  From subcluster " + subClusterId
++                + " running container " + container.getId());
+-      LOG.info("{} running containers including AM recovered from home RM ",
++      LOG.info("{} running containers including AM recovered from home RM {}",
+-   * to AM as if we are the RM that never fails over. When actual RM fails over,
+-   * we always re-register automatically.
++   * to AM as if we are the RM that never fails over (except when AMRMProxy
++   * restarts). When actual RM fails over, we always re-register automatically.
++
++    // Reset the heartbeat responseId to zero upon register
++    synchronized (this.lastAllocateResponseLock) {
++      this.lastAllocateResponse.setResponseId(0);
++    }
++    this.justRecovered = false;
++
+-      throws YarnException {
++      throws YarnException, IOException {
+-    if (this.justRecovered && this.lastHomeResponseId == Integer.MAX_VALUE) {
+-      // Save the responseId home RM is expecting
+-      this.lastHomeResponseId = request.getResponseId();
+-
++    if (this.justRecovered) {
+-    // Override responseId in the request in two cases:
+-    //
+-    // 1. After we just recovered after an NM restart and AM's responseId is
+-    // reset due to the exception we generate. We need to override the
+-    // responseId to the one homeRM expects.
+-    //
+-    // 2. After homeRM fail-over, the allocate response with reseted responseId
+-    // might not be returned successfully back to AM because of RPC connection
+-    // timeout between AM and AMRMProxy. In this case, we remember and reset the
+-    // responseId for AM.
+-    if (this.justRecovered
+-        || request.getResponseId() > this.lastHomeResponseId) {
+-      LOG.warn("Setting allocate responseId for {} from {} to {}",
+-          this.attemptId, request.getResponseId(), this.lastHomeResponseId);
+-      request.setResponseId(this.lastHomeResponseId);
++    // Check responseId and handle duplicate heartbeat exactly same as RM
++    synchronized (this.lastAllocateResponseLock) {
++      LOG.info("Heartbeat from " + this.attemptId + " with responseId "
++          + request.getResponseId() + " when we are expecting "
++          + this.lastAllocateResponse.getResponseId());
++      // Normally request.getResponseId() == lastResponse.getResponseId()
++      if (AMRMClientUtils.getNextResponseId(
++          request.getResponseId()) == this.lastAllocateResponse
++              .getResponseId()) {
++        // heartbeat one step old, simply return lastReponse
++        return this.lastAllocateResponse;
++      } else if (request.getResponseId() != this.lastAllocateResponse
++          .getResponseId()) {
++        throw new InvalidApplicationMasterRequestException(
++            AMRMClientUtils.assembleInvalidResponseIdExceptionMessage(attemptId,
++                this.lastAllocateResponse.getResponseId(),
++                request.getResponseId()));
++      }
+-      // Send the requests to the secondary sub-cluster resource managers.
+-      // These secondary requests are send asynchronously and the responses will
+-      // be collected and merged with the home response. In addition, it also
+-      // return the newly registered Unmanaged AMs.
+-      Registrations newRegistrations =
+-          sendRequestsToSecondaryResourceManagers(requests);
++      /**
++       * Send the requests to the all sub-cluster resource managers. All
++       * requests are synchronously triggered but sent asynchronously. Later the
++       * responses will be collected and merged. In addition, it also returns
++       * the newly registered UAMs.
++       */
++      Registrations newRegistrations = sendRequestsToResourceManagers(requests);
+-      // Send the request to the home RM and get the response
+-      AllocateRequest homeRequest = requests.get(this.homeSubClusterId);
+-      LOG.info("{} heartbeating to home RM with responseId {}", this.attemptId,
+-          homeRequest.getResponseId());
+-
+-      AllocateResponse homeResponse = this.homeRMRelayer.allocate(homeRequest);
+-
+-      // Reset the flag after the first successful homeRM allocate response,
+-      // otherwise keep overriding the responseId of new allocate request
+-      if (this.justRecovered) {
+-        this.justRecovered = false;
++      // Wait for the first async response to arrive
++      long startTime = this.clock.getTime();
++      synchronized (this.asyncResponseSink) {
++        try {
++          this.asyncResponseSink.wait(this.heartbeatMaxWaitTimeMs);
++        } catch (InterruptedException e) {
++        }
++      long firstResponseTime = this.clock.getTime() - startTime;
+-      // Notify policy of home response
++      // An extra brief wait for other async heart beats, so that most of their
++      // responses can make it back to AM in the same heart beat round trip.
+-        this.policyInterpreter.notifyOfResponse(this.homeSubClusterId,
+-            homeResponse);
+-      } catch (YarnException e) {
+-        LOG.warn("notifyOfResponse for policy failed for home sub-cluster "
+-            + this.homeSubClusterId, e);
++        Thread.sleep(firstResponseTime);
++      } catch (InterruptedException e) {
+-      // If the resource manager sent us a new token, add to the current user
+-      if (homeResponse.getAMRMToken() != null) {
+-        LOG.debug("Received new AMRMToken");
+-        YarnServerSecurityUtils.updateAMRMToken(homeResponse.getAMRMToken(),
+-            this.appOwner, getConf());
+-      }
++      // Prepare the response to AM
++      AllocateResponse response =
++          RECORD_FACTORY.newRecordInstance(AllocateResponse.class);
+-      // Merge the responses from home and secondary sub-cluster RMs
+-      homeResponse = mergeAllocateResponses(homeResponse);
++      // Merge all responses from response sink
++      mergeAllocateResponses(response);
+-      // the homeResponse.
++      // the response
+-        homeResponse = mergeRegistrationResponses(homeResponse,
++        mergeRegistrationResponses(response,
+-      LOG.info("{} heartbeat response from home RM with responseId {}",
+-          this.attemptId, homeResponse.getResponseId());
+-
+-      // Update lastHomeResponseId in three cases:
+-      // 1. The normal responseId increments
+-      // 2. homeResponse.getResponseId() == 1. This happens when homeRM fails
+-      // over, AMRMClientRelayer auto re-register and full re-send for homeRM.
+-      // 3. lastHomeResponseId == MAX_INT. This is the initial case or
+-      // responseId about to overflow and wrap around
+-      if (homeResponse.getResponseId() == this.lastHomeResponseId + 1
+-          || homeResponse.getResponseId() == 1
+-          || this.lastHomeResponseId == Integer.MAX_VALUE) {
+-        this.lastHomeResponseId = homeResponse.getResponseId();
++      // update the responseId and return the final response to AM
++      synchronized (this.lastAllocateResponseLock) {
++        response.setResponseId(AMRMClientUtils
++            .getNextResponseId(this.lastAllocateResponse.getResponseId()));
++        this.lastAllocateResponse = response;
+-
+-      // return the final response to the application master.
+-      return homeResponse;
+-    } catch (IOException ex) {
+-      LOG.error("Exception encountered while processing heart beat", ex);
++      return response;
++    } catch (Throwable ex) {
++      LOG.error("Exception encountered while processing heart beat for "
++          + this.attemptId, ex);
++    // Stop the home heartbeat thread
++    this.homeHeartbeartHandler.shutdown();
++
+-    homeRMRelayer.shutdown();
+-    for(AMRMClientRelayer relayer : secondaryRelayers.values()){
++
++    // Stop the home heartbeat thread
++    this.homeHeartbeartHandler.shutdown();
++    this.homeRMRelayer.shutdown();
++    for (AMRMClientRelayer relayer : this.secondaryRelayers.values()) {
++
+-  protected int getLastHomeResponseId() {
+-    return this.lastHomeResponseId;
++  protected ApplicationAttemptId getAttemptId() {
++    return this.attemptId;
++  }
++
++  @VisibleForTesting
++  protected AMHeartbeatRequestHandler getHomeHeartbeartHandler() {
++    return this.homeHeartbeartHandler;
++  @VisibleForTesting
++  protected AMHeartbeatRequestHandler createHomeHeartbeartHandler(
++      Configuration conf, ApplicationId appId) {
++    return new AMHeartbeatRequestHandler(conf, appId);
++  }
++
+-        completionService = new ExecutorCompletionService<>(threadpool);
++        completionService = new ExecutorCompletionService<>(this.threadpool);
+-   * sub-cluster resource managers.
++   * sub-cluster resource managers asynchronously.
+-   *          manager keyed by the resource manager address
++   *          manager keyed by the sub-cluster id
+-  private Registrations sendRequestsToSecondaryResourceManagers(
++  private Registrations sendRequestsToResourceManagers(
+-    // to the sub-cluster RMs using the Unmanaged application masters
+-    // asynchronously and don't wait for the response. The responses will
+-    // arrive asynchronously and will be added to the response sink. These
+-    // responses will be sent to the application master in some future heart
+-    // beat response.
++    // to the sub-cluster RMs asynchronously and don't wait for the response.
++    // The responses will arrive asynchronously and will be added to the
++    // response sink, then merged and sent to the application master.
+-      final SubClusterId subClusterId = entry.getKey();
++      SubClusterId subClusterId = entry.getKey();
+-        // Skip the request for the home sub-cluster resource manager.
+-        // It will be handled separately in the allocate() method
+-        continue;
++        // Request for the home sub-cluster resource manager
++        this.homeHeartbeartHandler.allocateAsync(entry.getValue(),
++            new HeartbeatCallBack(this.homeSubClusterId, false));
++      } else {
++        if (!this.uamPool.hasUAMId(subClusterId.getId())) {
++          // TODO: This means that the registration for this sub-cluster RM
++          // failed. For now, we ignore the resource requests and continue
++          // but we need to fix this and handle this situation. One way would
++          // be to send the request to another RM by consulting the policy.
++          LOG.warn("Unmanaged AM registration not found for sub-cluster {}",
++              subClusterId);
++          continue;
++        }
++        this.uamPool.allocateAsync(subClusterId.getId(), entry.getValue(),
++            new HeartbeatCallBack(subClusterId, true));
+-
+-      if (!this.uamPool.hasUAMId(subClusterId.getId())) {
+-        // TODO: This means that the registration for this sub-cluster RM
+-        // failed. For now, we ignore the resource requests and continue
+-        // but we need to fix this and handle this situation. One way would
+-        // be to send the request to another RM by consulting the policy.
+-        LOG.warn("Unmanaged AM registration not found for sub-cluster {}",
+-            subClusterId);
+-        continue;
+-      }
+-
+-      this.uamPool.allocateAsync(subClusterId.getId(), entry.getValue(),
+-          new HeartbeatCallBack(subClusterId));
+-          completionService = new ExecutorCompletionService<>(threadpool);
++          completionService = new ExecutorCompletionService<>(this.threadpool);
+-   * Merges the responses from other sub-clusters that we received
+-   * asynchronously with the specified home cluster response and keeps track of
+-   * the containers received from each sub-cluster resource managers.
++   * Merge the responses from all sub-clusters that we received asynchronously
++   * and keeps track of the containers received from each sub-cluster resource
++   * managers.
+-  private AllocateResponse mergeAllocateResponses(
+-      AllocateResponse homeResponse) {
+-    // Timing issue, we need to remove the completed and then save the new ones.
+-    removeFinishedContainersFromCache(
+-        homeResponse.getCompletedContainersStatuses());
+-    cacheAllocatedContainers(homeResponse.getAllocatedContainers(),
+-        this.homeSubClusterId);
+-
++  private void mergeAllocateResponses(AllocateResponse mergedResponse) {
+-      for (Entry<SubClusterId, List<AllocateResponse>> entry : asyncResponseSink
+-          .entrySet()) {
++      for (Entry<SubClusterId, List<AllocateResponse>> entry :
++          this.asyncResponseSink.entrySet()) {
+-            mergeAllocateResponse(homeResponse, response, subClusterId);
++            mergeAllocateResponse(mergedResponse, response, subClusterId);
+-
+-    return homeResponse;
+-   * Helper method for merging the responses from the secondary sub cluster RMs
+-   * with the home response to return to the AM.
++   * Helper method for merging the registration responses from the secondary sub
++   * cluster RMs into the allocate response to return to the AM.
+-  private AllocateResponse mergeRegistrationResponses(
+-      AllocateResponse homeResponse,
++  private void mergeRegistrationResponses(AllocateResponse homeResponse,
+-
+-    return homeResponse;
++    if (otherResponse.getAMRMToken() != null) {
++      // Propagate only the new amrmToken from home sub-cluster back to
++      // AMRMProxyService
++      if (otherRMAddress.equals(this.homeSubClusterId)) {
++        homeResponse.setAMRMToken(otherResponse.getAMRMToken());
++      } else {
++        throw new YarnRuntimeException(
++            "amrmToken from UAM " + otherRMAddress + " should be null here");
++      }
++    }
++
+-      if (containerIdToSubClusterIdMap.containsKey(container.getId())) {
++
++      if (this.containerIdToSubClusterIdMap.containsKey(container.getId())) {
+-            containerIdToSubClusterIdMap.get(container.getId());
++            this.containerIdToSubClusterIdMap.get(container.getId());
+-      containerIdToSubClusterIdMap.put(container.getId(), subClusterId);
++      this.containerIdToSubClusterIdMap.put(container.getId(), subClusterId);
+-
+-        AllocateRequest.newInstance(0, 0, null, null, null);
++        RECORD_FACTORY.newRecordInstance(AllocateRequest.class);
++  protected UnmanagedAMPoolManager getUnmanagedAMPool() {
++    return this.uamPool;
++  }
++
++  @VisibleForTesting
++    private boolean isUAM;
+-    HeartbeatCallBack(SubClusterId subClusterId) {
++    HeartbeatCallBack(SubClusterId subClusterId, boolean isUAM) {
++      this.isUAM = isUAM;
++        // Notify main thread about the response arrival
++        asyncResponseSink.notifyAll();
+-      if (response.getAMRMToken() != null) {
++      if (this.isUAM && response.getAMRMToken() != null) {
++        // Do not further propagate the new amrmToken for UAM
++        response.setAMRMToken(null);
++
+-          registryClient.writeAMRMTokenForUAM(attemptId.getApplicationId(),
+-              subClusterId.getId(), newToken);
++          if (registryClient.writeAMRMTokenForUAM(attemptId.getApplicationId(),
++              subClusterId.getId(), newToken)) {
++            try {
++              AMRMTokenIdentifier identifier = new AMRMTokenIdentifier();
++              identifier.readFields(new DataInputStream(
++                  new ByteArrayInputStream(newToken.getIdentifier())));
++              LOG.info(
++                  "Received new UAM amrmToken with keyId {} and "
++                      + "service {} from {} for {}, written to Registry",
++                  identifier.getKeyId(), newToken.getService(), subClusterId,
++                  attemptId);
++            } catch (IOException e) {
++            }
++          }
+-      // Notify policy of secondary sub-cluster responses
++      // Notify policy of allocate response
+-        LOG.warn("notifyOfResponse for policy failed for home sub-cluster "
++        LOG.warn("notifyOfResponse for policy failed for sub-cluster "
+
+MOV26 INS26 INS26 INS26 INS26 INS26 INS26 MOV23 MOV23 INS40 INS40 UPD40 INS40 INS40 INS40 INS40 INS23 INS23 INS23 INS23 INS31 INS31 INS31 UPD83 INS83 INS43 MOV43 INS59 INS83 INS83 INS43 INS59 INS83 INS43 INS59 INS83 INS39 INS59 INS83 INS43 INS59 INS43 INS8 MOV78 INS83 INS43 INS42 INS8 INS78 INS43 UPD42 INS78 INS83 INS43 INS42 INS44 INS44 INS8 UPD42 INS39 INS39 INS78 INS83 INS43 INS42 INS8 INS23 INS42 UPD42 INS32 INS42 INS42 INS42 INS14 INS42 INS42 INS42 INS42 INS42 INS14 INS60 INS21 INS21 INS21 INS21 INS21 INS21 INS21 INS21 MOV21 INS51 MOV21 INS42 MOV21 MOV25 INS51 INS54 INS21 INS21 INS42 INS41 INS42 INS42 INS42 INS42 INS43 INS42 INS43 INS42 INS41 UPD42 INS25 INS42 INS42 INS41 INS83 INS39 INS59 INS44 INS42 INS42 INS33 UPD66 INS66 UPD66 INS43 UPD66 INS43 MOV43 MOV59 INS7 INS32 INS32 INS32 INS32 INS7 INS32 INS7 UPD66 UPD66 INS22 INS8 MOV22 INS22 INS8 INS8 MOV12 INS32 MOV32 MOV22 INS42 INS42 INS14 UPD66 UPD66 INS8 UPD66 UPD66 UPD66 UPD66 UPD66 INS27 INS8 INS22 INS42 INS39 INS42 INS21 INS42 INS42 INS22 INS32 INS22 INS42 INS22 INS22 INS42 INS42 INS22 INS42 INS9 INS22 INS42 INS22 INS32 INS22 INS42 INS40 INS22 INS32 INS52 INS42 INS21 MOV52 MOV42 MOV52 UPD42 MOV42 MOV21 INS25 MOV60 INS60 INS60 INS51 INS60 INS54 INS60 MOV21 MOV25 INS51 MOV41 INS44 INS22 INS42 INS22 UPD42 INS22 UPD42 INS43 INS42 INS42 INS60 INS25 INS32 INS33 INS25 INS52 INS42 INS7 INS27 INS52 INS42 INS42 INS42 INS42 INS52 INS42 INS52 INS42 INS52 INS42 INS52 INS42 INS52 INS42 INS52 INS42 INS42 INS42 INS57 INS52 INS42 INS52 INS42 INS42 INS42 INS40 INS40 INS32 INS52 INS42 INS27 INS8 INS25 MOV43 INS59 INS39 INS59 INS22 INS8 INS39 INS59 INS8 INS12 MOV43 INS59 INS32 INS22 INS8 UPD42 INS43 INS42 INS52 INS42 INS52 INS42 INS52 INS42 INS42 INS22 INS43 INS59 MOV32 INS8 MOV8 INS42 INS42 MOV32 INS8 INS8 MOV32 UPD42 UPD42 INS57 INS22 INS42 INS21 INS22 MOV27 INS21 INS42 INS42 INS43 UPD45 INS22 INS42 INS34 UPD42 INS27 INS32 INS32 INS41 INS27 INS8 INS42 INS32 UPD42 MOV42 INS32 MOV52 UPD42 MOV42 MOV54 INS42 INS27 MOV21 INS44 INS8 INS42 INS32 MOV42 UPD42 MOV42 INS52 INS42 INS21 MOV21 INS42 INS52 INS42 INS42 INS42 INS32 INS21 INS22 UPD42 UPD42 MOV42 INS21 INS53 INS22 UPD42 INS22 MOV43 INS52 INS42 INS32 INS52 INS42 INS32 INS8 INS42 INS42 INS52 INS42 INS45 MOV22 INS45 MOV32 INS45 INS32 INS42 INS42 INS32 MOV22 INS42 INS22 MOV32 INS32 INS53 UPD42 MOV42 UPD42 MOV42 INS22 INS42 MOV32 INS42 INS43 INS42 UPD42 MOV42 INS42 INS57 MOV32 INS32 INS27 INS42 INS42 INS32 INS22 INS52 INS42 INS32 INS14 INS52 INS42 INS52 INS42 INS42 INS42 INS42 INS42 INS33 INS25 INS42 MOV22 INS42 MOV42 UPD42 MOV42 UPD42 INS52 INS42 INS22 UPD42 MOV42 INS14 MOV52 UPD42 MOV42 INS22 UPD42 UPD42 UPD42 INS42 INS42 INS43 UPD42 UPD42 MOV42 UPD42 MOV42 INS32 INS42 INS45 MOV22 INS22 INS42 INS32 INS14 INS52 INS42 INS42 INS42 INS32 INS43 INS27 MOV32 MOV32 INS8 UPD42 INS52 INS42 INS43 INS32 UPD43 INS52 INS42 INS42 UPD42 MOV42 UPD42 MOV42 INS32 UPD42 INS52 INS42 INS42 INS42 MOV43 MOV22 INS9 INS43 INS9 INS42 INS42 INS42 INS45 INS42 INS45 INS22 UPD42 INS54 UPD45 INS21 INS42 UPD42 MOV42 UPD42 MOV42 INS42 INS32 MOV32 UPD42 UPD42 INS22 MOV42 INS42 INS52 INS42 INS8 INS12 INS32 MOV22 INS42 UPD42 UPD42 MOV52 UPD42 MOV42 INS60 MOV21 INS21 MOV44 INS8 INS42 INS42 INS27 UPD42 UPD42 INS43 INS59 INS32 INS32 UPD42 INS45 INS42 INS45 INS32 INS42 INS42 INS14 INS42 INS42 INS14 INS42 INS42 INS27 INS32 INS32 INS42 INS42 INS42 INS42 INS43 INS43 INS14 INS45 INS45 INS42 INS42 INS42 INS42 INS42 INS42 INS43 INS32 INS42 INS42 INS42 DEL39 DEL52 DEL42 DEL22 DEL40 DEL7 DEL21 DEL52 DEL42 DEL22 DEL52 DEL42 DEL22 DEL52 DEL42 DEL22 DEL52 DEL42 DEL22 DEL22 DEL52 DEL42 DEL22 DEL40 DEL27 DEL27 DEL52 DEL42 DEL22 DEL7 DEL21 DEL45 DEL42 DEL42 DEL42 DEL45 DEL27 DEL42 DEL32 DEL21 DEL42 DEL45 DEL42 DEL32 DEL7 DEL42 DEL7 DEL42 DEL42 DEL32 DEL45 DEL52 DEL42 DEL22 DEL22 DEL27 DEL27 DEL32 DEL21 DEL8 DEL25 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL32 DEL59 DEL60 DEL42 DEL42 DEL45 DEL32 DEL32 DEL21 DEL59 DEL60 DEL8 DEL25 DEL33 DEL27 DEL42 DEL42 DEL42 DEL32 DEL52 DEL42 DEL22 DEL42 DEL32 DEL32 DEL21 DEL8 DEL25 DEL42 DEL42 DEL45 DEL32 DEL32 DEL21 DEL32 DEL22 DEL34 DEL27 DEL27 DEL42 DEL32 DEL34 DEL27 DEL27 DEL52 DEL42 DEL22 DEL40 DEL27 DEL27 DEL8 DEL25 DEL8 DEL54 DEL8 DEL42 DEL42 DEL42 DEL39 DEL42 DEL83 DEL42 DEL43 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL18 DEL8 DEL25 DEL42 DEL42 DEL42 DEL42 DEL32 DEL32 DEL21 DEL21 DEL42 DEL42 DEL41 DEL42 DEL41 DEL42 DEL32 DEL42 DEL42 DEL42 DEL34 DEL34 DEL33 DEL33 DEL33 DEL8

@@ -1,0 +1,223 @@
+YARN-5214. Fixed locking in DirectoryCollection to avoid hanging NMs when various code-paths hit slow disks. Contributed by Junping Du.
+
++import java.util.concurrent.ConcurrentHashMap;
++import java.util.concurrent.locks.ReentrantReadWriteLock;
++import java.util.concurrent.locks.ReentrantReadWriteLock.ReadLock;
++import java.util.concurrent.locks.ReentrantReadWriteLock.WriteLock;
++import org.apache.hadoop.fs.FileAlreadyExistsException;
++  // read/write lock for accessing above directories.
++  private final ReadLock readLock;
++  private final WriteLock writeLock;
++
+-    localDirs = new CopyOnWriteArrayList<String>(dirs);
+-    errorDirs = new CopyOnWriteArrayList<String>();
+-    fullDirs = new CopyOnWriteArrayList<String>();
++    localDirs = new CopyOnWriteArrayList<>(dirs);
++    errorDirs = new CopyOnWriteArrayList<>();
++    fullDirs = new CopyOnWriteArrayList<>();
++
++    ReentrantReadWriteLock lock = new ReentrantReadWriteLock();
++    this.readLock = lock.readLock();
++    this.writeLock = lock.writeLock();
+-    dirsChangeListeners = new HashSet<DirsChangeListener>();
++    dirsChangeListeners = Collections.newSetFromMap(
++        new ConcurrentHashMap<DirsChangeListener, Boolean>());
+-  synchronized void registerDirsChangeListener(
++  void registerDirsChangeListener(
+-  synchronized void deregisterDirsChangeListener(
++  void deregisterDirsChangeListener(
+-  synchronized List<String> getGoodDirs() {
+-    return Collections.unmodifiableList(localDirs);
++  List<String> getGoodDirs() {
++    this.readLock.lock();
++    try {
++      return Collections.unmodifiableList(localDirs);
++    } finally {
++      this.readLock.unlock();
++    }
+-  synchronized List<String> getFailedDirs() {
+-    return Collections.unmodifiableList(
+-        DirectoryCollection.concat(errorDirs, fullDirs));
++  List<String> getFailedDirs() {
++    this.readLock.lock();
++    try {
++      return Collections.unmodifiableList(
++          DirectoryCollection.concat(errorDirs, fullDirs));
++    } finally {
++      this.readLock.unlock();
++    }
+-  synchronized List<String> getFullDirs() {
+-    return fullDirs;
++  List<String> getFullDirs() {
++    this.readLock.lock();
++    try {
++      return fullDirs;
++    } finally {
++      this.readLock.unlock();
++    }
+-  synchronized int getNumFailures() {
+-    return numFailures;
++  int getNumFailures() {
++    this.readLock.lock();
++    try {
++      return numFailures;
++    }finally {
++      this.readLock.unlock();
++    }
+-  synchronized boolean createNonExistentDirs(FileContext localFs,
++  boolean createNonExistentDirs(FileContext localFs,
+-    for (final String dir : localDirs) {
++    List<String> localDirectories = null;
++    this.readLock.lock();
++    try {
++      localDirectories = new ArrayList<>(localDirs);
++    } finally {
++      this.readLock.unlock();
++    }
++    for (final String dir : localDirectories) {
+-        localDirs.remove(dir);
+-        errorDirs.add(dir);
+-        numFailures++;
++        this.writeLock.lock();
++        try {
++          localDirs.remove(dir);
++          errorDirs.add(dir);
++          numFailures++;
++        } finally {
++          this.writeLock.unlock();
++        }
+-  synchronized boolean checkDirs() {
++  boolean checkDirs() {
+-    Set<String> preCheckGoodDirs = new HashSet<String>(localDirs);
+-    Set<String> preCheckFullDirs = new HashSet<String>(fullDirs);
+-    Set<String> preCheckOtherErrorDirs = new HashSet<String>(errorDirs);
+-    List<String> failedDirs = DirectoryCollection.concat(errorDirs, fullDirs);
+-    List<String> allLocalDirs =
+-        DirectoryCollection.concat(localDirs, failedDirs);
++    Set<String> preCheckGoodDirs = null;
++    Set<String> preCheckFullDirs = null;
++    Set<String> preCheckOtherErrorDirs = null;
++    List<String> failedDirs = null;
++    List<String> allLocalDirs = null;
++    this.readLock.lock();
++    try {
++      preCheckGoodDirs = new HashSet<String>(localDirs);
++      preCheckFullDirs = new HashSet<String>(fullDirs);
++      preCheckOtherErrorDirs = new HashSet<String>(errorDirs);
++      failedDirs = DirectoryCollection.concat(errorDirs, fullDirs);
++      allLocalDirs = DirectoryCollection.concat(localDirs, failedDirs);
++    } finally {
++      this.readLock.unlock();
++    }
++    // move testDirs out of any lock as it could wait for very long time in
++    // case of busy IO
+-    localDirs.clear();
+-    errorDirs.clear();
+-    fullDirs.clear();
++    this.writeLock.lock();
++    try {
++      localDirs.clear();
++      errorDirs.clear();
++      fullDirs.clear();
+-    for (Map.Entry<String, DiskErrorInformation> entry : dirsFailedCheck
+-      .entrySet()) {
+-      String dir = entry.getKey();
+-      DiskErrorInformation errorInformation = entry.getValue();
+-      switch (entry.getValue().cause) {
+-      case DISK_FULL:
+-        fullDirs.add(entry.getKey());
+-        break;
+-      case OTHER:
+-        errorDirs.add(entry.getKey());
+-        break;
+-      }
+-      if (preCheckGoodDirs.contains(dir)) {
+-        LOG.warn("Directory " + dir + " error, " + errorInformation.message
+-            + ", removing from list of valid directories");
+-        setChanged = true;
+-        numFailures++;
+-      }
+-    }
+-    for (String dir : allLocalDirs) {
+-      if (!dirsFailedCheck.containsKey(dir)) {
+-        localDirs.add(dir);
+-        if (preCheckFullDirs.contains(dir)
+-            || preCheckOtherErrorDirs.contains(dir)) {
++      for (Map.Entry<String, DiskErrorInformation> entry : dirsFailedCheck
++          .entrySet()) {
++        String dir = entry.getKey();
++        DiskErrorInformation errorInformation = entry.getValue();
++        switch (entry.getValue().cause) {
++        case DISK_FULL:
++          fullDirs.add(entry.getKey());
++          break;
++        case OTHER:
++          errorDirs.add(entry.getKey());
++          break;
++        default:
++          LOG.warn(entry.getValue().cause + " is unknown for disk error.");
++          break;
++        }
++        if (preCheckGoodDirs.contains(dir)) {
++          LOG.warn("Directory " + dir + " error, " + errorInformation.message
++              + ", removing from list of valid directories");
+-          LOG.info("Directory " + dir
+-              + " passed disk check, adding to list of valid directories.");
++          numFailures++;
+-    }
+-    Set<String> postCheckFullDirs = new HashSet<String>(fullDirs);
+-    Set<String> postCheckOtherDirs = new HashSet<String>(errorDirs);
+-    for (String dir : preCheckFullDirs) {
+-      if (postCheckOtherDirs.contains(dir)) {
+-        LOG.warn("Directory " + dir + " error "
+-            + dirsFailedCheck.get(dir).message);
++      for (String dir : allLocalDirs) {
++        if (!dirsFailedCheck.containsKey(dir)) {
++          localDirs.add(dir);
++          if (preCheckFullDirs.contains(dir)
++              || preCheckOtherErrorDirs.contains(dir)) {
++            setChanged = true;
++            LOG.info("Directory " + dir
++                + " passed disk check, adding to list of valid directories.");
++          }
++        }
+-    }
++      Set<String> postCheckFullDirs = new HashSet<String>(fullDirs);
++      Set<String> postCheckOtherDirs = new HashSet<String>(errorDirs);
++      for (String dir : preCheckFullDirs) {
++        if (postCheckOtherDirs.contains(dir)) {
++          LOG.warn("Directory " + dir + " error "
++              + dirsFailedCheck.get(dir).message);
++        }
++      }
+-    for (String dir : preCheckOtherErrorDirs) {
+-      if (postCheckFullDirs.contains(dir)) {
+-        LOG.warn("Directory " + dir + " error "
+-            + dirsFailedCheck.get(dir).message);
++      for (String dir : preCheckOtherErrorDirs) {
++        if (postCheckFullDirs.contains(dir)) {
++          LOG.warn("Directory " + dir + " error "
++              + dirsFailedCheck.get(dir).message);
++        }
+-    }
+-    setGoodDirsDiskUtilizationPercentage();
+-    if (setChanged) {
+-      for (DirsChangeListener listener : dirsChangeListeners) {
+-        listener.onDirsChanged();
++      setGoodDirsDiskUtilizationPercentage();
++      if (setChanged) {
++        for (DirsChangeListener listener : dirsChangeListeners) {
++          listener.onDirsChanged();
++        }
++      return setChanged;
++    } finally {
++      this.writeLock.unlock();
+-    return setChanged;
+-      localFs.mkdir(dir, perm, false);
++      try {
++        localFs.mkdir(dir, perm, false);
++      } catch (FileAlreadyExistsException ex) {
++        // do nothing as other threads could in creating the same directory.
++      }
+
+INS26 INS26 INS26 INS26 INS26 INS40 INS40 INS40 INS40 INS40 INS23 INS23 INS31 INS83 INS83 INS43 INS59 INS83 INS83 INS43 INS59 MOV21 MOV21 INS8 INS8 INS8 MOV29 MOV39 MOV42 INS8 MOV60 INS42 INS42 INS42 INS42 INS60 INS21 INS21 INS21 INS54 INS21 INS54 INS21 INS54 INS21 INS54 INS60 INS21 INS54 INS21 INS54 INS21 INS54 INS43 INS59 INS7 INS7 INS32 MOV8 INS8 INS32 MOV8 INS8 INS32 MOV8 INS8 INS32 MOV8 INS8 INS74 INS59 INS32 INS8 INS8 UPD42 MOV74 MOV74 INS32 INS8 INS8 INS32 INS8 INS8 UPD42 UPD42 INS42 INS42 INS14 INS22 INS32 INS22 INS32 INS32 INS22 INS42 INS21 INS22 INS42 INS21 INS22 INS42 INS21 INS22 INS42 INS21 INS43 INS43 INS42 INS33 INS22 INS42 INS21 INS21 INS33 INS33 INS33 UPD42 INS33 UPD42 INS33 INS22 INS42 INS21 INS21 INS21 INS21 INS21 INS21 INS22 INS42 MOV21 MOV21 MOV21 MOV70 MOV70 MOV60 MOV60 MOV70 MOV70 MOV21 MOV25 MOV41 INS21 UPD74 INS42 UPD74 UPD74 INS43 INS52 INS42 INS42 INS42 INS52 INS42 INS42 INS42 INS42 INS42 INS14 INS52 INS42 INS32 INS52 INS42 INS32 INS52 INS42 INS32 INS52 INS42 INS32 INS42 INS42 INS52 INS42 INS7 INS32 INS52 INS42 INS7 INS7 INS7 INS7 INS7 INS32 INS52 INS42 INS32 INS54 INS42 UPD74 MOV74 INS22 INS42 INS22 INS42 INS22 INS42 INS22 INS42 INS42 INS14 INS22 INS42 INS42 MOV14 INS42 MOV14 INS42 MOV14 INS42 MOV32 INS42 MOV32 INS22 INS42 INS22 INS42 INS8 INS12 UPD43 INS43 INS52 INS42 INS52 INS42 INS52 INS42 INS52 INS42 INS74 INS42 INS52 INS42 INS21 INS54 INS52 INS42 INS49 INS21 INS10 INS52 INS42 MOV21 INS44 INS8 UPD42 INS42 INS43 INS32 INS8 INS8 INS32 INS43 INS42 INS42 INS22 INS42 MOV21 MOV21 MOV21 INS21 INS42 INS42 INS27 INS42 INS52 INS42 INS32 INS22 INS45 INS22 INS42 INS32 INS42 INS52 INS42 INS42 INS42 DEL42 DEL43 DEL42 DEL43 DEL42 DEL43 DEL42 DEL14 DEL83 DEL83 DEL83 DEL83 DEL83 DEL83 DEL31 DEL83 DEL83

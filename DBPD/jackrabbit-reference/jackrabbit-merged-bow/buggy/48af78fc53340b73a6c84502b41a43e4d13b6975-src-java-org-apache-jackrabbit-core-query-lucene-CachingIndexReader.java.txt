@@ -1,0 +1,272 @@
+Improve performance for complex path queries involving descendant-or-self axis. e.g: //foo//bar//*[@prop='bla']
+
+git-svn-id: https://svn.apache.org/repos/asf/incubator/jackrabbit/trunk@164208 13f79535-47bb-0310-9956-ffa450edef68
+
++import org.apache.log4j.Logger;
++import java.util.List;
++import java.util.ArrayList;
++import java.util.Arrays;
+- * Implements an <code>IndexReader</code> that caches document ids for the
+- * {@link FieldNames.UUID} field.
++ * Implements an <code>IndexReader</code> that maintains caches to resolve
++ * {@link IndexReader#termDocs(Term)} calls efficiently.
++ * <p/>
++ * The caches are:
++ * <ul>
++ * <li>idCache: maps UUID to document number</li>
++ * <li>documentCache: maps document number to {@link Document} instance</li>
++ * <li>parentCache: maps parentUUID to List of document numbers</li>
++ * </ul>
+-     * The document id cache. Maps UUIDs to document number.
++     * The logger instance for this class.
+-    private Map cache;
++    private static final Logger log = Logger.getLogger(CachingIndexReader.class);
++
++    /**
++     * The document idCache. Maps UUIDs to document number.
++     */
++    private Map idCache;
++
++    /**
++     * The document cache. Maps document number to Document instance.
++     */
++    private Map documentCache;
++
++    /**
++     * The parent id cache. Maps parent UUID to List of document numbers.
++     */
++    private Map parentCache;
+-                final Integer docNo = (Integer) cache.get(term.text());
++                Integer docNo = (Integer) idCache.get(term.text());
+-                    return new TermDocs() {
+-
+-                        private boolean consumed = false;
+-
+-                        private int doc = -1;
+-
+-                        public void seek(Term term) {
+-                            throw new UnsupportedOperationException();
+-                        }
+-
+-                        public void seek(TermEnum termEnum) {
+-                            throw new UnsupportedOperationException();
+-                        }
+-
+-                        public int doc() {
+-                            return doc;
+-                        }
+-
+-                        public int freq() {
+-                            return 1;
+-                        }
+-
+-                        public boolean next() {
+-                            if (consumed) {
+-                                return false;
+-                            } else {
+-                                doc = docNo.intValue();
+-                                consumed = true;
+-                                return true;
+-                            }
+-                        }
+-
+-                        public int read(int[] docs, int[] freqs) {
+-                            docs[0] = docNo.intValue();
+-                            freqs[0] = 1;
+-                            return 1;
+-                        }
+-
+-                        public boolean skipTo(int target) {
+-                            throw new UnsupportedOperationException();
+-                        }
+-
+-                        public void close() {
+-                        }
+-                    };
++                    return new CachingTermDocs(docNo);
++                }
++            }
++        } else if (term.field() == FieldNames.PARENT) {
++            synchronized (this) {
++                cacheInit();
++                List idList = (List) parentCache.get(term.text());
++                if (idList == null) {
++                    return EMPTY;
++                } else {
++                    return new CachingTermDocs(idList.iterator());
+-     * Removes the <code>TermEnum</code> from the cache and calls the base
++     * Returns the stored fields of the <code>n</code><sup>th</sup>
++     * <code>Document</code> in this index. This implementation returns cached
++     * versions of <code>Document</code> instance. Thus, the returned document
++     * must not be modified!
++     *
++     * @param n the document number.
++     * @return the <code>n</code><sup>th</sup> <code>Document</code> in this
++     *         index
++     * @throws IOException              if an error occurs while reading from
++     *                                  the index.
++     * @throws IllegalArgumentException if the document with number
++     *                                  <code>n</code> is deleted.
++     */
++    public Document document(int n) throws IOException {
++        if (isDeleted(n)) {
++            throw new IllegalArgumentException("attempt to access a deleted document");
++        }
++        synchronized (this) {
++            cacheInit();
++            return (Document) documentCache.get(new Integer(n));
++        }
++    }
++
++    /**
++     * Commits pending changes to disc.
++     * @throws IOException if an error occurs while writing changes.
++     */
++    public void commitDeleted() throws IOException {
++        commit();
++    }
++
++    /**
++     * Removes the <code>TermEnum</code> from the idCache and calls the base
+-        if (cache != null) {
+-            // todo keep a second map which contains the doc number to UUID mapping?
+-            for (Iterator it = cache.values().iterator(); it.hasNext();) {
+-                if (((Integer) it.next()).intValue() == n) {
+-                    it.remove();
+-                    break;
++        if (idCache != null) {
++            Document d = (Document) documentCache.remove(new Integer(n));
++            if (d != null) {
++                idCache.remove(d.get(FieldNames.UUID));
++                String parentUUID = d.get(FieldNames.PARENT);
++                List parents = (List) parentCache.get(parentUUID);
++                if (parents.size() == 1) {
++                    parentCache.remove(parentUUID);
++                } else {
++                    // replace existing list, other threads might use iterator
++                    // on existing list
++                    List repl = new ArrayList(parents);
++                    repl.remove(new Integer(n));
++                    parentCache.put(parentUUID, repl);
+-     * Initially fills the cache with all the UUID to document number mappings.
++     * Initially fills the caches: idCache, documentCache, parentCache.
+-        if (cache == null) {
+-            Map tmp = new HashMap();
++        if (idCache == null) {
++            long time = System.currentTimeMillis();
++            Map ids = new HashMap(in.numDocs());
++            Map documents = new HashMap(in.numDocs());
++            Map parents = new HashMap(in.numDocs());
+-                    tmp.put(d.get(FieldNames.UUID), new Integer(i));
++                    Integer docId = new Integer(i);
++                    ids.put(d.get(FieldNames.UUID), docId);
++                    documents.put(docId, d);
++                    String parentUUID = d.get(FieldNames.PARENT);
++                    List docIds = (List) parents.get(parentUUID);
++                    if (docIds == null) {
++                        docIds = new ArrayList();
++                        parents.put(parentUUID, docIds);
++                    }
++                    docIds.add(docId);
+-            cache = tmp;
++            idCache = ids;
++            documentCache = documents;
++            parentCache = parents;
++            time = System.currentTimeMillis() - time;
++            log.debug("IndexReader cache populated in: " + time + " ms.");
++    /**
++     * Implements a <code>TermDocs</code> that takes a list of document
++     * ids.
++     */
++    private static final class CachingTermDocs implements TermDocs {
++
++        /**
++         * The current document number.
++         */
++        private int current = -1;
++
++        /**
++         * Iterator over document numbers as <code>Integer</code> values.
++         */
++        private final Iterator docIds;
++
++        /**
++         * Creates a new <code>CachingTermDocs</code> instance with a single
++         * document id.
++         * @param docId the single document id.
++         */
++        CachingTermDocs(Integer docId) {
++            this(Arrays.asList(new Integer[]{docId}).iterator());
++        }
++
++        /**
++         * Creates a new <code>CachingTermDocs</code> instance that iterates
++         * over the <code>docIds</code>.
++         * @param docIds the actual document numbers / ids.
++         */
++        CachingTermDocs(Iterator docIds) {
++            this.docIds = docIds;
++        }
++
++        /**
++         * @throws UnsupportedOperationException always
++         */
++        public void seek(Term term) {
++            throw new UnsupportedOperationException();
++        }
++
++        /**
++         * @throws UnsupportedOperationException always
++         */
++        public void seek(TermEnum termEnum) {
++            throw new UnsupportedOperationException();
++        }
++
++
++        /**
++         * {@inheritDoc}
++         */
++        public int doc() {
++            return current;
++        }
++
++        /**
++         * {@inheritDoc}
++         */
++        public int freq() {
++            return 1;
++        }
++
++        /**
++         * {@inheritDoc}
++         */
++        public boolean next() {
++            boolean next = docIds.hasNext();
++            if (next) {
++                current = ((Integer) docIds.next()).intValue();
++            }
++            return next;
++        }
++
++        /**
++         * @throws UnsupportedOperationException always
++         */
++        public int read(int[] docs, int[] freqs) {
++            throw new UnsupportedOperationException();
++        }
++
++        /**
++         * @throws UnsupportedOperationException always
++         */
++        public boolean skipTo(int target) {
++            throw new UnsupportedOperationException();
++        }
++
++        /**
++         * {@inheritDoc}
++         */
++        public void close() {
++        }
++    }
+
+INS26 INS26 INS26 INS26 INS40 INS40 INS40 INS40 INS23 INS23 INS23 INS31 INS31 INS31 INS55 INS29 INS83 INS83 INS83 INS43 INS59 INS29 INS83 INS43 INS59 INS29 MOV83 INS43 MOV59 MOV29 MOV83 MOV43 UPD42 MOV42 MOV44 MOV43 INS8 INS29 MOV83 INS43 INS42 INS44 INS43 INS8 INS29 MOV83 MOV39 UPD42 MOV42 INS43 MOV8 INS29 INS83 INS83 INS83 INS42 MOV43 MOV23 INS23 INS31 INS31 MOV31 MOV31 INS31 INS31 INS31 INS31 MOV31 INS31 UPD66 UPD66 INS66 INS66 INS66 INS66 INS66 INS65 INS66 INS66 INS66 INS65 INS42 INS42 INS32 UPD42 INS65 INS42 INS42 INS65 INS42 UPD42 INS25 INS65 INS65 INS65 INS65 INS65 INS42 INS39 INS42 INS42 INS25 INS51 INS65 INS65 INS42 INS21 INS65 INS29 INS29 INS83 INS83 INS43 INS59 INS29 INS42 INS44 INS8 INS29 INS42 INS44 INS8 INS29 INS29 INS29 INS83 INS39 INS42 INS8 INS29 INS83 INS39 INS42 MOV8 INS29 INS83 INS39 INS42 INS8 INS29 INS83 INS39 INS42 MOV44 MOV44 INS8 INS29 INS29 INS83 INS39 INS42 INS8 INS68 INS42 INS66 INS42 INS42 INS57 UPD66 INS66 INS66 MOV27 INS8 INS25 INS66 INS66 INS66 INS66 INS42 INS66 INS66 INS66 INS42 INS66 INS66 INS42 INS66 INS66 INS32 INS8 INS52 INS8 INS66 INS42 INS66 INS32 UPD66 UPD66 INS66 INS66 INS65 UPD42 INS65 INS42 INS42 INS65 INS65 INS43 INS42 INS17 INS65 INS65 MOV43 INS42 INS21 INS65 INS65 INS65 INS41 INS65 INS65 INS60 INS25 INS41 INS65 INS53 INS65 INS65 INS42 INS42 INS69 INS43 INS51 INS27 INS8 MOV8 UPD42 MOV42 UPD42 MOV42 INS53 MOV21 MOV41 INS42 UPD42 INS60 INS25 UPD42 INS60 INS60 INS60 INS21 INS21 INS21 INS21 INS66 INS66 INS66 INS66 INS42 INS66 INS42 INS32 INS66 INS66 INS42 INS66 INS7 INS42 INS66 INS42 INS66 INS65 INS42 INS65 INS65 INS39 INS59 INS42 INS8 INS42 INS42 INS66 INS14 INS42 INS66 INS65 INS43 INS42 INS52 INS8 INS32 INS40 INS51 INS14 INS32 INS11 INS43 INS59 INS27 INS8 INS39 INS59 INS43 INS59 INS43 INS59 INS8 INS7 INS7 INS7 INS32 INS32 INS42 INS22 INS42 INS42 INS32 INS21 INS43 INS42 MOV21 MOV60 INS25 INS42 INS42 INS52 INS8 INS43 INS45 INS42 INS43 INS32 INS42 INS42 INS11 INS42 INS33 MOV21 INS60 INS60 INS25 INS42 INS32 UPD42 INS42 INS42 INS14 INS42 INS42 INS14 INS25 UPD42 UPD42 INS42 INS42 INS42 INS42 INS42 INS27 INS42 INS42 INS27 INS42 INS42 INS3 INS52 INS42 INS42 INS42 INS7 INS42 MOV43 MOV27 MOV8 INS8 INS21 INS60 MOV25 INS42 INS42 INS42 INS42 INS14 INS43 INS32 INS43 INS59 INS43 INS59 INS27 INS8 MOV8 INS42 INS42 INS32 INS43 INS32 INS43 INS32 MOV38 INS8 INS32 INS42 INS45 INS42 INS45 INS5 INS4 INS42 INS32 MOV41 INS32 INS43 INS59 INS27 MOV43 INS42 INS42 UPD42 MOV42 UPD42 MOV42 INS14 UPD42 UPD42 INS42 INS42 INS32 INS42 INS42 INS11 INS32 INS34 INS21 INS60 INS21 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 MOV60 INS60 INS21 INS21 INS60 INS60 MOV25 INS21 INS42 INS42 INS43 INS85 INS42 INS36 INS42 MOV43 INS14 INS42 INS42 INS42 INS11 INS42 INS33 INS41 INS43 INS42 UPD42 MOV42 UPD42 MOV42 INS40 INS43 MOV32 INS42 UPD42 MOV42 INS32 INS43 INS59 INS32 INS43 INS59 INS32 INS32 INS43 INS59 INS43 INS59 INS27 INS32 INS42 INS11 UPD42 INS43 INS42 INS43 INS32 INS42 INS14 INS42 INS42 INS42 UPD42 UPD42 INS42 INS42 INS42 INS42 INS42 INS14 UPD42 INS14 INS42 INS42 INS42 INS42 INS42 INS42 MOV14 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS11 INS42 INS33 INS21 INS21 INS42 INS42 INS42 INS43 INS32 INS42 INS42 INS42 INS42 INS32 INS43 INS32 INS43 INS42 INS43 INS42 INS42 INS42 INS40 INS42 INS42 INS40 INS43 INS32 INS7 INS32 INS42 INS42 INS42 INS42 INS42 INS42 UPD42 MOV42 UPD42 MOV42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS14 INS42 INS42 INS42 INS42 INS43 INS42 DEL40 DEL9 DEL83 DEL42 DEL42 DEL9 DEL42 DEL32 DEL7 DEL21 DEL42 DEL9 DEL7 DEL21 DEL9 DEL41 DEL42 DEL34 DEL2 DEL34 DEL7 DEL34 DEL83 DEL42 DEL52 DEL39 DEL23 DEL39 DEL8 DEL31 DEL83 DEL39 DEL42 DEL31 DEL83 DEL39 DEL42 DEL8 DEL31 DEL39 DEL42 DEL42 DEL34 DEL2 DEL32 DEL7 DEL21 DEL8 DEL31 DEL31 DEL1 DEL14 DEL41 DEL8 DEL25 DEL8 DEL51 DEL8 DEL25 DEL8 DEL31 DEL10 DEL42 DEL32 DEL42 DEL32 DEL59 DEL58 DEL32 DEL11 DEL36 DEL32 DEL42 DEL27 DEL25 DEL8 DEL24 DEL8

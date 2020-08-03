@@ -1,0 +1,205 @@
+HDFS-1623. High Availability Framework for HDFS NN. Contributed by Todd Lipcon, Aaron T. Myers, Eli Collins, Uma Maheswara Rao G, Bikas Saha, Suresh Srinivas, Jitendra Nath Pandey, Hari Mankude, Brandon Li, Sanjay Radia, Mingjie Lai, and Gregory Chanan
+
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/trunk@1296534 13f79535-47bb-0310-9956-ffa450edef68
+
++  private final NNStorage storage;
+-  private long maxSeenTransaction = 0L;
+-  public FileJournalManager(StorageDirectory sd) {
++  public FileJournalManager(StorageDirectory sd, NNStorage storage) {
++    this.storage = storage;
+-    currentInProgress = NNStorage.getInProgressEditsFile(sd, txid);
+-    EditLogOutputStream stm = new EditLogFileOutputStream(currentInProgress,
+-        outputBufferCapacity);
+-    stm.create();
+-    return stm;
++    try {
++      currentInProgress = NNStorage.getInProgressEditsFile(sd, txid);
++      EditLogOutputStream stm = new EditLogFileOutputStream(currentInProgress,
++          outputBufferCapacity);
++      stm.create();
++      return stm;
++    } catch (IOException e) {
++      storage.reportErrorsOnDirectory(sd);
++      throw e;
++    }
+-    LOG.debug("Finalizing edits file " + inprogressFile + " -> " + dstFile);
++    LOG.info("Finalizing edits file " + inprogressFile + " -> " + dstFile);
+-      throw new IOException("Unable to finalize edits file " + inprogressFile);
++      storage.reportErrorsOnDirectory(sd);
++      throw new IllegalStateException("Unable to finalize edits file " + inprogressFile);
++    LOG.info("Purging logs older than " + minTxIdToKeep);
+-    List<EditLogFile> allLogFiles = matchEditLogs(
+-        FileUtil.listFiles(currentDir));
++    List<EditLogFile> allLogFiles = matchEditLogs(currentDir);
+-      if (elf.isCorrupt() || elf.isInProgress()) continue;
++      if (elf.hasCorruptHeader() || elf.isInProgress()) continue;
+-        throw new IOException("Asked for firstTxId " + firstTxId
++        // Note that this behavior is different from getLogFiles below.
++        throw new IllegalStateException("Asked for firstTxId " + firstTxId
++  /**
++   * returns matching edit logs via the log directory. Simple helper function
++   * that lists the files in the logDir and calls matchEditLogs(File[])
++   * 
++   * @param logDir
++   *          directory to match edit logs in
++   * @return matched edit logs
++   * @throws IOException
++   *           IOException thrown for invalid logDir
++   */
++  static List<EditLogFile> matchEditLogs(File logDir) throws IOException {
++    return matchEditLogs(FileUtil.listFiles(logDir));
++  }
++  
+-        }          
++        }
+-  synchronized public EditLogInputStream getInputStream(long fromTxId) 
+-      throws IOException {
++  synchronized public EditLogInputStream getInputStream(long fromTxId,
++      boolean inProgressOk) throws IOException {
+-      if (elf.getFirstTxId() == fromTxId) {
++      if (elf.containsTxId(fromTxId)) {
++        if (!inProgressOk && elf.isInProgress()) {
++          continue;
++        }
+-        return new EditLogFileInputStream(elf.getFile(), 
+-            elf.getFirstTxId(), elf.getLastTxId());
++        EditLogFileInputStream elfis = new EditLogFileInputStream(elf.getFile(),
++            elf.getFirstTxId(), elf.getLastTxId(), elf.isInProgress());
++        long transactionsToSkip = fromTxId - elf.getFirstTxId();
++        if (transactionsToSkip > 0) {
++          LOG.info(String.format("Log begins at txid %d, but requested start "
++              + "txid is %d. Skipping %d edits.", elf.getFirstTxId(), fromTxId,
++              transactionsToSkip));
++          elfis.skipTransactions(transactionsToSkip);
++        }
++        return elfis;
+-    throw new IOException("Cannot find editlog file with " + fromTxId
+-        + " as first first txid");
++    throw new IOException("Cannot find editlog file containing " + fromTxId);
+-  public long getNumberOfTransactions(long fromTxId) 
++  public long getNumberOfTransactions(long fromTxId, boolean inProgressOk)
+-      } else if (fromTxId == elf.getFirstTxId()) {
++      } else if (elf.containsTxId(fromTxId)) {
++        if (!inProgressOk && elf.isInProgress()) {
++          break;
++        }
++        
+-        if (elf.isCorrupt()) {
++        if (elf.hasCorruptHeader()) {
++        numTxns += elf.getLastTxId() + 1 - fromTxId;
+-        numTxns += fromTxId - elf.getFirstTxId();
+-      } // else skip
++      }
+-    long max = findMaxTransaction();
++    long max = findMaxTransaction(inProgressOk);
++    
+-    List<EditLogFile> allLogFiles = matchEditLogs(currentDir.listFiles());
+-    
+-    // make sure journal is aware of max seen transaction before moving corrupt 
+-    // files aside
+-    findMaxTransaction();
++    LOG.info("Recovering unfinalized segments in " + currentDir);
++    List<EditLogFile> allLogFiles = matchEditLogs(currentDir);
+-        elf.validateLog();
+-
+-        if (elf.isCorrupt()) {
+-          elf.moveAsideCorruptFile();
++        // If the file is zero-length, we likely just crashed after opening the
++        // file, but before writing anything to it. Safe to delete it.
++        if (elf.getFile().length() == 0) {
++          LOG.info("Deleting zero-length edit log file " + elf);
++          if (!elf.getFile().delete()) {
++            throw new IOException("Unable to delete file " + elf.getFile());
++          }
++        
++        elf.validateLog();
++
++        if (elf.hasCorruptHeader()) {
++          elf.moveAsideCorruptFile();
++          throw new CorruptionException("In-progress edit log file is corrupt: "
++              + elf);
++        }
++        
++        // If the file has a valid header (isn't corrupt) but contains no
++        // transactions, we likely just crashed after opening the file and
++        // writing the header, but before syncing any transactions. Safe to
++        // delete the file.
++        if (elf.getNumTransactions() == 0) {
++          LOG.info("Deleting edit log file with zero transactions " + elf);
++          if (!elf.getFile().delete()) {
++            throw new IOException("Unable to delete " + elf.getFile());
++          }
++          continue;
++        }
++        
+-    List<EditLogFile> allLogFiles = matchEditLogs(currentDir.listFiles());
++    List<EditLogFile> allLogFiles = matchEditLogs(currentDir);
+-      if (fromTxId > elf.getFirstTxId()
+-          && fromTxId <= elf.getLastTxId()) {
+-        throw new IOException("Asked for fromTxId " + fromTxId
+-            + " which is in middle of file " + elf.file);
+-      }
+-      if (fromTxId <= elf.getFirstTxId()) {
++      if (fromTxId <= elf.getFirstTxId() ||
++          elf.containsTxId(fromTxId)) {
+-   * This gets stored in a member variable, as corrupt edit logs
+-   * will be moved aside, but we still need to remember their first
+-   * tranaction id in the case that it was the maximum transaction in
+-   * the journal.
+-  private long findMaxTransaction()
++  private long findMaxTransaction(boolean inProgressOk)
++    boolean considerSeenTxId = true;
++    long seenTxId = NNStorage.readTransactionIdFile(sd);
++    long maxSeenTransaction = 0;
++      if (elf.isInProgress() && !inProgressOk) {
++        if (elf.getFirstTxId() != HdfsConstants.INVALID_TXID &&
++            elf.getFirstTxId() <= seenTxId) {
++          // don't look at the seen_txid file if in-progress logs are not to be
++          // examined, and the value in seen_txid falls within the in-progress
++          // segment.
++          considerSeenTxId = false;
++        }
++        continue;
++      }
++      
+-    return maxSeenTransaction;
++    if (considerSeenTxId) {
++      return Math.max(maxSeenTransaction, seenTxId);
++    } else {
++      return maxSeenTransaction;
++    }
++    private long numTx = -1;
+-    private boolean isCorrupt = false;
++    private boolean hasCorruptHeader = false;
++    
++    boolean containsTxId(long txId) {
++      return firstTxId <= txId && txId <= lastTxId;
++    }
+-      if (val.getNumTransactions() == 0) {
+-        markCorrupt();
+-      } else {
+-        this.lastTxId = val.getEndTxId();
+-      }
++      this.numTx = val.getNumTransactions();
++      this.lastTxId = val.getEndTxId();
++      this.hasCorruptHeader = val.hasCorruptHeader();
++    }
++    
++    long getNumTransactions() {
++      return numTx;
+-    void markCorrupt() {
+-      isCorrupt = true;
+-    }
+-    
+-    boolean isCorrupt() {
+-      return isCorrupt;
++    boolean hasCorruptHeader() {
++      return hasCorruptHeader;
+-      assert isCorrupt;
++      assert hasCorruptHeader;
+-                           +"inProgress=%b,corrupt=%b)", file.toString(),
+-                           firstTxId, lastTxId, isInProgress(), isCorrupt);
++                           +"inProgress=%b,hasCorruptHeader=%b,numTx=%d)",
++                           file.toString(), firstTxId, lastTxId,
++                           isInProgress(), hasCorruptHeader, numTx);

@@ -1,0 +1,300 @@
+svn merge --reintegrate https://svn.apache.org/repos/asf/hadoop/common/branches/HDFS-5535 back to trunk.
+
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/trunk@1574259 13f79535-47bb-0310-9956-ffa450edef68
+
++import java.io.FileNotFoundException;
++import java.util.EnumSet;
+-import org.apache.hadoop.hdfs.protocol.LayoutVersion.Feature;
++import org.apache.hadoop.hdfs.server.common.HdfsServerConstants.RollingUpgradeStartupOption;
++        && !RollingUpgradeStartupOption.STARTED.matches(startOpt)
+-        && layoutVersion != HdfsConstants.LAYOUT_VERSION) {
++        && layoutVersion != HdfsConstants.NAMENODE_LAYOUT_VERSION) {
+-          + HdfsConstants.LAYOUT_VERSION + " is required.\n"
+-          + "Please restart NameNode with -upgrade option.");
++          + HdfsConstants.NAMENODE_LAYOUT_VERSION + " is required.\n"
++          + "Please restart NameNode with the \""
++          + RollingUpgradeStartupOption.STARTED.getOptionString()
++          + "\" option if a rolling upgraded is already started;"
++          + " or restart NameNode with the \""
++          + StartupOption.UPGRADE + "\" to start a new upgrade.");
+-    return loadFSImage(target, recovery, startOpt);
++    return loadFSImage(target, startOpt, recovery);
+-  void doUpgrade(FSNamesystem target) throws IOException {
+-    // Upgrade is allowed only if there are 
++  /** Check if upgrade is in progress. */
++  void checkUpgrade(FSNamesystem target) throws IOException {
++    // Upgrade or rolling upgrade is allowed only if there are 
++  }
++
++  /**
++   * @return true if there is rollback fsimage (for rolling upgrade) in NameNode
++   * directory.
++   */
++  public boolean hasRollbackFSImage() throws IOException {
++    final FSImageStorageInspector inspector = new FSImageTransactionalStorageInspector(
++        EnumSet.of(NameNodeFile.IMAGE_ROLLBACK));
++    storage.inspectStorageDirs(inspector);
++    try {
++      List<FSImageFile> images = inspector.getLatestImages();
++      return images != null && !images.isEmpty();
++    } catch (FileNotFoundException e) {
++      return false;
++    }
++  }
++
++  void doUpgrade(FSNamesystem target) throws IOException {
++    checkUpgrade(target);
++
+-    this.loadFSImage(target, null, StartupOption.UPGRADE);
++    this.loadFSImage(target, StartupOption.UPGRADE, null);
++    target.checkRollingUpgrade("upgrade namenode");
+-    storage.layoutVersion = HdfsConstants.LAYOUT_VERSION;
++    storage.layoutVersion = HdfsConstants.NAMENODE_LAYOUT_VERSION;
+-      prevState.getStorage().layoutVersion = HdfsConstants.LAYOUT_VERSION;
++      prevState.getStorage().layoutVersion = HdfsConstants.NAMENODE_LAYOUT_VERSION;
+-            HdfsConstants.LAYOUT_VERSION)) {
++            HdfsConstants.NAMENODE_LAYOUT_VERSION)) {
+-            HdfsConstants.LAYOUT_VERSION);
++            HdfsConstants.NAMENODE_LAYOUT_VERSION);
+-  boolean loadFSImage(FSNamesystem target, MetaRecoveryContext recovery,
+-      StartupOption startOpt) throws IOException {
+-    FSImageStorageInspector inspector = storage.readAndInspectDirs();
+-    FSImageFile imageFile = null;
+-    
++  private boolean loadFSImage(FSNamesystem target, StartupOption startOpt,
++      MetaRecoveryContext recovery)
++      throws IOException {
++    final boolean rollingRollback
++        = RollingUpgradeStartupOption.ROLLBACK.matches(startOpt);
++    final EnumSet<NameNodeFile> nnfs;
++    if (rollingRollback) {
++      // if it is rollback of rolling upgrade, only load from the rollback image
++      nnfs = EnumSet.of(NameNodeFile.IMAGE_ROLLBACK);
++    } else {
++      // otherwise we can load from both IMAGE and IMAGE_ROLLBACK
++      nnfs = EnumSet.of(NameNodeFile.IMAGE, NameNodeFile.IMAGE_ROLLBACK);
++    }
++    final FSImageStorageInspector inspector = storage.readAndInspectDirs(nnfs);
++
+- 
+-    if (LayoutVersion.supports(Feature.TXID_BASED_LAYOUT, 
+-                               getLayoutVersion())) {
++    if (NameNodeLayoutVersion.supports(
++        LayoutVersion.Feature.TXID_BASED_LAYOUT, getLayoutVersion())) {
+-      long toAtLeastTxId = editLog.isOpenForWrite() ? inspector.getMaxSeenTxId() : 0;
++      // In the meanwhile, for HA upgrade, we will still write editlog thus need
++      // this toAtLeastTxId to be set to the max-seen txid
++      // For rollback in rolling upgrade, we need to set the toAtLeastTxId to
++      // the txid right before the upgrade marker.  
++      long toAtLeastTxId = editLog.isOpenForWrite() ? inspector
++          .getMaxSeenTxId() : 0;
++      if (rollingRollback) {
++        // note that the first image in imageFiles is the special checkpoint
++        // for the rolling upgrade
++        toAtLeastTxId = imageFiles.get(0).getCheckpointTxId() + 2;
++      }
+-    int maxOpSize = conf.getInt(DFSConfigKeys.
+-          DFS_NAMENODE_MAX_OP_SIZE_KEY,
++    int maxOpSize = conf.getInt(DFSConfigKeys.DFS_NAMENODE_MAX_OP_SIZE_KEY,
++    FSImageFile imageFile = null;
+-    long txnsAdvanced = loadEdits(editStreams, target, recovery);
+-    needToSave |= needsResaveBasedOnStaleCheckpoint(imageFile.getFile(),
+-                                                    txnsAdvanced);
++    
++    if (!rollingRollback) {
++      long txnsAdvanced = loadEdits(editStreams, target, startOpt, recovery);
++      needToSave |= needsResaveBasedOnStaleCheckpoint(imageFile.getFile(),
++          txnsAdvanced);
++      if (RollingUpgradeStartupOption.DOWNGRADE.matches(startOpt)) {
++        // rename rollback image if it is downgrade
++        renameCheckpoint(NameNodeFile.IMAGE_ROLLBACK, NameNodeFile.IMAGE);
++      }
++    } else {
++      // Trigger the rollback for rolling upgrade. Here lastAppliedTxId equals
++      // to the last txid in rollback fsimage.
++      rollingRollback(lastAppliedTxId + 1, imageFiles.get(0).getCheckpointTxId());
++      needToSave = false;
++    }
++  /** rollback for rolling upgrade. */
++  private void rollingRollback(long discardSegmentTxId, long ckptId)
++      throws IOException {
++    // discard discard unnecessary editlog segments starting from the given id
++    this.editLog.discardSegments(discardSegmentTxId);
++    // rename the special checkpoint
++    renameCheckpoint(ckptId, NameNodeFile.IMAGE_ROLLBACK, NameNodeFile.IMAGE,
++        true);
++    // purge all the checkpoints after the marker
++    archivalManager.purgeCheckpoinsAfter(NameNodeFile.IMAGE, ckptId);
++    String nameserviceId = DFSUtil.getNamenodeNameServiceId(conf);
++    if (HAUtil.isHAEnabled(conf, nameserviceId)) {
++      // close the editlog since it is currently open for write
++      this.editLog.close();
++      // reopen the editlog for read
++      this.editLog.initSharedJournalsForRead();
++    }
++  }
++
+-    if (LayoutVersion.supports(Feature.TXID_BASED_LAYOUT,
+-                               getLayoutVersion())) {
++    if (NameNodeLayoutVersion.supports(
++        LayoutVersion.Feature.TXID_BASED_LAYOUT, getLayoutVersion())) {
+-    } else if (LayoutVersion.supports(Feature.FSIMAGE_CHECKSUM,
+-                                      getLayoutVersion())) {
++    } else if (NameNodeLayoutVersion.supports(
++        LayoutVersion.Feature.FSIMAGE_CHECKSUM, getLayoutVersion())) {
+-    } else if (HAUtil.isHAEnabled(conf, nameserviceId) &&
+-        startOpt == StartupOption.UPGRADE) {
+-      // This NN is HA, but we're doing an upgrade so init the edit log for
+-      // write.
++    } else if (HAUtil.isHAEnabled(conf, nameserviceId)
++        && (startOpt == StartupOption.UPGRADE
++            || RollingUpgradeStartupOption.ROLLBACK.matches(startOpt))) {
++      // This NN is HA, but we're doing an upgrade or a rollback of rolling
++      // upgrade so init the edit log for write.
+-      long sharedLogCTime = editLog.getSharedLogCTime();
+-      if (this.storage.getCTime() < sharedLogCTime) {
+-        throw new IOException("It looks like the shared log is already " +
+-            "being upgraded but this NN has not been upgraded yet. You " +
+-            "should restart this NameNode with the '" +
+-            StartupOption.BOOTSTRAPSTANDBY.getName() + "' option to bring " +
+-            "this NN in sync with the other.");
++      if (startOpt == StartupOption.UPGRADE) {
++        long sharedLogCTime = editLog.getSharedLogCTime();
++        if (this.storage.getCTime() < sharedLogCTime) {
++          throw new IOException("It looks like the shared log is already " +
++              "being upgraded but this NN has not been upgraded yet. You " +
++              "should restart this NameNode with the '" +
++              StartupOption.BOOTSTRAPSTANDBY.getName() + "' option to bring " +
++              "this NN in sync with the other.");
++        }
+-      FSNamesystem target, MetaRecoveryContext recovery) throws IOException {
++      FSNamesystem target) throws IOException {
++    return loadEdits(editStreams, target, null, null);
++  }
++
++  private long loadEdits(Iterable<EditLogInputStream> editStreams,
++      FSNamesystem target, StartupOption startOpt, MetaRecoveryContext recovery)
++      throws IOException {
+-          loader.loadFSEdits(editIn, lastAppliedTxId + 1, recovery);
++          loader.loadFSEdits(editIn, lastAppliedTxId + 1, startOpt, recovery);
+-      updateCountForQuota(target.dir.rootDir);   
++      updateCountForQuota(target.dir.rootDir);
++    // BlockPoolId is required when the FsImageLoader loads the rolling upgrade
++    // information. Make sure the ID is properly set.
++    target.setBlockPoolId(this.getBlockPoolID());
++
+-    target.setBlockPoolId(this.getBlockPoolID());
+-  void saveFSImage(SaveNamespaceContext context, StorageDirectory sd)
+-      throws IOException {
++  void saveFSImage(SaveNamespaceContext context, StorageDirectory sd,
++      NameNodeFile dstType) throws IOException {
+-    File dstFile = NNStorage.getStorageFile(sd, NameNodeFile.IMAGE, txid);
++    File dstFile = NNStorage.getStorageFile(sd, dstType, txid);
++    private final NameNodeFile nnf;
+-    public FSImageSaver(SaveNamespaceContext context, StorageDirectory sd) {
++    public FSImageSaver(SaveNamespaceContext context, StorageDirectory sd,
++        NameNodeFile nnf) {
++      this.nnf = nnf;
+-        saveFSImage(context, sd);
++        saveFSImage(context, sd, nnf);
+-    saveNamespace(source, null);
++    saveNamespace(source, NameNodeFile.IMAGE, null);
+-   * @param canceler 
++   * @param canceler
+-  public synchronized void saveNamespace(FSNamesystem source,
++  public synchronized void saveNamespace(FSNamesystem source, NameNodeFile nnf,
++    LOG.info("Save namespace ...");
+-      saveFSImageInAllDirs(source, imageTxId, canceler);
++      saveFSImageInAllDirs(source, nnf, imageTxId, canceler);
+-    saveFSImageInAllDirs(source, txid, null);
++    saveFSImageInAllDirs(source, NameNodeFile.IMAGE, txid, null);
+-  protected synchronized void saveFSImageInAllDirs(FSNamesystem source, long txid,
+-      Canceler canceler)
+-      throws IOException {    
++  private synchronized void saveFSImageInAllDirs(FSNamesystem source,
++      NameNodeFile nnf, long txid, Canceler canceler) throws IOException {
+-        FSImageSaver saver = new FSImageSaver(ctx, sd);
++        FSImageSaver saver = new FSImageSaver(ctx, sd, nnf);
+-      renameCheckpoint(txid);
++      renameCheckpoint(txid, NameNodeFile.IMAGE_NEW, nnf, false);
+-      purgeOldStorage();
++      purgeOldStorage(nnf);
+-  public void purgeOldStorage() {
++  void purgeOldStorage(NameNodeFile nnf) {
+-      archivalManager.purgeOldStorage();
++      archivalManager.purgeOldStorage(nnf);
+-      LOG.warn("Unable to purge old storage", e);
++      LOG.warn("Unable to purge old storage " + nnf.getName(), e);
+-   * Renames new image
++   * Rename FSImage with the specific txid
+-  private void renameCheckpoint(long txid) throws IOException {
++  private void renameCheckpoint(long txid, NameNodeFile fromNnf,
++      NameNodeFile toNnf, boolean renameMD5) throws IOException {
+-        renameCheckpointInDir(sd, txid);
++        renameImageFileInDir(sd, fromNnf, toNnf, txid, renameMD5);
+-  
++
++  /**
++   * Rename all the fsimage files with the specific NameNodeFile type. The
++   * associated checksum files will also be renamed.
++   */
++  void renameCheckpoint(NameNodeFile fromNnf, NameNodeFile toNnf)
++      throws IOException {
++    ArrayList<StorageDirectory> al = null;
++    FSImageTransactionalStorageInspector inspector =
++        new FSImageTransactionalStorageInspector(EnumSet.of(fromNnf));
++    storage.inspectStorageDirs(inspector);
++    for (FSImageFile image : inspector.getFoundImages()) {
++      try {
++        renameImageFileInDir(image.sd, fromNnf, toNnf, image.txId, true);
++      } catch (IOException ioe) {
++        LOG.warn("Unable to rename checkpoint in " + image.sd, ioe);
++        if (al == null) {
++          al = Lists.newArrayList();
++        }
++        al.add(image.sd);
++      }
++    }
++    if(al != null) {
++      storage.reportErrorsOnDirectories(al);
++    }
++  }
++
+-
+-  private void renameCheckpointInDir(StorageDirectory sd, long txid)
+-      throws IOException {
+-    File ckpt = NNStorage.getStorageFile(sd, NameNodeFile.IMAGE_NEW, txid);
+-    File curFile = NNStorage.getStorageFile(sd, NameNodeFile.IMAGE, txid);
+-    // renameTo fails on Windows if the destination file 
+-    // already exists.
++  private void renameImageFileInDir(StorageDirectory sd, NameNodeFile fromNnf,
++      NameNodeFile toNnf, long txid, boolean renameMD5) throws IOException {
++    final File fromFile = NNStorage.getStorageFile(sd, fromNnf, txid);
++    final File toFile = NNStorage.getStorageFile(sd, toNnf, txid);
++    // renameTo fails on Windows if the destination file already exists.
+-      LOG.debug("renaming  " + ckpt.getAbsolutePath() 
+-                + " to " + curFile.getAbsolutePath());
++      LOG.debug("renaming  " + fromFile.getAbsolutePath() 
++                + " to " + toFile.getAbsolutePath());
+-    if (!ckpt.renameTo(curFile)) {
+-      if (!curFile.delete() || !ckpt.renameTo(curFile)) {
+-        throw new IOException("renaming  " + ckpt.getAbsolutePath() + " to "  + 
+-            curFile.getAbsolutePath() + " FAILED");
++    if (!fromFile.renameTo(toFile)) {
++      if (!toFile.delete() || !fromFile.renameTo(toFile)) {
++        throw new IOException("renaming  " + fromFile.getAbsolutePath() + " to "  + 
++            toFile.getAbsolutePath() + " FAILED");
+-    }    
++    }
++    if (renameMD5) {
++      MD5FileUtils.renameMD5File(fromFile, toFile);
++    }
+-  public synchronized void saveDigestAndRenameCheckpointImage(
++  public synchronized void saveDigestAndRenameCheckpointImage(NameNodeFile nnf,
+-      File imageFile = NNStorage.getImageFile(sd, txid);
++      File imageFile = NNStorage.getImageFile(sd, nnf, txid);
+-    renameCheckpoint(txid);
++    renameCheckpoint(txid, NameNodeFile.IMAGE_NEW, nnf, false);
+
+MOV26 INS26 INS26 INS40 INS40 UPD40 INS31 INS31 MOV44 INS31 INS31 INS31 INS31 INS29 INS39 INS42 INS44 INS43 INS8 INS29 MOV83 INS39 INS42 INS43 INS8 INS83 MOV60 INS29 INS83 MOV39 INS42 INS44 INS44 INS43 INS8 MOV29 INS83 INS39 INS42 INS44 INS44 INS43 INS8 UPD83 INS44 MOV21 INS44 INS23 INS44 UPD83 INS44 MOV29 INS39 MOV42 INS44 MOV8 INS44 INS44 INS44 INS29 INS39 INS42 INS44 INS44 MOV43 INS8 UPD42 INS44 INS44 INS44 INS43 INS44 INS65 INS43 INS42 INS42 MOV24 INS65 INS42 INS60 INS21 INS54 INS21 INS21 INS60 INS60 INS25 INS25 INS65 INS39 INS42 INS39 INS42 INS42 INS21 INS21 INS21 INS60 INS25 INS74 INS42 INS43 INS42 INS42 INS41 INS43 INS42 INS43 INS42 INS83 INS83 INS43 INS59 INS44 INS43 INS42 INS21 INS43 INS42 INS43 INS42 INS43 INS42 INS43 INS42 INS39 INS42 INS65 INS43 INS42 INS43 INS42 INS60 INS60 INS21 INS70 INS25 INS43 INS42 INS43 INS42 INS39 INS42 INS42 INS25 INS43 INS42 INS66 INS42 INS66 INS66 INS83 INS43 INS59 INS32 INS8 INS12 INS32 INS32 INS83 INS39 INS59 INS83 INS74 INS59 INS42 INS8 INS8 INS83 INS38 INS8 INS8 INS66 INS32 INS32 INS32 INS43 INS59 MOV32 INS8 INS43 INS43 INS42 INS32 INS42 INS42 INS42 INS42 INS43 INS42 INS21 INS42 INS32 INS42 INS42 UPD66 INS42 INS42 INS66 INS66 INS42 INS42 INS74 INS59 INS43 INS59 INS32 INS44 INS32 INS8 INS27 INS8 INS42 INS42 INS83 MOV43 INS83 MOV43 INS42 INS8 INS42 INS42 INS42 INS42 INS14 INS42 INS42 INS42 INS60 INS41 INS44 INS8 INS42 INS42 INS33 INS42 INS42 INS45 UPD40 INS42 INS32 INS43 INS43 INS42 INS21 INS21 UPD42 UPD40 MOV32 INS25 INS42 MOV60 MOV21 INS25 INS21 INS21 INS22 INS42 INS42 INS42 INS42 INS40 INS40 INS9 INS42 INS42 INS40 INS42 INS42 INS42 INS32 INS21 INS21 UPD42 UPD40 MOV32 INS42 INS42 INS42 INS42 INS42 INS33 INS33 INS42 INS7 INS40 INS42 INS42 INS45 INS40 INS43 INS43 INS42 INS33 INS42 INS42 INS14 INS42 INS42 INS42 INS43 INS42 INS42 INS42 INS54 INS42 INS33 INS21 UPD42 UPD42 INS21 INS40 INS42 INS9 INS27 UPD40 INS43 INS32 INS74 INS59 INS27 INS43 INS42 INS41 INS40 INS42 INS42 INS42 INS42 INS7 INS7 INS42 INS42 INS8 INS32 INS8 INS32 INS7 INS52 INS42 INS42 INS42 INS42 INS32 INS32 UPD42 UPD40 MOV32 INS32 INS36 INS25 INS42 INS22 INS42 INS42 INS42 INS43 INS32 INS42 INS8 INS12 INS32 INS42 INS42 UPD42 UPD42 INS32 MOV27 INS38 INS42 INS42 INS42 INS40 INS43 INS43 INS42 INS32 INS27 INS38 INS42 INS9 UPD40 INS42 INS32 INS42 INS32 INS21 INS40 INS42 INS42 INS21 INS42 INS27 INS32 INS42 INS9 INS22 INS42 INS22 INS42 INS42 INS42 INS42 INS42 INS27 INS27 INS8 INS52 INS42 INS42 INS40 INS42 INS9 INS42 INS42 INS42 INS42 INS42 INS42 INS21 INS44 INS8 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 UPD40 UPD45 INS32 INS45 INS45 INS40 INS45 INS42 INS42 INS42 INS42 INS42 INS33 INS32 INS42 INS42 INS40 INS42 INS42 INS40 INS40 INS7 INS42 INS32 INS42 INS34 INS32 INS42 INS52 INS42 INS52 INS42 MOV27 INS32 INS42 INS40 MOV60 MOV25 INS42 MOV43 INS27 INS32 MOV43 INS42 INS21 INS25 INS21 INS42 INS40 INS42 INS42 INS40 INS42 INS42 INS42 INS42 INS27 INS42 INS40 INS40 INS42 INS42 INS34 INS40 INS42 INS42 INS45 INS32 UPD42 INS42 INS42 INS42 INS42 INS40 INS42 INS42 INS40 INS9 INS32 INS27 INS8 INS32 UPD42 UPD42 UPD42 UPD42 UPD42 INS43 UPD40 UPD40 INS32 INS34 MOV43 INS42 INS42 INS42 INS42 INS42 INS27 INS42 INS42 INS33 INS21 INS42 INS42 INS40 INS42 INS32 INS42 INS42 INS45 INS40 INS7 UPD42 UPD42 INS42 INS42 INS34 INS42 INS32 INS42 INS42 DEL42 DEL33 DEL40 DEL66 DEL45 DEL31 DEL40 DEL40

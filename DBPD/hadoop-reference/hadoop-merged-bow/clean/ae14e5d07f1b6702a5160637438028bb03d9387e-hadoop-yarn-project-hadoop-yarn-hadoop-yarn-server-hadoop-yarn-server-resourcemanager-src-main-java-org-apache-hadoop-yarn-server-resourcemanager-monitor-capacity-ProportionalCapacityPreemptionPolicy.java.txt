@@ -1,0 +1,172 @@
+YARN-4108. CapacityScheduler: Improve preemption to only kill containers that would satisfy the incoming request. (Wangda Tan)
+
+(cherry picked from commit 7e8c9beb4156dcaeb3a11e60aaa06d2370626913)
+
+-import org.apache.hadoop.yarn.api.records.NodeId;
++import org.apache.hadoop.yarn.api.records.ContainerId;
++import org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity.preemption.PreemptableQueue;
+-  private final Map<RMContainer,Long> preempted =
+-    new HashMap<RMContainer,Long>();
++  private final Map<RMContainer, Long> preempted = new HashMap<>();
++
++  // Preemptable Entities, synced from scheduler at every run
++  private Map<String, PreemptableQueue> preemptableEntities = null;
++  private Set<ContainerId> killableContainers;
++
++
++  @SuppressWarnings("unchecked")
++  private void cleanupStaledKillableContainers(Resource cluster,
++      Set<String> leafQueueNames) {
++    for (String q : leafQueueNames) {
++      for (TempQueuePerPartition tq : getQueuePartitions(q)) {
++        // When queue's used - killable <= guaranteed and, killable > 0, we need
++        // to check if any of killable containers needs to be reverted
++        if (Resources.lessThanOrEqual(rc, cluster,
++            Resources.subtract(tq.current, tq.killable), tq.idealAssigned)
++            && Resources.greaterThan(rc, cluster, tq.killable, Resources.none())) {
++          // How many killable resources need to be reverted
++          // need-to-revert = already-marked-killable - (current - ideal)
++          Resource toBeRevertedFromKillable = Resources.subtract(tq.killable,
++              Resources.subtract(tq.current, tq.idealAssigned));
++
++          Resource alreadyReverted = Resources.createResource(0);
++
++          for (RMContainer c : preemptableEntities.get(q).getKillableContainers(
++              tq.partition).values()) {
++            if (Resources.greaterThanOrEqual(rc, cluster, alreadyReverted,
++                toBeRevertedFromKillable)) {
++              break;
++            }
++
++            if (Resources.greaterThan(rc, cluster,
++                Resources.add(alreadyReverted, c.getAllocatedResource()),
++                toBeRevertedFromKillable)) {
++              continue;
++            } else {
++              // This container need to be marked to unkillable
++              Resources.addTo(alreadyReverted, c.getAllocatedResource());
++              rmContext.getDispatcher().getEventHandler().handle(
++                  new ContainerPreemptEvent(c.getApplicationAttemptId(), c,
++                      SchedulerEventType.MARK_CONTAINER_FOR_NONKILLABLE));
++            }
++          }
++
++        }
++      }
++    }
++  }
++
++  private void syncKillableContainersFromScheduler() {
++    // sync preemptable entities from scheduler
++    preemptableEntities =
++        scheduler.getPreemptionManager().getShallowCopyOfPreemptableEntities();
++
++    killableContainers = new HashSet<>();
++    for (Map.Entry<String, PreemptableQueue> entry : preemptableEntities
++        .entrySet()) {
++      PreemptableQueue entity = entry.getValue();
++      for (Map<ContainerId, RMContainer> map : entity.getKillableContainers()
++          .values()) {
++        killableContainers.addAll(map.keySet());
++      }
++    }
++  }
++    syncKillableContainersFromScheduler();
++
++    // remove containers from killable list when we want to preempt less resources
++    // from queue.
++    cleanupStaledKillableContainers(clusterResources, leafQueueNames);
++
+-      logToCSV(new ArrayList<String>(leafQueueNames));
++      logToCSV(new ArrayList<>(leafQueueNames));
+-          // kill it
++          // mark container killable
+-                  SchedulerEventType.KILL_PREEMPTED_CONTAINER));
++                  SchedulerEventType.MARK_CONTAINER_FOR_KILLABLE));
+-    List<TempQueuePerPartition> qAlloc = new ArrayList<TempQueuePerPartition>(queues);
++    List<TempQueuePerPartition> qAlloc = new ArrayList<>(queues);
+-    Set<TempQueuePerPartition> nonZeroGuarQueues = new HashSet<TempQueuePerPartition>();
+-    Set<TempQueuePerPartition> zeroGuarQueues = new HashSet<TempQueuePerPartition>();
++    Set<TempQueuePerPartition> nonZeroGuarQueues = new HashSet<>();
++    Set<TempQueuePerPartition> zeroGuarQueues = new HashSet<>();
+-    PriorityQueue<TempQueuePerPartition> orderedByNeed =
+-        new PriorityQueue<TempQueuePerPartition>(10, tqComparator);
++    PriorityQueue<TempQueuePerPartition> orderedByNeed = new PriorityQueue<>(10,
++        tqComparator);
+-    ArrayList<TempQueuePerPartition> underserved = new ArrayList<TempQueuePerPartition>();
++    ArrayList<TempQueuePerPartition> underserved = new ArrayList<>();
+-        q.normalizedGuarantee = (float)  1.0f / ((float) queues.size());
++        q.normalizedGuarantee = 1.0f / queues.size();
+-  private String getPartitionByNodeId(NodeId nodeId) {
+-    return scheduler.getSchedulerNode(nodeId).getPartition();
++  private String getPartitionByRMContainer(RMContainer rmContainer) {
++    return scheduler.getSchedulerNode(rmContainer.getAllocatedNode())
++        .getPartition();
+-    String nodePartition = getPartitionByNodeId(rmContainer.getAllocatedNode());
++    String nodePartition = getPartitionByRMContainer(rmContainer);
+-      set = new HashSet<RMContainer>();
++      set = new HashSet<>();
+-   * @param queues set of leaf queues to preempt from
++   * @param leafQueueNames set of leaf queues to preempt from
+-        new HashMap<ApplicationAttemptId, Set<RMContainer>>();
+-    List<RMContainer> skippedAMContainerlist = new ArrayList<RMContainer>();
++        new HashMap<>();
++    List<RMContainer> skippedAMContainerlist = new ArrayList<>();
+-          new HashMap<String, Resource>();
++          new HashMap<>();
+-   * @param resToObtain
+-        new ArrayList<RMContainer>(app.getReservedContainers());
++        new ArrayList<>(app.getReservedContainers());
+-    List<RMContainer> liveContainers =
+-      new ArrayList<RMContainer>(app.getLiveContainers());
++    List<RMContainer> liveContainers = new ArrayList<>(app.getLiveContainers());
++      // Skip already marked to killable containers
++      if (killableContainers.contains(c.getContainerId())) {
++        continue;
++      }
++
++  @VisibleForTesting
++  public Map<RMContainer, Long> getToPreemptContainers() {
++    return preempted;
++  }
++      Resource killable = Resources.none();
++      if (null != preemptableEntities.get(queueName)) {
++         killable = preemptableEntities.get(queueName)
++            .getKillableResource(partitionToLookAt);
++      }
+-            maxCapacity, preemptionDisabled, partitionToLookAt);
++            maxCapacity, preemptionDisabled, partitionToLookAt, killable);
+-                guaranteed, maxCapacity, false, partitionToLookAt);
++                guaranteed, maxCapacity, false, partitionToLookAt, killable);
+-      queuePartitions = new HashMap<String, TempQueuePerPartition>();
++      queuePartitions = new HashMap<>();
++    final Resource killable;
++
+-        String partition) {
++        String partition, Resource killableResource) {
+-      this.children = new ArrayList<TempQueuePerPartition>();
++      this.children = new ArrayList<>();
++      this.killable = killableResource;
+-    public void addChildren(ArrayList<TempQueuePerPartition> queues) {
+-      assert leafQueue == null;
+-      children.addAll(queues);
+-    }
+-
+-
+-    public void printAll() {
+-      LOG.info(this.toString());
+-      for (TempQueuePerPartition sub : this.getChildren()) {
+-        sub.printAll();
+-      }
+-    }
+-
+-      if (Resources.greaterThan(rc, clusterResource, current, idealAssigned)) {
+-          toBePreempted = Resources.multiply(
+-              Resources.subtract(current, idealAssigned), scalingFactor);
++      if (Resources.greaterThan(rc, clusterResource,
++          Resources.subtract(current, killable), idealAssigned)) {
++        toBePreempted = Resources.multiply(Resources.subtract(
++            Resources.subtract(current, killable), idealAssigned),
++            scalingFactor);
+
+INS26 MOV31 UPD40 INS40 INS23 INS23 INS31 INS31 INS31 INS83 INS74 INS59 INS83 UPD74 MOV74 INS59 INS79 INS39 INS42 INS44 INS44 INS8 INS83 INS39 INS42 INS8 MOV60 INS83 MOV43 INS42 INS44 INS8 INS78 INS83 INS74 INS42 INS8 INS23 INS43 MOV43 INS43 INS42 INS33 UPD43 INS42 INS42 INS45 INS43 INS42 INS74 INS42 INS70 INS21 INS21 INS70 INS21 INS21 INS43 INS42 INS41 INS42 INS43 INS43 INS43 INS41 INS83 MOV43 INS59 INS44 UPD74 INS42 INS42 UPD42 INS42 INS43 INS43 INS44 INS42 INS8 INS7 INS7 INS44 INS32 INS8 INS32 INS32 MOV74 INS59 MOV74 INS59 INS42 INS32 MOV43 UPD42 INS42 INS42 INS42 INS42 INS42 INS43 INS42 INS21 INS42 INS42 MOV43 INS42 INS70 INS42 INS32 INS42 INS14 INS74 INS42 INS42 INS42 INS60 INS70 INS42 INS42 INS42 INS42 UPD42 UPD42 INS42 INS14 INS42 INS14 MOV32 INS42 INS32 INS25 INS60 INS25 INS42 INS7 MOV44 INS32 INS8 INS32 INS42 INS74 INS43 MOV43 INS43 INS43 INS59 INS44 INS32 INS8 UPD74 UPD74 UPD74 INS74 MOV34 MOV42 INS74 INS42 UPD42 INS42 INS42 UPD74 UPD74 INS74 UPD74 MOV74 INS32 INS8 INS43 INS59 INS27 INS8 INS22 INS42 INS32 UPD42 INS42 INS42 INS25 INS42 INS42 INS43 INS40 INS42 INS42 INS42 INS32 INS74 INS42 INS32 INS42 INS21 MOV43 MOV43 UPD43 MOV43 INS42 INS42 INS32 INS18 INS42 INS42 INS32 INS33 INS32 INS21 UPD74 INS52 INS42 INS42 INS42 MOV42 INS42 INS27 INS8 INS42 INS42 INS42 INS43 INS43 MOV43 INS42 INS42 INS32 UPD74 INS8 UPD74 MOV42 UPD74 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS7 UPD74 INS32 INS32 INS60 INS60 INS70 INS42 INS42 INS42 INS42 INS32 INS21 MOV21 MOV43 INS42 INS32 INS42 INS42 INS42 INS42 INS32 INS40 INS42 INS42 INS42 INS42 INS40 INS32 INS43 INS59 INS43 INS59 INS44 INS32 INS8 INS42 INS42 INS32 INS34 MOV32 INS32 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS40 INS40 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS32 UPD43 MOV43 UPD42 MOV42 INS32 INS42 INS25 INS25 INS32 INS42 INS14 INS42 INS42 INS42 INS42 INS42 MOV42 INS42 INS42 INS42 INS40 INS32 INS42 INS42 INS34 UPD42 INS32 INS42 INS40 INS32 INS8 INS32 INS8 MOV8 INS32 INS42 INS43 INS42 INS42 INS40 INS42 INS42 INS40 INS40 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS10 INS42 INS42 INS42 INS42 MOV32 UPD42 MOV42 INS18 INS21 INS42 INS42 INS42 UPD42 UPD42 UPD42 INS32 INS32 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS32 UPD42 UPD40 INS42 INS42 DEL42 DEL43 DEL42 DEL42 DEL44 DEL32 DEL41 DEL8 DEL42 DEL43 DEL42 DEL43 DEL42 DEL43 DEL42 DEL43 DEL74 DEL42 DEL14 DEL59 DEL42 DEL43 DEL74 DEL42 DEL14 DEL59 DEL39 DEL34 DEL11 DEL39 DEL11 DEL36 DEL42 DEL43 DEL42 DEL43 DEL42 DEL65 DEL42 DEL43 DEL42 DEL43 DEL74 DEL42 DEL43 DEL42 DEL43 DEL83 DEL39 DEL42 DEL42 DEL43 DEL42 DEL43 DEL74 DEL42 DEL44 DEL42 DEL33 DEL27 DEL6 DEL42 DEL42 DEL42 DEL32 DEL21 DEL8 DEL31 DEL83 DEL39 DEL42 DEL42 DEL42 DEL52 DEL42 DEL32 DEL32 DEL21 DEL52 DEL42 DEL32 DEL42 DEL42 DEL32 DEL21 DEL8 DEL70 DEL8 DEL31

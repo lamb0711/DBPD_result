@@ -1,0 +1,229 @@
+Merge trunk to HDFS-4685.
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/branches/HDFS-4685@1556097 13f79535-47bb-0310-9956-ffa450edef68
+
+-import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_NAMENODE_CACHING_ENABLED_DEFAULT;
+-import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_NAMENODE_CACHING_ENABLED_KEY;
++import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_NAMENODE_PATH_BASED_CACHE_BLOCK_MAP_ALLOCATION_PERCENT;
++import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_NAMENODE_PATH_BASED_CACHE_BLOCK_MAP_ALLOCATION_PERCENT_DEFAULT;
++import java.util.concurrent.locks.ReentrantLock;
+-import org.apache.hadoop.hdfs.server.blockmanagement.BlockInfo;
+- * This class is instantiated by the FSNamesystem when caching is enabled.
++ * This class is instantiated by the FSNamesystem.
++  private static final float MIN_CACHED_BLOCKS_PERCENT = 0.001f;
++
+-   * Whether caching is enabled.
+-   *
+-   * If caching is disabled, we will not process cache reports or store
+-   * information about what is cached where.  We also do not start the
+-   * CacheReplicationMonitor thread.  This will save resources, but provide
+-   * less functionality.
+-   *     
+-   * Even when caching is disabled, we still store path-based cache
+-   * information.  This information is stored in the edit log and fsimage.  We
+-   * don't want to lose it just because a configuration setting was turned off.
+-   * However, we will not act on this information if caching is disabled.
+-   */
+-  private final boolean enabled;
+-
+-  /**
+-   * Whether the CacheManager is active.
+-   * 
+-   * When the CacheManager is active, it tells the DataNodes what to cache
+-   * and uncache.  The CacheManager cannot become active if enabled = false.
+-   */
+-  private boolean active = false;
+-
+-  /**
++   * Lock which protects the CacheReplicationMonitor.
++   */
++  private final ReentrantLock crmLock = new ReentrantLock();
++
++  /**
+-    this.enabled = conf.getBoolean(DFS_NAMENODE_CACHING_ENABLED_KEY,
+-        DFS_NAMENODE_CACHING_ENABLED_DEFAULT);
+-    this.cachedBlocks = !enabled ? null :
+-        new LightWeightGSet<CachedBlock, CachedBlock>(
+-            LightWeightGSet.computeCapacity(0.25, "cachedBlocks"));
++    float cachedBlocksPercent = conf.getFloat(
++          DFS_NAMENODE_PATH_BASED_CACHE_BLOCK_MAP_ALLOCATION_PERCENT,
++          DFS_NAMENODE_PATH_BASED_CACHE_BLOCK_MAP_ALLOCATION_PERCENT_DEFAULT);
++    if (cachedBlocksPercent < MIN_CACHED_BLOCKS_PERCENT) {
++      LOG.info("Using minimum value " + MIN_CACHED_BLOCKS_PERCENT +
++        " for " + DFS_NAMENODE_PATH_BASED_CACHE_BLOCK_MAP_ALLOCATION_PERCENT);
++      cachedBlocksPercent = MIN_CACHED_BLOCKS_PERCENT;
++    }
++    this.cachedBlocks = new LightWeightGSet<CachedBlock, CachedBlock>(
++          LightWeightGSet.computeCapacity(cachedBlocksPercent,
++              "cachedBlocks"));
++
+-  /**
+-   * Activate the cache manager.
+-   * 
+-   * When the cache manager is active, tell the datanodes where to cache files.
+-   */
+-  public void activate() {
+-    assert namesystem.hasWriteLock();
+-    if (enabled && (!active)) {
+-      LOG.info("Activating CacheManager.  " +
+-          "Starting replication monitor thread...");
+-      active = true;
+-      monitor = new CacheReplicationMonitor(namesystem, this,
+-         scanIntervalMs);
+-      monitor.start();
++  public void startMonitorThread() {
++    crmLock.lock();
++    try {
++      if (this.monitor == null) {
++        this.monitor = new CacheReplicationMonitor(namesystem, this,
++            scanIntervalMs, crmLock);
++        this.monitor.start();
++      }
++    } finally {
++      crmLock.unlock();
+-  /**
+-   * Deactivate the cache manager.
+-   * 
+-   * When the cache manager is inactive, it does not tell the datanodes where to
+-   * cache files.
+-   */
+-  public void deactivate() {
+-    assert namesystem.hasWriteLock();
+-    if (active) {
+-      LOG.info("Deactivating CacheManager.  " +
+-          "stopping CacheReplicationMonitor thread...");
+-      active = false;
+-      IOUtils.closeQuietly(monitor);
+-      monitor = null;
+-      LOG.info("CacheReplicationMonitor thread stopped and deactivated.");
++  public void stopMonitorThread() {
++    crmLock.lock();
++    try {
++      if (this.monitor != null) {
++        CacheReplicationMonitor prevMonitor = this.monitor;
++        this.monitor = null;
++        IOUtils.closeQuietly(prevMonitor);
++      }
++    } finally {
++      crmLock.unlock();
+-  /**
+-   * Return true only if the cache manager is active.
+-   * Must be called under the FSN read or write lock.
+-   */
+-  public boolean isActive() {
+-    return active;
++  public void clearDirectiveStats() {
++    assert namesystem.hasWriteLock();
++    for (CacheDirective directive : directivesById.values()) {
++      directive.resetStatistics();
++    }
+-    if (monitor != null) {
+-      monitor.setNeedsRescan();
+-    }
++    setNeedsRescan();
+-        // Can't kick and wait if caching is disabled
+-        if (monitor != null) {
+-          monitor.waitForRescan();
+-        }
+-      if (monitor != null) {
+-        monitor.setNeedsRescan();
+-      }
++      setNeedsRescan();
+-    if (monitor != null) {
+-      monitor.setNeedsRescan();
+-    }
++    setNeedsRescan();
+-    if (monitor != null) {
+-      monitor.waitForRescanIfNeeded();
+-    }
+-        if (monitor != null) {
+-          monitor.setNeedsRescan();
+-        }
++        setNeedsRescan();
+-      if (monitor != null) {
+-        monitor.setNeedsRescan();
+-      }
++      setNeedsRescan();
+-    if (monitor != null) {
+-      monitor.waitForRescanIfNeeded();
+-    }
+-    if (!enabled) {
+-      return;
+-    }
+-    if (!enabled) {
+-      LOG.info("Ignoring cache report from " + datanodeID +
+-          " because " + DFS_NAMENODE_CACHING_ENABLED_KEY + " = false. " +
+-          "number of blocks: " + blockIds.size());
+-      return;
+-    }
++    CachedBlocksList cachedList = datanode.getCached();
++    CachedBlocksList pendingCachedList = datanode.getPendingCached();
+-      Block block = new Block(iter.next());
+-      BlockInfo blockInfo = blockManager.getStoredBlock(block);
+-      if (!blockInfo.isComplete()) {
+-        LOG.warn("Ignoring block id " + block.getBlockId() + ", because " +
+-            "it is in not complete yet.  It is in state " + 
+-            blockInfo.getBlockUCState());
+-        continue;
+-      }
+-      Collection<DatanodeDescriptor> corruptReplicas =
+-          blockManager.getCorruptReplicas(blockInfo);
+-      if ((corruptReplicas != null) && corruptReplicas.contains(datanode)) {
+-        // The NameNode will eventually remove or update the corrupt block.
+-        // Until then, we pretend that it isn't cached.
+-        LOG.warn("Ignoring cached replica on " + datanode + " of " + block +
+-            " because it is corrupt.");
+-        continue;
+-      }
++      long blockId = iter.next();
+-          new CachedBlock(block.getBlockId(), (short)0, false);
++          new CachedBlock(blockId, (short)0, false);
+-      // Use the existing CachedBlock if it's present; otherwise,
+-      // insert a new one.
++      // Add the block ID from the cache report to the cachedBlocks map
++      // if it's not already there.
+-      if (!cachedBlock.isPresent(datanode.getCached())) {
+-        datanode.getCached().add(cachedBlock);
++      // Add the block to the datanode's implicit cached block list
++      // if it's not already there.  Similarly, remove it from the pending
++      // cached block list if it exists there.
++      if (!cachedBlock.isPresent(cachedList)) {
++        cachedList.add(cachedBlock);
+-      if (cachedBlock.isPresent(datanode.getPendingCached())) {
+-        datanode.getPendingCached().remove(cachedBlock);
++      if (cachedBlock.isPresent(pendingCachedList)) {
++        pendingCachedList.remove(cachedBlock);
++
++  public void waitForRescanIfNeeded() {
++    crmLock.lock();
++    try {
++      if (monitor != null) {
++        monitor.waitForRescanIfNeeded();
++      }
++    } finally {
++      crmLock.unlock();
++    }
++  }
++
++  private void setNeedsRescan() {
++    crmLock.lock();
++    try {
++      if (monitor != null) {
++        monitor.setNeedsRescan();
++      }
++    } finally {
++      crmLock.unlock();
++    }
++  }
++
++  @VisibleForTesting
++  public Thread getCacheReplicationMonitor() {
++    crmLock.lock();
++    try {
++      return monitor;
++    } finally {
++      crmLock.unlock();
++    }
++  }
+
+MOV26 MOV23 MOV23 UPD40 UPD40 UPD40 INS31 INS31 INS31 INS83 UPD39 INS83 INS43 UPD42 UPD42 INS8 UPD39 INS42 INS8 INS83 INS39 INS42 INS8 INS83 INS39 INS42 INS8 INS78 INS83 INS43 INS42 INS8 UPD66 UPD42 INS34 INS42 UPD42 INS14 INS60 INS25 INS21 INS54 MOV21 INS54 MOV6 INS70 MOV21 MOV21 INS60 INS60 INS21 INS54 INS21 INS54 INS42 INS42 INS21 INS54 UPD66 INS43 INS39 INS59 INS27 INS8 INS32 INS8 INS8 INS8 INS8 INS44 INS32 INS8 INS43 INS59 INS43 INS59 INS32 INS8 INS8 INS32 INS8 INS8 INS32 INS8 INS8 INS42 INS42 INS32 INS42 INS42 INS21 INS21 MOV14 UPD42 MOV42 UPD42 MOV42 MOV25 INS21 UPD42 UPD42 INS25 MOV21 INS43 INS42 INS42 INS42 INS21 MOV21 MOV21 INS42 INS42 MOV32 INS42 INS42 MOV32 INS42 INS42 MOV25 INS21 INS42 INS42 MOV25 INS21 INS42 INS42 INS41 INS21 MOV42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 INS32 INS7 UPD27 INS32 INS27 INS8 INS42 INS32 INS39 INS32 INS32 INS42 INS32 INS42 INS42 INS27 INS42 INS42 INS42 INS22 INS33 INS42 INS42 INS22 INS33 INS60 MOV21 MOV21 UPD42 UPD42 INS42 INS42 INS21 UPD42 MOV32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS45 INS42 INS45 INS42 INS52 INS42 INS52 INS42 INS43 INS59 INS32 INS42 INS42 INS22 INS22 INS42 INS42 INS22 INS22 INS33 UPD42 INS42 UPD42 MOV42 UPD42 MOV42 INS52 INS42 INS42 INS52 INS42 INS52 INS42 INS52 INS42 DEL66 DEL66 DEL66 DEL66 DEL66 DEL66 DEL66 DEL66 DEL66 DEL65 DEL29 DEL66 DEL66 DEL39 DEL9 DEL52 DEL42 DEL22 DEL32 DEL7 DEL21 DEL34 DEL42 DEL38 DEL33 DEL16 DEL66 DEL66 DEL65 DEL29 DEL42 DEL42 DEL38 DEL36 DEL42 DEL42 DEL45 DEL45 DEL27 DEL32 DEL21 DEL42 DEL9 DEL7 DEL21 DEL42 DEL42 DEL32 DEL6 DEL66 DEL66 DEL66 DEL65 DEL29 DEL45 DEL45 DEL27 DEL42 DEL9 DEL45 DEL42 DEL42 DEL33 DEL7 DEL21 DEL8 DEL25 DEL8 DEL66 DEL66 DEL65 DEL29 DEL42 DEL42 DEL41 DEL8 DEL42 DEL42 DEL33 DEL27 DEL8 DEL25 DEL42 DEL33 DEL27 DEL42 DEL42 DEL32 DEL21 DEL8 DEL25 DEL42 DEL42 DEL33 DEL27 DEL8 DEL25 DEL42 DEL42 DEL33 DEL27 DEL8 DEL25 DEL42 DEL33 DEL27 DEL42 DEL42 DEL32 DEL21 DEL8 DEL25 DEL42 DEL42 DEL33 DEL27 DEL8 DEL25 DEL42 DEL38 DEL41 DEL8 DEL25 DEL42 DEL38 DEL42 DEL42 DEL45 DEL42 DEL45 DEL42 DEL45 DEL45 DEL42 DEL42 DEL32 DEL27 DEL32 DEL21 DEL41 DEL8 DEL25 DEL42 DEL43 DEL42 DEL43 DEL14 DEL42 DEL43 DEL42 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL42 DEL32 DEL38 DEL42 DEL42 DEL45 DEL42 DEL42 DEL32 DEL45 DEL45 DEL42 DEL42 DEL32 DEL27 DEL32 DEL21 DEL18 DEL8 DEL25 DEL42 DEL43 DEL42 DEL43 DEL74 DEL42 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL33 DEL27 DEL36 DEL42 DEL42 DEL42 DEL32 DEL27 DEL42 DEL42 DEL45 DEL42 DEL45 DEL42 DEL45 DEL27 DEL32 DEL21 DEL18 DEL8 DEL25 DEL42 DEL42 DEL32 DEL42 DEL32 DEL42 DEL32

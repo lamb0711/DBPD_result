@@ -1,0 +1,175 @@
+JCR-2216: Append-only index updates
+
+git-svn-id: https://svn.apache.org/repos/asf/jackrabbit/trunk@801253 13f79535-47bb-0310-9956-ffa450edef68
+
++import java.util.Calendar;
++import java.text.DateFormat;
+-    private final IndexInfos indexNames = new IndexInfos("indexes");
++    private final IndexInfos indexNames;
++
++    /**
++     * The history of the multi index.
++     */
++    private final IndexHistory indexHistory;
++     * Key = index name (String), Value = time when last in use (Long)
+-    private final Set<String> deletable = new HashSet<String>();
++    private final Map<String, Long> deletable = new HashMap<String, Long>();
+-    private final RedoLog redoLog;
++    private RedoLog redoLog;
+-        this.redoLog = new RedoLog(indexDir);
+-        if (indexNames.exists(indexDir)) {
+-            indexNames.read(indexDir);
+-        }
++        indexNames = new IndexInfos(indexDir, "indexes");
++
++        this.indexHistory = new IndexHistory(indexDir,
++                handler.getMaxHistoryAge() * 1000);
++        this.redoLog = RedoLog.create(indexDir, indexNames.getGeneration());
++
+-        for (int i = 0; i < indexNames.size(); i++) {
+-            String name = indexNames.getName(i);
++        for (Iterator it = indexNames.iterator(); it.hasNext(); ) {
++            IndexInfo info = (IndexInfo) it.next();
++            String name = info.getName();
+-                    cache, indexingQueue, directoryManager);
++                    cache, indexingQueue, directoryManager,
++                    handler.getMaxHistoryAge());
+-                log.info("Created initial index for {} nodes", new Long(count));
++                log.info("Created initial index for {} nodes", count);
+-            boolean flush = false;
+-                    flush |= checkVolatileCommit();
++                    checkVolatileCommit();
+-
+-            // flush whole index when volatile index has been commited.
+-            if (flush) {
+-                flush();
+-            }
+-            for (int i = 0; i < indexes.size(); i++) {
+-                PersistentIndex index = (PersistentIndex) indexes.get(i);
++            for (PersistentIndex index : indexes) {
+-                    cache, indexingQueue, directoryManager);
++                    cache, indexingQueue, directoryManager,
++                    handler.getMaxHistoryAge());
+-                deletable.add(indexName);
++                deletable.put(indexName, Long.MIN_VALUE);
+-            log.debug("hierarchy cache initialized in {} ms", new Long(time));
++            log.debug("hierarchy cache initialized in {} ms", time);
+-                for (int i = 0; i < indexes.size(); i++) {
+-                    PersistentIndex pIdx = (PersistentIndex) indexes.get(i);
++                for (PersistentIndex pIdx : indexes) {
+-            for (int i = 0; i < indexes.size(); i++) {
+-                ((PersistentIndex) indexes.get(i)).close();
++            for (PersistentIndex index : indexes) {
++                index.close();
+-     * Removes the <code>index</code> from the list of active sub indexes. The
+-     * Index is not acutally deleted right away, but postponed to the transaction
+-     * commit.
++     * Removes the <code>index</code> from the list of active sub indexes.
++     * Depending on the {@link SearchIndex#getMaxHistoryAge()}, the
++     * Index is not deleted right away.
+-            deletable.add(index.getName());
++            deletable.put(index.getName(), System.currentTimeMillis());
+-            // commit volatile index
+-            executeAndLog(new Start(Action.INTERNAL_TRANSACTION));
+-            commitVolatileIndex();
++            // only start transaction when there is something to commit
++            boolean transactionStarted = false;
++
++            if (volatileIndex.getNumDocuments() > 0) {
++                // commit volatile index
++                executeAndLog(new Start(Action.INTERNAL_TRANSACTION));
++                transactionStarted = true;
++                commitVolatileIndex();
++            }
++
++            boolean indexesModified = false;
+-                PersistentIndex index = (PersistentIndex) indexes.get(i);
++                PersistentIndex index = indexes.get(i);
++                    long gen = index.getCurrentGeneration();
++                    if (gen != index.getCurrentGeneration()) {
++                        indexesModified = true;
++                        log.debug("Committed revision {} of index {}",
++                                Long.toString(index.getCurrentGeneration(), Character.MAX_RADIX),
++                                index.getName());
++                    }
++                        if (!transactionStarted) {
++                            executeAndLog(new Start(Action.INTERNAL_TRANSACTION));
++                            transactionStarted = true;
++                        }
+-            executeAndLog(new Commit(getTransactionId()));
+-            indexNames.write(indexDir);
++            if (transactionStarted) {
++                executeAndLog(new Commit(getTransactionId()));
++            }
+-            // reset redo log
+-            redoLog.clear();
++            if (transactionStarted || indexesModified || redoLog.hasEntries()) {
++                indexNames.write();
++
++                indexHistory.addIndexInfos(indexNames);
++
++                // close redo.log and create a new one based
++                // on the new indexNames generation
++                redoLog.close();
++                redoLog = RedoLog.create(indexDir, indexNames.getGeneration());
++            }
++        indexHistory.pruneOutdated();
++
+-        String[] dirNames = directoryManager.getDirectoryNames();
+-        for (int i = 0; i < dirNames.length; i++) {
+-            if (dirNames[i].startsWith("_") && !indexNames.contains(dirNames[i])) {
+-                deletable.add(dirNames[i]);
++        for (String name : directoryManager.getDirectoryNames()) {
++            if (!name.startsWith("_")) {
++                continue;
++            }
++            long lastUse = indexHistory.getLastUseOf(name);
++            if (lastUse != Long.MAX_VALUE) {
++                if (log.isDebugEnabled()) {
++                    String msg = "Segment " + name + " not is use anymore. ";
++                    if (lastUse != Long.MIN_VALUE) {
++                        Calendar cal = Calendar.getInstance();
++                        DateFormat df = DateFormat.getInstance();
++                        cal.setTimeInMillis(lastUse);
++                        msg += "Unused since: " + df.format(cal.getTime());
++                    } else {
++                        msg += "(orphaned)";
++                    }
++                    log.debug(msg);
++                }
++                deletable.put(name, lastUse);
++        // now prune outdated index infos
++        indexHistory.pruneOutdated();
++     *
++     * @throws IOException if the volatile index cannot be reset.
+-     * @param path     the path of the current node.
++     * @param path     the path of the current <code>node</code> state.
+-            log.info("indexing... {} ({})", resolver.getJCRPath(path), new Long(count));
++            log.info("indexing... {} ({})", resolver.getJCRPath(path), count);
+-     * Attempts to delete all files recorded in {@link #deletable}.
++     * Attempts to delete all files that are older than
++     *{@link SearchIndex#getMaxHistoryAge()}.
+-            for (Iterator<String> it = deletable.iterator(); it.hasNext(); ) {
+-                String indexName = it.next();
+-                if (directoryManager.delete(indexName)) {
+-                    it.remove();
+-                } else {
+-                    log.info("Unable to delete obsolete index: " + indexName);
++            for (Iterator<Map.Entry<String, Long>> it = deletable.entrySet().iterator(); it.hasNext(); ) {
++                Map.Entry<String, Long> entry = it.next();
++                String indexName = entry.getKey();
++                long lastUse = entry.getValue();
++                if (System.currentTimeMillis() - handler.getMaxHistoryAge() * 1000 > lastUse) {
++                    if (directoryManager.delete(indexName)) {
++                        it.remove();
++                    } else {
++                        log.info("Unable to delete obsolete index: " + indexName);
++                    }
+-                    new Long(finished.size()));
++                    finished.size());
+-                index.indexNames.addName(indexName);
++                index.indexNames.addName(indexName, idx.getCurrentGeneration());
+-                    PersistentIndex idx = (PersistentIndex) index.indexes.get(i);
++                    PersistentIndex idx = index.indexes.get(i);
++         * @param targetIndex   the name of the index where the volatile index
++         *                      will be committed.

@@ -1,0 +1,313 @@
+JCR-190: Caching in QueryHandler does not scale well
+
+git-svn-id: https://svn.apache.org/repos/asf/incubator/jackrabbit/trunk@234492 13f79535-47bb-0310-9956-ffa450edef68
+
+-import org.apache.lucene.index.IndexReader;
+-import org.apache.lucene.index.TermEnum;
++import java.util.Map;
++import java.util.IdentityHashMap;
+-class CachingMultiReader extends MultiReader {
++final class CachingMultiReader extends MultiReader {
+-    private IndexReader[] subReaders;
++    private ReadOnlyIndexReader[] subReaders;
++
++    /**
++     * Map of OffsetReaders, identified by caching reader they are based on.
++     */
++    private final Map readersByBase = new IdentityHashMap();
++
++    /**
++     * Document number cache if available. May be <code>null</code>.
++     */
++    private final DocNumberCache cache;
+-     * <p/>
+-     * This <code>CachingMultiReader</code> poses type requirements on the
+-     * <code>subReaders</code>: all but one sub readers must be a
+-     * {@link ReadOnlyIndexReader}. The single allowed sub reader not of type
+-     * {@link ReadOnlyIndexReader} must be the last reader in
+-     * <code>subReaders</code>! Otherwise this constructor will throw an
+-     * {@link IllegalArgumentException}.
++     * @param cache the document number cache.
+-     * @exception IllegalArgumentException if <code>subReaders</code> does
+-     * not comply to the above type requirements.
+-    public CachingMultiReader(IndexReader[] subReaders)
+-            throws IOException, IllegalArgumentException {
++    public CachingMultiReader(ReadOnlyIndexReader[] subReaders,
++                              DocNumberCache cache)
++            throws IOException {
+-        // check readers, all but last must be a ReadOnlyIndexReader
+-        for (int i = 0; i < subReaders.length - 1; i++) {
+-            if (!(subReaders[i] instanceof ReadOnlyIndexReader)) {
+-                throw new IllegalArgumentException("subReader " + i + " must be of type ReadOnlyIndexReader");
+-            }
+-        }
++        this.cache = cache;
++            OffsetReader offsetReader = new OffsetReader(subReaders[i], starts[i]);
++            readersByBase.put(subReaders[i].getBase().getBase(), offsetReader);
++     * Returns the document number of the parent of <code>n</code> or
++     * <code>-1</code> if <code>n</code> does not have a parent (<code>n</code>
++     * is the root node).
++     *
++     * @param n the document number.
++     * @return the document number of <code>n</code>'s parent.
++     * @throws IOException if an error occurs while reading from the index.
++     */
++    final public int getParent(int n) throws IOException {
++        int i = readerIndex(n);
++        DocId id = subReaders[i].getParent(n - starts[i]);
++        id = id.applyOffset(starts[i]);
++        return id.getDocumentNumber(this);
++    }
++
++    /**
+-            for (int i = 0; i < subReaders.length; i++) {
+-                TermDocs docs = subReaders[i].termDocs(term);
+-                if (docs != CachingIndexReader.EMPTY) {
+-                    // apply offset
+-                    return new OffsetTermDocs(docs, starts[i]);
++            // check cache
++            DocNumberCache.Entry e = cache.get(term.text());
++            if (e != null) {
++                // check if valid:
++                // 1) reader must be in the set of readers
++                // 2) doc must not be deleted
++                OffsetReader offsetReader = (OffsetReader) readersByBase.get(e.reader);
++                if (offsetReader != null && !offsetReader.reader.isDeleted(e.doc)) {
++                    return new SingleTermDocs(e.doc + offsetReader.offset);
+-        } else if (term.field() == FieldNames.PARENT) {
+-            TermDocs[] termDocs = new TermDocs[subReaders.length];
++
++            // if we get here, entry is either invalid or did not exist
++            // search through readers
+-                termDocs[i] = subReaders[i].termDocs(term);
++                TermDocs docs = subReaders[i].termDocs(term);
++                try {
++                    if (docs.next()) {
++                        return new SingleTermDocs(docs.doc() + starts[i]);
++                    }
++                } finally {
++                    docs.close();
++                }
+-            return new MultiTermDocs(termDocs, starts);
++
++    //------------------------< internal >--------------------------------------
++
+-     * Partial <code>TermDocs</code> implementation that applies an offset
+-     * to a base <code>TermDocs</code> instance.
++     * Returns the reader index for document <code>n</code>.
++     * Implementation copied from lucene MultiReader class.
++     *
++     * @param n document number.
++     * @return the reader index.
+-    private static final class OffsetTermDocs implements TermDocs {
++    final private int readerIndex(int n) {
++        int lo = 0;                                      // search starts array
++        int hi = subReaders.length - 1;                  // for first element less
+-        /**
+-         * The base <code>TermDocs</code> instance.
+-         */
+-        private final TermDocs base;
+-
+-        /**
+-         * The offset to apply
+-         */
+-        private final int offset;
+-
+-        /**
+-         * Creates a new <code>OffsetTermDocs</code> instance.
+-         * @param base the base <code>TermDocs</code>.
+-         * @param offset the offset to apply.
+-         */
+-        OffsetTermDocs(TermDocs base, int offset) {
+-            this.base = base;
+-            this.offset = offset;
++        while (hi >= lo) {
++            int mid = (lo + hi) >> 1;
++            int midValue = starts[mid];
++            if (n < midValue) {
++                hi = mid - 1;
++            } else if (n > midValue) {
++                lo = mid + 1;
++            } else {                                      // found a match
++                while (mid + 1 < subReaders.length && starts[mid + 1] == midValue) {
++                    mid++;                                  // scan to last match
++                }
++                return mid;
++            }
+-
+-        /**
+-         * @throws UnsupportedOperationException always
+-         */
+-        public void seek(Term term) {
+-            throw new UnsupportedOperationException();
+-        }
+-
+-        /**
+-         * @throws UnsupportedOperationException always
+-         */
+-        public void seek(TermEnum termEnum) {
+-            throw new UnsupportedOperationException();
+-        }
+-
+-        /**
+-         * {@inheritDoc}
+-         */
+-        public int doc() {
+-            return base.doc() + offset;
+-        }
+-
+-        /**
+-         * {@inheritDoc}
+-         */
+-        public int freq() {
+-            return base.freq();
+-        }
+-
+-        /**
+-         * {@inheritDoc}
+-         */
+-        public boolean next() throws IOException {
+-            return base.next();
+-        }
+-
+-        /**
+-         * @throws UnsupportedOperationException always
+-         */
+-        public int read(int[] docs, int[] freqs) {
+-            throw new UnsupportedOperationException();
+-        }
+-
+-        /**
+-         * @throws UnsupportedOperationException always
+-         */
+-        public boolean skipTo(int target) {
+-            throw new UnsupportedOperationException();
+-        }
+-
+-        /**
+-         * {@inheritDoc}
+-         */
+-        public void close() throws IOException {
+-            base.close();
+-        }
++        return hi;
++    //-----------------------< OffsetTermDocs >---------------------------------
++
+-     * Implements a <code>TermDocs</code> which spans multiple other
+-     * <code>TermDocs</code>.
++     * Simple helper struct that associates an offset with an IndexReader.
+-    private static final class MultiTermDocs implements TermDocs {
++    private static final class OffsetReader {
+-         * The actual <code>TermDocs</code>.
++         * The index reader.
+-        private final TermDocs[] termDocs;
++        final ReadOnlyIndexReader reader;
+-         * The document number offsets for each <code>TermDocs</code>.
++         * The reader offset in this multi reader instance.
+-        private final int[] starts;
++        final int offset;
+-         * The current <code>TermDocs</code> instance. If <code>null</code>
+-         * there are no more documents.
++         * Creates a new <code>OffsetReader</code>.
++         *
++         * @param reader the index reader.
++         * @param offset the reader offset in a multi reader.
+-        private TermDocs current;
+-
+-        /**
+-         * The current index into {@link #termDocs} and {@link #starts}.
+-         */
+-        private int idx = 0;
+-
+-        /**
+-         * Creates a new <code>MultiTermDocs</code> instance.
+-         * @param termDocs the actual <code>TermDocs</code>.
+-         * @param starts the document number offsets for each
+-         *  <code>TermDocs</code>
+-         */
+-        MultiTermDocs(TermDocs[] termDocs, int[] starts) {
+-            this.termDocs = termDocs;
+-            this.starts = starts;
+-            current = termDocs[idx];
+-        }
+-
+-        /**
+-         * @throws UnsupportedOperationException always
+-         */
+-        public void seek(Term term) {
+-            throw new UnsupportedOperationException();
+-        }
+-
+-        /**
+-         * @throws UnsupportedOperationException always
+-         */
+-        public void seek(TermEnum termEnum) {
+-            throw new UnsupportedOperationException();
+-        }
+-
+-        /**
+-         * {@inheritDoc}
+-         */
+-        public int doc() {
+-            return starts[idx] + current.doc();
+-        }
+-
+-        /**
+-         * {@inheritDoc}
+-         */
+-        public int freq() {
+-            return current.freq();
+-        }
+-
+-        /**
+-         * {@inheritDoc}
+-         */
+-        public boolean next() throws IOException {
+-            while (current != null && !current.next()) {
+-                if (++idx >= termDocs.length) {
+-                    // no more TermDocs
+-                    current = null;
+-                } else {
+-                    // move to next TermDocs
+-                    current = termDocs[idx];
+-                }
+-            }
+-            return current != null;
+-        }
+-
+-        /**
+-         * {@inheritDoc}
+-         */
+-        public int read(int[] docs, int[] freqs) throws IOException {
+-            int count = 0;
+-            for (int i = 0; i < docs.length && next(); i++, count++) {
+-                docs[i] = doc();
+-                freqs[i] = freq();
+-            }
+-            return count;
+-        }
+-
+-        /**
+-         * {@inheritDoc}
+-         */
+-        public boolean skipTo(int target) throws IOException {
+-            do {
+-                if (!next()) {
+-                    return false;
+-                }
+-            } while (target > doc());
+-            return true;
+-        }
+-
+-        /**
+-         * {@inheritDoc}
+-         */
+-        public void close() throws IOException {
+-            for (int i = 0; i < termDocs.length; i++) {
+-                termDocs[i].close();
+-            }
++        OffsetReader(ReadOnlyIndexReader reader, int offset) {
++            this.reader = reader;
++            this.offset = offset;
+
+MOV26 MOV26 UPD40 UPD40 INS83 INS42 INS23 MOV23 INS31 INS31 INS31 INS55 UPD5 INS29 INS83 INS83 INS43 INS59 UPD43 MOV65 INS44 INS29 INS83 MOV83 MOV39 UPD42 MOV42 MOV44 MOV43 INS8 MOV29 MOV83 MOV43 INS42 MOV44 MOV43 INS8 MOV29 INS83 UPD83 MOV83 MOV39 UPD42 MOV42 MOV44 INS8 INS29 INS83 INS83 INS83 INS42 INS23 INS23 MOV31 UPD43 MOV65 INS42 INS42 INS14 UPD42 UPD42 UPD65 UPD5 INS43 INS42 INS21 MOV65 UPD65 MOV65 UPD65 MOV65 MOV65 INS39 UPD42 INS60 INS60 MOV21 INS41 INS25 MOV41 INS65 INS65 INS65 INS39 UPD42 MOV60 INS60 INS61 INS41 INS65 INS29 INS83 MOV43 INS59 INS29 INS83 INS39 MOV59 UPD42 UPD42 UPD66 INS43 UPD66 UPD42 UPD66 UPD43 UPD42 MOV42 INS7 INS66 INS66 UPD66 UPD42 UPD66 UPD66 UPD42 UPD66 INS39 INS59 INS43 INS59 INS32 MOV27 INS8 INS66 INS66 INS42 INS66 INS66 INS39 INS59 INS27 INS8 INS42 INS66 INS65 INS42 INS65 UPD43 UPD42 UPD42 MOV42 UPD42 INS22 INS42 INS60 INS21 INS42 INS32 UPD42 MOV42 INS42 INS32 INS42 INS32 INS42 INS42 INS52 INS60 INS25 MOV24 UPD42 UPD42 MOV42 MOV27 UPD42 MOV42 INS42 INS60 INS60 INS25 INS66 INS66 UPD66 UPD42 UPD66 UPD66 UPD42 INS52 INS42 INS43 INS59 INS32 UPD42 MOV42 UPD42 MOV42 MOV2 INS42 INS27 INS42 INS42 MOV2 INS43 INS59 INS27 INS8 INS8 INS39 INS59 INS39 INS59 INS27 INS8 INS25 UPD42 INS42 INS42 INS14 INS42 INS42 INS32 INS42 INS42 INS2 INS40 INS42 INS32 INS42 INS33 INS60 INS25 MOV60 INS54 INS42 INS27 INS42 INS2 INS42 INS42 MOV21 INS27 INS8 INS8 UPD42 INS43 INS2 INS2 INS32 INS42 INS42 INS42 INS42 INS42 INS32 INS43 INS59 INS27 INS8 INS8 INS8 INS36 INS34 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 INS42 INS21 INS61 INS41 INS42 INS42 INS42 INS42 INS42 MOV2 INS42 INS42 INS42 INS42 INS42 INS11 MOV27 MOV38 INS41 MOV25 INS21 INS27 INS42 INS27 INS7 INS27 INS8 INS42 INS43 INS32 UPD42 INS14 INS32 INS32 INS42 INS42 INS42 INS34 INS42 INS27 INS27 INS27 INS21 INS42 UPD42 MOV42 UPD42 MOV42 INS40 INS40 UPD42 INS40 INS43 INS27 INS42 INS42 INS42 INS42 INS42 INS34 INS27 UPD40 MOV40 INS2 INS42 INS37 INS42 UPD40 MOV40 INS40 UPD42 MOV42 INS34 INS42 INS27 UPD42 MOV42 UPD43 INS27 INS42 INS34 UPD42 INS32 INS2 INS42 INS42 INS42 INS42 DEL42 DEL66 DEL66 DEL66 DEL66 DEL42 DEL65 DEL66 DEL42 DEL65 DEL66 DEL66 DEL42 DEL65 DEL66 DEL66 DEL43 DEL39 DEL42 DEL34 DEL59 DEL58 DEL42 DEL27 DEL42 DEL37 DEL62 DEL36 DEL38 DEL42 DEL43 DEL45 DEL42 DEL45 DEL27 DEL14 DEL53 DEL8 DEL25 DEL8 DEL24 DEL42 DEL39 DEL85 DEL5 DEL52 DEL42 DEL22 DEL42 DEL42 DEL42 DEL40 DEL27 DEL42 DEL8 DEL83 DEL42 DEL8 DEL42 DEL42 DEL32 DEL40 DEL27 DEL42 DEL43 DEL85 DEL5 DEL42 DEL42 DEL43 DEL85 DEL5 DEL40 DEL3 DEL59 DEL60 DEL39 DEL42 DEL34 DEL59 DEL58 DEL42 DEL40 DEL27 DEL42 DEL37 DEL42 DEL42 DEL2 DEL42 DEL42 DEL32 DEL7 DEL21 DEL8 DEL24 DEL42 DEL43 DEL42 DEL42 DEL14 DEL41 DEL8 DEL25 DEL25 DEL8 DEL31 DEL65 DEL65 DEL39 DEL85 DEL5 DEL42 DEL42 DEL2 DEL42 DEL32 DEL29 DEL83 DEL83 DEL83 DEL42 DEL43 DEL29 DEL83 DEL83 DEL39 DEL23 DEL29 DEL83 DEL39 DEL42 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL14 DEL53 DEL8 DEL31 DEL29 DEL83 DEL39 DEL42 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL14 DEL53 DEL8 DEL31 DEL65 DEL65 DEL29 DEL83 DEL39 DEL42 DEL42 DEL42 DEL32 DEL42 DEL27 DEL41 DEL8 DEL31 DEL65 DEL65 DEL29 DEL83 DEL39 DEL42 DEL42 DEL42 DEL32 DEL41 DEL8 DEL31 DEL65 DEL65 DEL29 DEL83 DEL39 DEL42 DEL42 DEL43 DEL42 DEL42 DEL32 DEL41 DEL8 DEL31 DEL29 DEL39 DEL85 DEL5 DEL42 DEL44 DEL42 DEL43 DEL14 DEL53 DEL8 DEL31 DEL42 DEL66 DEL65 DEL29 DEL83 DEL39 DEL42 DEL39 DEL42 DEL44 DEL42 DEL43 DEL14 DEL53 DEL8 DEL31 DEL65 DEL65 DEL29 DEL83 DEL39 DEL42 DEL42 DEL43 DEL32 DEL21 DEL8 DEL31 DEL55 DEL66 DEL66 DEL65 DEL29 DEL83 DEL83 DEL83 DEL42 DEL43 DEL66 DEL65 DEL29 DEL83 DEL83 DEL42 DEL43 DEL85 DEL5 DEL42 DEL59 DEL23 DEL66 DEL65 DEL29 DEL83 DEL83 DEL39 DEL85 DEL5 DEL42 DEL59 DEL23 DEL66 DEL66 DEL65 DEL29 DEL83 DEL42 DEL43 DEL42 DEL59 DEL23 DEL66 DEL42 DEL67 DEL65 DEL66 DEL42 DEL67 DEL65 DEL66 DEL65 DEL29 DEL83 DEL39 DEL42 DEL34 DEL59 DEL23 DEL66 DEL65 DEL42 DEL66 DEL65 DEL42 DEL66 DEL66 DEL65 DEL29 DEL42 DEL42 DEL43 DEL85 DEL5 DEL42 DEL44 DEL39 DEL85 DEL5 DEL42 DEL44 DEL52 DEL42 DEL22 DEL42 DEL7 DEL21 DEL42 DEL42 DEL42 DEL2 DEL7 DEL21 DEL8 DEL31 DEL42 DEL66 DEL65 DEL29 DEL39 DEL42 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL14 DEL53 DEL8 DEL31 DEL42 DEL66 DEL65 DEL29 DEL83 DEL39 DEL42 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL14 DEL53 DEL8 DEL31 DEL65 DEL65 DEL29 DEL83 DEL39 DEL42 DEL42 DEL42 DEL2 DEL42 DEL42 DEL32 DEL27 DEL41 DEL8 DEL31 DEL65 DEL65 DEL29 DEL83 DEL39 DEL42 DEL32 DEL41 DEL8 DEL31 DEL65 DEL65 DEL29 DEL83 DEL39 DEL42 DEL42 DEL43 DEL27 DEL42 DEL38 DEL27 DEL42 DEL33 DEL7 DEL21 DEL8 DEL42 DEL42 DEL42 DEL2 DEL7 DEL21 DEL8 DEL25 DEL8 DEL61 DEL42 DEL33 DEL27 DEL41 DEL8 DEL31 DEL39 DEL85 DEL5 DEL42 DEL44 DEL39 DEL34 DEL59 DEL58 DEL40 DEL27 DEL42 DEL32 DEL27 DEL42 DEL37 DEL42 DEL37 DEL2 DEL42 DEL32 DEL7 DEL21 DEL8 DEL24 DEL42 DEL41 DEL8 DEL31 DEL65 DEL65 DEL29 DEL83 DEL39 DEL42 DEL39 DEL42 DEL44 DEL42 DEL43 DEL42 DEL32 DEL38 DEL9 DEL41 DEL8 DEL25 DEL8 DEL42 DEL32 DEL27 DEL19 DEL9 DEL41 DEL8 DEL31 DEL65 DEL65 DEL29 DEL83 DEL39 DEL42 DEL42 DEL43 DEL39 DEL42 DEL34 DEL59 DEL58 DEL27 DEL37 DEL42 DEL42 DEL2 DEL42 DEL32 DEL21 DEL8 DEL24 DEL8 DEL31 DEL55

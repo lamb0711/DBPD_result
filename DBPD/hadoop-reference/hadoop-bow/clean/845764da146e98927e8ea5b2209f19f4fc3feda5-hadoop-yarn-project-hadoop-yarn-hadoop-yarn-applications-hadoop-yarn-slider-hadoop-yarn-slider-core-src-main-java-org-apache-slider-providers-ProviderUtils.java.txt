@@ -1,0 +1,279 @@
+YARN-6405. Improve configuring services through REST API. Contributed by Jian He
+
++import org.apache.hadoop.fs.FileSystem;
+-import org.apache.hadoop.io.IOUtils;
+-import org.apache.slider.api.InternalKeys;
++import java.io.OutputStream;
++import java.util.concurrent.ExecutionException;
++import static org.apache.slider.api.ServiceApiConstants.*;
++import static org.apache.slider.util.ServiceApiUtil.$;
++
+-   * @param provider provider to add
++   * @param providerClass provider to add
+-  // Build key -> value map
+-  // value will be substituted by corresponding data in tokenMap
+-  public Map<String, String> substituteConfigs(Map<String, String> configs,
++  public static String substituteStrWithTokens(String content,
++      Map<String, String> tokensForSubstitution) {
++    for (Map.Entry<String, String> token : tokensForSubstitution.entrySet()) {
++      content =
++          content.replaceAll(Pattern.quote(token.getKey()), token.getValue());
++    }
++    return content;
++  }
++
++  // configs will be substituted by corresponding env in tokenMap
++  public void substituteMapWithTokens(Map<String, String> configs,
+-    String format = "${%s}";
+-    Map<String, String> filteredOptions = new HashMap<>();
+-      String key = entry.getKey();
+-      filteredOptions.put(String.format(format, key), value);
++      entry.setValue(value);
+-
+-    return filteredOptions;
++  public static void addEnvForSubstitution(Map<String, String> env,
++      Map<String, String> tokensForSubstitution) {
++    if (env == null || env.isEmpty() || tokensForSubstitution == null
++        || tokensForSubstitution.isEmpty()) {
++      return;
++    }
++    for (Map.Entry<String, String> entry : env.entrySet()) {
++      tokensForSubstitution.put($(entry.getKey()), entry.getValue());
++    }
++  }
+-  //TODO handle Template format config file
+-  public void createConfigFileAndAddLocalResource(ContainerLauncher launcher,
+-      SliderFileSystem fs, Component component,
+-      Map<String, String> tokensForSubstitution,
+-      StateAccessForProviders amState) throws IOException {
++  public synchronized void createConfigFileAndAddLocalResource(
++      ContainerLauncher launcher, SliderFileSystem fs, Component component,
++      Map<String, String> tokensForSubstitution, RoleInstance roleInstance)
++      throws IOException {
+-    if (!fs.getFileSystem().exists(compDir)) {
+-      fs.getFileSystem().mkdirs(compDir,
++    Path compInstanceDir =
++        new Path(compDir, roleInstance.getCompInstanceName());
++    if (!fs.getFileSystem().exists(compInstanceDir)) {
++      fs.getFileSystem().mkdirs(compInstanceDir,
+-      log.info("Creating component dir: " + compDir);
++      roleInstance.compInstanceDir = compInstanceDir;
++      log.info("Creating component instance dir: " + compInstanceDir);
+-      log.info("Component conf dir already exists: " + compDir);
+-      return;
++      log.info("Component instance conf dir already exists: " + compInstanceDir);
+-    for (ConfigFile configFile : component.getConfiguration().getFiles()) {
+-      String fileName = configFile.getSrcFile();
++    // add Configuration#env into tokens substitution
++    addEnvForSubstitution(component.getConfiguration().getEnv(),
++        tokensForSubstitution);
++
++    log.info("Tokens substitution for component: " + roleInstance
++        .getCompInstanceName() + System.lineSeparator()
++        + tokensForSubstitution);
++
++    for (ConfigFile originalFile : component.getConfiguration().getFiles()) {
++      ConfigFile configFile = originalFile.copy();
++      String fileName = new Path(configFile.getDestFile()).getName();
++
+-      // substitute configs
+-      substituteConfigs(configFile.getProps(), tokensForSubstitution);
+-      // write configs onto hdfs
+-      PublishedConfiguration publishedConfiguration =
+-          new PublishedConfiguration(fileName,
+-              configFile.getProps().entrySet());
+-      Path remoteFile = new Path(compDir, fileName);
++      Path remoteFile = new Path(compInstanceDir, fileName);
+-        synchronized (this) {
+-          if (!fs.getFileSystem().exists(remoteFile)) {
+-            PublishedConfigurationOutputter configurationOutputter =
+-                PublishedConfigurationOutputter.createOutputter(
+-                    ConfigFormat.resolve(configFile.getType().toString()),
+-                    publishedConfiguration);
+-            FSDataOutputStream os = null;
+-            try {
+-              os = fs.getFileSystem().create(remoteFile);
+-              configurationOutputter.save(os);
+-              os.flush();
+-              log.info("Created config file on hdfs: " + remoteFile);
+-            } finally {
+-              IOUtils.closeStream(os);
+-            }
++        log.info("Saving config file on hdfs for component " + roleInstance
++            .getCompInstanceName() + ": " + configFile);
++
++        if (configFile.getSrcFile() != null) {
++          // Load config file template
++          switch (configFile.getType()) {
++          case HADOOP_XML:
++            // Hadoop_xml_template
++            resolveHadoopXmlTemplateAndSaveOnHdfs(fs.getFileSystem(),
++                tokensForSubstitution, configFile, remoteFile, roleInstance);
++            break;
++          case TEMPLATE:
++            // plain-template
++            resolvePlainTemplateAndSaveOnHdfs(fs.getFileSystem(),
++                tokensForSubstitution, configFile, remoteFile, roleInstance);
++            break;
++          default:
++            log.info("Not supporting loading src_file for " + configFile);
++            break;
++        } else {
++          // non-template
++          resolveNonTemplateConfigsAndSaveOnHdfs(fs, tokensForSubstitution,
++              roleInstance, configFile, fileName, remoteFile);
+-      // Publish configs
+-      amState.getPublishedSliderConfigurations()
+-          .put(configFile.getSrcFile(), publishedConfiguration);
+-
+-      //TODO why to we need to differetiate  RESOURCE_DIR vs APP_CONF_DIR
++      String symlink = APP_CONF_DIR + "/" + fileName;
+-        String symlink = RESOURCE_DIR + "/" + fileName;
+-        String symlink = APP_CONF_DIR + "/" + fileName;
++  private void resolveNonTemplateConfigsAndSaveOnHdfs(SliderFileSystem fs,
++      Map<String, String> tokensForSubstitution, RoleInstance roleInstance,
++      ConfigFile configFile, String fileName, Path remoteFile)
++      throws IOException {
++    // substitute non-template configs
++    substituteMapWithTokens(configFile.getProps(), tokensForSubstitution);
++
++    // write configs onto hdfs
++    PublishedConfiguration publishedConfiguration =
++        new PublishedConfiguration(fileName,
++            configFile.getProps().entrySet());
++    if (!fs.getFileSystem().exists(remoteFile)) {
++      PublishedConfigurationOutputter configurationOutputter =
++          PublishedConfigurationOutputter.createOutputter(
++              ConfigFormat.resolve(configFile.getType().toString()),
++              publishedConfiguration);
++      try (FSDataOutputStream os = fs.getFileSystem().create(remoteFile)) {
++        configurationOutputter.save(os);
++        os.flush();
++      }
++    } else {
++      log.info("Component instance = " + roleInstance.getCompInstanceName()
++              + ", config file already exists: " + remoteFile);
++    }
++  }
++
++  // 1. substitute config template - only handle hadoop_xml format
++  // 2. save on hdfs
++  @SuppressWarnings("unchecked")
++  private void resolveHadoopXmlTemplateAndSaveOnHdfs(FileSystem fs,
++      Map<String, String> tokensForSubstitution, ConfigFile configFile,
++      Path remoteFile, RoleInstance roleInstance) throws IOException {
++    Map<String, String> conf;
++    try {
++      conf = (Map<String, String>) roleInstance.providerRole.
++          appState.configFileCache.get(configFile);
++    } catch (ExecutionException e) {
++      log.info("Failed to load config file: " + configFile, e);
++      return;
++    }
++    // make a copy for substitution
++    org.apache.hadoop.conf.Configuration confCopy =
++        new org.apache.hadoop.conf.Configuration(false);
++    for (Map.Entry<String, String> entry : conf.entrySet()) {
++      confCopy.set(entry.getKey(), entry.getValue());
++    }
++    // substitute properties
++    for (Map.Entry<String, String> entry : configFile.getProps().entrySet()) {
++      confCopy.set(entry.getKey(), entry.getValue());
++    }
++    // substitute env variables
++    for (Map.Entry<String, String> entry : confCopy) {
++      String val = entry.getValue();
++      if (val != null) {
++        for (Map.Entry<String, String> token : tokensForSubstitution
++            .entrySet()) {
++          val = val.replaceAll(Pattern.quote(token.getKey()), token.getValue());
++          confCopy.set(entry.getKey(), val);
++        }
++      }
++    }
++    // save on hdfs
++    try (OutputStream output = fs.create(remoteFile)) {
++      confCopy.writeXml(output);
++      log.info("Reading config from: " + configFile.getSrcFile()
++          + ", writing to: " + remoteFile);
++    }
++  }
++
++  // 1) read the template as a string
++  // 2) do token substitution
++  // 3) save on hdfs
++  private void resolvePlainTemplateAndSaveOnHdfs(FileSystem fs,
++      Map<String, String> tokensForSubstitution, ConfigFile configFile,
++      Path remoteFile, RoleInstance roleInstance) {
++    String content;
++    try {
++      content = (String) roleInstance.providerRole.appState.configFileCache
++          .get(configFile);
++    } catch (ExecutionException e) {
++      log.info("Failed to load config file: " + configFile, e);
++      return;
++    }
++    // substitute tokens
++    substituteStrWithTokens(content, tokensForSubstitution);
++
++    try (OutputStream output = fs.create(remoteFile)) {
++      org.apache.commons.io.IOUtils.write(content, output);
++    } catch (IOException e) {
++      log.info("Failed to create " + remoteFile);
++    }
++  }
++
+-   * @param componentName component name
+-   * @param componentGroup component group
+-   * @param containerId container ID
+-  public Map<String, String> getStandardTokenMap(
+-      Configuration appConf, Configuration componentConf, String componentName,
+-      String componentGroup, String containerId, String clusterName) {
++  public Map<String, String> getStandardTokenMap(Configuration appConf,
++      RoleInstance roleInstance, String clusterName) {
+-    if (containerId != null) {
+-      tokens.put("${CONTAINER_ID}", containerId);
+-    }
++
+-    String prefix = componentConf.getProperty(ROLE_PREFIX);
+-    String dataDirSuffix = "";
+-    if (prefix == null) {
+-      prefix = "";
+-    } else {
+-      dataDirSuffix = "_" + SliderUtils.trimPrefix(prefix);
+-    }
+-    tokens.put("${DEFAULT_DATA_DIR}",
+-        appConf.getProperty(InternalKeys.INTERNAL_DATA_DIR_PATH)
+-            + dataDirSuffix);
+-    tokens.put("${JAVA_HOME}", appConf.getProperty(JAVA_HOME));
+-    tokens.put("${COMPONENT_NAME}", componentName);
+-    tokens.put("${COMPONENT_NAME.lc}", componentName.toLowerCase());
+-    tokens.put("${COMPONENT_PREFIX}", prefix);
+-    tokens.put("${COMPONENT_PREFIX.lc}", prefix.toLowerCase());
+-    if (!componentName.equals(componentGroup) &&
+-        componentName.startsWith(componentGroup)) {
+-      tokens.put("${COMPONENT_ID}",
+-          componentName.substring(componentGroup.length()));
+-    }
+-    if (clusterName != null) {
+-      tokens.put("${CLUSTER_NAME}", clusterName);
+-      tokens.put("${CLUSTER_NAME.lc}", clusterName.toLowerCase());
+-      tokens.put("${APP_NAME}", clusterName);
+-      tokens.put("${APP_NAME.lc}", clusterName.toLowerCase());
+-    }
+-    tokens.put("${APP_COMPONENT_NAME}", componentName);
+-    tokens.put("${APP_COMPONENT_NAME.lc}", componentName.toLowerCase());
++    tokens.put(SERVICE_NAME_LC, clusterName.toLowerCase());
++    tokens.put(SERVICE_NAME, clusterName);
++    tokens.put(COMPONENT_NAME, roleInstance.role);
++    tokens.put(COMPONENT_NAME_LC, roleInstance.role.toLowerCase());
++    tokens.put(COMPONENT_INSTANCE_NAME, roleInstance.getCompInstanceName());
++    tokens.put(CONTAINER_ID, roleInstance.getContainerId().toString());
++    tokens.put(COMPONENT_ID, String.valueOf(roleInstance.componentId));
+-  public void addRoleHostTokens(Map<String, String> tokens,
++  public void addComponentHostTokens(Map<String, String> tokens,
+-      tokens.put("${" + tokenName + "}", hosts);
++      tokens.put($(tokenName), hosts);
+-        record.description = roleName.replaceAll("_", "-");
++        String componentInstanceName = role.getCompInstanceName();
++        record.description = componentInstanceName.replaceAll("_", "-");

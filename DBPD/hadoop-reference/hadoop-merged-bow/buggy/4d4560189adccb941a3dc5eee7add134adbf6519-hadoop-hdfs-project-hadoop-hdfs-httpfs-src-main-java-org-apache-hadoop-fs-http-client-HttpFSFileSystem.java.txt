@@ -1,0 +1,289 @@
+HDFS-3113. httpfs does not support delegation tokens. (tucu)
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/trunk@1365988 13f79535-47bb-0310-9956-ffa450edef68
+
++import org.apache.hadoop.fs.DelegationTokenRenewer;
++import org.apache.hadoop.hdfs.DFSConfigKeys;
++import org.apache.hadoop.net.NetUtils;
++import org.apache.hadoop.security.token.Token;
++import org.apache.hadoop.security.token.TokenIdentifier;
+-import org.json.simple.parser.JSONParser;
+-import org.json.simple.parser.ParseException;
+-import java.io.InputStreamReader;
+-import java.lang.reflect.Constructor;
++import java.net.InetSocketAddress;
+-import java.net.URLEncoder;
++import java.security.PrivilegedExceptionAction;
++import java.util.List;
++import java.util.concurrent.Callable;
+-public class HttpFSFileSystem extends FileSystem {
++public class HttpFSFileSystem extends FileSystem
++  implements DelegationTokenRenewer.Renewable {
+-  public static final String SERVICE_NAME = "/webhdfs";
++  public static final String SERVICE_NAME = HttpFSUtils.SERVICE_NAME;
+-  public static final String SERVICE_VERSION = "/v1";
++  public static final String SERVICE_VERSION = HttpFSUtils.SERVICE_VERSION;
+-  public static final String SERVICE_PREFIX = SERVICE_NAME + SERVICE_VERSION;
++  public static final String SCHEME = "webhdfs";
+-  public static final String RENEWER_PARAM = "renewer";
+-  public static final String DELEGATION_TOKEN_JSON = "Token";
+-  public static final String DELEGATION_TOKEN_URL_STRING_JSON = "urlString";
+-
++  private InetSocketAddress httpFSAddr;
++  private UserGroupInformation realUser;
++  private Token<?> delegationToken;
++
++  //This method enables handling UGI doAs with SPNEGO, we have to
++  //fallback to the realuser who logged in with Kerberos credentials
++  private <T> T doAsRealUserIfNecessary(final Callable<T> callable)
++    throws IOException {
++    try {
++      if (realUser.getShortUserName().equals(doAs)) {
++        return callable.call();
++      } else {
++        return realUser.doAs(new PrivilegedExceptionAction<T>() {
++          @Override
++          public T run() throws Exception {
++            return callable.call();
++          }
++        });
++      }
++    } catch (Exception ex) {
++      throw new IOException(ex.toString(), ex);
++    }
++  }
+-  private HttpURLConnection getConnection(String method, Map<String, String> params,
+-                                          Path path, boolean makeQualified) throws IOException {
+-    params.put(DO_AS_PARAM, doAs);
++  private HttpURLConnection getConnection(final String method,
++      Map<String, String> params, Path path, boolean makeQualified)
++      throws IOException {
++    if (!realUser.getShortUserName().equals(doAs)) {
++      params.put(DO_AS_PARAM, doAs);
++    }
++    HttpFSKerberosAuthenticator.injectDelegationToken(params, delegationToken);
+-    URI uri = path.toUri();
+-    StringBuilder sb = new StringBuilder();
+-    sb.append(uri.getScheme()).append("://").append(uri.getAuthority()).
+-      append(SERVICE_PREFIX).append(uri.getPath());
+-
+-    String separator = "?";
+-    for (Map.Entry<String, String> entry : params.entrySet()) {
+-      sb.append(separator).append(entry.getKey()).append("=").
+-        append(URLEncoder.encode(entry.getValue(), "UTF8"));
+-      separator = "&";
+-    }
+-    URL url = new URL(sb.toString());
+-    return getConnection(url, method);
++    final URL url = HttpFSUtils.createHttpURL(path, params);
++    return doAsRealUserIfNecessary(new Callable<HttpURLConnection>() {
++      @Override
++      public HttpURLConnection call() throws Exception {
++        return getConnection(url, method);
++      }
++    });
+-      getConf().getClass("httpfs.authenticator.class", HttpKerberosAuthenticator.class, Authenticator.class);
++      getConf().getClass("httpfs.authenticator.class",
++                         HttpFSKerberosAuthenticator.class, Authenticator.class);
+-   * Convenience method that JSON Parses the <code>InputStream</code> of a <code>HttpURLConnection</code>.
+-   *
+-   * @param conn the <code>HttpURLConnection</code>.
+-   *
+-   * @return the parsed JSON object.
+-   *
+-   * @throws IOException thrown if the <code>InputStream</code> could not be JSON parsed.
+-   */
+-  private static Object jsonParse(HttpURLConnection conn) throws IOException {
+-    try {
+-      JSONParser parser = new JSONParser();
+-      return parser.parse(new InputStreamReader(conn.getInputStream()));
+-    } catch (ParseException ex) {
+-      throw new IOException("JSON parser error, " + ex.getMessage(), ex);
+-    }
+-  }
+-
+-  /**
+-   * Validates the status of an <code>HttpURLConnection</code> against an expected HTTP
+-   * status code. If the current status code is not the expected one it throws an exception
+-   * with a detail message using Server side error messages if available.
+-   *
+-   * @param conn the <code>HttpURLConnection</code>.
+-   * @param expected the expected HTTP status code.
+-   *
+-   * @throws IOException thrown if the current status code does not match the expected one.
+-   */
+-  private static void validateResponse(HttpURLConnection conn, int expected) throws IOException {
+-    int status = conn.getResponseCode();
+-    if (status != expected) {
+-      try {
+-        JSONObject json = (JSONObject) jsonParse(conn);
+-        json = (JSONObject) json.get(ERROR_JSON);
+-        String message = (String) json.get(ERROR_MESSAGE_JSON);
+-        String exception = (String) json.get(ERROR_EXCEPTION_JSON);
+-        String className = (String) json.get(ERROR_CLASSNAME_JSON);
+-
+-        try {
+-          ClassLoader cl = HttpFSFileSystem.class.getClassLoader();
+-          Class klass = cl.loadClass(className);
+-          Constructor constr = klass.getConstructor(String.class);
+-          throw (IOException) constr.newInstance(message);
+-        } catch (IOException ex) {
+-          throw ex;
+-        } catch (Exception ex) {
+-          throw new IOException(MessageFormat.format("{0} - {1}", exception, message));
+-        }
+-      } catch (IOException ex) {
+-        if (ex.getCause() instanceof IOException) {
+-          throw (IOException) ex.getCause();
+-        }
+-        throw new IOException(MessageFormat.format("HTTP status [{0}], {1}", status, conn.getResponseMessage()));
+-      }
+-    }
+-  }
+-
+-  /**
+-    doAs = ugi.getUserName();
++
++    //the real use is the one that has the Kerberos credentials needed for
++    //SPNEGO to work
++    realUser = ugi.getRealUser();
++    if (realUser == null) {
++      realUser = UserGroupInformation.getLoginUser();
++    }
++    doAs = ugi.getShortUserName();
+-      uri = new URI(name.getScheme() + "://" + name.getHost() + ":" + name.getPort());
++      uri = new URI(name.getScheme() + "://" + name.getAuthority());
++      httpFSAddr = NetUtils.createSocketAddr(getCanonicalUri().toString());
++  @Override
++  public String getScheme() {
++    return SCHEME;
++  }
++
++   * Get the default port for this file system.
++   * @return the default port or 0 if there isn't one
++   */
++  @Override
++  protected int getDefaultPort() {
++    return getConf().getInt(DFSConfigKeys.DFS_NAMENODE_HTTP_PORT_KEY,
++        DFSConfigKeys.DFS_NAMENODE_HTTP_PORT_DEFAULT);
++  }
++
++  /**
+-    validateResponse(conn, HttpURLConnection.HTTP_OK);
++    HttpFSUtils.validateResponse(conn, HttpURLConnection.HTTP_OK);
+-        validateResponse(conn, closeStatus);
++        HttpFSUtils.validateResponse(conn, closeStatus);
+-            validateResponse(conn, expectedStatus);
++            HttpFSUtils.validateResponse(conn, expectedStatus);
+-          validateResponse(conn, HTTP_TEMPORARY_REDIRECT);
++          HttpFSUtils.validateResponse(conn, HTTP_TEMPORARY_REDIRECT);
+-        validateResponse(conn, HTTP_TEMPORARY_REDIRECT);
++        HttpFSUtils.validateResponse(conn, HTTP_TEMPORARY_REDIRECT);
+-    validateResponse(conn, HttpURLConnection.HTTP_OK);
+-    JSONObject json = (JSONObject) jsonParse(conn);
++    HttpFSUtils.validateResponse(conn, HttpURLConnection.HTTP_OK);
++    JSONObject json = (JSONObject) HttpFSUtils.jsonParse(conn);
+-    validateResponse(conn, HttpURLConnection.HTTP_OK);
+-    JSONObject json = (JSONObject) jsonParse(conn);
++    HttpFSUtils.validateResponse(conn, HttpURLConnection.HTTP_OK);
++    JSONObject json = (JSONObject) HttpFSUtils.jsonParse(conn);
+-    validateResponse(conn, HttpURLConnection.HTTP_OK);
+-    JSONObject json = (JSONObject) jsonParse(conn);
++    HttpFSUtils.validateResponse(conn, HttpURLConnection.HTTP_OK);
++    JSONObject json = (JSONObject) HttpFSUtils.jsonParse(conn);
+-    validateResponse(conn, HttpURLConnection.HTTP_OK);
+-    JSONObject json = (JSONObject) jsonParse(conn);
++    HttpFSUtils.validateResponse(conn, HttpURLConnection.HTTP_OK);
++    JSONObject json = (JSONObject) HttpFSUtils.jsonParse(conn);
+-    validateResponse(conn, HttpURLConnection.HTTP_OK);
+-    JSONObject json = (JSONObject) jsonParse(conn);
++    HttpFSUtils.validateResponse(conn, HttpURLConnection.HTTP_OK);
++    JSONObject json = (JSONObject) HttpFSUtils.jsonParse(conn);
+-      validateResponse(conn, HttpURLConnection.HTTP_OK);
+-      JSONObject json = (JSONObject) jsonParse(conn);
++      HttpFSUtils.validateResponse(conn, HttpURLConnection.HTTP_OK);
++      JSONObject json = (JSONObject) HttpFSUtils.jsonParse(conn);
+-    validateResponse(conn, HttpURLConnection.HTTP_OK);
++    HttpFSUtils.validateResponse(conn, HttpURLConnection.HTTP_OK);
+-    validateResponse(conn, HttpURLConnection.HTTP_OK);
++    HttpFSUtils.validateResponse(conn, HttpURLConnection.HTTP_OK);
+-    validateResponse(conn, HttpURLConnection.HTTP_OK);
++    HttpFSUtils.validateResponse(conn, HttpURLConnection.HTTP_OK);
+-    validateResponse(conn, HttpURLConnection.HTTP_OK);
+-    JSONObject json = (JSONObject) jsonParse(conn);
++    HttpFSUtils.validateResponse(conn, HttpURLConnection.HTTP_OK);
++    JSONObject json = (JSONObject) HttpFSUtils.jsonParse(conn);
+-  /**
+-   * Creates a <code>FileStatus</code> object using a JSON file-status payload
+-   * received from a HttpFSServer server.
+-   *
+-   * @param json a JSON file-status payload received from a HttpFSServer server
+-   *
+-   * @return the corresponding <code>FileStatus</code>
+-   */
+-    validateResponse(conn, HttpURLConnection.HTTP_OK);
+-    JSONObject json =
+-      (JSONObject) ((JSONObject) jsonParse(conn)).get(CONTENT_SUMMARY_JSON);
++    HttpFSUtils.validateResponse(conn, HttpURLConnection.HTTP_OK);
++    JSONObject json = (JSONObject) ((JSONObject)
++      HttpFSUtils.jsonParse(conn)).get(CONTENT_SUMMARY_JSON);
+-    validateResponse(conn, HttpURLConnection.HTTP_OK);
+-    final JSONObject json =
+-      (JSONObject) ((JSONObject) jsonParse(conn)).get(FILE_CHECKSUM_JSON);
++    HttpFSUtils.validateResponse(conn, HttpURLConnection.HTTP_OK);
++    final JSONObject json = (JSONObject) ((JSONObject)
++      HttpFSUtils.jsonParse(conn)).get(FILE_CHECKSUM_JSON);
++
++  @Override
++  @SuppressWarnings("deprecation")
++  public Token<?> getDelegationToken(final String renewer)
++    throws IOException {
++    return doAsRealUserIfNecessary(new Callable<Token<?>>() {
++      @Override
++      public Token<?> call() throws Exception {
++        return HttpFSKerberosAuthenticator.
++          getDelegationToken(uri, httpFSAddr, authToken, renewer);
++      }
++    });
++  }
++
++
++  @Override
++  public List<Token<?>> getDelegationTokens(final String renewer)
++    throws IOException {
++    return doAsRealUserIfNecessary(new Callable<List<Token<?>>>() {
++      @Override
++      public List<Token<?>> call() throws Exception {
++        return HttpFSKerberosAuthenticator.
++          getDelegationTokens(uri, httpFSAddr, authToken, renewer);
++      }
++    });
++  }
++
++  public long renewDelegationToken(final Token<?> token) throws IOException {
++    return doAsRealUserIfNecessary(new Callable<Long>() {
++      @Override
++      public Long call() throws Exception {
++        return HttpFSKerberosAuthenticator.
++          renewDelegationToken(uri,  authToken, token);
++      }
++    });
++  }
++
++  public void cancelDelegationToken(final Token<?> token) throws IOException {
++    HttpFSKerberosAuthenticator.
++      cancelDelegationToken(uri, authToken, token);
++  }
++
++  @Override
++  public Token<?> getRenewToken() {
++    return delegationToken;
++  }
++
++  @Override
++  public <T extends TokenIdentifier> void setDelegationToken(Token<T> token) {
++    delegationToken = token;
++  }
++
+
+MOV26 MOV26 MOV26 MOV26 MOV26 INS26 INS26 INS26 INS26 MOV23 MOV23 MOV23 MOV31 UPD40 INS40 INS40 UPD40 INS40 UPD40 UPD40 UPD40 INS40 INS43 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS40 MOV43 MOV43 MOV43 UPD83 UPD43 UPD83 UPD43 UPD83 INS74 INS73 UPD43 UPD42 MOV43 MOV25 INS78 INS83 MOV43 INS42 INS8 INS29 INS78 UPD83 MOV83 UPD39 MOV39 INS42 INS8 INS78 INS79 INS83 INS74 INS42 MOV44 MOV43 INS8 INS78 INS83 INS74 INS42 INS44 MOV43 INS8 INS83 INS39 INS42 INS44 MOV43 INS8 INS83 INS39 INS42 INS44 MOV43 INS8 INS78 INS83 INS74 INS42 INS8 INS78 INS83 INS73 INS39 INS42 INS44 INS8 INS40 INS40 INS42 INS45 UPD42 UPD42 UPD42 UPD42 INS43 INS76 UPD42 INS42 UPD42 INS83 INS74 UPD42 INS83 MOV43 INS25 INS60 INS41 INS21 INS25 INS42 INS41 INS65 UPD65 MOV65 INS42 INS41 INS42 INS42 INS45 INS43 INS76 INS83 MOV43 UPD42 INS41 INS42 INS43 INS74 INS83 MOV43 INS42 INS41 INS83 INS74 INS42 INS41 INS83 INS74 UPD42 MOV42 INS21 INS42 INS43 INS76 INS41 INS42 INS42 INS43 INS74 INS42 INS21 UPD42 MOV42 INS43 INS43 INS38 INS8 INS83 MOV43 INS59 INS32 INS7 INS27 INS8 INS42 UPD66 MOV66 UPD66 INS32 MOV43 MOV43 MOV43 MOV43 MOV43 MOV43 MOV43 UPD42 MOV42 INS32 UPD42 MOV42 INS43 INS76 INS32 INS43 INS76 INS32 INS43 INS76 INS32 UPD42 MOV42 INS42 INS42 INS43 INS43 INS7 UPD42 MOV42 INS42 INS25 MOV44 INS32 MOV21 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 UPD42 INS42 INS32 UPD42 MOV42 INS14 INS42 INS32 INS42 INS33 INS21 INS21 INS32 INS42 INS40 INS40 INS42 MOV44 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS14 UPD42 MOV42 UPD42 MOV42 INS14 UPD42 MOV42 UPD42 MOV42 INS14 UPD42 MOV42 INS42 INS42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 INS42 INS42 INS42 INS42 INS32 INS8 INS8 INS32 INS42 INS42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 INS74 INS1 INS42 INS42 INS7 UPD42 INS7 INS42 MOV43 MOV43 MOV43 MOV43 MOV43 MOV43 MOV43 MOV43 MOV43 INS74 INS1 INS74 INS1 INS74 INS1 INS32 INS42 INS42 INS41 MOV41 UPD42 MOV42 UPD42 MOV42 INS43 MOV43 INS31 UPD43 INS42 INS32 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS43 INS74 INS31 INS43 INS74 INS31 INS43 INS43 INS31 INS42 INS42 INS32 INS32 INS42 INS42 INS78 INS83 MOV43 INS42 INS43 INS8 UPD42 INS42 INS42 INS42 INS42 INS32 INS42 MOV53 MOV43 INS42 INS43 INS76 INS78 INS83 INS74 INS42 INS43 INS8 UPD42 MOV42 INS43 INS74 INS78 INS83 INS74 INS42 INS43 INS8 INS42 UPD42 MOV42 INS78 INS83 INS43 INS42 INS43 INS8 INS42 INS42 UPD42 UPD42 MOV42 UPD42 MOV42 INS42 UPD42 MOV42 INS42 MOV41 INS32 INS42 INS42 MOV43 INS32 INS42 INS42 INS43 INS76 UPD42 MOV42 INS41 INS42 INS43 INS76 INS42 INS43 INS74 INS42 INS41 INS42 INS42 UPD42 MOV42 INS41 INS74 INS1 UPD42 INS42 INS42 INS42 INS42 MOV42 MOV42 INS42 INS32 UPD42 MOV42 INS42 INS43 INS76 INS32 INS32 INS43 INS43 INS31 MOV44 INS42 INS42 UPD42 MOV42 UPD42 MOV42 INS42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 INS42 UPD42 MOV42 UPD42 MOV42 INS42 INS42 INS42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 INS42 INS42 UPD42 MOV42 INS42 INS78 INS83 INS43 INS42 INS43 INS8 MOV53 INS42 INS42 INS42 INS41 INS32 INS42 UPD42 MOV42 UPD42 MOV42 DEL45 DEL45 DEL42 DEL42 DEL42 DEL27 DEL83 DEL83 DEL45 DEL83 DEL83 DEL45 DEL83 DEL83 DEL43 DEL45 DEL66 DEL65 DEL42 DEL66 DEL65 DEL66 DEL65 DEL42 DEL66 DEL65 DEL29 DEL83 DEL43 DEL32 DEL42 DEL43 DEL42 DEL42 DEL43 DEL14 DEL59 DEL60 DEL42 DEL43 DEL42 DEL44 DEL45 DEL32 DEL27 DEL42 DEL43 DEL42 DEL43 DEL42 DEL32 DEL59 DEL60 DEL42 DEL43 DEL42 DEL42 DEL43 DEL14 DEL59 DEL60 DEL42 DEL42 DEL42 DEL42 DEL32 DEL32 DEL42 DEL45 DEL32 DEL42 DEL42 DEL32 DEL32 DEL32 DEL42 DEL42 DEL32 DEL42 DEL43 DEL42 DEL45 DEL59 DEL60 DEL40 DEL43 DEL74 DEL42 DEL44 DEL42 DEL42 DEL32 DEL32 DEL42 DEL42 DEL32 DEL32 DEL45 DEL32 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL45 DEL32 DEL32 DEL21 DEL42 DEL45 DEL7 DEL21 DEL8 DEL70 DEL43 DEL42 DEL42 DEL42 DEL32 DEL14 DEL59 DEL60 DEL66 DEL66 DEL66 DEL65 DEL42 DEL66 DEL65 DEL42 DEL65 DEL29 DEL83 DEL42 DEL42 DEL44 DEL39 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL42 DEL27 DEL43 DEL42 DEL32 DEL11 DEL59 DEL60 DEL42 DEL42 DEL32 DEL11 DEL7 DEL21 DEL43 DEL42 DEL43 DEL42 DEL42 DEL32 DEL11 DEL59 DEL60 DEL43 DEL42 DEL43 DEL42 DEL42 DEL42 DEL32 DEL11 DEL59 DEL60 DEL43 DEL42 DEL42 DEL32 DEL11 DEL59 DEL60 DEL42 DEL43 DEL42 DEL42 DEL43 DEL57 DEL42 DEL32 DEL59 DEL60 DEL43 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL43 DEL42 DEL42 DEL42 DEL57 DEL32 DEL59 DEL60 DEL43 DEL32 DEL11 DEL53 DEL8 DEL43 DEL44 DEL42 DEL53 DEL8 DEL12 DEL42 DEL43 DEL45 DEL42 DEL32 DEL14 DEL53 DEL8 DEL12 DEL54 DEL8 DEL43 DEL42 DEL44 DEL42 DEL42 DEL32 DEL62 DEL42 DEL42 DEL32 DEL11 DEL53 DEL8 DEL25 DEL42 DEL42 DEL45 DEL42 DEL42 DEL42 DEL32 DEL32 DEL14 DEL53 DEL8 DEL12 DEL54 DEL8 DEL25 DEL8 DEL31 DEL45 DEL42 DEL42 DEL32 DEL42 DEL66 DEL66 DEL65 DEL42 DEL66 DEL65 DEL66 DEL65 DEL29 DEL42 DEL43 DEL42 DEL43 DEL32 DEL39

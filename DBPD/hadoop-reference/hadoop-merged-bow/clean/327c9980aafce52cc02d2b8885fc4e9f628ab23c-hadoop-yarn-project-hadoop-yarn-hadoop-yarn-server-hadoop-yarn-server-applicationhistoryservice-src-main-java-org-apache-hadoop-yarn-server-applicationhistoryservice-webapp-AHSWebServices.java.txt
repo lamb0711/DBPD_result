@@ -1,0 +1,216 @@
+YARN-6100. Improve YARN webservice to output aggregated container logs. Contributed by Xuan Gong.
+
+-import java.io.DataInputStream;
+-import java.io.EOFException;
++import org.apache.hadoop.classification.InterfaceAudience.Private;
+-import org.apache.hadoop.fs.FileContext;
+-import org.apache.hadoop.fs.FileStatus;
+-import org.apache.hadoop.fs.RemoteIterator;
+-import org.apache.hadoop.yarn.conf.YarnConfiguration;
+-import org.apache.hadoop.yarn.logaggregation.AggregatedLogFormat;
+-import org.apache.hadoop.yarn.logaggregation.LogAggregationUtils;
+-import org.apache.hadoop.yarn.logaggregation.AggregatedLogFormat.LogKey;
+-import org.apache.hadoop.yarn.util.Times;
++import com.google.common.annotations.VisibleForTesting;
+-          filename, format, length);
++          filename, format, length, false);
+-
+-    ContainerInfo containerInfo;
+-    try {
+-      containerInfo = super.getContainer(
+-          req, res, appId.toString(),
+-          containerId.getApplicationAttemptId().toString(),
+-          containerId.toString());
+-    } catch (Exception ex) {
+-      if (isFinishedState(appInfo.getAppState())) {
+-        // directly find logs from HDFS.
+-        return sendStreamOutputResponse(appId, appOwner, null, containerIdStr,
+-            filename, format, length);
+-      }
+-      return createBadResponse(Status.INTERNAL_SERVER_ERROR,
+-          "Can not get ContainerInfo for the container: " + containerId);
++    if (isFinishedState(appInfo.getAppState())) {
++      // directly find logs from HDFS.
++      return sendStreamOutputResponse(appId, appOwner, null, containerIdStr,
++          filename, format, length, false);
+-    String nodeId = containerInfo.getNodeId();
++
++      ContainerInfo containerInfo;
++      try {
++        containerInfo = super.getContainer(
++            req, res, appId.toString(),
++            containerId.getApplicationAttemptId().toString(),
++            containerId.toString());
++      } catch (Exception ex) {
++        // output the aggregated logs
++        return sendStreamOutputResponse(appId, appOwner, null, containerIdStr,
++            filename, format, length, true);
++      }
+-    } else if (isFinishedState(appInfo.getAppState())) {
+-      return sendStreamOutputResponse(appId, appOwner, nodeId,
+-          containerIdStr, filename, format, length);
+-      String fileName, String format, long bytes) {
++      String fileName, String format, long bytes,
++      boolean printEmptyLocalContainerLog) {
+-          containerIdStr, fileName, bytes);
++          containerIdStr, fileName, bytes, printEmptyLocalContainerLog);
+-    if (stream == null) {
+-      return createBadResponse(Status.INTERNAL_SERVER_ERROR,
+-          "Can not get log for container: " + containerIdStr);
+-    }
+-  private StreamingOutput getStreamingOutput(ApplicationId appId,
+-      String appOwner, final String nodeId, final String containerIdStr,
+-      final String logFile, final long bytes) throws IOException{
+-    String suffix = LogAggregationUtils.getRemoteNodeLogDirSuffix(conf);
+-    org.apache.hadoop.fs.Path remoteRootLogDir = new org.apache.hadoop.fs.Path(
+-        conf.get(YarnConfiguration.NM_REMOTE_APP_LOG_DIR,
+-            YarnConfiguration.DEFAULT_NM_REMOTE_APP_LOG_DIR));
+-    org.apache.hadoop.fs.Path qualifiedRemoteRootLogDir =
+-        FileContext.getFileContext(conf).makeQualified(remoteRootLogDir);
+-    FileContext fc = FileContext.getFileContext(
+-        qualifiedRemoteRootLogDir.toUri(), conf);
+-    org.apache.hadoop.fs.Path remoteAppDir = null;
+-    if (appOwner == null) {
+-      org.apache.hadoop.fs.Path toMatch = LogAggregationUtils
+-          .getRemoteAppLogDir(remoteRootLogDir, appId, "*", suffix);
+-      FileStatus[] matching  = fc.util().globStatus(toMatch);
+-      if (matching == null || matching.length != 1) {
+-        return null;
+-      }
+-      remoteAppDir = matching[0].getPath();
+-    } else {
+-      remoteAppDir = LogAggregationUtils
+-          .getRemoteAppLogDir(remoteRootLogDir, appId, appOwner, suffix);
+-    }
+-    final RemoteIterator<FileStatus> nodeFiles;
+-    nodeFiles = fc.listStatus(remoteAppDir);
+-    if (!nodeFiles.hasNext()) {
+-      return null;
+-    }
+-
++  private StreamingOutput getStreamingOutput(final ApplicationId appId,
++      final String appOwner, final String nodeId, final String containerIdStr,
++      final String logFile, final long bytes,
++      final boolean printEmptyLocalContainerLog) throws IOException{
+-        boolean findLogs = false;
+-        while (nodeFiles.hasNext()) {
+-          final FileStatus thisNodeFile = nodeFiles.next();
+-          String nodeName = thisNodeFile.getPath().getName();
+-          if ((nodeId == null || nodeName.contains(LogAggregationUtils
+-              .getNodeString(nodeId))) && !nodeName.endsWith(
+-              LogAggregationUtils.TMP_FILE_SUFFIX)) {
+-            AggregatedLogFormat.LogReader reader = null;
+-            try {
+-              reader = new AggregatedLogFormat.LogReader(conf,
+-                  thisNodeFile.getPath());
+-              DataInputStream valueStream;
+-              LogKey key = new LogKey();
+-              valueStream = reader.next(key);
+-              while (valueStream != null && !key.toString()
+-                  .equals(containerIdStr)) {
+-                // Next container
+-                key = new LogKey();
+-                valueStream = reader.next(key);
+-              }
+-              if (valueStream == null) {
+-                continue;
+-              }
+-              while (true) {
+-                try {
+-                  String fileType = valueStream.readUTF();
+-                  String fileLengthStr = valueStream.readUTF();
+-                  long fileLength = Long.parseLong(fileLengthStr);
+-                  if (fileType.equalsIgnoreCase(logFile)) {
+-                    StringBuilder sb = new StringBuilder();
+-                    sb.append("LogType:");
+-                    sb.append(fileType + "\n");
+-                    sb.append("Log Upload Time:");
+-                    sb.append(Times.format(System.currentTimeMillis()) + "\n");
+-                    sb.append("LogLength:");
+-                    sb.append(fileLengthStr + "\n");
+-                    sb.append("Log Contents:\n");
+-                    byte[] b = sb.toString().getBytes(
+-                        Charset.forName("UTF-8"));
+-                    os.write(b, 0, b.length);
+-
+-                    long toSkip = 0;
+-                    long totalBytesToRead = fileLength;
+-                    long skipAfterRead = 0;
+-                    if (bytes < 0) {
+-                      long absBytes = Math.abs(bytes);
+-                      if (absBytes < fileLength) {
+-                        toSkip = fileLength - absBytes;
+-                        totalBytesToRead = absBytes;
+-                      }
+-                      org.apache.hadoop.io.IOUtils.skipFully(
+-                          valueStream, toSkip);
+-                    } else {
+-                      if (bytes < fileLength) {
+-                        totalBytesToRead = bytes;
+-                        skipAfterRead = fileLength - bytes;
+-                      }
+-                    }
+-
+-                    long curRead = 0;
+-                    long pendingRead = totalBytesToRead - curRead;
+-                    int toRead = pendingRead > buf.length ? buf.length
+-                        : (int) pendingRead;
+-                    int len = valueStream.read(buf, 0, toRead);
+-                    while (len != -1 && curRead < totalBytesToRead) {
+-                      os.write(buf, 0, len);
+-                      curRead += len;
+-
+-                      pendingRead = totalBytesToRead - curRead;
+-                      toRead = pendingRead > buf.length ? buf.length
+-                          : (int) pendingRead;
+-                      len = valueStream.read(buf, 0, toRead);
+-                    }
+-                    org.apache.hadoop.io.IOUtils.skipFully(
+-                        valueStream, skipAfterRead);
+-                    sb = new StringBuilder();
+-                    sb.append("\nEnd of LogType:" + fileType + "\n");
+-                    b = sb.toString().getBytes(Charset.forName("UTF-8"));
+-                    os.write(b, 0, b.length);
+-                    findLogs = true;
+-                  } else {
+-                    long totalSkipped = 0;
+-                    long currSkipped = 0;
+-                    while (currSkipped != -1 && totalSkipped < fileLength) {
+-                      currSkipped = valueStream.skip(
+-                          fileLength - totalSkipped);
+-                      totalSkipped += currSkipped;
+-                    }
+-                  }
+-                } catch (EOFException eof) {
+-                  break;
+-                }
+-              }
+-            } finally {
+-              if (reader != null) {
+-                reader.close();
+-              }
+-            }
+-          }
+-        }
+-        os.flush();
++        boolean findLogs = LogToolUtils.outputAggregatedContainerLog(conf,
++            appId, appOwner, containerIdStr, nodeId, logFile, bytes, os, buf);
++        } else {
++          if (printEmptyLocalContainerLog) {
++            StringBuilder sb = new StringBuilder();
++            sb.append(containerIdStr + "\n");
++            sb.append("LogType: " + ContainerLogType.LOCAL + "\n");
++            sb.append("LogContents:\n");
++            sb.append(getNoRedirectWarning() + "\n");
++            os.write(sb.toString().getBytes(Charset.forName("UTF-8")));
++          }
++
++  @Private
++  @VisibleForTesting
++  public static String getNoRedirectWarning() {
++    return "We do not have NodeManager web address, so we can not "
++        + "re-direct the request to related NodeManager "
++        + "for local container logs.";
++  }
+
+MOV26 MOV26 UPD40 UPD40 INS31 INS44 INS44 INS8 INS78 INS78 INS83 INS83 MOV43 INS42 INS8 INS25 INS39 INS42 INS83 INS83 MOV43 INS83 INS39 INS42 MOV60 MOV41 INS42 INS42 INS41 MOV32 INS8 MOV8 INS27 INS41 MOV60 MOV54 INS45 INS45 INS45 INS32 INS42 INS42 INS42 INS33 UPD42 MOV42 UPD42 MOV42 INS42 INS42 INS9 INS8 INS9 MOV41 INS42 INS60 INS25 INS9 MOV39 INS59 MOV38 MOV8 INS8 MOV42 INS32 MOV25 UPD42 MOV42 UPD42 MOV42 INS42 UPD42 MOV42 UPD42 MOV42 MOV42 INS42 INS42 INS42 UPD42 MOV42 UPD42 MOV42 INS42 UPD45 MOV32 INS42 INS45 INS40 INS32 INS42 DEL40 DEL26 DEL40 DEL26 DEL40 DEL26 DEL40 DEL26 DEL40 DEL26 DEL40 DEL26 DEL40 DEL26 DEL40 DEL26 DEL42 DEL43 DEL42 DEL32 DEL59 DEL60 DEL8 DEL25 DEL42 DEL40 DEL45 DEL42 DEL27 DEL32 DEL41 DEL8 DEL42 DEL42 DEL42 DEL32 DEL32 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL41 DEL8 DEL25 DEL42 DEL33 DEL27 DEL42 DEL40 DEL45 DEL42 DEL27 DEL32 DEL41 DEL8 DEL25 DEL42 DEL43 DEL42 DEL42 DEL42 DEL32 DEL42 DEL42 DEL45 DEL32 DEL21 DEL42 DEL42 DEL42 DEL45 DEL27 DEL32 DEL21 DEL42 DEL42 DEL45 DEL32 DEL21 DEL42 DEL42 DEL42 DEL42 DEL32 DEL32 DEL42 DEL42 DEL45 DEL32 DEL21 DEL42 DEL39 DEL85 DEL5 DEL42 DEL59 DEL60 DEL42 DEL42 DEL42 DEL34 DEL40 DEL32 DEL21 DEL39 DEL42 DEL34 DEL59 DEL60 DEL39 DEL42 DEL42 DEL59 DEL60 DEL39 DEL42 DEL34 DEL59 DEL60 DEL42 DEL34 DEL27 DEL39 DEL42 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL42 DEL27 DEL42 DEL42 DEL42 DEL27 DEL7 DEL21 DEL42 DEL42 DEL7 DEL21 DEL8 DEL25 DEL40 DEL42 DEL42 DEL42 DEL32 DEL21 DEL8 DEL42 DEL42 DEL27 DEL42 DEL42 DEL7 DEL21 DEL42 DEL42 DEL42 DEL27 DEL7 DEL21 DEL8 DEL25 DEL8 DEL25 DEL39 DEL42 DEL34 DEL59 DEL60 DEL39 DEL42 DEL42 DEL42 DEL27 DEL59 DEL60 DEL39 DEL42 DEL42 DEL40 DEL27 DEL40 DEL39 DEL42 DEL11 DEL16 DEL59 DEL60 DEL39 DEL42 DEL42 DEL42 DEL42 DEL34 DEL42 DEL32 DEL59 DEL60 DEL42 DEL34 DEL38 DEL27 DEL42 DEL42 DEL27 DEL27 DEL42 DEL42 DEL42 DEL34 DEL42 DEL32 DEL21 DEL42 DEL42 DEL7 DEL21 DEL42 DEL42 DEL42 DEL27 DEL7 DEL21 DEL42 DEL42 DEL40 DEL27 DEL40 DEL39 DEL42 DEL11 DEL16 DEL7 DEL21 DEL42 DEL42 DEL42 DEL42 DEL34 DEL42 DEL32 DEL7 DEL21 DEL8 DEL61 DEL40 DEL42 DEL42 DEL42 DEL32 DEL21 DEL42 DEL42 DEL43 DEL14 DEL7 DEL21 DEL45 DEL42 DEL42 DEL42 DEL42 DEL32 DEL42 DEL42 DEL42 DEL45 DEL32 DEL32 DEL7 DEL21 DEL42 DEL34 DEL40 DEL42 DEL9 DEL7 DEL21 DEL39 DEL42 DEL34 DEL59 DEL60 DEL39 DEL42 DEL34 DEL59 DEL60 DEL42 DEL34 DEL38 DEL27 DEL42 DEL42 DEL27 DEL27 DEL42 DEL42 DEL42 DEL42 DEL42 DEL27 DEL32 DEL7 DEL21 DEL42 DEL42 DEL7 DEL21 DEL8 DEL61 DEL8 DEL9 DEL59 DEL60 DEL42 DEL42 DEL32 DEL83 DEL42 DEL43 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL43 DEL42 DEL42 DEL42 DEL32 DEL42 DEL32 DEL59 DEL60 DEL42 DEL33 DEL27 DEL42 DEL42 DEL42 DEL32 DEL32 DEL27 DEL36 DEL42 DEL42 DEL40 DEL32 DEL38 DEL27 DEL40 DEL43 DEL42 DEL33 DEL59 DEL60 DEL42 DEL40 DEL43 DEL42 DEL42 DEL32 DEL14 DEL7 DEL21 DEL42 DEL43 DEL42 DEL59 DEL60 DEL42 DEL43 DEL42 DEL42 DEL43 DEL14 DEL59 DEL60 DEL42 DEL42 DEL42 DEL32 DEL7 DEL21 DEL42 DEL33 DEL27 DEL42 DEL42 DEL32 DEL42 DEL32 DEL38 DEL27 DEL42 DEL42 DEL43 DEL14 DEL7 DEL21 DEL42 DEL42 DEL32 DEL7 DEL21 DEL8 DEL61 DEL42 DEL33 DEL27 DEL18 DEL8 DEL25 DEL9 DEL42 DEL43 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL39 DEL42 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL8 DEL42 DEL43 DEL42 DEL44 DEL10 DEL8 DEL12 DEL54 DEL8 DEL61 DEL8 DEL42 DEL33 DEL27 DEL42 DEL42 DEL32 DEL21 DEL8 DEL25 DEL8 DEL54 DEL8 DEL25 DEL8 DEL61 DEL42 DEL42 DEL32 DEL21 DEL25 DEL42 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL40 DEL43 DEL42 DEL40 DEL43 DEL42 DEL42 DEL40 DEL40 DEL32 DEL14 DEL59 DEL60 DEL40 DEL43 DEL42 DEL42 DEL42 DEL42 DEL32 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL43 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL42 DEL32 DEL59 DEL60 DEL40 DEL43 DEL42 DEL33 DEL59 DEL60 DEL42 DEL33 DEL27 DEL40 DEL43 DEL42 DEL42 DEL42 DEL42 DEL42 DEL45 DEL42 DEL32 DEL59 DEL60 DEL42 DEL43 DEL85 DEL5 DEL42 DEL42 DEL42 DEL32 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL33 DEL27 DEL40 DEL34 DEL27 DEL27 DEL33 DEL41 DEL8 DEL25 DEL42 DEL42 DEL34 DEL2 DEL42 DEL32 DEL7 DEL21 DEL8 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL7 DEL21 DEL8 DEL25 DEL83 DEL42 DEL43 DEL42 DEL43 DEL74 DEL42 DEL59 DEL60 DEL42 DEL42 DEL42 DEL42 DEL32 DEL7 DEL21 DEL42 DEL42 DEL32 DEL38 DEL33 DEL41 DEL8 DEL25 DEL8

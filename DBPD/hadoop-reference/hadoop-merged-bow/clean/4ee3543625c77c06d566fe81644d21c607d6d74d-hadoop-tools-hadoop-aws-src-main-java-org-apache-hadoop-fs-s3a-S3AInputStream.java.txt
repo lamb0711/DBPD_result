@@ -1,0 +1,191 @@
+HADOOP-13203 S3A: Support fadvise "random" mode for high performance readPositioned() reads. Contributed by Rajesh Balamohan and stevel.
+
+-  public static final long CLOSE_THRESHOLD = 4096;
+-  private long readahead;
++  private final S3AInputPolicy inputPolicy;
++  private long readahead = Constants.DEFAULT_READAHEAD_RANGE;
+-  /* Amount of data desired from the request */
+-  private long requestedStreamLen;
++  /**
++   * The end of the content range of the last request.
++   * This is an absolute value of the range, not a length field.
++   */
++  private long contentRangeFinish;
++
++  /**
++   * The start of the content range of the last request.
++   */
++  private long contentRangeStart;
+-      long readahead) {
++      long readahead,
++      S3AInputPolicy inputPolicy) {
++    this.inputPolicy = inputPolicy;
+-    requestedStreamLen = this.contentLength;
+-      closeStream("reopen(" + reason + ")", requestedStreamLen);
++      closeStream("reopen(" + reason + ")", contentRangeFinish);
+-    LOG.debug("reopen({}) for {} at targetPos={}, length={}," +
+-        " requestedStreamLen={}, streamPosition={}, nextReadPosition={}",
+-        uri, reason, targetPos, length, requestedStreamLen, pos, nextReadPos);
++
++    contentRangeFinish = calculateRequestLimit(inputPolicy, targetPos,
++        length, contentLength, readahead);
++    LOG.debug("reopen({}) for {} range[{}-{}], length={}," +
++        " streamPosition={}, nextReadPosition={}",
++        uri, reason, targetPos, contentRangeFinish, length,  pos, nextReadPos);
+-          .withRange(targetPos, requestedStreamLen);
++          .withRange(targetPos, contentRangeFinish);
+-
++      contentRangeStart = targetPos;
+-      long forwardSeekLimit = Math.min(remaining(), forwardSeekRange);
+-      if (diff <= forwardSeekLimit) {
++      long remainingInCurrentRequest = remainingInCurrentRequest();
++
++      long forwardSeekLimit = Math.min(remainingInCurrentRequest,
++          forwardSeekRange);
++      boolean skipForward = remainingInCurrentRequest > 0
++          && diff <= forwardSeekLimit;
++      if (skipForward) {
+-      // this should never happen as the caller filters it out.
+-      // Retained just in case
+-      LOG.debug("Ignoring seek {} to {} as target position == current",
+-          uri, targetPos);
++      if (remainingInCurrentRequest() > 0) {
++        // if there is data left in the stream, keep going
++        return;
++      }
++
++    // if the code reaches here, the stream needs to be reopened.
+-    closeStream("seekInStream()", this.requestedStreamLen);
++    closeStream("seekInStream()", this.contentRangeFinish);
+-    if (targetPos != this.pos) {
+-      seekInStream(targetPos, len);
+-    }
++    seekInStream(targetPos, len);
+-
+-   * @throws EOFException if there is no more data
+-      throw e;
++      onReadFailure(e, len);
++      // the base implementation swallows EOFs.
++      return -1;
+-        closeStream("close() operation", this.contentLength);
++        closeStream("close() operation", this.contentRangeFinish);
+-      boolean shouldAbort = length - pos > CLOSE_THRESHOLD;
++
++      // if the amount of data remaining in the current request is greater
++      // than the readahead value: abort.
++      long remaining = remainingInCurrentRequest();
++      boolean shouldAbort = remaining > readahead;
+-          streamStatistics.streamClose(false);
++          streamStatistics.streamClose(false, remaining);
+-        streamStatistics.streamClose(true);
++        streamStatistics.streamClose(true, remaining);
+-          " length={}",
+-          uri, (shouldAbort ? "aborted":"closed"), reason, pos, nextReadPos,
++          " request range {}-{} length={}",
++          uri, (shouldAbort ? "aborted" : "closed"), reason,
++          pos, nextReadPos,
++          contentRangeStart, contentRangeFinish,
+-    long remaining = remaining();
++    long remaining = remainingInFile();
+-  protected long remaining() {
++  @InterfaceAudience.Private
++  @InterfaceStability.Unstable
++  public synchronized long remainingInFile() {
++  /**
++   * Bytes left in the current request.
++   * Only valid if there is an active request.
++   * @return how many bytes are left to read in the current GET.
++   */
++  @InterfaceAudience.Private
++  @InterfaceStability.Unstable
++  public synchronized long remainingInCurrentRequest() {
++    return this.contentRangeFinish - this.pos;
++  }
++
++  @InterfaceAudience.Private
++  @InterfaceStability.Unstable
++  public synchronized long getContentRangeFinish() {
++    return contentRangeFinish;
++  }
++
++  @InterfaceAudience.Private
++  @InterfaceStability.Unstable
++  public synchronized long getContentRangeStart() {
++    return contentRangeStart;
++  }
++
+-    final StringBuilder sb = new StringBuilder(
+-        "S3AInputStream{");
+-    sb.append(uri);
+-    sb.append(" pos=").append(pos);
+-    sb.append(" nextReadPos=").append(nextReadPos);
+-    sb.append(" contentLength=").append(contentLength);
+-    sb.append(" ").append(streamStatistics.toString());
+-    sb.append('}');
+-    return sb.toString();
++    String s = streamStatistics.toString();
++    synchronized (this) {
++      final StringBuilder sb = new StringBuilder(
++          "S3AInputStream{");
++      sb.append(uri);
++      sb.append(" wrappedStream=")
++          .append(wrappedStream != null ? "open" : "closed");
++      sb.append(" read policy=").append(inputPolicy);
++      sb.append(" pos=").append(pos);
++      sb.append(" nextReadPos=").append(nextReadPos);
++      sb.append(" contentLength=").append(contentLength);
++      sb.append(" contentRangeStart=").append(contentRangeStart);
++      sb.append(" contentRangeFinish=").append(contentRangeFinish);
++      sb.append(" remainingInCurrentRequest=")
++          .append(remainingInCurrentRequest());
++      sb.append('\n').append(s);
++      sb.append('}');
++      return sb.toString();
++    }
+-  public void setReadahead(Long readahead) {
++  public synchronized void setReadahead(Long readahead) {
+-  public long getReadahead() {
++  public synchronized long getReadahead() {
++
++  /**
++   * Calculate the limit for a get request, based on input policy
++   * and state of object.
++   * @param inputPolicy input policy
++   * @param targetPos position of the read
++   * @param length length of bytes requested; if less than zero "unknown"
++   * @param contentLength total length of file
++   * @param readahead current readahead value
++   * @return the absolute value of the limit of the request.
++   */
++  static long calculateRequestLimit(
++      S3AInputPolicy inputPolicy,
++      long targetPos,
++      long length,
++      long contentLength,
++      long readahead) {
++    long rangeLimit;
++    switch (inputPolicy) {
++    case Random:
++      // positioned.
++      // read either this block, or the here + readahead value.
++      rangeLimit = (length < 0) ? contentLength
++          : targetPos + Math.max(readahead, length);
++      break;
++
++    case Sequential:
++      // sequential: plan for reading the entire object.
++      rangeLimit = contentLength;
++      break;
++
++    case Normal:
++    default:
++      rangeLimit = contentLength;
++
++    }
++    // cannot read past the end of the object
++    rangeLimit = Math.min(contentLength, rangeLimit);
++    return rangeLimit;
++  }
++
+
+MOV23 INS23 INS31 INS31 INS31 INS31 UPD83 INS43 INS29 INS29 INS83 INS39 INS59 INS44 MOV21 MOV8 INS78 INS78 INS83 UPD83 UPD42 INS29 INS78 INS78 INS83 INS83 INS39 INS42 INS8 INS78 INS78 INS83 INS83 INS39 INS42 INS8 INS78 INS78 INS83 INS83 INS39 INS42 INS8 INS8 INS83 INS83 INS29 INS83 INS39 INS42 INS44 INS44 INS44 INS44 INS44 INS8 INS42 UPD42 INS40 INS65 UPD42 INS65 INS42 INS43 INS42 INS21 MOV25 INS40 INS40 INS65 INS65 INS40 INS40 INS41 INS40 INS40 INS41 INS40 INS40 INS41 INS60 INS51 INS65 INS65 INS65 INS65 INS65 INS65 INS65 INS43 INS42 INS39 INS42 INS39 INS42 INS39 INS42 INS39 INS42 INS60 INS50 INS21 INS41 INS66 INS66 INS66 INS42 INS7 INS66 INS66 INS66 UPD27 MOV27 INS42 INS42 INS43 INS59 INS52 MOV8 MOV21 INS66 INS66 INS42 INS66 INS42 INS66 INS42 INS66 INS42 INS66 INS42 INS66 INS66 INS42 INS39 INS59 INS42 INS49 INS21 INS10 INS49 INS21 INS10 INS49 INS49 INS21 INS7 INS42 INS22 INS42 INS42 INS32 UPD42 UPD42 INS21 INS60 INS60 INS60 INS22 INS42 INS42 MOV32 INS21 INS21 INS21 INS21 INS21 INS42 INS42 INS7 INS42 INS7 INS42 INS7 INS42 INS32 INS52 INS42 INS42 INS42 INS42 INS42 INS42 INS42 UPD45 UPD45 INS7 INS39 INS59 INS39 INS59 INS42 INS25 UPD42 INS21 INS41 INS39 INS59 UPD42 INS52 INS42 INS32 INS32 INS32 INS32 INS32 INS42 INS16 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 UPD42 INS42 INS42 INS42 INS32 INS42 INS27 INS27 INS8 INS32 INS38 INS42 INS32 INS42 INS42 INS32 INS42 INS16 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS32 INS32 INS42 INS42 INS36 INS42 INS27 UPD42 INS42 UPD42 MOV42 INS27 MOV27 INS32 INS34 INS41 INS42 INS42 INS42 INS34 INS42 UPD42 MOV42 UPD42 MOV42 UPD45 INS42 INS42 INS45 INS27 INS45 INS45 UPD45 INS42 INS42 INS45 INS42 INS42 INS45 INS42 INS42 INS45 INS42 INS42 INS42 INS13 INS27 INS42 INS32 INS42 INS34 UPD42 MOV42 INS42 INS42 INS33 INS42 INS34 INS42 INS42 INS42 INS42 UPD42 INS42 DEL83 DEL39 DEL34 DEL42 DEL52 DEL42 DEL22 DEL32 DEL42 DEL45 DEL42 DEL42 DEL32 DEL21 DEL25 DEL8 DEL42 DEL66 DEL65 DEL42 DEL53 DEL27 DEL42 DEL42

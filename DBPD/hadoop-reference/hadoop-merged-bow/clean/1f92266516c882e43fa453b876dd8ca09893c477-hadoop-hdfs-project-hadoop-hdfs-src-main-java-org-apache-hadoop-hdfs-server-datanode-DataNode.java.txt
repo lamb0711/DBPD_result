@@ -1,0 +1,366 @@
+HDFS-2563. Some cleanup in BPOfferService. Contributed by Todd Lipcon.
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/trunk@1203943 13f79535-47bb-0310-9956-ffa450edef68
+
++import com.google.common.annotations.VisibleForTesting;
++import com.google.common.base.Preconditions;
++
+-    DatanodeRegistration bpRegistration;
++    
++    /**
++     * Information about the namespace that this service
++     * is registering with. This is assigned after
++     * the first phase of the handshake.
++     */
++
++    /**
++     * The registration information for this block pool.
++     * This is assigned after the second phase of the
++     * handshake.
++     */
++    DatanodeRegistration bpRegistration;
++    
+-    private String blockPoolId;
+-      this.bpRegistration = dn.createRegistration();
+-    public boolean initialized() {
++    public boolean isInitialized() {
+-      return blockPoolId;
++      if (bpNSInfo != null) {
++        return bpNSInfo.getBlockPoolID();
++      } else {
++        LOG.warn("Block pool ID needed, but service not yet registered with NN",
++            new Exception("trace"));
++        return null;
++      }
++    }
++    
++    public NamespaceInfo getNamespaceInfo() {
++      return bpNSInfo;
++    }
++    
++    public String toString() {
++      if (bpNSInfo == null) {
++        // If we haven't yet connected to our NN, we don't yet know our
++        // own block pool ID.
++        // If _none_ of the block pools have connected yet, we don't even
++        // know the storage ID of this DN.
++        String storageId = dn.getStorageId();
++        if (storageId == null || "".equals(storageId)) {
++          storageId = "unknown";
++        }
++        return "Block pool <registering> (storage id " + storageId +
++          ") connecting to " + nnAddr;
++      } else {
++        return "Block pool " + getBlockPoolId() +
++          " (storage id " + dn.getStorageId() +
++          ") registered with " + nnAddr;
++      }
+-    void setNamespaceInfo(NamespaceInfo nsinfo) {
+-      bpNSInfo = nsinfo;
+-      this.blockPoolId = nsinfo.getBlockPoolID();
+-    }
+-
++    /**
++     * Used to inject a spy NN in the unit tests.
++     */
++    @VisibleForTesting
+-        bpNamenode = dnProtocol;
++      bpNamenode = dnProtocol;
+-    private NamespaceInfo handshake() throws IOException {
+-      NamespaceInfo nsInfo = new NamespaceInfo();
+-      while (dn.shouldRun && shouldServiceRun) {
++    /**
++     * Perform the first part of the handshake with the NameNode.
++     * This calls <code>versionRequest</code> to determine the NN's
++     * namespace and version info. It automatically retries until
++     * the NN responds or the DN is shutting down.
++     * 
++     * @return the NamespaceInfo
++     * @throws IncorrectVersionException if the remote NN does not match
++     * this DN's version
++     */
++    NamespaceInfo retrieveNamespaceInfo() throws IncorrectVersionException {
++      NamespaceInfo nsInfo = null;
++      while (shouldRun()) {
+-          // verify build version
+-          String nsVer = nsInfo.getBuildVersion();
+-          String stVer = Storage.getBuildVersion();
+-          LOG.info("handshake: namespace info = " + nsInfo);
+-          
+-          if(! nsVer.equals(stVer)) {
+-            String errorMsg = "Incompatible build versions: bp = " + blockPoolId + 
+-            "namenode BV = " + nsVer + "; datanode BV = " + stVer;
+-            LOG.warn(errorMsg);
+-            bpNamenode.errorReport( bpRegistration, 
+-                DatanodeProtocol.NOTIFY, errorMsg );
+-          } else {
+-            break;
+-          }
++          LOG.debug(this + " received versionRequest response: " + nsInfo);
++          break;
+-        try {
+-          Thread.sleep(5000);
+-        } catch (InterruptedException ie) {}
++        sleepAndLogInterrupts(5000, "requesting version info from NN");
+-      assert HdfsConstants.LAYOUT_VERSION == nsInfo.getLayoutVersion() :
+-        "Data-node and name-node layout versions must be the same."
+-        + "Expected: "+ HdfsConstants.LAYOUT_VERSION 
+-        + " actual "+ nsInfo.getLayoutVersion();
++      if (nsInfo != null) {
++        checkNNVersion(nsInfo);        
++      }
+-    void setupBP(Configuration conf) 
+-    throws IOException {
+-      // get NN proxy
+-      DatanodeProtocol dnp = 
+-        (DatanodeProtocol)RPC.waitForProxy(DatanodeProtocol.class,
+-            DatanodeProtocol.versionID, nnAddr, conf);
+-      setNameNode(dnp);
+-
+-      // handshake with NN
+-      NamespaceInfo nsInfo = handshake();
+-      setNamespaceInfo(nsInfo);
+-      dn.initBlockPool(this, nsInfo);
+-      
+-      bpRegistration.setStorageID(dn.getStorageId());
+-      StorageInfo storageInfo = dn.storage.getBPStorage(blockPoolId);
+-      if (storageInfo == null) {
+-        // it's null in the case of SimulatedDataSet
+-        bpRegistration.storageInfo.layoutVersion = HdfsConstants.LAYOUT_VERSION;
+-        bpRegistration.setStorageInfo(nsInfo);
+-      } else {
+-        bpRegistration.setStorageInfo(storageInfo);
++    private void checkNNVersion(NamespaceInfo nsInfo)
++        throws IncorrectVersionException {
++      // build and layout versions should match
++      String nsBuildVer = nsInfo.getBuildVersion();
++      String stBuildVer = Storage.getBuildVersion();
++      if (!nsBuildVer.equals(stBuildVer)) {
++        LOG.warn("Data-node and name-node Build versions must be the same. " +
++          "Namenode build version: " + nsBuildVer + "Datanode " +
++          "build version: " + stBuildVer);
++        throw new IncorrectVersionException(nsBuildVer, "namenode", stBuildVer);
++
++      if (HdfsConstants.LAYOUT_VERSION != nsInfo.getLayoutVersion()) {
++        LOG.warn("Data-node and name-node layout versions must be the same." +
++          " Expected: "+ HdfsConstants.LAYOUT_VERSION +
++          " actual "+ bpNSInfo.getLayoutVersion());
++        throw new IncorrectVersionException(
++            bpNSInfo.getLayoutVersion(), "namenode");
++      }
++    }
++
++    private void connectToNNAndHandshake() throws IOException {
++      // get NN proxy
++      bpNamenode = 
++        (DatanodeProtocol)RPC.waitForProxy(DatanodeProtocol.class,
++            DatanodeProtocol.versionID, nnAddr, dn.getConf());
++
++      // First phase of the handshake with NN - get the namespace
++      // info.
++      bpNSInfo = retrieveNamespaceInfo();
++      
++      // Now that we know the namespace ID, etc, we can pass this to the DN.
++      // The DN can now initialize its local storage if we are the
++      // first BP to handshake, etc.
++      dn.initBlockPool(this);
++      
++      // Second phase of the handshake with the NN.
++      register();
+-        bpNamenode.blockReceivedAndDeleted(bpRegistration, blockPoolId,
++        bpNamenode.blockReceivedAndDeleted(bpRegistration, getBlockPoolId(),
+-      if (!block.getBlockPoolId().equals(blockPoolId)) {
++      if (!block.getBlockPoolId().equals(getBlockPoolId())) {
+-            + blockPoolId);
++            + getBlockPoolId());
+-      if (!block.getBlockPoolId().equals(blockPoolId)) {
++      if (!block.getBlockPoolId().equals(getBlockPoolId())) {
+-            + blockPoolId);
++            + getBlockPoolId());
+-        BlockListAsLongs bReport = dn.data.getBlockReport(blockPoolId);
++        BlockListAsLongs bReport = dn.data.getBlockReport(getBlockPoolId());
+-        cmd = bpNamenode.blockReport(bpRegistration, blockPoolId, bReport
++        cmd = bpNamenode.blockReport(bpRegistration, getBlockPoolId(), bReport
+-          dn.data.getBlockPoolUsed(blockPoolId),
++          dn.data.getBlockPoolUsed(getBlockPoolId()),
+-      while (dn.shouldRun && shouldServiceRun) {
++      while (shouldRun()) {
+-            dn.blockScanner.addBlockPool(this.blockPoolId);
++            dn.blockScanner.addBlockPool(this.getBlockPoolId());
+-                LOG.warn("BPOfferService for block pool="
+-                    + this.getBlockPoolId() + " received exception:" + ie);
++                LOG.warn("BPOfferService for " + this + " interrupted");
+-            LOG.warn("blockpool " + blockPoolId + " is shutting down", re);
++            LOG.warn(this + " is shutting down", re);
+-      } // while (shouldRun && shouldServiceRun)
++      } // while (shouldRun())
+-      LOG.info("in register: sid=" + bpRegistration.getStorageID() + ";SI="
+-          + bpRegistration.storageInfo); 
++      Preconditions.checkState(bpNSInfo != null,
++          "register() should be called after handshake()");
++      
++      // The handshake() phase loaded the block pool storage
++      // off disk - so update the bpRegistration object from that info
++      bpRegistration = dn.createBPRegistration(bpNSInfo);
+-      // build and layout versions should match
+-      String nsBuildVer = bpNamenode.versionRequest().getBuildVersion();
+-      String stBuildVer = Storage.getBuildVersion();
++      LOG.info(this + " beginning handshake with NN");
+-      if (!nsBuildVer.equals(stBuildVer)) {
+-        LOG.warn("Data-node and name-node Build versions must be " +
+-          "the same. Namenode build version: " + nsBuildVer + "Datanode " +
+-          "build version: " + stBuildVer);
+-        throw new IncorrectVersionException(nsBuildVer, "namenode", stBuildVer);
+-      }
+-
+-      if (HdfsConstants.LAYOUT_VERSION != bpNSInfo.getLayoutVersion()) {
+-        LOG.warn("Data-node and name-node layout versions must be " +
+-          "the same. Expected: "+ HdfsConstants.LAYOUT_VERSION +
+-          " actual "+ bpNSInfo.getLayoutVersion());
+-        throw new IncorrectVersionException
+-          (bpNSInfo.getLayoutVersion(), "namenode");
+-      }
+-
+-      while(dn.shouldRun && shouldServiceRun) {
++      while (shouldRun()) {
+-
+-          LOG.info("bpReg after =" + bpRegistration.storageInfo + 
+-              ";sid=" + bpRegistration.storageID + ";name="+bpRegistration.getName());
+-
+-          try {
+-            Thread.sleep(1000);
+-          } catch (InterruptedException ie) {}
++          sleepAndLogInterrupts(1000, "connecting to server");
+-      dn.bpRegistrationSucceeded(bpRegistration, blockPoolId);
+-
+-      LOG.info("in register:" + ";bpDNR="+bpRegistration.storageInfo);
++      LOG.info("Block pool " + this + " successfully registered with NN");
++      dn.bpRegistrationSucceeded(bpRegistration, getBlockPoolId());
++    private void sleepAndLogInterrupts(int millis,
++        String stateString) {
++      try {
++        Thread.sleep(millis);
++      } catch (InterruptedException ie) {
++        LOG.info("BPOfferService " + this +
++            " interrupted while " + stateString);
++      }
++    }
++
+-      LOG.info(bpRegistration + "In BPOfferService.run, data = " + dn.data
+-          + ";bp=" + blockPoolId);
++      LOG.info(this + " starting to offer service");
+-          setupBP(dn.conf);
+-          register();
++          connectToNNAndHandshake();
+-          LOG.fatal(bpRegistration + " initialization failed for block pool "
+-              + blockPoolId, ioe);
++          LOG.fatal("Initialization failed for block pool " + this, ioe);
+-        while (dn.shouldRun && shouldServiceRun) {
++        while (shouldRun()) {
+-            LOG.error("Exception in BPOfferService", ex);
+-            if (dn.shouldRun && shouldServiceRun) {
+-              try {
+-                Thread.sleep(5000);
+-              } catch (InterruptedException ie) {
+-                LOG.warn("Received exception", ie);
+-              }
+-            }
++            LOG.error("Exception in BPOfferService for " + this, ex);
++            sleepAndLogInterrupts(5000, "offering service");
+-        LOG.warn("Unexpected exception", ex);
++        LOG.warn("Unexpected exception in block pool " + this, ex);
+-        LOG.warn(bpRegistration + " ending block pool service for: " 
+-            + blockPoolId + " thread " + Thread.currentThread().getId());
++        LOG.warn("Ending block pool service for: " + this);
++    private boolean shouldRun() {
++      return shouldServiceRun && dn.shouldRun();
++    }
++
+-        if (dn.shouldRun && shouldServiceRun) {
++        if (shouldRun()) {
++          // re-retrieve namespace info to make sure that, if the NN
++          // was restarted, we still match its version (HDFS-2120)
++          retrieveNamespaceInfo();
++          // and re-register
+-          dn.blockPoolTokenSecretManager.setKeys(blockPoolId, 
++          dn.blockPoolTokenSecretManager.setKeys(getBlockPoolId(), 
+-          new UpgradeManagerDatanode(dn, blockPoolId);
++          new UpgradeManagerDatanode(dn, getBlockPoolId());
++
++   * Create a DatanodeRegistration for a specific block pool.
++   * @param nsInfo the namespace info from the first part of the NN handshake
++   */
++  DatanodeRegistration createBPRegistration(NamespaceInfo nsInfo) {
++    DatanodeRegistration bpRegistration = createUnknownBPRegistration();
++    String blockPoolId = nsInfo.getBlockPoolID();
++    
++    bpRegistration.setStorageID(getStorageId());
++    StorageInfo storageInfo = storage.getBPStorage(blockPoolId);
++    if (storageInfo == null) {
++      // it's null in the case of SimulatedDataSet
++      bpRegistration.storageInfo.layoutVersion = HdfsConstants.LAYOUT_VERSION;
++      bpRegistration.setStorageInfo(nsInfo);
++    } else {
++      bpRegistration.setStorageInfo(storageInfo);
++    }
++    return bpRegistration;
++  }
++
++  /**
+-  void initBlockPool(BPOfferService bpOfferService,
+-      NamespaceInfo nsInfo) throws IOException {
++  /**
++   * One of the Block Pools has successfully connected to its NN.
++   * This initializes the local storage for that block pool,
++   * checks consistency of the NN's cluster ID, etc.
++   * 
++   * If this is the first block pool to register, this also initializes
++   * the datanode-scoped storage.
++   * 
++   * @param nsInfo the handshake response from the NN.
++   * @throws IOException if the NN is inconsistent with the local storage.
++   */
++  void initBlockPool(BPOfferService bpos) throws IOException {
++    NamespaceInfo nsInfo = bpos.getNamespaceInfo();
++    Preconditions.checkState(nsInfo != null,
++        "Block pool " + bpos + " should have retrieved " +
++        "its namespace info before calling initBlockPool.");
++    
+-    blockPoolManager.addBlockPool(bpOfferService);
++    // Register the new block pool with the BP manager.
++    blockPoolManager.addBlockPool(bpos);
++    
++    // In the case that this is the first block pool to connect, initialize
++    // the dataset, block scanners, etc.
+-    initPeriodicScanners(conf);    
+-    data.addBlockPool(nsInfo.getBlockPoolID(), conf);
++    initPeriodicScanners(conf);
++    
++    data.addBlockPool(blockPoolId, conf);
+-  private DatanodeRegistration createRegistration() {
++  /**
++   * Create a DatanodeRegistration object with no valid StorageInfo.
++   * This is used when reporting an error during handshake - ie
++   * before we can load any specific block pool.
++   */
++  private DatanodeRegistration createUnknownBPRegistration() {
+-  /**
+-   * To be used by tests only to set a mock namenode in BPOfferService
+-   */
+-  void setBPNamenode(String bpid, DatanodeProtocol namenode) {
+-    BPOfferService bp = blockPoolManager.get(bpid);
+-    if (bp != null) {
+-      bp.setNameNode(namenode);
+-    }
+-  }
+-
+-        info.put(bpos.getNNSocketAddress().getHostName(), bpos.blockPoolId);
++        info.put(bpos.getNNSocketAddress().getHostName(), bpos.getBlockPoolId());
+-      if (!bp.initialized() || !bp.isAlive()) {
++      if (!bp.isInitialized() || !bp.isAlive()) {
++
++  boolean shouldRun() {
++    return shouldRun;
++  }
+
+INS26 INS26 MOV31 INS40 INS40 MOV23 MOV31 INS31 INS31 INS31 INS31 INS31 INS31 INS43 INS42 MOV44 INS8 INS29 INS29 UPD42 INS39 INS42 INS8 INS29 INS29 UPD42 INS83 MOV43 INS42 INS8 MOV43 UPD42 INS83 MOV43 UPD42 INS8 INS29 INS78 INS29 INS42 UPD43 INS83 MOV39 UPD42 MOV42 MOV44 INS43 MOV8 INS83 INS39 INS42 MOV43 INS8 MOV29 INS39 INS42 MOV43 INS8 INS83 UPD42 INS44 INS44 INS8 INS83 INS39 INS42 INS8 INS65 UPD65 UPD42 MOV42 INS60 MOV60 MOV21 INS60 MOV25 INS41 INS65 INS65 INS65 UPD42 INS60 INS21 INS65 INS41 INS65 INS65 INS25 INS25 INS65 INS42 INS65 INS65 INS65 UPD42 INS25 UPD43 UPD42 UPD42 MOV42 MOV60 INS21 MOV21 INS21 MOV21 INS25 MOV25 MOV21 MOV21 MOV21 MOV61 INS21 INS21 MOV21 INS39 INS42 MOV43 INS42 INS54 INS41 INS66 INS42 UPD66 INS43 INS59 UPD43 MOV43 INS59 INS42 INS66 INS66 INS66 INS66 INS66 INS42 INS66 INS42 INS66 MOV43 INS59 INS32 INS66 INS66 INS66 INS42 INS66 INS66 INS66 INS66 INS66 INS66 INS27 INS8 INS8 UPD42 INS27 INS8 INS8 INS66 INS66 INS66 INS66 INS66 INS66 INS42 INS66 INS66 MOV43 INS32 INS27 INS8 UPD42 UPD27 MOV27 INS7 INS7 INS32 INS38 INS8 INS32 INS7 INS32 INS32 INS32 INS8 INS12 INS27 UPD42 MOV42 INS42 INS32 UPD42 UPD42 UPD42 UPD42 INS32 INS42 INS32 INS42 INS32 INS42 INS42 INS27 INS27 UPD42 UPD42 MOV42 INS42 INS33 INS41 INS21 INS41 INS42 INS33 INS60 INS25 INS41 INS41 INS33 INS42 MOV21 INS42 INS33 INS21 UPD42 INS42 INS11 INS42 INS32 INS42 UPD42 MOV42 INS52 INS32 INS21 INS41 INS42 UPD42 INS42 INS27 INS45 INS42 INS32 UPD42 UPD42 INS27 INS42 INS42 INS42 INS27 UPD42 MOV42 INS42 INS42 INS32 INS21 MOV44 INS8 INS42 INS32 INS32 MOV8 INS42 UPD42 UPD42 UPD42 MOV42 INS42 INS42 INS42 INS42 INS42 INS42 INS33 INS45 INS42 INS45 INS45 INS32 INS32 INS33 MOV43 INS59 INS27 INS8 INS27 INS27 INS32 MOV43 MOV32 UPD42 MOV42 MOV32 INS42 INS32 INS32 INS32 INS32 INS42 INS33 MOV42 UPD42 MOV42 UPD42 MOV42 INS52 INS45 INS45 INS52 INS45 UPD42 MOV42 INS32 INS21 INS52 UPD45 INS8 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS45 INS14 INS42 INS32 INS27 INS32 MOV21 INS45 INS42 INS45 INS42 INS45 INS32 INS45 MOV32 INS45 INS42 MOV10 UPD42 INS45 INS42 MOV42 INS32 INS32 INS42 INS42 INS42 INS27 UPD42 MOV42 UPD42 MOV42 INS8 INS42 INS42 INS42 INS32 INS21 INS42 INS32 INS43 INS45 INS42 INS42 INS42 INS33 INS45 INS42 INS42 UPD42 MOV42 INS42 UPD42 MOV42 UPD42 MOV42 INS45 MOV32 INS45 INS32 INS32 INS32 INS32 MOV21 MOV21 INS42 INS42 INS27 INS32 INS27 UPD45 INS52 UPD42 INS32 INS42 INS32 UPD42 INS42 UPD42 INS45 UPD42 UPD45 UPD45 UPD45 UPD45 INS42 INS42 UPD42 MOV42 UPD42 MOV42 INS45 INS52 INS45 INS42 INS42 INS45 INS52 UPD42 MOV42 INS42 INS42 INS52 UPD45 UPD42 INS45 MOV21 MOV32 UPD45 INS52 INS27 UPD42 INS45 INS52 INS45 INS52 UPD45 INS52 UPD45 DEL83 DEL42 DEL59 DEL23 DEL52 DEL42 DEL22 DEL42 DEL42 DEL32 DEL7 DEL21 DEL39 DEL42 DEL42 DEL44 DEL52 DEL42 DEL22 DEL42 DEL32 DEL7 DEL21 DEL8 DEL83 DEL42 DEL42 DEL43 DEL14 DEL40 DEL42 DEL27 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL42 DEL42 DEL32 DEL38 DEL42 DEL43 DEL42 DEL45 DEL42 DEL45 DEL42 DEL45 DEL42 DEL27 DEL59 DEL60 DEL42 DEL42 DEL42 DEL32 DEL21 DEL42 DEL42 DEL42 DEL40 DEL42 DEL32 DEL21 DEL8 DEL8 DEL25 DEL42 DEL8 DEL42 DEL43 DEL42 DEL44 DEL8 DEL12 DEL54 DEL45 DEL45 DEL27 DEL40 DEL45 DEL42 DEL32 DEL27 DEL6 DEL42 DEL42 DEL45 DEL42 DEL42 DEL32 DEL45 DEL40 DEL27 DEL32 DEL21 DEL42 DEL42 DEL42 DEL32 DEL42 DEL32 DEL59 DEL60 DEL40 DEL42 DEL42 DEL32 DEL27 DEL42 DEL42 DEL42 DEL42 DEL32 DEL21 DEL42 DEL42 DEL45 DEL45 DEL40 DEL27 DEL32 DEL21 DEL42 DEL32 DEL43 DEL42 DEL11 DEL59 DEL60 DEL42 DEL32 DEL59 DEL60 DEL42 DEL40 DEL32 DEL59 DEL60 DEL8 DEL31 DEL42 DEL42 DEL42 DEL32 DEL38 DEL42 DEL42 DEL45 DEL45 DEL42 DEL27 DEL32 DEL21 DEL41 DEL8 DEL25 DEL40 DEL42 DEL27 DEL52 DEL42 DEL22 DEL42 DEL45 DEL42 DEL42 DEL52 DEL32 DEL40 DEL42 DEL27 DEL42 DEL42 DEL45 DEL40 DEL45 DEL40 DEL45 DEL42 DEL42 DEL32 DEL27 DEL32 DEL21 DEL42 DEL8 DEL8 DEL12 DEL54 DEL8 DEL42 DEL40 DEL45 DEL42 DEL42 DEL42 DEL40 DEL42 DEL27 DEL45 DEL42 DEL40 DEL42 DEL27 DEL8 DEL42 DEL43 DEL42 DEL44 DEL42 DEL42 DEL45 DEL42 DEL32 DEL21 DEL8 DEL12 DEL54 DEL8 DEL25 DEL45 DEL42 DEL42 DEL45 DEL42 DEL42 DEL32 DEL42 DEL32 DEL40 DEL40 DEL42 DEL27 DEL8 DEL42 DEL42 DEL39 DEL42 DEL43 DEL42 DEL44 DEL43 DEL42 DEL44 DEL42 DEL33 DEL27 DEL8 DEL25 DEL8 DEL42 DEL32 DEL40

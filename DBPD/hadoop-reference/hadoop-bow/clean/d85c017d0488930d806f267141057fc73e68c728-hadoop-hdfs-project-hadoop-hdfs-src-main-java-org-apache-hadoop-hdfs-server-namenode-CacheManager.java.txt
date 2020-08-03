@@ -1,0 +1,189 @@
+HDFS-5651. Remove dfs.namenode.caching.enabled and improve CRM locking. Contributed by Colin Patrick McCabe.
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/trunk@1555002 13f79535-47bb-0310-9956-ffa450edef68
+
+-import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_NAMENODE_CACHING_ENABLED_DEFAULT;
+-import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_NAMENODE_CACHING_ENABLED_KEY;
++import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_NAMENODE_PATH_BASED_CACHE_BLOCK_MAP_ALLOCATION_PERCENT;
++import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_NAMENODE_PATH_BASED_CACHE_BLOCK_MAP_ALLOCATION_PERCENT_DEFAULT;
++import java.util.concurrent.locks.ReentrantLock;
+- * This class is instantiated by the FSNamesystem when caching is enabled.
++ * This class is instantiated by the FSNamesystem.
++  private static final float MIN_CACHED_BLOCKS_PERCENT = 0.001f;
++
+-   * Whether caching is enabled.
+-   *
+-   * If caching is disabled, we will not process cache reports or store
+-   * information about what is cached where.  We also do not start the
+-   * CacheReplicationMonitor thread.  This will save resources, but provide
+-   * less functionality.
+-   *     
+-   * Even when caching is disabled, we still store path-based cache
+-   * information.  This information is stored in the edit log and fsimage.  We
+-   * don't want to lose it just because a configuration setting was turned off.
+-   * However, we will not act on this information if caching is disabled.
+-   */
+-  private final boolean enabled;
+-
+-  /**
+-   * Whether the CacheManager is active.
+-   * 
+-   * When the CacheManager is active, it tells the DataNodes what to cache
+-   * and uncache.  The CacheManager cannot become active if enabled = false.
+-   */
+-  private boolean active = false;
+-
+-  /**
++   * Lock which protects the CacheReplicationMonitor.
++   */
++  private final ReentrantLock crmLock = new ReentrantLock();
++
++  /**
+-    this.enabled = conf.getBoolean(DFS_NAMENODE_CACHING_ENABLED_KEY,
+-        DFS_NAMENODE_CACHING_ENABLED_DEFAULT);
+-    this.cachedBlocks = !enabled ? null :
+-        new LightWeightGSet<CachedBlock, CachedBlock>(
+-            LightWeightGSet.computeCapacity(0.25, "cachedBlocks"));
++    float cachedBlocksPercent = conf.getFloat(
++          DFS_NAMENODE_PATH_BASED_CACHE_BLOCK_MAP_ALLOCATION_PERCENT,
++          DFS_NAMENODE_PATH_BASED_CACHE_BLOCK_MAP_ALLOCATION_PERCENT_DEFAULT);
++    if (cachedBlocksPercent < MIN_CACHED_BLOCKS_PERCENT) {
++      LOG.info("Using minimum value " + MIN_CACHED_BLOCKS_PERCENT +
++        " for " + DFS_NAMENODE_PATH_BASED_CACHE_BLOCK_MAP_ALLOCATION_PERCENT);
++      cachedBlocksPercent = MIN_CACHED_BLOCKS_PERCENT;
++    }
++    this.cachedBlocks = new LightWeightGSet<CachedBlock, CachedBlock>(
++          LightWeightGSet.computeCapacity(cachedBlocksPercent,
++              "cachedBlocks"));
++
+-  /**
+-   * Activate the cache manager.
+-   * 
+-   * When the cache manager is active, tell the datanodes where to cache files.
+-   */
+-  public void activate() {
+-    assert namesystem.hasWriteLock();
+-    if (enabled && (!active)) {
+-      LOG.info("Activating CacheManager.  " +
+-          "Starting replication monitor thread...");
+-      active = true;
+-      monitor = new CacheReplicationMonitor(namesystem, this,
+-         scanIntervalMs);
+-      monitor.start();
++  public void startMonitorThread() {
++    crmLock.lock();
++    try {
++      if (this.monitor == null) {
++        this.monitor = new CacheReplicationMonitor(namesystem, this,
++            scanIntervalMs, crmLock);
++        this.monitor.start();
++      }
++    } finally {
++      crmLock.unlock();
+-  /**
+-   * Deactivate the cache manager.
+-   * 
+-   * When the cache manager is inactive, it does not tell the datanodes where to
+-   * cache files.
+-   */
+-  public void deactivate() {
+-    assert namesystem.hasWriteLock();
+-    if (active) {
+-      LOG.info("Deactivating CacheManager.  " +
+-          "stopping CacheReplicationMonitor thread...");
+-      active = false;
+-      IOUtils.closeQuietly(monitor);
+-      monitor = null;
+-      LOG.info("CacheReplicationMonitor thread stopped and deactivated.");
++  public void stopMonitorThread() {
++    crmLock.lock();
++    try {
++      if (this.monitor != null) {
++        CacheReplicationMonitor prevMonitor = this.monitor;
++        this.monitor = null;
++        IOUtils.closeQuietly(prevMonitor);
++      }
++    } finally {
++      crmLock.unlock();
+-  /**
+-   * Return true only if the cache manager is active.
+-   * Must be called under the FSN read or write lock.
+-   */
+-  public boolean isActive() {
+-    return active;
++  public void clearDirectiveStats() {
++    assert namesystem.hasWriteLock();
++    for (CacheDirective directive : directivesById.values()) {
++      directive.resetStatistics();
++    }
+-    if (monitor != null) {
+-      monitor.setNeedsRescan();
+-    }
++    setNeedsRescan();
+-        // Can't kick and wait if caching is disabled
+-        if (monitor != null) {
+-          monitor.waitForRescan();
+-        }
+-      if (monitor != null) {
+-        monitor.setNeedsRescan();
+-      }
++      setNeedsRescan();
+-    if (monitor != null) {
+-      monitor.setNeedsRescan();
+-    }
++    setNeedsRescan();
+-    if (monitor != null) {
+-      monitor.waitForRescanIfNeeded();
+-    }
+-        if (monitor != null) {
+-          monitor.setNeedsRescan();
+-        }
++        setNeedsRescan();
+-      if (monitor != null) {
+-        monitor.setNeedsRescan();
+-      }
++      setNeedsRescan();
+-    if (monitor != null) {
+-      monitor.waitForRescanIfNeeded();
+-    }
+-    if (!enabled) {
+-      return;
+-    }
+-    if (!enabled) {
+-      LOG.info("Ignoring cache report from " + datanodeID +
+-          " because " + DFS_NAMENODE_CACHING_ENABLED_KEY + " = false. " +
+-          "number of blocks: " + blockIds.size());
+-      return;
+-    }
++
++  public void waitForRescanIfNeeded() {
++    crmLock.lock();
++    try {
++      if (monitor != null) {
++        monitor.waitForRescanIfNeeded();
++      }
++    } finally {
++      crmLock.unlock();
++    }
++  }
++
++  private void setNeedsRescan() {
++    crmLock.lock();
++    try {
++      if (monitor != null) {
++        monitor.setNeedsRescan();
++      }
++    } finally {
++      crmLock.unlock();
++    }
++  }
++
++  @VisibleForTesting
++  public Thread getCacheReplicationMonitor() {
++    crmLock.lock();
++    try {
++      return monitor;
++    } finally {
++      crmLock.unlock();
++    }
++  }

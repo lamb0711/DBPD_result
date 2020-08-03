@@ -1,0 +1,346 @@
+HDFS-13166: [SPS]: Implement caching mechanism to keep LIVE datanodes to minimize costly getLiveDatanodeStorageReport() calls. Contributed by Rakesh R.
+
++import java.util.Set;
+-import org.apache.hadoop.hdfs.server.protocol.DatanodeStorageReport;
+-import org.apache.hadoop.hdfs.server.protocol.StorageReport;
++  private DatanodeCacheManager<T> dnCacheMgr;
++
++    dnCacheMgr = new DatanodeCacheManager<T>(conf);
+-            DatanodeStorageReport[] liveDnReports;
+-              liveDnReports = ctxt.getLiveDatanodeStorageReport();
+-                  existingStoragePolicy, liveDnReports);
++                  existingStoragePolicy);
+-      BlockStoragePolicy existingStoragePolicy,
+-      DatanodeStorageReport[] liveDns) {
++      BlockStoragePolicy existingStoragePolicy) throws IOException {
++    DatanodeMap liveDns = dnCacheMgr.getLiveDatanodeStorageReport(ctxt);
+-        && status == BlocksMovingAnalysis.Status.NO_BLOCKS_TARGETS_PAIRED) {
++        && status != BlocksMovingAnalysis.Status.BLOCKS_TARGETS_PAIRED) {
++   * @param liveDns
++   *          - live datanodes which can be used as targets
++   * @param ecPolicy
++   *          - ec policy of sps invoked file
+-      DatanodeInfo[] storages, DatanodeStorageReport[] liveDns,
++      DatanodeInfo[] storages, DatanodeMap liveDns,
+-      StorageTypeNodeMap locsForExpectedStorageTypes =
++      EnumMap<StorageType, List<DatanodeWithStorage.StorageDetails>> targetDns =
+-          expectedStorageTypes, locsForExpectedStorageTypes,
++          expectedStorageTypes, targetDns,
+-   * @param expected
++   * @param expectedTypes
+-   * @param locsForExpectedStorageTypes
++   * @param targetDns
+-      List<StorageType> expected,
+-      StorageTypeNodeMap locsForExpectedStorageTypes,
++      List<StorageType> expectedTypes,
++      EnumMap<StorageType, List<DatanodeWithStorage.StorageDetails>> targetDns,
+-      if (!expected.contains(existingTypeNodePair.storageType)) {
++      if (!expectedTypes.contains(existingTypeNodePair.storageType)) {
+-            existingTypeNodePair.dn, expected);
++            existingTypeNodePair.dn, targetDns, expectedTypes);
+-          expected.remove(chosenTarget.storageType);
++          expectedTypes.remove(chosenTarget.storageType);
+-      if (chosenTarget == null && ctxt
+-          .getNetworkTopology().isNodeGroupAware()) {
++      if (chosenTarget == null && dnCacheMgr.getCluster().isNodeGroupAware()) {
+-            expected, Matcher.SAME_NODE_GROUP, locsForExpectedStorageTypes,
++            expectedTypes, Matcher.SAME_NODE_GROUP, targetDns,
+-            chooseTarget(blockInfo, existingTypeNodePair.dn, expected,
+-                Matcher.SAME_RACK, locsForExpectedStorageTypes, excludeNodes);
++            chooseTarget(blockInfo, existingTypeNodePair.dn, expectedTypes,
++                Matcher.SAME_RACK, targetDns, excludeNodes);
+-            chooseTarget(blockInfo, existingTypeNodePair.dn, expected,
+-                Matcher.ANY_OTHER, locsForExpectedStorageTypes, excludeNodes);
++            chooseTarget(blockInfo, existingTypeNodePair.dn, expectedTypes,
++                Matcher.ANY_OTHER, targetDns, excludeNodes);
+-        expected.remove(chosenTarget.storageType);
++        expectedTypes.remove(chosenTarget.storageType);
+-            expected, blockInfo, existingTypeNodePair.storageType);
++            expectedTypes, blockInfo, existingTypeNodePair.storageType);
+-    if (expected.size() > 0) {
++    if (expectedTypes.size() > 0) {
+-   * @param block
++   * @param blockInfo
++   * @param targetDns
++   *          - set of target datanodes with its respective storage type
+-      DatanodeInfo source, List<StorageType> targetTypes) {
++      DatanodeInfo source,
++      EnumMap<StorageType, List<DatanodeWithStorage.StorageDetails>> targetDns,
++      List<StorageType> targetTypes) {
+-      boolean goodTargetDn =
+-          ctxt.checkDNSpaceForScheduling(source, t, blockInfo.getBlockSize());
+-      if (goodTargetDn) {
+-        return new StorageTypeNodePair(t, source);
++      List<DatanodeWithStorage.StorageDetails> targetNodeStorages =
++          targetDns.get(t);
++      if (targetNodeStorages == null) {
++        continue;
++      }
++      for (DatanodeWithStorage.StorageDetails targetNode : targetNodeStorages) {
++        if (targetNode.getDatanodeInfo().equals(source)) {
++          // Good target with enough space to write the given block size.
++          if (targetNode.hasSpaceForScheduling(blockInfo.getBlockSize())) {
++            targetNode.incScheduledSize(blockInfo.getBlockSize());
++            return new StorageTypeNodePair(t, source);
++          }
++          if (LOG.isDebugEnabled()) {
++            LOG.debug("Datanode:{} storage type:{} doesn't have sufficient "
++                + "space:{} to move the target block size:{}",
++                source, t, targetNode, blockInfo.getBlockSize());
++          }
++        }
+-      StorageTypeNodeMap locsForExpectedStorageTypes,
+-      List<DatanodeInfo> excludeNodes) {
++      EnumMap<StorageType, List<DatanodeWithStorage.StorageDetails>>
++      locsForExpectedStorageTypes, List<DatanodeInfo> excludeNodes) {
+-      List<DatanodeInfo> nodesWithStorages =
+-          locsForExpectedStorageTypes.getNodesWithStorages(t);
++      List<DatanodeWithStorage.StorageDetails> nodesWithStorages =
++          locsForExpectedStorageTypes.get(t);
+-      for (DatanodeInfo target : nodesWithStorages) {
++      for (DatanodeWithStorage.StorageDetails targetNode : nodesWithStorages) {
++        DatanodeInfo target = targetNode.getDatanodeInfo();
+-            && matcher.match(ctxt.getNetworkTopology(), source, target)) {
+-          boolean goodTargetDn =
+-              ctxt.checkDNSpaceForScheduling(target, t, block.getBlockSize());
+-          if (goodTargetDn) {
++            && matcher.match(dnCacheMgr.getCluster(), source, target)) {
++          // Good target with enough space to write the given block size.
++          if (targetNode.hasSpaceForScheduling(block.getBlockSize())) {
++            targetNode.incScheduledSize(block.getBlockSize());
++          if (LOG.isDebugEnabled()) {
++            LOG.debug("Datanode:{} storage type:{} doesn't have sufficient "
++                + "space:{} to move the target block size:{}",
++                target, t, targetNode, block.getBlockSize());
++          }
+-  private static class StorageTypeNodePair {
+-    private StorageType storageType = null;
+-    private DatanodeInfo dn = null;
++  /**
++   * Keeps datanode with its respective storage type.
++   */
++  private static final class StorageTypeNodePair {
++    private final StorageType storageType;
++    private final DatanodeInfo dn;
+-    StorageTypeNodePair(StorageType storageType, DatanodeInfo dn) {
++    private StorageTypeNodePair(StorageType storageType, DatanodeInfo dn) {
+-  private StorageTypeNodeMap findTargetsForExpectedStorageTypes(
+-      List<StorageType> expected, DatanodeStorageReport[] liveDns) {
+-    StorageTypeNodeMap targetMap = new StorageTypeNodeMap();
+-    for (DatanodeStorageReport dn : liveDns) {
+-      StorageReport[] storageReports = dn.getStorageReports();
+-      for (StorageReport storageReport : storageReports) {
+-        StorageType t = storageReport.getStorage().getStorageType();
+-        if (expected.contains(t)) {
+-          final long maxRemaining = getMaxRemaining(dn.getStorageReports(), t);
+-          if (maxRemaining > 0L) {
+-            targetMap.add(t, dn.getDatanodeInfo());
+-          }
++  private EnumMap<StorageType, List<DatanodeWithStorage.StorageDetails>>
++      findTargetsForExpectedStorageTypes(List<StorageType> expected,
++        DatanodeMap liveDns) {
++    EnumMap<StorageType, List<DatanodeWithStorage.StorageDetails>> targetsMap =
++        new EnumMap<StorageType, List<DatanodeWithStorage.StorageDetails>>(
++        StorageType.class);
++
++    for (StorageType storageType : expected) {
++      List<DatanodeWithStorage> nodes = liveDns.getTarget(storageType);
++      if (nodes == null) {
++        return targetsMap;
++      }
++      List<DatanodeWithStorage.StorageDetails> listNodes = targetsMap
++          .get(storageType);
++      if (listNodes == null) {
++        listNodes = new ArrayList<>();
++        targetsMap.put(storageType, listNodes);
++      }
++
++      for (DatanodeWithStorage n : nodes) {
++        final DatanodeWithStorage.StorageDetails node = getMaxRemaining(n,
++            storageType);
++        if (node != null) {
++          listNodes.add(node);
+-    return targetMap;
++    return targetsMap;
+-  private static long getMaxRemaining(StorageReport[] storageReports,
+-      StorageType t) {
++  private static DatanodeWithStorage.StorageDetails getMaxRemaining(
++      DatanodeWithStorage node, StorageType storageType) {
+-    for (StorageReport r : storageReports) {
+-      if (r.getStorage().getStorageType() == t) {
+-        if (r.getRemaining() > max) {
+-          max = r.getRemaining();
+-        }
++    DatanodeWithStorage.StorageDetails nodeInfo = null;
++    List<DatanodeWithStorage.StorageDetails> storages = node
++        .getNodesWithStorages(storageType);
++    for (DatanodeWithStorage.StorageDetails n : storages) {
++      if (n.availableSizeToMove() > max) {
++        max = n.availableSizeToMove();
++        nodeInfo = n;
+-    return max;
++    return nodeInfo;
+-      List<StorageType> existing, List<StorageType> expectedStorageTypes,
+-      DatanodeStorageReport[] liveDns) {
++      List<StorageType> existingStorageTypes,
++      List<StorageType> expectedStorageTypes, DatanodeMap liveDns) {
+-    for (DatanodeStorageReport liveDn : liveDns) {
+-      if (dn.equals(liveDn.getDatanodeInfo())) {
+-        StorageReport[] storageReports = liveDn.getStorageReports();
+-        for (StorageReport eachStorage : storageReports) {
+-          StorageType storageType = eachStorage.getStorage().getStorageType();
+-          if (existing.contains(storageType)) {
++    for (DatanodeWithStorage liveDn : liveDns.getTargets()) {
++      if (dn.equals(liveDn.datanode)) {
++        for (StorageType eachType : liveDn.getStorageTypes()) {
++          if (existingStorageTypes.contains(eachType)) {
+-          if (expectedStorageTypes.contains(storageType)) {
++          if (expectedStorageTypes.contains(eachType)) {
+-  private static class StorageTypeNodeMap {
+-    private final EnumMap<StorageType, List<DatanodeInfo>> typeNodeMap =
+-        new EnumMap<StorageType, List<DatanodeInfo>>(StorageType.class);
++  /**
++   * Maintains storage type map with the available datanodes in the cluster.
++   */
++  public static class DatanodeMap {
++    private final EnumMap<StorageType, List<DatanodeWithStorage>> targetsMap =
++        new EnumMap<StorageType, List<DatanodeWithStorage>>(StorageType.class);
+-    private void add(StorageType t, DatanodeInfo dn) {
+-      List<DatanodeInfo> nodesWithStorages = getNodesWithStorages(t);
+-      LinkedList<DatanodeInfo> value = null;
+-      if (nodesWithStorages == null) {
+-        value = new LinkedList<DatanodeInfo>();
+-        value.add(dn);
+-        typeNodeMap.put(t, value);
+-      } else {
+-        nodesWithStorages.add(dn);
++    private List<DatanodeWithStorage> targets = new ArrayList<>();
++
++    /**
++     * Build datanode map with the available storage types.
++     *
++     * @param node
++     *          datanode
++     * @param storageTypes
++     *          list of available storage types in the given datanode
++     * @param maxSize2Move
++     *          available space which can be used for scheduling block move
++     */
++    void addTarget(DatanodeInfo node, List<StorageType> storageTypes,
++        List<Long> maxSize2Move) {
++      DatanodeWithStorage nodeStorage = new DatanodeWithStorage(node);
++      targets.add(nodeStorage);
++      for (int i = 0; i < storageTypes.size(); i++) {
++        StorageType type = storageTypes.get(i);
++        List<DatanodeWithStorage> nodeStorages = targetsMap.get(type);
++        nodeStorage.addStorageType(type, maxSize2Move.get(i));
++        if (nodeStorages == null) {
++          nodeStorages = new LinkedList<>();
++          targetsMap.put(type, nodeStorages);
++        }
++        nodeStorages.add(nodeStorage);
++    List<DatanodeWithStorage> getTarget(StorageType storageType) {
++      return targetsMap.get(storageType);
++    }
++
++    public List<DatanodeWithStorage> getTargets() {
++      return targets;
++    }
++
++    void reset() {
++      targetsMap.clear();
++    }
++  }
++
++  /**
++   * Keeps datanode with its respective set of supported storage types. It holds
++   * the available space in each volumes and will be used while pairing the
++   * target datanodes.
++   */
++  public static final class DatanodeWithStorage {
++    private final EnumMap<StorageType, List<StorageDetails>> storageMap =
++        new EnumMap<StorageType, List<StorageDetails>>(StorageType.class);
++    private final DatanodeInfo datanode;
++
++    private DatanodeWithStorage(DatanodeInfo datanode) {
++      this.datanode = datanode;
++    }
++
++    public DatanodeInfo getDatanodeInfo() {
++      return datanode;
++    }
++
++    Set<StorageType> getStorageTypes() {
++      return storageMap.keySet();
++    }
++
++    private void addStorageType(StorageType t, long maxSize2Move) {
++      List<StorageDetails> nodesWithStorages = getNodesWithStorages(t);
++      if (nodesWithStorages == null) {
++        nodesWithStorages = new LinkedList<StorageDetails>();
++        storageMap.put(t, nodesWithStorages);
++      }
++      nodesWithStorages.add(new StorageDetails(maxSize2Move));
++    }
++
++     * Returns datanode storages which has the given storage type.
++     *
+-     *          - Storage type
+-     * @return datanodes which has the given storage type
++     *          - storage type
++     * @return datanodes for the given storage type
+-    private List<DatanodeInfo> getNodesWithStorages(StorageType type) {
+-      return typeNodeMap.get(type);
++    private List<StorageDetails> getNodesWithStorages(StorageType type) {
++      return storageMap.get(type);
++    }
++
++    @Override
++    public String toString() {
++      return new StringBuilder().append("DatanodeWithStorageInfo(\n  ")
++          .append("Datanode: ").append(datanode).append(" StorageTypeNodeMap: ")
++          .append(storageMap).append(")").toString();
++    }
++
++    /** Storage details in a datanode storage type. */
++    final class StorageDetails {
++      private final long maxSize2Move;
++      private long scheduledSize = 0L;
++
++      private StorageDetails(long maxSize2Move) {
++        this.maxSize2Move = maxSize2Move;
++      }
++
++      private DatanodeInfo getDatanodeInfo() {
++        return DatanodeWithStorage.this.datanode;
++      }
++
++      /**
++       * Checks whether this datanode storage has sufficient space to occupy the
++       * given block size.
++       */
++      private synchronized boolean hasSpaceForScheduling(long size) {
++        return availableSizeToMove() > size;
++      }
++
++      /**
++       * @return the total number of bytes that need to be moved.
++       */
++      private synchronized long availableSizeToMove() {
++        return maxSize2Move - scheduledSize;
++      }
++
++      /** Increment scheduled size. */
++      private synchronized void incScheduledSize(long size) {
++        scheduledSize += size;
++      }
++
++      @Override
++      public String toString() {
++        return new StringBuilder().append("StorageDetails(\n  ")
++            .append("maxSize2Move: ").append(maxSize2Move)
++            .append(" scheduledSize: ").append(scheduledSize).append(")")
++            .toString();
++      }
+
+MOV26 UPD40 INS23 INS55 INS55 INS83 INS74 INS59 INS43 INS44 INS29 INS83 INS74 INS43 INS29 UPD83 MOV83 MOV83 UPD42 MOV42 MOV23 INS23 INS31 INS31 INS31 INS31 INS29 INS83 INS83 INS83 INS42 INS23 INS23 INS31 INS31 INS31 INS31 MOV31 INS31 INS55 INS43 INS43 INS42 INS21 UPD42 MOV42 INS60 INS65 INS65 INS43 UPD42 INS74 UPD42 INS65 INS74 INS42 INS74 INS65 INS83 INS83 INS83 INS43 INS43 INS74 INS43 INS40 INS43 UPD42 UPD42 INS60 INS60 INS70 UPD42 INS43 INS65 UPD74 INS83 INS74 INS59 INS29 MOV39 UPD42 MOV42 INS44 MOV44 INS44 INS8 INS74 INS42 INS44 INS8 INS83 INS74 INS42 INS8 INS39 INS42 INS8 INS65 INS83 INS83 INS74 INS59 INS83 INS83 MOV43 INS59 INS83 INS42 INS44 INS8 INS83 MOV43 INS42 INS8 INS74 INS42 INS8 INS83 INS39 INS42 MOV44 INS44 INS8 UPD74 INS78 INS83 INS43 INS42 INS8 INS29 INS83 INS42 INS23 INS23 INS31 INS31 INS31 INS31 INS31 INS31 INS42 INS42 INS7 INS43 INS59 INS42 INS66 INS42 INS66 UPD42 MOV42 UPD42 UPD42 INS43 INS43 INS74 UPD42 INS42 INS66 INS43 INS43 INS74 INS43 INS43 INS74 INS66 INS42 UPD42 MOV42 INS43 INS43 UPD42 MOV42 INS74 UPD42 UPD42 UPD42 MOV42 INS43 INS59 UPD74 MOV74 INS59 INS44 INS42 INS8 UPD42 UPD42 MOV42 INS32 INS66 INS43 INS43 INS74 UPD42 INS43 INS43 INS42 INS14 INS65 INS65 INS65 INS65 MOV43 INS42 INS74 INS42 INS74 INS42 MOV60 INS21 INS24 INS43 INS43 INS43 INS42 INS41 INS43 INS43 INS41 INS21 INS66 INS66 INS66 INS43 INS43 INS74 INS42 INS14 INS42 MOV43 INS42 INS21 INS41 INS43 INS43 INS41 INS39 INS42 MOV60 INS25 MOV21 INS65 INS43 INS42 INS42 INS41 INS65 INS83 INS83 INS39 INS59 INS83 INS39 INS59 INS83 INS42 INS44 INS8 INS83 MOV43 INS42 INS8 INS29 INS83 INS83 INS39 INS42 INS44 INS8 INS29 INS83 INS83 INS39 INS42 INS8 INS29 INS83 INS83 INS39 INS42 INS44 INS8 INS78 INS83 INS43 INS42 INS8 INS42 INS14 INS42 INS42 INS32 UPD27 INS42 UPD42 MOV42 INS43 INS43 INS42 INS42 INS43 INS43 INS60 INS25 INS70 INS42 UPD42 MOV42 INS43 INS43 INS42 INS40 MOV43 INS43 INS74 UPD42 UPD43 UPD42 INS25 MOV60 INS25 INS70 INS40 INS42 INS33 INS43 INS42 INS32 INS43 INS42 MOV25 UPD43 INS42 INS42 INS42 INS42 INS43 INS43 UPD74 INS57 INS42 INS42 INS74 INS66 INS42 INS66 INS42 INS66 INS42 INS66 INS43 INS43 INS43 INS43 INS43 INS32 INS58 INS27 INS37 INS8 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS32 INS42 INS42 INS43 INS43 INS74 INS57 INS7 INS42 INS42 INS42 INS32 INS74 MOV27 INS8 INS66 UPD66 UPD66 INS42 INS32 INS66 INS42 INS42 INS34 INS39 INS42 INS21 INS41 INS65 INS39 INS42 INS41 INS65 INS41 INS65 INS39 INS42 INS21 INS42 INS42 INS41 INS74 INS42 INS42 INS42 INS42 UPD40 INS74 INS42 INS40 MOV27 MOV27 UPD42 INS42 INS40 INS74 INS59 INS27 INS8 INS44 INS42 INS8 INS42 INS40 UPD74 UPD42 MOV42 INS43 INS43 INS74 MOV57 UPD42 UPD74 MOV74 INS27 INS8 UPD74 MOV74 INS27 INS8 INS44 INS42 INS8 INS40 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 INS40 UPD42 INS42 INS42 INS43 INS74 INS43 INS43 UPD42 MOV42 INS42 INS42 INS42 INS42 INS42 INS14 INS42 INS42 INS42 INS39 INS59 INS42 INS32 INS42 INS60 INS60 MOV21 INS25 INS21 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS43 INS43 INS74 INS43 INS22 INS42 INS42 INS42 INS43 INS43 INS21 INS21 INS14 UPD42 INS32 INS42 INS7 INS22 INS66 INS66 INS27 INS66 INS27 INS66 INS7 INS32 INS43 INS43 INS43 INS43 INS74 UPD42 MOV27 INS43 INS43 INS42 INS32 INS42 INS33 INS18 INS43 INS42 INS25 UPD43 INS43 UPD42 INS60 INS42 INS40 MOV43 MOV43 INS74 INS43 UPD42 INS42 INS33 INS41 UPD43 UPD42 INS42 INS33 INS21 INS21 INS43 INS42 MOV60 MOV25 INS21 INS40 INS42 INS43 INS43 INS42 INS42 INS43 INS42 INS42 INS34 INS42 INS42 MOV43 INS59 INS74 INS59 INS27 INS8 INS32 INS42 INS42 INS43 INS43 INS42 INS52 INS42 INS42 INS42 INS7 INS32 INS43 INS42 INS32 INS42 INS45 INS22 INS42 INS52 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS42 UPD42 MOV42 INS43 INS43 UPD42 UPD42 INS42 INS40 INS42 INS42 INS42 INS40 INS32 INS8 INS40 UPD42 INS40 MOV43 INS59 INS43 INS43 INS42 UPD42 INS42 UPD42 INS42 INS40 UPD42 MOV42 UPD42 MOV42 UPD42 INS7 INS32 INS42 INS43 UPD27 UPD42 UPD42 INS7 INS32 INS42 INS42 INS42 INS42 INS32 INS43 INS43 INS42 INS32 UPD42 UPD42 UPD42 INS32 INS42 INS33 MOV21 MOV21 INS42 INS42 INS42 INS42 INS42 INS42 INS14 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS52 INS42 INS42 INS42 INS32 INS42 INS45 INS42 INS40 UPD42 UPD42 UPD42 UPD42 INS32 INS42 INS42 MOV25 INS25 INS42 INS32 INS25 UPD42 MOV42 INS40 INS42 INS14 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 INS42 INS40 UPD42 UPD42 INS33 INS42 INS42 MOV43 UPD42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 UPD74 MOV74 INS32 INS42 INS45 INS32 INS42 INS42 INS42 UPD42 UPD42 UPD42 UPD42 UPD42 UPD42 UPD42 INS42 INS42 INS32 INS32 INS8 INS42 INS42 INS32 INS32 INS8 INS74 UPD42 MOV42 UPD42 MOV42 UPD42 UPD42 UPD42 UPD42 UPD42 UPD42 INS43 INS32 INS42 INS42 INS32 INS42 INS45 UPD42 INS42 INS42 INS32 INS21 INS42 INS42 INS21 UPD42 UPD42 INS42 INS42 INS32 INS21 INS42 INS42 INS21 INS43 UPD42 UPD42 MOV42 UPD42 UPD42 UPD42 UPD74 INS42 INS32 INS42 INS45 INS32 INS42 INS42 INS42 INS42 INS32 INS32 INS42 INS42 INS32 INS32 INS42 INS14 INS42 INS45 INS32 INS42 INS45 INS42 INS42 INS32 UPD42 MOV42 UPD42 MOV42 INS27 MOV42 MOV42 INS42 MOV32 INS42 INS42 INS32 UPD42 MOV42 UPD42 MOV42 INS27 MOV42 MOV42 INS42 MOV32 INS43 INS14 INS42 INS45 INS42 INS42 INS45 INS45 INS42 INS42 INS45 INS45 INS42 INS43 INS42 DEL40 DEL26 DEL42 DEL43 DEL85 DEL5 DEL42 DEL59 DEL60 DEL42 DEL42 DEL42 DEL32 DEL7 DEL21 DEL42 DEL43 DEL85 DEL5 DEL42 DEL44 DEL43 DEL85 DEL5 DEL43 DEL43 DEL42 DEL39 DEL42 DEL32 DEL59 DEL60 DEL43 DEL42 DEL39 DEL42 DEL32 DEL59 DEL60 DEL42 DEL33 DEL33 DEL43 DEL43 DEL85 DEL5 DEL43 DEL43 DEL42 DEL43 DEL85 DEL5 DEL42 DEL32 DEL39 DEL32 DEL42 DEL34 DEL42 DEL42 DEL32 DEL42 DEL43 DEL42 DEL44 DEL42 DEL32 DEL8 DEL25 DEL8 DEL70 DEL39 DEL43 DEL85 DEL5 DEL42 DEL43 DEL42 DEL44 DEL42 DEL32 DEL32 DEL42 DEL27 DEL8 DEL25 DEL8 DEL70 DEL43 DEL85 DEL5 DEL42 DEL42 DEL42 DEL32 DEL42 DEL43 DEL85 DEL5 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL43 DEL42 DEL42 DEL42 DEL42 DEL32 DEL42 DEL32 DEL59 DEL60 DEL43 DEL42 DEL42 DEL33 DEL42 DEL83 DEL8 DEL8 DEL25 DEL8 DEL31 DEL55

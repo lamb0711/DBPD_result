@@ -1,0 +1,209 @@
+HDDS-297. Add pipeline actions in Ozone.  Contributed by Mukul Kumar Singh and Shashikant Banerjee
+
++import org.apache.hadoop.hdds.protocol.proto
++    .StorageContainerDatanodeProtocolProtos.ClosePipelineInfo;
++import org.apache.hadoop.hdds.protocol.proto
++    .StorageContainerDatanodeProtocolProtos.PipelineAction;
++import org.apache.hadoop.ozone.container.common.statemachine.StateContext;
++import org.apache.ratis.protocol.RaftPeerId;
++import org.apache.ratis.protocol.RaftGroup;
++import org.apache.ratis.protocol.RaftGroupId;
++import org.apache.ratis.shaded.proto.RaftProtos;
++import org.apache.ratis.shaded.proto.RaftProtos.RoleInfoProto;
++import java.util.UUID;
++  private final StateContext context;
++  private final ReplicationLevel replicationLevel;
++  private long nodeFailureTimeoutMs;
+-      ContainerDispatcher dispatcher, Configuration conf) throws IOException {
++      ContainerDispatcher dispatcher, Configuration conf, StateContext context)
++      throws IOException {
++    Objects.requireNonNull(dd, "id == null");
++    this.port = port;
++    RaftProperties serverProperties = newRaftProperties(conf, storageDir);
++    final int numWriteChunkThreads = conf.getInt(
++        OzoneConfigKeys.DFS_CONTAINER_RATIS_NUM_WRITE_CHUNK_THREADS_KEY,
++        OzoneConfigKeys.DFS_CONTAINER_RATIS_NUM_WRITE_CHUNK_THREADS_DEFAULT);
++    chunkExecutor =
++        new ThreadPoolExecutor(numWriteChunkThreads, numWriteChunkThreads,
++            100, TimeUnit.SECONDS,
++            new ArrayBlockingQueue<>(1024),
++            new ThreadPoolExecutor.CallerRunsPolicy());
++    this.context = context;
++    this.replicationLevel =
++        conf.getEnum(OzoneConfigKeys.DFS_CONTAINER_RATIS_REPLICATION_LEVEL_KEY,
++            OzoneConfigKeys.DFS_CONTAINER_RATIS_REPLICATION_LEVEL_DEFAULT);
++    ContainerStateMachine stateMachine =
++        new ContainerStateMachine(dispatcher, chunkExecutor, this);
++    this.server = RaftServer.newBuilder()
++        .setServerId(RatisHelper.toRaftPeerId(dd))
++        .setGroup(RatisHelper.emptyRaftGroup())
++        .setProperties(serverProperties)
++        .setStateMachine(stateMachine)
++        .build();
++  }
++
++  private RaftProperties newRaftProperties(Configuration conf,
++      String storageDir) {
++    final RaftProperties properties = new RaftProperties();
++
++    // Set rpc type
++    RaftConfigKeys.Rpc.setType(properties, rpc);
++
++    // set raft segment size
++    RaftServerConfigKeys.Log.setSegmentSizeMax(properties,
++        SizeInBytes.valueOf(raftSegmentSize));
++
++    // set raft segment pre-allocated size
++    RaftServerConfigKeys.Log.Appender.setBufferCapacity(properties,
++        SizeInBytes.valueOf(raftSegmentPreallocatedSize));
++    RaftServerConfigKeys.Log.setPreallocatedSize(properties,
++        SizeInBytes.valueOf(raftSegmentPreallocatedSize));
++
++    // Set max write buffer size, which is the scm chunk size
+-    final int numWriteChunkThreads = conf.getInt(
+-        OzoneConfigKeys.DFS_CONTAINER_RATIS_NUM_WRITE_CHUNK_THREADS_KEY,
+-        OzoneConfigKeys.DFS_CONTAINER_RATIS_NUM_WRITE_CHUNK_THREADS_DEFAULT);
++    RaftServerConfigKeys.Log.setWriteBufferSize(properties,
++        SizeInBytes.valueOf(maxChunkSize));
++
++    // Set the client requestTimeout
++    RaftClientConfigKeys.Rpc
++        .setRequestTimeout(properties, clientRequestTimeout);
++
++    // Set the server Request timeout
+-
+-    Objects.requireNonNull(dd, "id == null");
+-    this.port = port;
+-    RaftProperties serverProperties =
+-        newRaftProperties(rpc, port, storageDir, maxChunkSize, raftSegmentSize,
+-            raftSegmentPreallocatedSize);
+-    setRequestTimeout(serverProperties, clientRequestTimeout,
+-        serverRequestTimeout);
+-
+-    chunkExecutor =
+-        new ThreadPoolExecutor(numWriteChunkThreads, numWriteChunkThreads,
+-            100, TimeUnit.SECONDS,
+-            new ArrayBlockingQueue<>(1024),
+-            new ThreadPoolExecutor.CallerRunsPolicy());
+-    ContainerStateMachine stateMachine =
+-        new ContainerStateMachine(dispatcher, chunkExecutor);
+-    this.server = RaftServer.newBuilder()
+-        .setServerId(RatisHelper.toRaftPeerId(dd))
+-        .setGroup(RatisHelper.emptyRaftGroup())
+-        .setProperties(serverProperties)
+-        .setStateMachine(stateMachine)
+-        .build();
+-  }
+-
+-  private static void setRequestTimeout(RaftProperties serverProperties,
+-      TimeDuration clientRequestTimeout, TimeDuration serverRequestTimeout) {
+-    RaftClientConfigKeys.Rpc
+-        .setRequestTimeout(serverProperties, clientRequestTimeout);
+-        .setRequestTimeout(serverProperties, serverRequestTimeout);
+-  }
++        .setRequestTimeout(properties, serverRequestTimeout);
+-  private static RaftProperties newRaftProperties(
+-      RpcType rpc, int port, String storageDir, int scmChunkSize,
+-      int raftSegmentSize, int raftSegmentPreallocatedSize) {
+-    final RaftProperties properties = new RaftProperties();
++    // Enable batch append on raft server
+-    RaftServerConfigKeys.Log.Appender.setBufferCapacity(properties,
+-        SizeInBytes.valueOf(raftSegmentPreallocatedSize));
+-    RaftServerConfigKeys.Log.setWriteBufferSize(properties,
+-        SizeInBytes.valueOf(scmChunkSize));
+-    RaftServerConfigKeys.Log.setPreallocatedSize(properties,
+-        SizeInBytes.valueOf(raftSegmentPreallocatedSize));
+-    RaftServerConfigKeys.Log.setSegmentSizeMax(properties,
+-        SizeInBytes.valueOf(raftSegmentSize));
+-    RaftServerConfigKeys.setStorageDir(properties, new File(storageDir));
+-    RaftConfigKeys.Rpc.setType(properties, rpc);
++    // Set the maximum cache segments
+-    GrpcConfigKeys.setMessageSizeMax(properties,
+-        SizeInBytes.valueOf(scmChunkSize + raftSegmentPreallocatedSize));
++
++    // Set the ratis leader election timeout
++
++    // set the node failure timeout
++    timeUnit = OzoneConfigKeys.DFS_RATIS_SERVER_FAILURE_DURATION_DEFAULT
++        .getUnit();
++    duration = conf.getTimeDuration(
++        OzoneConfigKeys.DFS_RATIS_SERVER_FAILURE_DURATION_KEY,
++        OzoneConfigKeys.DFS_RATIS_SERVER_FAILURE_DURATION_DEFAULT
++            .getDuration(), timeUnit);
++    final TimeDuration nodeFailureTimeout =
++        TimeDuration.valueOf(duration, timeUnit);
++    RaftServerConfigKeys.setLeaderElectionTimeout(properties,
++        nodeFailureTimeout);
++    RaftServerConfigKeys.Rpc.setSlownessTimeout(properties,
++        nodeFailureTimeout);
++    nodeFailureTimeoutMs = nodeFailureTimeout.toLong(TimeUnit.MILLISECONDS);
++
++    // Set the ratis storage directory
++    RaftServerConfigKeys.setStorageDir(properties, new File(storageDir));
++
++    // For grpc set the maximum message size
++    GrpcConfigKeys.setMessageSizeMax(properties,
++        SizeInBytes.valueOf(maxChunkSize + raftSegmentPreallocatedSize));
++
++    // Set the ratis port number
+-      ContainerDispatcher dispatcher) throws IOException {
++      ContainerDispatcher dispatcher, StateContext context) throws IOException {
+-        dispatcher, ozoneConf);
++        dispatcher, ozoneConf, context);
+-            RaftClientRequest.writeRequestType(ReplicationLevel.ALL));
++            RaftClientRequest.writeRequestType(replicationLevel));
++
++  private void handlePipelineFailure(RaftGroupId groupId,
++      RoleInfoProto roleInfoProto) {
++    String msg;
++    UUID datanode = RatisHelper.toDatanodeId(roleInfoProto.getSelf());
++    RaftPeerId id = RaftPeerId.valueOf(roleInfoProto.getSelf().getId());
++    switch (roleInfoProto.getRole()) {
++    case CANDIDATE:
++      msg = datanode + " is in candidate state for " +
++          roleInfoProto.getCandidateInfo().getLastLeaderElapsedTimeMs() + "ms";
++      break;
++    case LEADER:
++      StringBuilder sb = new StringBuilder();
++      sb.append(datanode).append(" has not seen follower/s");
++      for (RaftProtos.ServerRpcProto follower : roleInfoProto.getLeaderInfo()
++          .getFollowerInfoList()) {
++        if (follower.getLastRpcElapsedTimeMs() > nodeFailureTimeoutMs) {
++          sb.append(" ").append(RatisHelper.toDatanodeId(follower.getId()))
++              .append(" for ").append(follower.getLastRpcElapsedTimeMs())
++              .append("ms");
++        }
++      }
++      msg = sb.toString();
++      break;
++    default:
++      LOG.error("unknown state:" + roleInfoProto.getRole());
++      throw new IllegalStateException("node" + id + " is in illegal role "
++          + roleInfoProto.getRole());
++    }
++
++    PipelineID pipelineID = PipelineID.valueOf(groupId);
++    ClosePipelineInfo.Builder closePipelineInfo =
++        ClosePipelineInfo.newBuilder()
++            .setPipelineID(pipelineID.getProtobuf())
++            .setReason(ClosePipelineInfo.Reason.PIPELINE_FAILED)
++            .setDetailedReason(msg);
++
++    PipelineAction action = PipelineAction.newBuilder()
++        .setClosePipeline(closePipelineInfo)
++        .setAction(PipelineAction.Action.CLOSE)
++        .build();
++    context.addPipelineActionIfAbsent(action);
++  }
++
++  void handleNodeSlowness(
++      RaftGroup group, RoleInfoProto roleInfoProto) {
++    handlePipelineFailure(group.getGroupId(), roleInfoProto);
++  }
++
++  void handleNoLeader(
++      RaftGroup group, RoleInfoProto roleInfoProto) {
++    handlePipelineFailure(group.getGroupId(), roleInfoProto);
++  }
+
+INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS23 INS23 INS23 INS31 INS31 INS31 INS83 INS83 INS43 INS59 INS83 INS83 INS43 INS59 INS83 INS39 INS59 INS44 MOV60 MOV21 MOV21 MOV21 MOV21 MOV21 MOV21 INS44 INS83 MOV39 UPD42 MOV42 MOV44 MOV44 INS8 INS39 INS42 INS44 INS44 INS8 INS39 INS42 INS44 INS44 INS8 INS42 INS42 INS42 INS42 INS42 INS43 INS42 INS21 INS21 UPD43 UPD42 MOV60 MOV60 MOV60 MOV60 MOV60 MOV60 MOV60 MOV60 INS21 MOV21 MOV21 MOV60 INS21 INS21 INS21 INS60 INS21 INS21 INS21 INS43 INS42 UPD43 UPD42 UPD43 UPD42 INS60 INS60 INS60 INS50 INS60 INS60 INS60 MOV21 INS43 INS42 INS43 INS42 INS21 INS43 INS42 INS43 INS42 INS21 INS42 INS7 INS7 MOV43 UPD42 INS32 INS32 INS7 INS7 INS83 MOV43 INS59 INS32 INS32 INS7 INS42 UPD42 UPD42 INS43 INS59 INS43 INS59 INS43 INS59 INS32 INS49 INS21 INS10 INS49 INS60 INS21 INS70 INS21 INS10 INS49 INS21 INS53 INS43 INS59 INS43 INS59 INS43 INS59 INS42 INS42 INS32 INS42 INS42 INS32 INS22 INS42 INS22 INS32 INS40 INS42 INS42 INS42 INS40 INS42 INS42 INS42 INS42 INS32 INS42 INS32 INS42 INS32 INS42 INS42 INS42 INS42 INS40 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS42 INS7 INS42 INS43 INS59 INS32 INS44 INS32 INS8 INS7 INS32 INS14 INS42 INS42 INS32 INS40 INS42 INS32 INS42 INS42 INS32 UPD42 UPD42 UPD42 INS42 INS32 INS42 INS42 INS32 INS42 UPD42 INS52 INS42 INS52 INS42 UPD42 MOV42 UPD42 MOV42 INS40 INS40 MOV43 INS52 UPD42 INS40 INS42 INS42 INS42 INS40 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS40 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS27 INS42 INS42 INS14 INS32 INS42 INS45 INS43 UPD42 MOV42 INS32 INS42 INS25 INS42 INS32 INS42 INS42 INS27 INS43 INS27 INS42 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS40 INS42 UPD42 INS42 INS42 INS42 INS32 INS42 INS42 INS45 INS32 INS45 INS43 INS42 INS42 INS42 INS40 INS42 INS42 INS27 INS8 INS42 INS42 INS45 INS32 INS42 INS45 INS42 INS45 INS32 INS32 INS42 INS40 INS32 INS42 INS40 INS42 INS42 INS32 INS42 INS42 INS32 INS42 MOV21 INS42 INS42 INS42 INS42 INS32 INS42 INS32 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS45 INS32 INS42 INS32 INS32 INS42 INS45 INS42 UPD42 MOV42 INS32 INS42 INS32 UPD42 MOV42 INS42 INS45 UPD42 MOV42 INS42 INS32 INS42 INS42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL21 DEL83 DEL83 DEL44 DEL8 DEL31 DEL83 DEL39 DEL42 DEL44 DEL39 DEL42 DEL44 DEL39 DEL42 DEL44 DEL39 DEL42 DEL44 DEL40 DEL40 DEL32 DEL40

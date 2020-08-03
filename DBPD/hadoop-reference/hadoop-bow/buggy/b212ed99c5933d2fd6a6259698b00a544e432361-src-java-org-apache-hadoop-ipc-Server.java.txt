@@ -1,0 +1,134 @@
+HADOOP-6713. The RPC server Listener thread is a scalability bottleneck. Contributed by Dmytro Molkov.
+
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/trunk@938590 13f79535-47bb-0310-9956-ffa450edef68
+
++import java.util.concurrent.ExecutorService;
++import java.util.concurrent.Executors;
++  private int readThreads;                        // number of read threads
++    private Reader[] readers = null;
++    private int currentReader = 0;
++    private ExecutorService readPool;
++      readers = new Reader[readThreads];
++      readPool = Executors.newFixedThreadPool(readThreads);
++      for (int i = 0; i < readThreads; i++) {
++        Selector readSelector = Selector.open();
++        Reader reader = new Reader(readSelector);
++        readers[i] = reader;
++        readPool.execute(reader);
++      }
++    
++    private class Reader implements Runnable {
++      private volatile boolean adding = false;
++      private Selector readSelector = null;
++
++      Reader(Selector readSelector) {
++        this.readSelector = readSelector;
++      }
++      public void run() {
++        LOG.info("Starting SocketReader");
++        synchronized (this) {
++          while (running) {
++            SelectionKey key = null;
++            try {
++              readSelector.select();
++              while (adding) {
++                this.wait(1000);
++              }              
++
++              Iterator<SelectionKey> iter = readSelector.selectedKeys().iterator();
++              while (iter.hasNext()) {
++                key = iter.next();
++                iter.remove();
++                if (key.isValid()) {
++                  if (key.isReadable()) {
++                    doRead(key);
++                  }
++                }
++                key = null;
++              }
++            } catch (InterruptedException e) {
++              if (running) {                      // unexpected -- log it
++                LOG.info(getName() + " caught: " +
++                         StringUtils.stringifyException(e));
++              }
++            } catch (IOException ex) {
++              LOG.error("Error in Reader", ex);
++            }
++          }
++        }
++      }
++
++      /**
++       * This gets reader into the state that waits for the new channel
++       * to be registered with readSelector. If it was waiting in select()
++       * the thread will be woken up, otherwise whenever select() is called
++       * it will return even if there is nothing to read and wait
++       * in while(adding) for finishAdd call
++       */
++      public void startAdd() {
++        adding = true;
++        readSelector.wakeup();
++      }
++      
++      public synchronized SelectionKey registerChannel(SocketChannel channel)
++                                                          throws IOException {
++          return channel.register(readSelector, SelectionKey.OP_READ);
++      }
++
++      public synchronized void finishAdd() {
++        adding = false;
++        this.notify();        
++      }
++    }
+-                else if (key.isReadable())
+-                  doRead(key);
+-        } catch (InterruptedException e) {
+-          if (running) {                          // unexpected -- log it
+-            LOG.info(getName() + " caught: " +
+-                     StringUtils.stringifyException(e));
+-          }
+-      // accept up to 10 connections
+-      for (int i=0; i<10; i++) {
+-        SocketChannel channel = server.accept();
+-        if (channel==null) return;
++      SocketChannel channel;
++      while ((channel = server.accept()) != null) {
+-        SelectionKey readKey = channel.register(getSelector(), 
+-          SelectionKey.OP_READ);
+-        c = new Connection(readKey, channel, System.currentTimeMillis());
+-        readKey.attach(c);
+-        synchronized (connectionList) {
+-          connectionList.add(numConnections, c);
+-          numConnections++;
++        
++        Reader reader = getReader();
++        try {
++          reader.startAdd();
++          SelectionKey readKey = reader.registerChannel(channel);
++          c = new Connection(readKey, channel, System.currentTimeMillis());
++          readKey.attach(c);
++          synchronized (connectionList) {
++            connectionList.add(numConnections, c);
++            numConnections++;
++          }
++          if (LOG.isDebugEnabled())
++            LOG.debug("Server connection from " + c.toString() +
++                "; # active connections: " + numConnections +
++                "; # queued calls: " + callQueue.size());          
++        } finally {
++          reader.finishAdd(); 
+-        if (LOG.isDebugEnabled())
+-          LOG.debug("Server connection from " + c.toString() +
+-              "; # active connections: " + numConnections +
+-              "; # queued calls: " + callQueue.size());
++      readPool.shutdown();
++    // The method that will return the next reader to work with
++    // Simplistic implementation of round robin for now
++    Reader getReader() {
++      currentReader = (currentReader + 1) % readers.length;
++      return readers[currentReader];
++    }
++    this.readThreads = conf.getInt(
++        CommonConfigurationKeys.IPC_SERVER_RPC_READ_THREADS_KEY,
++        CommonConfigurationKeys.IPC_SERVER_RPC_READ_THREADS_DEFAULT);

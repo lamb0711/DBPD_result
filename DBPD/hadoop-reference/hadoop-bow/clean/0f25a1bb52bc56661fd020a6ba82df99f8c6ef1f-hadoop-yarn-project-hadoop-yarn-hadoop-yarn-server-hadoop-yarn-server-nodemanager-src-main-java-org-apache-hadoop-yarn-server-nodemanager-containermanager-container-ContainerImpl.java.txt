@@ -1,0 +1,187 @@
+YARN-3998. Add support in the NodeManager to re-launch containers. Contributed by Jun Gong.
+
++import org.apache.hadoop.yarn.api.records.ContainerRetryContext;
++import org.apache.hadoop.yarn.api.records.ContainerRetryPolicy;
++import org.apache.hadoop.yarn.server.nodemanager.ContainerExecutor.ExitCode;
++import org.apache.hadoop.yarn.server.nodemanager.recovery.NMStateStoreService.RecoveredContainerState;
++  private final int diagnosticsMaxSize;
++  private final ContainerRetryContext containerRetryContext;
++  // remaining retries to relaunch container if needed
++  private int remainingRetryAttempts;
++  private String workDir;
++  private String logDir;
++    if (launchContext != null
++        && launchContext.getContainerRetryContext() != null) {
++      this.containerRetryContext = launchContext.getContainerRetryContext();
++    } else {
++      this.containerRetryContext = ContainerRetryContext.NEVER_RETRY_CONTEXT;
++    }
++    this.remainingRetryAttempts = containerRetryContext.getMaxRetries();
++    this.diagnosticsMaxSize = conf.getInt(
++        YarnConfiguration.NM_CONTAINER_DIAGNOSTICS_MAXIMUM_SIZE,
++        YarnConfiguration.DEFAULT_NM_CONTAINER_DIAGNOSTICS_MAXIMUM_SIZE);
+-      ContainerTokenIdentifier containerTokenIdentifier,
+-      RecoveredContainerStatus recoveredStatus, int exitCode,
+-      String diagnostics, boolean wasKilled, Resource recoveredCapability,
+-      Context context) {
++      ContainerTokenIdentifier containerTokenIdentifier, Context context,
++      RecoveredContainerState rcs) {
+-    this.recoveredStatus = recoveredStatus;
+-    this.exitCode = exitCode;
+-    this.recoveredAsKilled = wasKilled;
+-    this.diagnostics.append(diagnostics);
++    this.recoveredStatus = rcs.getStatus();
++    this.exitCode = rcs.getExitCode();
++    this.recoveredAsKilled = rcs.getKilled();
++    this.diagnostics.append(rcs.getDiagnostics());
++    Resource recoveredCapability = rcs.getCapability();
++    this.remainingRetryAttempts = rcs.getRemainingRetryAttempts();
++    this.workDir = rcs.getWorkDir();
++    this.logDir = rcs.getLogDir();
+-        ContainerState.EXITED_WITH_FAILURE,
++        EnumSet.of(ContainerState.RELAUNCHING,
++            ContainerState.EXITED_WITH_FAILURE),
+-        new ExitedWithFailureTransition(true))
++        new RetryFailureTransition())
++    // From RELAUNCHING State
++    .addTransition(ContainerState.RELAUNCHING, ContainerState.RUNNING,
++        ContainerEventType.CONTAINER_LAUNCHED, new LaunchTransition())
++    .addTransition(ContainerState.RELAUNCHING,
++        ContainerState.EXITED_WITH_FAILURE,
++        ContainerEventType.CONTAINER_EXITED_WITH_FAILURE,
++        new ExitedWithFailureTransition(true))
++    .addTransition(ContainerState.RELAUNCHING, ContainerState.RELAUNCHING,
++        ContainerEventType.UPDATE_DIAGNOSTICS_MSG,
++        UPDATE_DIAGNOSTICS_TRANSITION)
++    .addTransition(ContainerState.RELAUNCHING, ContainerState.KILLING,
++        ContainerEventType.KILL_CONTAINER, new KillTransition())
++
++    case RELAUNCHING:
+-      if (ContainerState.LOCALIZED == getContainerState()) {
++      if (ContainerState.LOCALIZED == getContainerState()
++          || ContainerState.RELAUNCHING == getContainerState()) {
++  @Override
++  public String getWorkDir() {
++    return workDir;
++  }
++
++  @Override
++  public void setWorkDir(String workDir) {
++    this.workDir = workDir;
++  }
++
++  @Override
++  public String getLogDir() {
++    return logDir;
++  }
++
++  @Override
++  public void setLogDir(String logDir) {
++    this.logDir = logDir;
++  }
++
++  @SuppressWarnings("unchecked") // dispatcher not typed
++  private void sendRelaunchEvent() {
++    ContainersLauncherEventType launcherEvent =
++        ContainersLauncherEventType.RELAUNCH_CONTAINER;
++    dispatcher.getEventHandler().handle(
++        new ContainersLauncherEvent(this, launcherEvent));
++  }
++
++    if (isRetryContextSet() && diagnostics.length() > diagnosticsMaxSize) {
++      diagnostics.delete(0, diagnostics.length() - diagnosticsMaxSize);
++    }
++   * Transition to EXITED_WITH_FAILURE or LOCALIZED state upon
++   * CONTAINER_EXITED_WITH_FAILURE state.
++   **/
++  @SuppressWarnings("unchecked")  // dispatcher not typed
++  static class RetryFailureTransition implements
++      MultipleArcTransition<ContainerImpl, ContainerEvent, ContainerState> {
++
++    @Override
++    public ContainerState transition(final ContainerImpl container,
++        ContainerEvent event) {
++      ContainerExitEvent exitEvent = (ContainerExitEvent) event;
++      container.exitCode = exitEvent.getExitCode();
++      if (exitEvent.getDiagnosticInfo() != null) {
++        if (container.containerRetryContext.getRetryPolicy()
++            != ContainerRetryPolicy.NEVER_RETRY) {
++          int n = container.containerRetryContext.getMaxRetries()
++              - container.remainingRetryAttempts;
++          container.addDiagnostics("Diagnostic message from attempt "
++              + n + " : ", "\n");
++        }
++        container.addDiagnostics(exitEvent.getDiagnosticInfo(), "\n");
++      }
++
++      if (container.shouldRetry(container.exitCode)) {
++        if (container.remainingRetryAttempts > 0) {
++          container.remainingRetryAttempts--;
++          try {
++            container.stateStore.storeContainerRemainingRetryAttempts(
++                container.getContainerId(), container.remainingRetryAttempts);
++          } catch (IOException e) {
++            LOG.warn(
++                "Unable to update remainingRetryAttempts in state store for "
++                + container.getContainerId(), e);
++          }
++        }
++        LOG.info("Relaunching Container " + container.getContainerId()
++            + ". Remaining retry attempts(after relaunch) : "
++            + container.remainingRetryAttempts
++            + ". Interval between retries is "
++            + container.containerRetryContext.getRetryInterval() + "ms");
++        container.wasLaunched  = false;
++        container.metrics.endRunningContainer();
++        if (container.containerRetryContext.getRetryInterval() == 0) {
++          container.sendRelaunchEvent();
++        } else {
++          // wait for some time, then send launch event
++          new Thread() {
++            @Override
++            public void run() {
++              try {
++                Thread.sleep(
++                    container.containerRetryContext.getRetryInterval());
++                container.sendRelaunchEvent();
++              } catch (InterruptedException e) {
++                return;
++              }
++            }
++          }.start();
++        }
++        return ContainerState.RELAUNCHING;
++      } else {
++        new ExitedWithFailureTransition(true).transition(container, event);
++        return ContainerState.EXITED_WITH_FAILURE;
++      }
++    }
++  }
++
++  @Override
++  public boolean isRetryContextSet() {
++    return containerRetryContext.getRetryPolicy()
++        != ContainerRetryPolicy.NEVER_RETRY;
++  }
++
++  @Override
++  public boolean shouldRetry(int errorCode) {
++    if (errorCode == ExitCode.SUCCESS.getExitCode()
++        || errorCode == ExitCode.FORCE_KILLED.getExitCode()
++        || errorCode == ExitCode.TERMINATED.getExitCode()) {
++      return false;
++    }
++
++    ContainerRetryPolicy retryPolicy = containerRetryContext.getRetryPolicy();
++    if (retryPolicy == ContainerRetryPolicy.RETRY_ON_ALL_ERRORS
++        || (retryPolicy == ContainerRetryPolicy.RETRY_ON_SPECIFIC_ERROR_CODES
++            && containerRetryContext.getErrorCodes() != null
++            && containerRetryContext.getErrorCodes().contains(errorCode))) {
++      return remainingRetryAttempts > 0
++          || remainingRetryAttempts == ContainerRetryContext.RETRY_FOREVER;
++    }
++
++    return false;
++  }
++
++  /**

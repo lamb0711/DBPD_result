@@ -1,0 +1,203 @@
+HADOOP-15576. S3A Multipart Uploader to work with S3Guard and encryption Originally contributed by Ewan Higgs with refinements by Steve Loughran.
+
+-import com.amazonaws.services.s3.model.AbortMultipartUploadRequest;
+-import com.amazonaws.services.s3.model.CompleteMultipartUploadRequest;
++import java.io.ByteArrayInputStream;
++import java.io.ByteArrayOutputStream;
++import java.io.DataInputStream;
++import java.io.DataOutputStream;
++import java.io.IOException;
++import java.io.InputStream;
++import java.nio.ByteBuffer;
++import java.util.ArrayList;
++import java.util.List;
++import java.util.concurrent.atomic.AtomicInteger;
++
+-import com.amazonaws.services.s3.model.InitiateMultipartUploadRequest;
+-import com.amazonaws.services.s3.model.InitiateMultipartUploadResult;
++import com.google.common.annotations.VisibleForTesting;
++import com.google.common.base.Preconditions;
++
++import org.apache.commons.lang3.StringUtils;
+-import org.apache.hadoop.hdfs.DFSUtilClient;
+-import java.io.IOException;
+-import java.io.InputStream;
+-import java.nio.ByteBuffer;
+-import java.util.List;
+-import java.util.stream.Collectors;
++import static org.apache.hadoop.fs.s3a.Constants.FS_S3A;
++  /** Header for Parts: {@value}. */
++
++  public static final String HEADER = "S3A-part01";
++
++    final WriteOperationHelper writeHelper = s3a.getWriteOperationHelper();
+-    InitiateMultipartUploadRequest request =
+-        new InitiateMultipartUploadRequest(s3a.getBucket(), key);
+-    LOG.debug("initialize request: {}", request);
+-    InitiateMultipartUploadResult result = s3a.initiateMultipartUpload(request);
+-    String uploadId = result.getUploadId();
++    String uploadId = writeHelper.initiateMultiPartUpload(key);
+-      int partNumber, UploadHandle uploadId, long lengthInBytes) {
+-    String key = s3a.pathToKey(filePath);
+-    UploadPartRequest request = new UploadPartRequest();
+-    byte[] uploadIdBytes = uploadId.toByteArray();
+-    request.setUploadId(new String(uploadIdBytes, 0, uploadIdBytes.length,
+-        Charsets.UTF_8));
+-    request.setInputStream(inputStream);
+-    request.setPartSize(lengthInBytes);
+-    request.setPartNumber(partNumber);
+-    request.setBucketName(s3a.getBucket());
+-    request.setKey(key);
+-    LOG.debug("putPart request: {}", request);
+-    UploadPartResult result = s3a.uploadPart(request);
+-    String eTag = result.getETag();
+-    return BBPartHandle.from(ByteBuffer.wrap(eTag.getBytes(Charsets.UTF_8)));
+-  }
+-
+-  @Override
+-  public PathHandle complete(Path filePath,
+-      List<Pair<Integer, PartHandle>> handles, UploadHandle uploadId) {
+-    String key = s3a.pathToKey(filePath);
+-    CompleteMultipartUploadRequest request =
+-        new CompleteMultipartUploadRequest();
+-    request.setBucketName(s3a.getBucket());
+-    request.setKey(key);
+-    byte[] uploadIdBytes = uploadId.toByteArray();
+-    request.setUploadId(new String(uploadIdBytes, 0, uploadIdBytes.length,
+-        Charsets.UTF_8));
+-    List<PartETag> eTags = handles
+-        .stream()
+-        .map(handle -> {
+-          byte[] partEtagBytes = handle.getRight().toByteArray();
+-          return new PartETag(handle.getLeft(),
+-              new String(partEtagBytes, 0, partEtagBytes.length,
+-                  Charsets.UTF_8));
+-        })
+-        .collect(Collectors.toList());
+-    request.setPartETags(eTags);
+-    LOG.debug("Complete request: {}", request);
+-    CompleteMultipartUploadResult completeMultipartUploadResult =
+-        s3a.getAmazonS3Client().completeMultipartUpload(request);
+-
+-    byte[] eTag = DFSUtilClient.string2Bytes(
+-        completeMultipartUploadResult.getETag());
+-    return (PathHandle) () -> ByteBuffer.wrap(eTag);
+-  }
+-
+-  @Override
+-  public void abort(Path filePath, UploadHandle uploadId) {
++      int partNumber, UploadHandle uploadId, long lengthInBytes)
++      throws IOException {
++    final WriteOperationHelper writeHelper = s3a.getWriteOperationHelper();
+-    AbortMultipartUploadRequest request = new AbortMultipartUploadRequest(s3a
+-        .getBucket(), key, uploadIdString);
+-    LOG.debug("Abort request: {}", request);
+-    s3a.getAmazonS3Client().abortMultipartUpload(request);
++    UploadPartRequest request = writeHelper.newUploadPartRequest(key,
++        uploadIdString, partNumber, (int) lengthInBytes, inputStream, null, 0L);
++    UploadPartResult result = writeHelper.uploadPart(request);
++    String eTag = result.getETag();
++    return BBPartHandle.from(
++        ByteBuffer.wrap(
++            buildPartHandlePayload(eTag, lengthInBytes)));
++  }
++
++  @Override
++  public PathHandle complete(Path filePath,
++      List<Pair<Integer, PartHandle>> handles, UploadHandle uploadId)
++      throws IOException {
++    byte[] uploadIdBytes = uploadId.toByteArray();
++    checkUploadId(uploadIdBytes);
++    if (handles.isEmpty()) {
++      throw new IOException("Empty upload");
++    }
++
++    final WriteOperationHelper writeHelper = s3a.getWriteOperationHelper();
++    String key = s3a.pathToKey(filePath);
++
++    String uploadIdStr = new String(uploadIdBytes, 0, uploadIdBytes.length,
++        Charsets.UTF_8);
++    ArrayList<PartETag> eTags = new ArrayList<>();
++    eTags.ensureCapacity(handles.size());
++    long totalLength = 0;
++    for (Pair<Integer, PartHandle> handle : handles) {
++      byte[] payload = handle.getRight().toByteArray();
++      Pair<Long, String> result = parsePartHandlePayload(payload);
++      totalLength += result.getLeft();
++      eTags.add(new PartETag(handle.getLeft(), result.getRight()));
++    }
++    AtomicInteger errorCount = new AtomicInteger(0);
++    CompleteMultipartUploadResult result = writeHelper.completeMPUwithRetries(
++        key, uploadIdStr, eTags, totalLength, errorCount);
++
++    byte[] eTag = result.getETag().getBytes(Charsets.UTF_8);
++    return (PathHandle) () -> ByteBuffer.wrap(eTag);
++  }
++
++  @Override
++  public void abort(Path filePath, UploadHandle uploadId) throws IOException {
++    final byte[] uploadIdBytes = uploadId.toByteArray();
++    checkUploadId(uploadIdBytes);
++    final WriteOperationHelper writeHelper = s3a.getWriteOperationHelper();
++    String key = s3a.pathToKey(filePath);
++    String uploadIdString = new String(uploadIdBytes, 0, uploadIdBytes.length,
++        Charsets.UTF_8);
++    writeHelper.abortMultipartCommit(key, uploadIdString);
+-      if (fs.getScheme().equals("s3a")) {
++      if (FS_S3A.equals(fs.getScheme())) {
++
++  private void checkUploadId(byte[] uploadId) throws IllegalArgumentException {
++    Preconditions.checkArgument(uploadId.length > 0,
++        "Empty UploadId is not valid");
++  }
++
++  /**
++   * Build the payload for marshalling.
++   * @param eTag upload etag
++   * @param len length
++   * @return a byte array to marshall.
++   * @throws IOException error writing the payload
++   */
++  @VisibleForTesting
++  static byte[] buildPartHandlePayload(String eTag, long len)
++      throws IOException {
++    Preconditions.checkArgument(StringUtils.isNotEmpty(eTag),
++        "Empty etag");
++    Preconditions.checkArgument(len > 0,
++        "Invalid length");
++
++    ByteArrayOutputStream bytes = new ByteArrayOutputStream();
++    try(DataOutputStream output = new DataOutputStream(bytes)) {
++      output.writeUTF(HEADER);
++      output.writeLong(len);
++      output.writeUTF(eTag);
++    }
++    return bytes.toByteArray();
++  }
++
++  /**
++   * Parse the payload marshalled as a part handle.
++   * @param data handle data
++   * @return the length and etag
++   * @throws IOException error reading the payload
++   */
++  static Pair<Long, String> parsePartHandlePayload(byte[] data)
++      throws IOException {
++
++    try(DataInputStream input =
++            new DataInputStream(new ByteArrayInputStream(data))) {
++      final String header = input.readUTF();
++      if (!HEADER.equals(header)) {
++        throw new IOException("Wrong header string: \"" + header + "\"");
++      }
++      final long len = input.readLong();
++      final String etag = input.readUTF();
++      if (len <= 0) {
++        throw new IOException("Negative length");
++      }
++      return Pair.of(len, etag);
++    }
++  }
++
+
+MOV26 MOV26 MOV26 MOV26 MOV26 MOV26 MOV26 INS26 INS26 INS26 INS26 MOV31 INS40 INS40 INS40 INS40 UPD40 UPD40 UPD40 UPD40 UPD40 UPD40 INS23 INS31 INS31 INS31 INS31 INS29 INS83 INS83 INS83 INS43 INS59 MOV60 MOV78 INS83 MOV43 MOV42 MOV44 MOV44 MOV44 MOV44 MOV44 INS43 INS8 INS43 MOV60 MOV78 INS83 INS39 INS42 MOV44 MOV44 INS43 INS8 INS83 INS39 INS42 INS44 INS43 INS8 INS29 INS78 INS83 INS5 INS42 INS44 INS44 INS43 INS8 INS29 UPD83 INS74 INS42 INS44 INS43 INS8 INS65 INS42 INS42 INS45 INS42 MOV60 MOV60 MOV60 MOV60 INS60 INS60 MOV60 INS41 INS42 INS21 INS25 INS60 INS60 INS60 INS21 INS60 INS70 INS60 INS42 INS60 INS21 INS60 MOV60 INS60 MOV21 INS5 INS42 INS42 MOV21 INS65 INS65 INS65 INS65 INS65 INS42 INS39 INS85 INS43 INS42 INS39 INS42 INS42 MOV21 MOV21 INS60 INS54 INS41 INS65 INS65 INS65 INS65 INS43 INS43 INS43 INS5 INS42 INS42 INS54 INS66 INS65 INS66 INS83 UPD43 MOV43 INS83 UPD43 MOV43 INS59 MOV43 INS59 INS32 INS32 INS32 INS8 INS83 INS43 INS59 MOV43 INS59 UPD74 MOV74 INS59 INS32 INS39 INS59 INS44 INS42 MOV8 INS43 INS59 INS83 INS5 INS59 INS32 INS83 INS43 INS59 INS43 INS59 INS39 INS85 INS66 INS42 INS66 INS42 INS66 INS66 INS42 INS66 INS42 INS43 INS59 INS58 INS8 INS32 INS66 INS42 INS66 INS66 INS42 INS66 INS42 INS42 INS42 MOV39 MOV85 INS58 INS8 UPD42 UPD42 INS32 UPD42 UPD42 UPD42 INS32 INS42 INS32 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS53 INS42 INS42 INS32 INS42 MOV14 UPD43 INS42 INS14 UPD42 MOV42 INS42 MOV32 UPD42 MOV42 INS34 INS74 INS42 INS60 INS21 INS21 INS42 INS42 INS14 UPD42 INS39 INS85 INS42 INS32 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS14 INS42 UPD42 UPD42 UPD42 MOV32 UPD42 UPD42 INS27 INS45 UPD42 UPD42 INS45 UPD42 UPD42 INS27 INS45 INS42 INS42 INS14 INS43 INS59 INS21 INS21 INS21 UPD42 MOV42 INS42 INS43 INS59 INS60 INS25 INS60 INS60 INS25 INS41 MOV42 UPD42 MOV42 UPD42 UPD42 UPD42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS11 INS42 INS33 INS34 INS42 INS42 INS42 INS42 INS42 INS32 INS14 MOV42 UPD42 MOV42 UPD42 INS74 UPD42 INS43 INS43 INS43 INS74 INS59 INS7 INS32 INS43 INS34 UPD42 MOV42 UPD42 MOV42 INS42 UPD42 INS42 INS42 UPD42 INS42 INS40 UPD42 MOV42 INS42 INS42 INS42 MOV43 MOV42 MOV34 MOV40 MOV40 INS42 INS40 INS34 UPD42 UPD42 INS42 INS42 INS34 INS43 INS42 UPD42 MOV42 INS14 INS32 INS32 INS32 INS42 UPD42 MOV42 INS14 INS83 UPD43 MOV43 INS59 INS38 INS8 INS83 INS39 INS59 INS83 INS43 INS59 INS27 INS8 INS32 INS39 INS42 INS42 INS42 INS42 UPD43 MOV43 INS45 INS43 INS42 INS42 INS42 UPD42 INS43 INS43 INS43 INS42 INS32 INS42 INS32 INS42 INS42 MOV14 INS42 UPD42 INS42 INS43 INS42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 INS42 UPD42 MOV42 MOV42 INS43 INS14 UPD42 INS42 INS32 INS32 INS53 INS42 INS32 INS42 INS42 INS32 INS42 INS34 INS53 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 UPD42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS43 INS42 INS42 INS42 INS42 INS42 INS42 INS14 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 INS14 INS42 INS42 INS42 UPD43 MOV43 INS27 INS43 INS45 UPD42 INS45 INS42 INS45 INS42 DEL42 DEL43 DEL32 DEL42 DEL14 DEL42 DEL42 DEL45 DEL42 DEL32 DEL21 DEL42 DEL43 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL14 DEL83 DEL42 DEL14 DEL32 DEL21 DEL42 DEL42 DEL42 DEL32 DEL21 DEL42 DEL42 DEL45 DEL42 DEL32 DEL21 DEL32 DEL59 DEL60 DEL40 DEL32 DEL32 DEL32 DEL41 DEL8 DEL31 DEL42 DEL43 DEL42 DEL14 DEL59 DEL60 DEL42 DEL42 DEL32 DEL32 DEL21 DEL42 DEL42 DEL42 DEL32 DEL21 DEL42 DEL34 DEL40 DEL40 DEL14 DEL41 DEL42 DEL32 DEL21 DEL42 DEL42 DEL59 DEL86 DEL32 DEL42 DEL42 DEL42 DEL32 DEL32 DEL59 DEL60 DEL42 DEL42 DEL42 DEL32 DEL21 DEL42 DEL42 DEL45 DEL42 DEL32 DEL21 DEL32 DEL42 DEL42 DEL45 DEL42 DEL42 DEL39 DEL42 DEL5 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL32 DEL42 DEL42 DEL14 DEL59 DEL60 DEL42 DEL45 DEL32 DEL21 DEL32 DEL32 DEL21 DEL8

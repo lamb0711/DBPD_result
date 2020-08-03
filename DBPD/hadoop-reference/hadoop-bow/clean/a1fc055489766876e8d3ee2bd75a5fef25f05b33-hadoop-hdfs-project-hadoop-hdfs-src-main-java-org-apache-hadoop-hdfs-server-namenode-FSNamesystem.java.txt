@@ -1,0 +1,969 @@
+HDFS-1623. High Availability Framework for HDFS NN. Contributed by Todd Lipcon, Aaron T. Myers, Eli Collins, Uma Maheswara Rao G, Bikas Saha, Suresh Srinivas, Jitendra Nath Pandey, Hari Mankude, Brandon Li, Sanjay Radia, Mingjie Lai, and Gregory Chanan
+
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/trunk@1296534 13f79535-47bb-0310-9956-ffa450edef68
+
++import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_NAMENODE_DELEGATION_TOKEN_ALWAYS_USE_KEY;
++import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_NAMENODE_DELEGATION_TOKEN_ALWAYS_USE_DEFAULT;
++import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_HA_STANDBY_CHECKPOINTS_DEFAULT;
++import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_HA_STANDBY_CHECKPOINTS_KEY;
++import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_NAMENODE_SHARED_EDITS_DIR_KEY;
++import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_PERSIST_BLOCKS_KEY;
++import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_PERSIST_BLOCKS_DEFAULT;
++import java.io.StringWriter;
++import java.util.LinkedHashSet;
++import org.apache.hadoop.ha.ServiceFailedException;
++import org.apache.hadoop.ha.HAServiceProtocol.HAServiceState;
++import org.apache.hadoop.hdfs.HAUtil;
++import org.apache.hadoop.hdfs.server.namenode.NameNode.OperationCategory;
++import org.apache.hadoop.hdfs.server.namenode.ha.ActiveState;
++import org.apache.hadoop.hdfs.server.namenode.ha.EditLogTailer;
++import org.apache.hadoop.hdfs.server.namenode.ha.HAContext;
++import org.apache.hadoop.hdfs.server.namenode.ha.HAState;
++import org.apache.hadoop.hdfs.server.namenode.ha.StandbyCheckpointer;
++import org.apache.hadoop.hdfs.server.namenode.ha.StandbyState;
++import org.apache.hadoop.hdfs.server.protocol.HeartbeatResponse;
++import org.apache.hadoop.hdfs.server.protocol.NNHAStatusHeartbeat;
++import org.apache.hadoop.ipc.StandbyException;
+-import org.apache.hadoop.util.StringUtils;
+-import com.google.common.base.Preconditions;
+-
++import com.google.common.base.Preconditions;
++import com.google.common.collect.Lists;
+-  static final Log LOG = LogFactory.getLog(FSNamesystem.class);
++  public static final Log LOG = LogFactory.getLog(FSNamesystem.class);
++  private boolean persistBlocks;
++  private boolean standbyShouldCheckpoint;
++  private boolean alwaysUseDelegationTokensForTests;
++  
+-  Daemon lmthread = null;   // LeaseMonitor thread
+-  
++  /**
++   * Used when this NN is in standby state to read from the shared edit log.
++   */
++  private EditLogTailer editLogTailer = null;
++
++  /**
++   * Used when this NN is in standby state to perform checkpoints.
++   */
++  private StandbyCheckpointer standbyCheckpointer;
++
++  /**
++   * Reference to the NN's HAContext object. This is only set once
++   * {@link #startCommonServices(Configuration, HAContext)} is called. 
++   */
++  private HAContext haContext;
++
++  private boolean haEnabled;
++
++  private final Configuration conf;
++    
+-  public static FSNamesystem loadFromDisk(Configuration conf) throws IOException {
++  public static FSNamesystem loadFromDisk(Configuration conf)
++    throws IOException {
+-    Collection<URI> namespaceEditsDirs = 
++    List<URI> namespaceEditsDirs = 
+-    namesystem.loadFSImage(startOpt, fsImage);
++    String nameserviceId = DFSUtil.getNamenodeNameServiceId(conf);
++    namesystem.loadFSImage(startOpt, fsImage,
++      HAUtil.isHAEnabled(conf, nameserviceId));
++    this.conf = conf;
+-  void loadFSImage(StartupOption startOpt, FSImage fsImage)
++  void loadFSImage(StartupOption startOpt, FSImage fsImage, boolean haEnabled)
++    writeLock();
+-      if (fsImage.recoverTransitionRead(startOpt, this)) {
++      // We shouldn't be calling saveNamespace if we've come up in standby state.
++      if (fsImage.recoverTransitionRead(startOpt, this) && !haEnabled) {
+-      fsImage.openEditLog();
++      // This will start a new log segment and write to the seen_txid file, so
++      // we shouldn't do it when coming up in standby state
++      if (!haEnabled) {
++        fsImage.openEditLogForWrite();
++      }
++      writeUnlock();
+-  void activateSecretManager() throws IOException {
++  private void startSecretManager() {
+-      dtSecretManager.startThreads();
++      try {
++        dtSecretManager.startThreads();
++      } catch (IOException e) {
++        // Inability to start secret manager
++        // can't be recovered from.
++        throw new RuntimeException(e);
++      }
+-  /**
+-   * Activate FSNamesystem daemons.
+-   */
+-  void activate(Configuration conf) throws IOException {
+-    this.registerMBean(); // register the MBean for the FSNamesystemState
++  private void startSecretManagerIfNecessary() {
++    boolean shouldRun = shouldUseDelegationTokens() &&
++      !isInSafeMode() && getEditLog().isOpenForWrite();
++    boolean running = dtSecretManager.isRunning();
++    if (shouldRun && !running) {
++      startSecretManager();
++    }
++  }
++  private void stopSecretManager() {
++    if (dtSecretManager != null) {
++      dtSecretManager.stopThreads();
++    }
++  }
++  
++  /** 
++   * Start services common to both active and standby states
++   * @param haContext 
++   * @throws IOException
++   */
++  void startCommonServices(Configuration conf, HAContext haContext) throws IOException {
++    this.registerMBean(); // register the MBean for the FSNamesystemState
++    this.haContext = haContext;
+-
++      assert safeMode != null &&
++        !safeMode.isPopulatingReplQueues();
+-
+-      this.lmthread = new Daemon(leaseManager.new Monitor());
+-      lmthread.start();
+-
+-  public static Collection<URI> getNamespaceDirs(Configuration conf) {
+-    return getStorageDirs(conf, DFS_NAMENODE_NAME_DIR_KEY);
+-  }
+-  public static Collection<URI> getNamespaceEditsDirs(Configuration conf) {
+-    Collection<URI> editsDirs = getStorageDirs(conf, DFS_NAMENODE_EDITS_DIR_KEY);
+-    if (editsDirs.isEmpty()) {
+-      // If this is the case, no edit dirs have been explicitly configured.
+-      // Image dirs are to be used for edits too.
+-      return getNamespaceDirs(conf);
+-    } else {
+-      return editsDirs;
++  /** 
++   * Stop services common to both active and standby states
++   * @throws IOException
++   */
++  void stopCommonServices() {
++    writeLock();
++    try {
++      if (blockManager != null) blockManager.close();
++      if (nnrmthread != null) nnrmthread.interrupt();
++    } finally {
++      writeUnlock();
++  /**
++   * Start services required in active state
++   * @throws IOException
++   */
++  void startActiveServices() throws IOException {
++    LOG.info("Starting services required for active state");
++    writeLock();
++    try {
++      FSEditLog editLog = dir.fsImage.getEditLog();
++      
++      if (!editLog.isOpenForWrite()) {
++        // During startup, we're already open for write during initialization.
++        editLog.initJournalsForWrite();
++        // May need to recover
++        editLog.recoverUnclosedStreams();
++        
++        LOG.info("Catching up to latest edits from old active before " +
++            "taking over writer role in edits logs.");
++        editLogTailer.catchupDuringFailover();
++        
++        LOG.info("Reprocessing replication and invalidation queues...");
++        blockManager.getDatanodeManager().markAllDatanodesStale();
++        blockManager.clearQueues();
++        blockManager.processAllPendingDNMessages();
++        blockManager.processMisReplicatedBlocks();
++        
++        if (LOG.isDebugEnabled()) {
++          LOG.debug("NameNode metadata after re-processing " +
++              "replication and invalidation queues during failover:\n" +
++              metaSaveAsString());
++        }
++        
++        long nextTxId = dir.fsImage.getLastAppliedTxId() + 1;
++        LOG.info("Will take over writing edit logs at txnid " + 
++            nextTxId);
++        editLog.setNextTxId(nextTxId);
++
++        dir.fsImage.editLog.openForWrite();
++      }
++      if (haEnabled) {
++        // Renew all of the leases before becoming active.
++        // This is because, while we were in standby mode,
++        // the leases weren't getting renewed on this NN.
++        // Give them all a fresh start here.
++        leaseManager.renewAllLeases();
++      }
++      leaseManager.startMonitor();
++      startSecretManagerIfNecessary();
++    } finally {
++      writeUnlock();
++    }
++  }
++
++  private boolean shouldUseDelegationTokens() {
++    return UserGroupInformation.isSecurityEnabled() ||
++      alwaysUseDelegationTokensForTests;
++  }
++
++  /** 
++   * Stop services required in active state
++   * @throws InterruptedException
++   */
++  void stopActiveServices() {
++    LOG.info("Stopping services started for active state");
++    writeLock();
++    try {
++      stopSecretManager();
++      if (leaseManager != null) {
++        leaseManager.stopMonitor();
++      }
++      if (dir != null && dir.fsImage != null) {
++        if (dir.fsImage.editLog != null) {
++          dir.fsImage.editLog.close();
++        }
++        // Update the fsimage with the last txid that we wrote
++        // so that the tailer starts from the right spot.
++        dir.fsImage.updateLastAppliedTxIdFromWritten();
++      }
++    } finally {
++      writeUnlock();
++    }
++  }
++  
++  /** Start services required in standby state */
++  void startStandbyServices() {
++    LOG.info("Starting services required for standby state");
++    if (!dir.fsImage.editLog.isOpenForRead()) {
++      // During startup, we're already open for read.
++      dir.fsImage.editLog.initSharedJournalsForRead();
++    }
++    editLogTailer = new EditLogTailer(this);
++    editLogTailer.start();
++    if (standbyShouldCheckpoint) {
++      standbyCheckpointer = new StandbyCheckpointer(conf, this);
++      standbyCheckpointer.start();
++    }
++  }
++
++
++  /**
++   * Called while the NN is in Standby state, but just about to be
++   * asked to enter Active state. This cancels any checkpoints
++   * currently being taken.
++   */
++  void prepareToStopStandbyServices() throws ServiceFailedException {
++    if (standbyCheckpointer != null) {
++      standbyCheckpointer.cancelAndPreventCheckpoints();
++    }
++  }
++
++  /** Stop services required in standby state */
++  void stopStandbyServices() throws IOException {
++    LOG.info("Stopping services started for standby state");
++    if (standbyCheckpointer != null) {
++      standbyCheckpointer.stop();
++    }
++    if (editLogTailer != null) {
++      editLogTailer.stop();
++    }
++    if (dir != null && dir.fsImage != null && dir.fsImage.editLog != null) {
++      dir.fsImage.editLog.close();
++    }
++  }
++  
++  
++  void checkOperation(OperationCategory op) throws StandbyException {
++    if (haContext != null) {
++      // null in some unit tests
++      haContext.checkOperation(op);
++    }
++  }
++  
++  public static Collection<URI> getNamespaceDirs(Configuration conf) {
++    return getStorageDirs(conf, DFS_NAMENODE_NAME_DIR_KEY);
++  }
++
++  /**
++   * Get all edits dirs which are required. If any shared edits dirs are
++   * configured, these are also included in the set of required dirs.
++   * 
++   * @param conf the HDFS configuration.
++   * @return all required dirs.
++   */
+-    return getStorageDirs(conf, DFS_NAMENODE_EDITS_DIR_REQUIRED_KEY);
++    Set<URI> ret = new HashSet<URI>();
++    ret.addAll(getStorageDirs(conf, DFS_NAMENODE_EDITS_DIR_REQUIRED_KEY));
++    ret.addAll(getSharedEditsDirs(conf));
++    return ret;
++  /**
++   * Return an ordered list of edits directories to write to.
++   * The list is ordered such that all shared edits directories
++   * are ordered before non-shared directories, and any duplicates
++   * are removed. The order they are specified in the configuration
++   * is retained.
++   * @return Collection of shared edits directories.
++   * @throws IOException if multiple shared edits directories are configured
++   */
++  public static List<URI> getNamespaceEditsDirs(Configuration conf)
++      throws IOException {
++    // Use a LinkedHashSet so that order is maintained while we de-dup
++    // the entries.
++    LinkedHashSet<URI> editsDirs = new LinkedHashSet<URI>();
++    
++    List<URI> sharedDirs = getSharedEditsDirs(conf);
++
++    // Fail until multiple shared edits directories are supported (HDFS-2782)
++    if (sharedDirs.size() > 1) {
++      throw new IOException(
++          "Multiple shared edits directories are not yet supported");
++    }
++
++    // First add the shared edits dirs. It's critical that the shared dirs
++    // are added first, since JournalSet syncs them in the order they are listed,
++    // and we need to make sure all edits are in place in the shared storage
++    // before they are replicated locally. See HDFS-2874.
++    for (URI dir : sharedDirs) {
++      if (!editsDirs.add(dir)) {
++        LOG.warn("Edits URI " + dir + " listed multiple times in " + 
++            DFS_NAMENODE_SHARED_EDITS_DIR_KEY + ". Ignoring duplicates.");
++      }
++    }
++    
++    // Now add the non-shared dirs.
++    for (URI dir : getStorageDirs(conf, DFS_NAMENODE_EDITS_DIR_KEY)) {
++      if (!editsDirs.add(dir)) {
++        LOG.warn("Edits URI " + dir + " listed multiple times in " + 
++            DFS_NAMENODE_SHARED_EDITS_DIR_KEY + " and " +
++            DFS_NAMENODE_EDITS_DIR_KEY + ". Ignoring duplicates.");
++      }
++    }
++
++    if (editsDirs.isEmpty()) {
++      // If this is the case, no edit dirs have been explicitly configured.
++      // Image dirs are to be used for edits too.
++      return Lists.newArrayList(getNamespaceDirs(conf));
++    } else {
++      return Lists.newArrayList(editsDirs);
++    }
++  }
++  
++  /**
++   * Returns edit directories that are shared between primary and secondary.
++   * @param conf
++   * @return Collection of edit directories.
++   */
++  public static List<URI> getSharedEditsDirs(Configuration conf) {
++    // don't use getStorageDirs here, because we want an empty default
++    // rather than the dir in /tmp
++    Collection<String> dirNames = conf.getTrimmedStringCollection(
++        DFS_NAMENODE_SHARED_EDITS_DIR_KEY);
++    return Util.stringCollectionAsURIs(dirNames);
++  }
++  
++  public Configuration getConf() {
++    return conf;
++  }
++
++  public void writeLockInterruptibly() throws InterruptedException {
++    this.fsLock.writeLock().lockInterruptibly();
++  }
++  @Override
++
++    this.persistBlocks = conf.getBoolean(DFS_PERSIST_BLOCKS_KEY,
++                                         DFS_PERSIST_BLOCKS_DEFAULT);
++    // block allocation has to be persisted in HA using a shared edits directory
++    // so that the standby has up-to-date namespace information
++    String nameserviceId = DFSUtil.getNamenodeNameServiceId(conf);
++    this.haEnabled = HAUtil.isHAEnabled(conf, nameserviceId);  
++    this.persistBlocks |= haEnabled && HAUtil.usesSharedEditsDir(conf);
++    
++    // Sanity check the HA-related config.
++    if (nameserviceId != null) {
++      LOG.info("Determined nameservice ID: " + nameserviceId);
++    }
++    LOG.info("HA Enabled: " + haEnabled);
++    if (!haEnabled && HAUtil.usesSharedEditsDir(conf)) {
++      LOG.warn("Configured NNs:\n" + DFSUtil.nnAddressesAsString(conf));
++      throw new IOException("Invalid configuration: a shared edits dir " +
++          "must not be specified if HA is not enabled.");
++    }
++
++    
++    this.standbyShouldCheckpoint = conf.getBoolean(
++        DFS_HA_STANDBY_CHECKPOINTS_KEY,
++        DFS_HA_STANDBY_CHECKPOINTS_DEFAULT);
++    
++    // For testing purposes, allow the DT secret manager to be started regardless
++    // of whether security is enabled.
++    alwaysUseDelegationTokensForTests = 
++      conf.getBoolean(DFS_NAMENODE_DELEGATION_TOKEN_ALWAYS_USE_KEY,
++          DFS_NAMENODE_DELEGATION_TOKEN_ALWAYS_USE_DEFAULT);
+-   * Version of {@see #getNamespaceInfo()} that is not protected by a lock.
++   * Version of @see #getNamespaceInfo() that is not protected by a lock.
+-      if (blockManager != null) blockManager.close();
++      stopCommonServices();
+-      if (dtSecretManager != null) dtSecretManager.stopThreads();
+-      if (nnrmthread != null) nnrmthread.interrupt();
+-    } catch (Exception e) {
+-      LOG.warn("Exception shutting down FSNamesystem", e);
+-        if (lmthread != null) {
+-          lmthread.interrupt();
+-          lmthread.join(3000);
+-        }
++        stopActiveServices();
++        stopStandbyServices();
+-      } catch (InterruptedException ie) {
++  
++  @Override
++  public boolean isInStandbyState() {
++    if (haContext == null || haContext.getState() == null) {
++      // We're still starting up. In this case, if HA is
++      // on for the cluster, we always start in standby. Otherwise
++      // start in active.
++      return haEnabled;
++    }
++  
++    return haContext.getState() instanceof StandbyState;
++  }
+-  
+-      long totalInodes = this.dir.totalInodes();
+-      long totalBlocks = this.getBlocksTotal();
+-      out.println(totalInodes + " files and directories, " + totalBlocks
+-          + " blocks = " + (totalInodes + totalBlocks) + " total");
+-
+-      blockManager.metaSave(out);
+-
++      metaSave(out);
++  private void metaSave(PrintWriter out) {
++    assert hasWriteLock();
++    long totalInodes = this.dir.totalInodes();
++    long totalBlocks = this.getBlocksTotal();
++    out.println(totalInodes + " files and directories, " + totalBlocks
++        + " blocks = " + (totalInodes + totalBlocks) + " total");
++
++    blockManager.metaSave(out);
++  }
++
++  private String metaSaveAsString() {
++    StringWriter sw = new StringWriter();
++    PrintWriter pw = new PrintWriter(sw);
++    metaSave(pw);
++    pw.flush();
++    return sw.toString();
++  }
++  
++
+-  FsServerDefaults getServerDefaults() {
++  FsServerDefaults getServerDefaults() throws StandbyException {
++    checkOperation(OperationCategory.READ);
++      checkOperation(OperationCategory.WRITE);
++
++      checkOperation(OperationCategory.WRITE);
++
+-
+-      // if the namenode is in safemode, then do not update access time
+-      if (isInSafeMode()) {
+-        doAccessTime = false;
+-      }
+-
++        checkOperation(OperationCategory.READ);
++
++        // if the namenode is in safemode, then do not update access time
++        if (isInSafeMode()) {
++          doAccessTime = false;
++        }
++
++      checkOperation(OperationCategory.WRITE);
++      checkOperation(OperationCategory.WRITE);
++
++      checkOperation(OperationCategory.WRITE);
++
++      checkOperation(OperationCategory.WRITE);
++
++      checkOperation(OperationCategory.READ);
++      checkOperation(OperationCategory.WRITE);
++
+-        //
+-        // Replace current node with a INodeUnderConstruction.
+-        // Recreate in-memory lease record.
+-        //
+-        INodeFile node = (INodeFile) myFile;
+-        INodeFileUnderConstruction cons = new INodeFileUnderConstruction(
+-                                        node.getLocalNameBytes(),
+-                                        node.getReplication(),
+-                                        node.getModificationTime(),
+-                                        node.getPreferredBlockSize(),
+-                                        node.getBlocks(),
+-                                        node.getPermissionStatus(),
+-                                        holder,
+-                                        clientMachine,
+-                                        clientNode);
+-        dir.replaceNode(src, node, cons);
+-        leaseManager.addLease(cons.getClientName(), src);
+-        
+-        // convert last block to under-construction
+-        LocatedBlock ret = blockManager.convertLastBlockToUnderConstruction(cons);
+-
+-        // add append file record to log, record lease, etc.
+-        getEditLog().logOpenFile(src, cons);
+-        return ret;
++        return prepareFileForWrite(
++            src, myFile, holder, clientMachine, clientNode, true);
++  
++  /**
++   * Replace current node with a INodeUnderConstruction.
++   * Recreate in-memory lease record.
++   * 
++   * @param src path to the file
++   * @param file existing file object
++   * @param leaseHolder identifier of the lease holder on this file
++   * @param clientMachine identifier of the client machine
++   * @param clientNode if the client is collocated with a DN, that DN's descriptor
++   * @param writeToEditLog whether to persist this change to the edit log
++   * @return the last block locations if the block is partial or null otherwise
++   * @throws UnresolvedLinkException
++   * @throws IOException
++   */
++  public LocatedBlock prepareFileForWrite(String src, INode file,
++      String leaseHolder, String clientMachine, DatanodeDescriptor clientNode,
++      boolean writeToEditLog)
++      throws UnresolvedLinkException, IOException {
++    INodeFile node = (INodeFile) file;
++    INodeFileUnderConstruction cons = new INodeFileUnderConstruction(
++                                    node.getLocalNameBytes(),
++                                    node.getReplication(),
++                                    node.getModificationTime(),
++                                    node.getPreferredBlockSize(),
++                                    node.getBlocks(),
++                                    node.getPermissionStatus(),
++                                    leaseHolder,
++                                    clientMachine,
++                                    clientNode);
++    dir.replaceNode(src, node, cons);
++    leaseManager.addLease(cons.getClientName(), src);
++    
++    LocatedBlock ret = blockManager.convertLastBlockToUnderConstruction(cons);
++    if (writeToEditLog) {
++      getEditLog().logOpenFile(src, cons);
++    }
++    return ret;
++  }
++      checkOperation(OperationCategory.WRITE);
++
++      checkOperation(OperationCategory.WRITE);
++
++      checkOperation(OperationCategory.WRITE);
++
++      checkOperation(OperationCategory.WRITE);
+-      }      
++      }
++      dir.persistBlocks(src, pendingFile);
++    if (persistBlocks) {
++      getEditLog().logSync();
++    }
++      checkOperation(OperationCategory.WRITE);
++      checkOperation(OperationCategory.WRITE);
+-      return true;
++      dir.persistBlocks(src, file);
++    if (persistBlocks) {
++      getEditLog().logSync();
++    }
++
++    return true;
++      checkOperation(OperationCategory.WRITE);
++
+-      DatanodeDescriptor targets[]) throws QuotaExceededException {
++      DatanodeDescriptor targets[]) throws QuotaExceededException,
++      SafeModeException {
++    // Increment the generation stamp for every new block.
++    nextGenerationStamp();
++      checkOperation(OperationCategory.WRITE);
++
++      checkOperation(OperationCategory.WRITE);
++
++      checkOperation(OperationCategory.WRITE);
+-    for(Block b : blocks) {
++    
++    // In the case that we are a Standby tailing edits from the
++    // active while in safe-mode, we need to track the total number
++    // of blocks and safe blocks in the system.
++    boolean trackBlockCounts = isSafeModeTrackingBlocks();
++    int numRemovedComplete = 0, numRemovedSafe = 0;
++
++    for (Block b : blocks) {
++      if (trackBlockCounts) {
++        BlockInfo bi = blockManager.getStoredBlock(b);
++        if (bi.isComplete()) {
++          numRemovedComplete++;
++          if (bi.numNodes() >= blockManager.minReplication) {
++            numRemovedSafe++;
++          }
++        }
++      }
++    if (trackBlockCounts) {
++      if (LOG.isDebugEnabled()) {
++        LOG.debug("Adjusting safe-mode totals for deletion of " + src + ":" +
++            "decreasing safeBlocks by " + numRemovedSafe +
++            ", totalBlocks by " + numRemovedComplete);
++      }
++      adjustSafeModeBlockTotals(-numRemovedSafe, -numRemovedComplete);
++    }
++  }
++
++  /**
++   * @see SafeModeInfo#shouldIncrementallyTrackBlocks
++   */
++  private boolean isSafeModeTrackingBlocks() {
++    if (!haEnabled) {
++      // Never track blocks incrementally in non-HA code.
++      return false;
++    }
++    SafeModeInfo sm = this.safeMode;
++    return sm != null && sm.shouldIncrementallyTrackBlocks();
++   * @throws StandbyException 
+-    throws AccessControlException, UnresolvedLinkException {
++    throws AccessControlException, UnresolvedLinkException,
++           StandbyException {
++      checkOperation(OperationCategory.READ);
++
++      checkOperation(OperationCategory.WRITE);
++
+-      FileNotFoundException, UnresolvedLinkException {
++      FileNotFoundException, UnresolvedLinkException, StandbyException {
++      checkOperation(OperationCategory.READ);
++
++      checkOperation(OperationCategory.WRITE);
++      checkOperation(OperationCategory.WRITE);
++      checkOperation(OperationCategory.WRITE);
++      // If a DN tries to commit to the standby, the recovery will
++      // fail, and the next retry will succeed on the new NN.
++  
+-        // If this commit does not want to close the file, persist
+-        // blocks only if append is supported 
++        // If this commit does not want to close the file, persist blocks
++        // only if append is supported or we're explicitly told to
++      checkOperation(OperationCategory.WRITE);
++
++      checkOperation(OperationCategory.READ);
++
+-  DatanodeCommand[] handleHeartbeat(DatanodeRegistration nodeReg,
++  HeartbeatResponse handleHeartbeat(DatanodeRegistration nodeReg,
+-      if (cmds != null) {
+-        return cmds;
++      if (cmds == null || cmds.length == 0) {
++        DatanodeCommand cmd = upgradeManager.getBroadcastCommand();
++        if (cmd != null) {
++          cmds = new DatanodeCommand[] {cmd};
++        }
+-
+-      //check distributed upgrade
+-      DatanodeCommand cmd = upgradeManager.getBroadcastCommand();
+-      if (cmd != null) {
+-        return new DatanodeCommand[] {cmd};
+-      }
+-      return null;
++      
++      return new HeartbeatResponse(cmds, createHaStatusHeartbeat());
++  private NNHAStatusHeartbeat createHaStatusHeartbeat() {
++    HAState state = haContext.getState();
++    NNHAStatusHeartbeat.State hbState;
++    if (state instanceof ActiveState) {
++      hbState = NNHAStatusHeartbeat.State.ACTIVE;
++    } else if (state instanceof StandbyState) {
++      hbState = NNHAStatusHeartbeat.State.STANDBY;      
++    } else {
++      throw new AssertionError("Invalid state: " + state.getClass());
++    }
++    return new NNHAStatusHeartbeat(hbState,
++        getFSImage().getLastAppliedOrWrittenTxId());
++  }
++
+-  private boolean nameNodeHasResourcesAvailable() {
++  boolean nameNodeHasResourcesAvailable() {
+-  private void checkAvailableResources() throws IOException {
++  void checkAvailableResources() {
+-  FSImage getFSImage() {
++  public FSImage getFSImage() {
+-  FSEditLog getEditLog() {
++  public FSEditLog getEditLog() {
+-    return (getEditLog().getLastWrittenTxId() -
+-        getEditLog().getCurSegmentTxId()) + 1;
++    if (isInStandbyState()) {
++      return 0;
++    } else {
++      return getEditLog().getLastWrittenTxId() -
++        getEditLog().getCurSegmentTxId() + 1;
++    }
++    /** Should safemode adjust its block totals as blocks come in */
++    private boolean shouldIncrementallyTrackBlocks = false;
++     * In the HA case, the StandbyNode can be in safemode while the namespace
++     * is modified by the edit log tailer. In this case, the number of total
++     * blocks changes as edits are processed (eg blocks are added and deleted).
++     * However, we don't want to do the incremental tracking during the
++     * startup-time loading process -- only once the initial total has been
++     * set after the image has been loaded.
++     */
++    private boolean shouldIncrementallyTrackBlocks() {
++      return shouldIncrementallyTrackBlocks;
++    }
++
++    /**
+-      try {
+-        assert isConsistent() : " SafeMode: Inconsistent filesystem state: "
+-          + "Total num of blocks, active blocks, or "
+-          + "total safe blocks don't match.";
+-      } catch(IOException e) {
+-        System.err.print(StringUtils.stringifyException(e));
+-      }
++      doConsistencyCheck();
+-      // if not done yet, initialize replication queues
+-      if (!isPopulatingReplQueues()) {
++      // if not done yet, initialize replication queues.
++      // In the standby, do not populate repl queues
++      if (!isPopulatingReplQueues() && !isInStandbyState()) {
++
++      startSecretManagerIfNecessary();
+-      return blockSafe >= blockReplQueueThreshold;
++      return !isInStandbyState() && blockSafe >= blockReplQueueThreshold;
++      // Have to have write-lock since leaving safemode initializes
++      // repl queues, which requires write lock
++      assert hasWriteLock();
++      if (haEnabled) {
++        // After we initialize the block count, any further namespace
++        // modifications done while in safe mode need to keep track
++        // of the number of total blocks in the system.
++        this.shouldIncrementallyTrackBlocks = true;
++      }
++      
+-      if (replication == safeReplication)
++      if (replication == safeReplication) {
+-      checkMode();
++        checkMode();
++      }
+-      if (replication == safeReplication-1)
++      if (replication == safeReplication-1) {
+-      checkMode();
++        assert blockSafe >= 0 || isManual();
++        checkMode();
++      }
+-     * This is costly and currently called only in assert.
+-     * @throws IOException 
++     * This is costly so only runs if asserts are enabled.
+-    private boolean isConsistent() throws IOException {
++    private void doConsistencyCheck() {
++      boolean assertsOn = false;
++      assert assertsOn = true; // set to true if asserts are on
++      if (!assertsOn) return;
++      
+-        return true; // manual safe mode
++        return; // manual safe mode
+-      return (blockTotal == activeBlocks) ||
+-        (blockSafe >= 0 && blockSafe <= blockTotal);
++      if ((blockTotal != activeBlocks) &&
++          !(blockSafe >= 0 && blockSafe <= blockTotal)) {
++        throw new AssertionError(
++            " SafeMode: Inconsistent filesystem state: "
++        + "SafeMode data: blockTotal=" + blockTotal
++        + " blockSafe=" + blockSafe + "; "
++        + "BlockManager data: active="  + activeBlocks);
++      }
++    }
++
++    private synchronized void adjustBlockTotals(int deltaSafe, int deltaTotal) {
++      if (!shouldIncrementallyTrackBlocks) {
++        return;
++      }
++      assert haEnabled;
++      
++      if (LOG.isDebugEnabled()) {
++        LOG.debug("Adjusting block totals from " +
++            blockSafe + "/" + blockTotal + " to " +
++            (blockSafe + deltaSafe) + "/" + (blockTotal + deltaTotal));
++      }
++      assert blockSafe + deltaSafe >= 0 : "Can't reduce blockSafe " +
++        blockSafe + " by " + deltaSafe + ": would be negative";
++      assert blockTotal + deltaTotal >= 0 : "Can't reduce blockTotal " +
++        blockTotal + " by " + deltaTotal + ": would be negative";
++      
++      blockSafe += deltaSafe;
++      setBlockTotal(blockTotal + deltaTotal);
++    if (isInStandbyState()) {
++      return false;
++    }
+-    safeMode.decrementSafeBlockCount((short)blockManager.countNodes(b).liveReplicas());
++    BlockInfo storedBlock = blockManager.getStoredBlock(b);
++    if (storedBlock.isComplete()) {
++      safeMode.decrementSafeBlockCount((short)blockManager.countNodes(b).liveReplicas());
++    }
++  }
++  
++  /**
++   * Adjust the total number of blocks safe and expected during safe mode.
++   * If safe mode is not currently on, this is a no-op.
++   * @param deltaSafe the change in number of safe blocks
++   * @param deltaTotal the change i nnumber of total blocks expected
++   */
++  public void adjustSafeModeBlockTotals(int deltaSafe, int deltaTotal) {
++    // safeMode is volatile, and may be set to null at any time
++    SafeModeInfo safeMode = this.safeMode;
++    if (safeMode == null)
++      return;
++    safeMode.adjustBlockTotals(deltaSafe, deltaTotal);
+-  void setBlockTotal() {
++  public void setBlockTotal() {
+-            "Found a lease for file that is not under construction.";
++            "Found a lease for file " + path + " that is not under construction." +
++            " lease=" + lease;
+-    // Ensure that any concurrent operations have been fully synced
+-    // before entering safe mode. This ensures that the FSImage
+-    // is entirely stable on disk as soon as we're in safe mode.
+-    getEditLog().logSyncAll();
+-    if (!isInSafeMode()) {
+-      safeMode = new SafeModeInfo(resourcesLow);
+-      return;
+-    }
+-    if (resourcesLow) {
+-      safeMode.setResourcesLow();
+-    }
+-    safeMode.setManual();
+-    getEditLog().logSyncAll();
+-    NameNode.stateChangeLog.info("STATE* Safe mode is ON. " 
+-                                + safeMode.getTurnOffTip());
++      // Stop the secret manager, since rolling the master key would
++      // try to write to the edit log
++      stopSecretManager();
++
++      // Ensure that any concurrent operations have been fully synced
++      // before entering safe mode. This ensures that the FSImage
++      // is entirely stable on disk as soon as we're in safe mode.
++      boolean isEditlogOpenForWrite = getEditLog().isOpenForWrite();
++      // Before Editlog is in OpenForWrite mode, editLogStream will be null. So,
++      // logSyncAll call can be called only when Edlitlog is in OpenForWrite mode
++      if (isEditlogOpenForWrite) {
++        getEditLog().logSyncAll();
++      }
++      if (!isInSafeMode()) {
++        safeMode = new SafeModeInfo(resourcesLow);
++        return;
++      }
++      if (resourcesLow) {
++        safeMode.setResourcesLow();
++      }
++      safeMode.setManual();
++      if (isEditlogOpenForWrite) {
++        getEditLog().logSyncAll();
++      }
++      NameNode.stateChangeLog.info("STATE* Safe mode is ON. "
++          + safeMode.getTurnOffTip());
++      checkOperation(OperationCategory.JOURNAL);
++      checkOperation(OperationCategory.CHECKPOINT);
++
++      checkOperation(OperationCategory.CHECKPOINT);
++
++  // HA-only metric
++  @Metric
++  public long getPostponedMisreplicatedBlocks() {
++    return blockManager.getPostponedMisreplicatedBlocksCount();
++  }
++
++  // HA-only metric
++  @Metric
++  public int getPendingDataNodeMessageCount() {
++    return blockManager.getPendingDataNodeMessageCount();
++  }
++  
++  // HA-only metric
++  @Metric
++  public String getHAState() {
++    return haContext.getState().toString();
++  }
++
++  // HA-only metric
++  @Metric
++  public long getMillisSinceLastLoadedEdits() {
++    if (isInStandbyState() && editLogTailer != null) {
++      return now() - editLogTailer.getLastLoadTimestamp();
++    } else {
++      return 0;
++    }
++  }
++  
++
++   * Client is reporting some bad block locations.
++   */
++  void reportBadBlocks(LocatedBlock[] blocks) throws IOException {
++    writeLock();
++    try {
++      checkOperation(OperationCategory.WRITE);
++      
++      NameNode.stateChangeLog.info("*DIR* NameNode.reportBadBlocks");
++      for (int i = 0; i < blocks.length; i++) {
++        ExtendedBlock blk = blocks[i].getBlock();
++        DatanodeInfo[] nodes = blocks[i].getLocations();
++        for (int j = 0; j < nodes.length; j++) {
++          DatanodeInfo dn = nodes[j];
++          blockManager.findAndMarkBlockAsCorrupt(blk, dn,
++              "client machine reported it");
++        }
++      }
++    } finally {
++      writeUnlock();
++    }
++  }
++
++  /**
++      checkOperation(OperationCategory.WRITE);
++
++      checkOperation(OperationCategory.WRITE);
++
+-    if (supportAppends) {
++    if (supportAppends || persistBlocks) {
++      checkOperation(OperationCategory.READ);
++
++      checkOperation(OperationCategory.WRITE);
++
++      checkOperation(OperationCategory.WRITE);
++
++      checkOperation(OperationCategory.WRITE);
++
+-    writeLock();
+-    try {
+-      if (isInSafeMode()) {
+-        throw new SafeModeException(
+-          "Cannot log master key update in safe mode", safeMode);
+-      }
+-      getEditLog().logUpdateMasterKey(key);
+-    } finally {
+-      writeUnlock();
+-    }
++    
++    assert !isInSafeMode() :
++      "this should never be called while in safemode, since we stop " +
++      "the DT manager before entering safemode!";
++    // No need to hold FSN lock since we don't access any internal
++    // structures, and this is stopped before the FSN shuts itself
++    // down, etc.
++    getEditLog().logUpdateMasterKey(key);
++  
++  public boolean isGenStampInFuture(long genStamp) {
++    return (genStamp > getGenerationStamp());
++  }
++  @VisibleForTesting
++  public EditLogTailer getEditLogTailer() {
++    return editLogTailer;
++  }
++  
++  @VisibleForTesting
++  void setFsLockForTests(ReentrantReadWriteLock lock) {
++    this.fsLock = lock;
++  }
++  
++  @VisibleForTesting
++  ReentrantReadWriteLock getFsLockForTests() {
++    return fsLock;
++  }
++  
++  @VisibleForTesting
++  public void setNNResourceChecker(NameNodeResourceChecker nnResourceChecker) {
++    this.nnResourceChecker = nnResourceChecker;
++  }

@@ -1,0 +1,176 @@
+YARN-5959. RM changes to support change of container ExecutionType. (Arun Suresh via wangda)
+
++import java.util.Arrays;
++import org.apache.hadoop.yarn.api.records.ContainerUpdateType;
++import org.apache.hadoop.yarn.api.records.UpdateContainerError;
++  protected Map<ContainerId, RMContainer> newlyPromotedContainers = new HashMap<>();
++  protected Map<ContainerId, RMContainer> newlyDemotedContainers = new HashMap<>();
++  protected List<RMContainer> tempContainerToKill = new ArrayList<>();
++  protected List<UpdateContainerError> updateContainerErrors = new ArrayList<>();
++
++  public ContainerUpdateContext getUpdateContext() {
++    return this.appSchedulingInfo.getUpdateContext();
++  }
++
+-        rmContainer = new RMContainerImpl(container, getApplicationAttemptId(),
+-            node.getNodeID(), appSchedulingInfo.getUser(), rmContext);
++        rmContainer = new RMContainerImpl(container, schedulerKey,
++            getApplicationAttemptId(), node.getNodeID(),
++            appSchedulingInfo.getUser(), rmContext);
+-      boolean newContainer, boolean increasedContainer) {
++      ContainerUpdateType updateType) {
+-    if (!newContainer) {
++    if (updateType != null) {
+-    if (newContainer) {
++    if (updateType == null ||
++        ContainerUpdateType.PROMOTE_EXECUTION_TYPE == updateType ||
++        ContainerUpdateType.DEMOTE_EXECUTION_TYPE == updateType) {
+-          rmContainer.getContainerId(), increasedContainer));
++          rmContainer.getContainerId(),
++          ContainerUpdateType.INCREASE_RESOURCE == updateType));
+-        Container updatedContainer = updateContainerAndNMToken(rmContainer,
+-            true, false);
++        Container updatedContainer =
++            updateContainerAndNMToken(rmContainer, null);
+-
+-  
++
++  public void addToNewlyDemotedContainers(ContainerId containerId,
++      RMContainer rmContainer) {
++    newlyDemotedContainers.put(containerId, rmContainer);
++  }
++
++  protected synchronized void addToUpdateContainerErrors(
++      UpdateContainerError error) {
++    updateContainerErrors.add(error);
++  }
++
++  protected synchronized void addToNewlyAllocatedContainers(
++      SchedulerNode node, RMContainer rmContainer) {
++    if (oppContainerContext == null) {
++      newlyAllocatedContainers.add(rmContainer);
++      return;
++    }
++    ContainerId matchedContainerId =
++        getUpdateContext().matchContainerToOutstandingIncreaseReq(
++            node, rmContainer.getAllocatedSchedulerKey(), rmContainer);
++    if (matchedContainerId != null) {
++      if (ContainerUpdateContext.UNDEFINED == matchedContainerId) {
++        // This is a spurious allocation (relaxLocality = false
++        // resulted in the Container being allocated on an NM on the same host
++        // but not on the NM running the container to be updated. Can
++        // happen if more than one NM exists on the same host.. usually
++        // occurs when using MiniYARNCluster to test).
++        tempContainerToKill.add(rmContainer);
++      } else {
++        newlyPromotedContainers.put(matchedContainerId, rmContainer);
++      }
++    } else {
++      newlyAllocatedContainers.add(rmContainer);
++    }
++  }
++
++  public List<Container> pullNewlyPromotedContainers() {
++    return pullContainersWithUpdatedExecType(newlyPromotedContainers,
++        ContainerUpdateType.PROMOTE_EXECUTION_TYPE);
++  }
++
++  public List<Container> pullNewlyDemotedContainers() {
++    return pullContainersWithUpdatedExecType(newlyDemotedContainers,
++        ContainerUpdateType.DEMOTE_EXECUTION_TYPE);
++  }
++
++  public List<UpdateContainerError> pullUpdateContainerErrors() {
++    List<UpdateContainerError> errors =
++        new ArrayList<>(updateContainerErrors);
++    updateContainerErrors.clear();
++    return errors;
++  }
++
++  /**
++   * A container is promoted if its executionType is changed from
++   * OPPORTUNISTIC to GUARANTEED. It id demoted if the change is from
++   * GUARANTEED to OPPORTUNISTIC.
++   * @return Newly Promoted and Demoted containers
++   */
++  private List<Container> pullContainersWithUpdatedExecType(
++      Map<ContainerId, RMContainer> newlyUpdatedContainers,
++      ContainerUpdateType updateTpe) {
++    List<Container> updatedContainers = new ArrayList<>();
++    if (oppContainerContext == null) {
++      return updatedContainers;
++    }
++    try {
++      writeLock.lock();
++      Iterator<Map.Entry<ContainerId, RMContainer>> i =
++          newlyUpdatedContainers.entrySet().iterator();
++      while (i.hasNext()) {
++        Map.Entry<ContainerId, RMContainer> entry = i.next();
++        ContainerId matchedContainerId = entry.getKey();
++        RMContainer rmContainer = entry.getValue();
++
++        // swap containers
++        RMContainer existingRMContainer = swapContainer(
++            rmContainer, matchedContainerId);
++        getUpdateContext().removeFromOutstandingUpdate(
++            rmContainer.getAllocatedSchedulerKey(),
++            existingRMContainer.getContainer());
++        Container updatedContainer = updateContainerAndNMToken(
++            existingRMContainer, updateTpe);
++        updatedContainers.add(updatedContainer);
++
++        tempContainerToKill.add(rmContainer);
++        i.remove();
++      }
++      // Release all temporary containers
++      Iterator<RMContainer> tempIter = tempContainerToKill.iterator();
++      while (tempIter.hasNext()) {
++        RMContainer c = tempIter.next();
++        // Mark container for release (set RRs to null, so RM does not think
++        // it is a recoverable container)
++        ((RMContainerImpl) c).setResourceRequests(null);
++        ((AbstractYarnScheduler) rmContext.getScheduler()).completedContainer(c,
++            SchedulerUtils.createAbnormalContainerStatus(c.getContainerId(),
++                SchedulerUtils.UPDATED_CONTAINER),
++            RMContainerEventType.KILL);
++        tempIter.remove();
++      }
++      return updatedContainers;
++    } finally {
++      writeLock.unlock();
++    }
++  }
++
++  private RMContainer swapContainer(RMContainer rmContainer, ContainerId
++      matchedContainerId) {
++    RMContainer existingRMContainer =
++        getRMContainer(matchedContainerId);
++    if (existingRMContainer != null) {
++      // Swap updated container with the existing container
++      Container updatedContainer = rmContainer.getContainer();
++
++      Container newContainer = Container.newInstance(matchedContainerId,
++          existingRMContainer.getContainer().getNodeId(),
++          existingRMContainer.getContainer().getNodeHttpAddress(),
++          updatedContainer.getResource(),
++          existingRMContainer.getContainer().getPriority(), null,
++          updatedContainer.getExecutionType());
++      newContainer.setAllocationRequestId(
++          existingRMContainer.getContainer().getAllocationRequestId());
++      newContainer.setVersion(existingRMContainer.getContainer().getVersion());
++
++      rmContainer.getContainer().setResource(
++          existingRMContainer.getContainer().getResource());
++      rmContainer.getContainer().setExecutionType(
++          existingRMContainer.getContainer().getExecutionType());
++
++      ((RMContainerImpl)existingRMContainer).setContainer(newContainer);
++    }
++    return existingRMContainer;
++  }
++
+-            false, increase);
++            increase ? ContainerUpdateType.INCREASE_RESOURCE :
++                ContainerUpdateType.DECREASE_RESOURCE);
+
+INS26 INS26 INS26 INS40 INS40 INS40 INS23 INS23 INS23 INS23 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS83 INS74 INS59 INS83 INS74 INS59 INS83 INS74 INS59 INS83 INS74 INS59 INS83 INS43 INS42 INS8 INS83 INS39 INS42 INS44 INS44 INS8 INS83 INS83 INS39 INS42 INS44 INS8 INS83 INS83 INS39 INS42 INS44 INS44 INS8 INS83 INS74 INS42 INS8 INS83 INS74 INS42 INS8 INS83 INS74 INS42 INS8 INS29 INS83 INS74 INS42 INS44 INS44 INS8 INS83 INS43 INS42 INS44 INS44 INS8 INS43 INS43 INS43 INS42 INS14 INS43 INS43 INS43 INS42 INS14 INS43 INS43 INS42 INS14 INS43 INS43 INS42 INS14 INS42 INS41 INS43 INS42 INS43 INS42 INS43 INS42 INS21 INS43 INS42 INS21 INS43 INS42 INS43 INS42 INS25 INS60 INS25 INS43 INS43 INS41 INS43 INS43 INS41 INS43 INS43 INS60 INS21 INS41 INS65 INS65 INS43 INS43 INS74 INS42 INS43 INS42 INS60 INS25 INS54 INS42 INS43 INS42 INS43 INS42 INS60 INS25 INS41 INS42 INS42 INS42 INS74 INS42 INS42 INS42 INS74 INS42 INS42 INS74 INS42 INS42 INS74 INS32 INS42 INS27 INS27 INS42 INS42 INS32 INS42 INS32 INS42 INS42 INS27 INS8 INS43 INS59 INS27 INS8 INS8 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS74 INS59 INS32 INS42 INS66 INS66 INS66 INS66 INS42 INS42 INS43 INS43 INS43 INS42 INS74 INS59 INS27 INS8 INS8 INS8 INS42 INS42 INS43 INS59 INS27 INS8 INS42 INS43 INS43 INS43 INS43 INS22 INS42 INS42 INS33 INS27 INS27 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS33 INS21 INS41 INS42 INS42 INS32 INS42 INS33 INS25 INS21 INS42 INS42 INS40 INS42 INS42 INS40 INS43 INS43 INS42 INS14 INS42 INS42 INS42 INS42 INS42 INS43 INS43 INS42 INS14 INS42 INS33 INS41 INS21 INS60 INS61 INS60 INS61 INS41 INS21 INS42 INS42 INS32 INS42 INS33 INS60 INS60 INS21 INS21 INS21 INS21 INS21 INS42 INS42 INS42 INS42 INS52 INS42 INS27 INS27 INS40 INS42 INS32 INS32 INS42 INS42 INS32 INS42 INS27 INS8 INS8 INS32 INS42 INS42 INS74 INS42 INS42 INS42 INS74 INS42 INS32 INS74 INS59 INS32 INS8 INS74 INS59 INS32 INS8 INS42 INS32 INS42 INS42 INS43 INS59 INS43 INS59 INS32 INS32 INS32 INS32 INS32 INS42 INS33 INS40 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS40 INS42 INS21 INS21 INS42 INS42 INS42 INS43 INS43 INS42 INS42 INS43 INS74 INS42 INS32 INS42 INS42 INS60 INS60 INS60 INS60 INS21 INS60 INS21 INS21 INS21 INS43 INS43 INS42 INS32 INS42 INS42 INS60 INS21 INS21 INS21 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS32 INS32 INS42 INS32 INS32 INS42 INS32 INS36 INS42 INS42 INS27 INS43 INS32 INS32 INS42 INS42 INS42 INS43 INS43 INS43 INS32 INS42 INS74 INS59 INS43 INS59 INS43 INS59 INS43 INS59 INS32 MOV43 INS59 INS32 INS32 INS32 INS42 INS42 INS42 INS42 INS43 INS59 INS32 INS32 INS32 INS42 INS42 INS42 INS42 INS42 INS32 INS32 INS32 INS32 INS33 INS32 INS32 INS42 INS32 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS32 INS42 INS11 INS40 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS40 INS42 INS42 INS42 INS42 INS43 INS43 INS43 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS32 INS32 INS42 INS32 INS32 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS36 INS42 INS33 INS36 INS42 INS42 INS32 INS40 INS42 INS42 INS32 INS42 INS32 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS43 INS42 INS42 INS33 INS40 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS11 INS11 INS42 INS42 INS32 INS40 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS16 INS43 INS42 INS43 INS32 INS42 INS42 INS42 INS40 INS40 INS42 INS42 INS42 INS42 DEL39 DEL42 DEL39 DEL42 DEL44 DEL42 DEL38 DEL42 DEL42 DEL9 DEL9 DEL9 DEL42

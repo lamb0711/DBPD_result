@@ -1,0 +1,225 @@
+HADOOP-14445. Use DelegationTokenIssuer to create KMS delegation tokens that can authenticate to all KMS instances.
+Contributed by Daryn Sharp, Xiao Chen, Rushabh S Shah.
+
+-import org.apache.hadoop.security.authentication.client.AuthenticatedURL;
+-import org.apache.hadoop.security.authentication.client.KerberosAuthenticator;
++import org.apache.hadoop.security.token.delegation.AbstractDelegationTokenSelector;
+-import java.net.InetSocketAddress;
+-  private static final Logger LOG =
++  static final Logger LOG =
++  private KeyProviderDelegationTokenExtension.DelegationTokenExtension
++      clientTokenProvider = this;
++  // the token's service.
+-
+-  // Allow fallback to default kms server port 9600 for certain tests that do
+-  // not specify the port explicitly in the kms provider url.
+-  @VisibleForTesting
+-  public static volatile boolean fallbackDefaultPortForTesting = false;
++  // alias in the credentials.
++  private final Text canonicalService;
++  static class TokenSelector extends AbstractDelegationTokenSelector {
++    static final TokenSelector INSTANCE = new TokenSelector();
++
++    TokenSelector() {
++      super(TOKEN_KIND);
++    }
++  }
++
+-      KeyProvider keyProvider = KMSUtil.createKeyProvider(conf,
+-          KeyProviderFactory.KEY_PROVIDER_PATH);
++      KeyProvider keyProvider = createKeyProvider(token, conf);
+-      KeyProvider keyProvider = KMSUtil.createKeyProvider(conf,
+-          KeyProviderFactory.KEY_PROVIDER_PATH);
++      KeyProvider keyProvider = createKeyProvider(token, conf);
++
++    private static KeyProvider createKeyProvider(
++        Token<?> token, Configuration conf) throws IOException {
++      String service = token.getService().toString();
++      URI uri;
++      if (service != null && service.startsWith(SCHEME_NAME + ":/")) {
++        LOG.debug("Creating key provider with token service value {}", service);
++        uri = URI.create(service);
++      } else { // conf fallback
++        uri = KMSUtil.getKeyProviderUri(conf);
++      }
++      return (uri != null) ? KMSUtil.createKeyProviderFromUri(conf, uri) : null;
++    }
+-        return createProvider(conf, origUrl, port, hostsPart);
++        KMSClientProvider[] providers =
++            createProviders(conf, origUrl, port, hostsPart);
++        return new LoadBalancingKMSClientProvider(providerUri, providers, conf);
+-    private KeyProvider createProvider(Configuration conf,
++    private KMSClientProvider[] createProviders(Configuration conf,
+-      return new LoadBalancingKMSClientProvider(providers, conf);
++      return providers;
+-    int kmsPort = kmsUrl.getPort();
+-    if ((kmsPort == -1) && fallbackDefaultPortForTesting) {
+-      kmsPort = 9600;
+-    }
+-
+-    InetSocketAddress addr = new InetSocketAddress(kmsUrl.getHost(), kmsPort);
+-    dtService = SecurityUtil.buildTokenService(addr);
++    // the token's service so it can be instantiated for renew/cancel.
++    dtService = getDtService(uri);
++    // the canonical service is the alias for the token in the credentials.
++    // typically it's the actual service in the token but older clients expect
++    // an address.
++    URI serviceUri = URI.create(kmsUrl.toString());
++    canonicalService = SecurityUtil.buildTokenService(serviceUri);
+-    LOG.debug("KMSClientProvider for KMS url: {} delegation token service: {}" +
+-        " created.", kmsUrl, dtService);
++    LOG.debug("KMSClientProvider created for KMS url: {} delegation token "
++            + "service: {} canonical service: {}.", kmsUrl, dtService,
++        canonicalService);
++  }
++
++  protected static Text getDtService(URI uri) {
++    Text service;
++    // remove fragment for forward compatibility with logical naming.
++    final String fragment = uri.getFragment();
++    if (fragment != null) {
++      service = new Text(
++          uri.getScheme() + ":" + uri.getSchemeSpecificPart());
++    } else {
++      service = new Text(uri.toString());
++    }
++    return service;
+-              new DelegationTokenAuthenticatedURL(configurator);
++              createAuthenticatedURL();
++  // note: this is only a crutch for backwards compatibility.
++  // override the instance that will be used to select a token, intended
++  // to allow load balancing provider to find a token issued by any of its
++  // sub-providers.
++  protected void setClientTokenProvider(
++      KeyProviderDelegationTokenExtension.DelegationTokenExtension provider) {
++    clientTokenProvider = provider;
++  }
++
++  @VisibleForTesting
++  DelegationTokenAuthenticatedURL createAuthenticatedURL() {
++    return new DelegationTokenAuthenticatedURL(configurator) {
++      @Override
++      public org.apache.hadoop.security.token.Token<? extends TokenIdentifier>
++          selectDelegationToken(URL url, Credentials creds) {
++        if (LOG.isDebugEnabled()) {
++          LOG.debug("Looking for delegation token. creds: {}",
++              creds.getAllTokens());
++        }
++        // clientTokenProvider is either "this" or a load balancing instance.
++        // if the latter, it will first look for the load balancer's uri
++        // service followed by each sub-provider for backwards-compatibility.
++        return clientTokenProvider.selectDelegationToken(creds);
++      }
++    };
++  }
++
++  @InterfaceAudience.Private
++  @Override
++  public Token<?> selectDelegationToken(Credentials creds) {
++    Token<?> token = selectDelegationToken(creds, dtService);
++    if (token == null) {
++      token = selectDelegationToken(creds, canonicalService);
++    }
++    return token;
++  }
++
++  protected static Token<?> selectDelegationToken(Credentials creds,
++                                                  Text service) {
++    Token<?> token = creds.getToken(service);
++    LOG.debug("selected by alias={} token={}", service, token);
++    if (token != null && TOKEN_KIND.equals(token.getKind())) {
++      return token;
++    }
++    token = TokenSelector.INSTANCE.selectToken(service, creds.getAllTokens());
++    LOG.debug("selected by service={} token={}", service, token);
++    return token;
++  }
++
++  @Override
++  public String getCanonicalServiceName() {
++    return canonicalService.toString();
++  }
++
++  @Override
++  public Token<?> getDelegationToken(final String renewer) throws IOException {
++    final URL url = createURL(null, null, null, null);
++    final DelegationTokenAuthenticatedURL authUrl =
++        new DelegationTokenAuthenticatedURL(configurator);
++    Token<?> token = null;
++    try {
++      final String doAsUser = getDoAsUser();
++      token = getActualUgi().doAs(new PrivilegedExceptionAction<Token<?>>() {
++        @Override
++        public Token<?> run() throws Exception {
++          // Not using the cached token here.. Creating a new token here
++          // everytime.
++          LOG.debug("Getting new token from {}, renewer:{}", url, renewer);
++          return authUrl.getDelegationToken(url,
++              new DelegationTokenAuthenticatedURL.Token(), renewer, doAsUser);
++        }
++      });
++      if (token != null) {
++        token.setService(dtService);
++        LOG.info("New token created: ({})", token);
++      } else {
++        throw new IOException("Got NULL as delegation token");
++      }
++    } catch (InterruptedException e) {
++      Thread.currentThread().interrupt();
++    } catch (Exception e) {
++      if (e instanceof IOException) {
++        throw (IOException) e;
++      } else {
++        throw new IOException(e);
++      }
++    }
++    return token;
++  }
++
+-          new DelegationTokenAuthenticatedURL(configurator);
++          createAuthenticatedURL();
+-                  new DelegationTokenAuthenticatedURL(configurator);
++                  createAuthenticatedURL();
+-  @Override
+-  public Token<?>[] addDelegationTokens(final String renewer,
+-      Credentials credentials) throws IOException {
+-    Token<?>[] tokens = null;
+-    Token<?> token = credentials.getToken(dtService);
+-    if (token == null) {
+-      final URL url = createURL(null, null, null, null);
+-      final DelegationTokenAuthenticatedURL authUrl =
+-          new DelegationTokenAuthenticatedURL(configurator);
+-      try {
+-        final String doAsUser = getDoAsUser();
+-        token = getActualUgi().doAs(new PrivilegedExceptionAction<Token<?>>() {
+-          @Override
+-          public Token<?> run() throws Exception {
+-            // Not using the cached token here.. Creating a new token here
+-            // everytime.
+-            LOG.info("Getting new token from {}, renewer:{}", url, renewer);
+-            return authUrl.getDelegationToken(url,
+-                new DelegationTokenAuthenticatedURL.Token(), renewer, doAsUser);
+-          }
+-        });
+-        if (token != null) {
+-          LOG.info("New token received: ({})", token);
+-          credentials.addToken(token.getService(), token);
+-          tokens = new Token<?>[] { token };
+-        } else {
+-          throw new IOException("Got NULL as delegation token");
+-        }
+-      } catch (InterruptedException e) {
+-        Thread.currentThread().interrupt();
+-      } catch (Exception e) {
+-        if (e instanceof IOException) {
+-          throw (IOException) e;
+-        } else {
+-          throw new IOException(e);
+-        }
+-      }
+-    }
+-    return tokens;
+-  }
+-
+
+MOV26 MOV31 UPD40 INS23 INS23 INS55 INS31 INS31 INS31 INS31 INS31 INS31 INS83 INS43 INS59 INS83 INS83 INS43 INS59 INS83 INS42 INS43 INS23 INS31 INS31 INS83 INS83 INS43 INS42 INS44 INS8 INS83 INS39 INS42 INS44 INS8 MOV78 INS43 INS42 INS8 INS78 INS78 INS83 INS74 INS42 INS44 INS8 INS83 INS83 INS74 INS42 MOV44 INS44 INS8 INS78 INS83 INS43 INS42 INS8 MOV74 UPD42 MOV8 INS40 INS42 INS52 INS42 INS42 INS42 MOV83 INS83 INS43 INS59 INS42 INS8 INS83 INS83 MOV43 INS42 INS44 INS44 INS43 INS8 INS5 UPD42 INS21 INS42 INS43 INS42 INS60 INS60 INS25 INS41 INS43 INS42 INS21 INS42 INS41 INS40 INS42 INS43 INS76 INS43 INS42 INS60 INS25 INS41 INS43 INS76 UPD42 INS43 INS42 INS60 INS21 INS25 INS21 INS21 INS41 INS42 INS42 INS41 MOV60 INS41 INS42 INS42 INS14 INS46 INS42 INS74 INS42 INS43 INS42 INS42 INS60 INS60 INS25 INS41 INS43 INS85 INS7 UPD43 INS42 INS43 INS59 INS83 INS43 INS59 INS27 INS8 INS8 INS42 INS40 INS7 INS14 INS42 INS42 MOV74 INS59 MOV27 INS8 INS42 INS42 INS42 MOV74 INS59 INS32 INS27 INS8 INS7 INS32 INS42 INS32 INS42 INS43 INS42 INS43 INS76 INS42 INS43 INS59 INS43 INS59 INS27 INS8 INS8 INS16 UPD42 MOV42 INS42 INS42 INS32 UPD42 UPD42 INS32 UPD42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS33 INS21 INS21 INS42 INS42 MOV43 INS42 INS1 UPD42 MOV42 INS32 INS21 INS42 INS32 INS42 INS42 INS45 INS42 INS42 INS27 INS32 INS41 INS42 INS32 INS42 INS42 INS45 INS42 INS42 INS42 INS42 INS33 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS27 INS32 INS21 INS21 INS21 INS36 INS32 INS33 INS60 INS41 UPD42 MOV42 UPD42 MOV42 INS42 INS42 INS32 UPD42 UPD45 UPD45 INS42 INS42 INS7 INS7 INS31 INS42 INS42 INS42 INS7 INS42 INS42 INS42 INS42 INS33 INS42 INS42 INS32 INS42 INS40 INS42 INS42 INS32 INS42 INS42 MOV32 INS42 INS42 INS33 INS42 INS42 INS27 INS32 INS7 INS7 INS27 INS42 INS42 INS42 INS42 INS5 INS59 INS14 MOV42 UPD42 MOV42 INS42 INS14 INS42 INS14 INS78 INS83 INS74 INS42 INS44 INS44 INS8 INS42 INS32 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS45 INS42 INS42 INS45 INS42 INS42 INS32 INS42 INS32 INS42 INS33 INS43 INS85 INS42 INS32 MOV43 INS42 INS42 INS42 INS43 INS27 INS43 INS32 INS42 INS43 INS76 INS43 INS42 INS43 INS42 INS25 INS41 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 UPD42 MOV42 MOV42 MOV42 MOV42 MOV42 INS42 INS32 INS45 INS32 INS42 INS42 INS42 INS40 INS43 INS42 INS42 INS32 INS8 INS32 UPD42 UPD42 UPD42 UPD42 UPD42 INS45 MOV42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS21 INS42 INS42 INS42 INS32 INS42 INS42 INS45 INS32 MOV43 INS42 INS42 INS32 INS32 UPD42 INS42 INS42 DEL40 DEL26 DEL40 DEL26 DEL83 DEL83 DEL83 DEL39 DEL9 DEL59 DEL23 DEL42 DEL40 DEL42 DEL40 DEL32 DEL41 DEL42 DEL42 DEL14 DEL39 DEL42 DEL32 DEL59 DEL60 DEL42 DEL34 DEL38 DEL27 DEL36 DEL42 DEL27 DEL42 DEL34 DEL7 DEL21 DEL8 DEL25 DEL42 DEL43 DEL32 DEL42 DEL14 DEL42 DEL14 DEL85 DEL5 DEL42 DEL42 DEL42 DEL32 DEL45 DEL42 DEL42 DEL85 DEL5 DEL42 DEL4 DEL3 DEL7 DEL21 DEL85 DEL5 DEL42 DEL33 DEL59 DEL60 DEL25 DEL42 DEL41 DEL8 DEL42 DEL43 DEL42 DEL14 DEL42 DEL43 DEL42 DEL14

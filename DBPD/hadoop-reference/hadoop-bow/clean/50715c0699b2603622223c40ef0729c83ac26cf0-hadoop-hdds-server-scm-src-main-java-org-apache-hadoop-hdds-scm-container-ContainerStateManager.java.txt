@@ -1,0 +1,242 @@
+HDDS-662. Introduce ContainerReplicaState in StorageContainerManager. Contributed by Nanda kumar.
+
+-import com.google.common.annotations.VisibleForTesting;
+-import org.apache.hadoop.hdds.protocol.DatanodeDetails;
+-import org.apache.hadoop.hdds.scm.container.common.helpers.ContainerWithPipeline;
+-import org.apache.hadoop.hdds.scm.container.common.helpers.ContainerInfo;
+-import org.apache.hadoop.hdds.scm.container.replication.ReplicationRequest;
+-import java.io.Closeable;
+-import java.util.ArrayList;
+-import java.util.List;
+-public class ContainerStateManager implements Closeable {
++public class ContainerStateManager {
+-  public ContainerStateManager(Configuration configuration,
+-      ContainerManager containerManager, PipelineSelector pipelineSelector) {
++  public ContainerStateManager(final Configuration configuration) {
+-    Set<HddsProtos.LifeCycleState> finalStates = new HashSet();
++    final Set<HddsProtos.LifeCycleState> finalStates = new HashSet();
+-    lastUsedMap = new ConcurrentHashMap<>();
+-    containerCount = new AtomicLong(0);
+-    containers = new ContainerStateMap();
+-  }
+-
+-  /**
+-   * Return the info of all the containers kept by the in-memory mapping.
+-   *
+-   * @return the list of all container info.
+-   */
+-  public List<ContainerInfo> getAllContainers() {
+-    List<ContainerInfo> list = new ArrayList<>();
+-
+-    //No Locking needed since the return value is an immutable map.
+-    containers.getContainerMap().forEach((key, value) -> list.add(value));
+-    return list;
++    this.lastUsedMap = new ConcurrentHashMap<>();
++    this.containerCount = new AtomicLong(0);
++    this.containers = new ContainerStateMap();
+-  public void addExistingContainer(ContainerInfo containerInfo)
++  void loadContainer(final ContainerInfo containerInfo)
+-    long containerID = containerInfo.getContainerID();
+-    if (containerCount.get() < containerID) {
+-      containerCount.set(containerID);
+-    }
++    containerCount.set(Long.max(
++        containerInfo.getContainerID(), containerCount.get()));
+-   * allocates a new container based on the type, replication etc.
++   * Allocates a new container based on the type, replication etc.
+-  public ContainerWithPipeline allocateContainer(PipelineSelector selector,
+-      HddsProtos.ReplicationType type,
+-      HddsProtos.ReplicationFactor replicationFactor, String owner)
++  ContainerInfo allocateContainer(final PipelineSelector selector,
++      final HddsProtos.ReplicationType type,
++      final HddsProtos.ReplicationFactor replicationFactor, final String owner)
+-    Pipeline pipeline = selector.getReplicationPipeline(type,
++    final Pipeline pipeline = selector.getReplicationPipeline(type,
+-    long containerID = containerCount.incrementAndGet();
+-    ContainerInfo containerInfo = new ContainerInfo.Builder()
++    final long containerID = containerCount.incrementAndGet();
++    final ContainerInfo containerInfo = new ContainerInfo.Builder()
+-        // This is bytes allocated for blocks inside container, not the
+-        // container size
+-        .setAllocatedBytes(0)
+-    return new ContainerWithPipeline(containerInfo, pipeline);
++    return containerInfo;
+-   * @param info - ContainerInfo
++   * @param containerID - ContainerID
+-  public ContainerInfo updateContainerState(ContainerInfo
+-      info, HddsProtos.LifeCycleEvent event) throws SCMException {
+-    LifeCycleState newState;
++  ContainerInfo updateContainerState(final ContainerID containerID,
++      final HddsProtos.LifeCycleEvent event)
++      throws SCMException, ContainerNotFoundException {
++    final ContainerInfo info = containers.getContainerInfo(containerID);
+-      newState = this.stateMachine.getNextState(info.getState(), event);
++      final LifeCycleState newState = stateMachine.getNextState(
++          info.getState(), event);
++      containers.updateState(containerID, info.getState(), newState);
++      return containers.getContainerInfo(containerID);
+-          info.getContainerID(), info.getState(), event);
++          containerID, info.getState(), event);
+-
+-    // This is a post condition after executing getNextState.
+-    Preconditions.checkNotNull(newState);
+-    containers.updateState(info, info.getState(), newState);
+-    return containers.getContainerInfo(info);
+-  public ContainerInfo updateContainerInfo(ContainerInfo info)
+-      throws SCMException {
++  ContainerInfo updateContainerInfo(final ContainerInfo info)
++      throws ContainerNotFoundException {
+-    return containers.getContainerInfo(info);
++    return containers.getContainerInfo(info.containerID());
+-  public void updateDeleteTransactionId(Map<Long, Long> deleteTransactionMap) {
+-    for (Map.Entry<Long, Long> entry : deleteTransactionMap.entrySet()) {
+-      containers.getContainerMap().get(ContainerID.valueof(entry.getKey()))
+-          .updateDeleteTransactionId(entry.getValue());
+-    }
++  void updateDeleteTransactionId(
++      final Map<Long, Long> deleteTransactionMap) {
++    deleteTransactionMap.forEach((k, v) -> {
++      try {
++        containers.getContainerInfo(ContainerID.valueof(k))
++            .updateDeleteTransactionId(v);
++      } catch (ContainerNotFoundException e) {
++        LOG.warn("Exception while updating delete transaction id.", e);
++      }
++    });
+-  public ContainerInfo getMatchingContainer(final long size,
++  ContainerInfo getMatchingContainer(final long size,
+-    NavigableSet<ContainerID> matchingSet =
++    final NavigableSet<ContainerID> matchingSet =
+-    ContainerState key = new ContainerState(owner, type, factor);
+-    ContainerID lastID = lastUsedMap.get(key);
+-    if (lastID == null) {
+-      lastID = matchingSet.first();
+-    }
++    final ContainerState key = new ContainerState(owner, type, factor);
++    final ContainerID lastID = lastUsedMap
++        .getOrDefault(key, matchingSet.first());
+-    // Update the allocated Bytes on this container.
+-    if (selectedContainer != null) {
+-      selectedContainer.updateAllocatedBytes(size);
+-    }
+-  private ContainerInfo findContainerWithSpace(long size,
+-      NavigableSet<ContainerID> searchSet, String owner) {
+-    // Get the container with space to meet our request.
+-    for (ContainerID id : searchSet) {
+-      ContainerInfo containerInfo = containers.getContainerInfo(id);
+-      if (containerInfo.getAllocatedBytes() + size <= this.containerSize) {
+-        containerInfo.updateLastUsedTime();
++  private ContainerInfo findContainerWithSpace(final long size,
++      final NavigableSet<ContainerID> searchSet, final String owner) {
++    try {
++      // Get the container with space to meet our request.
++      for (ContainerID id : searchSet) {
++        final ContainerInfo containerInfo = containers.getContainerInfo(id);
++        if (containerInfo.getUsedBytes() + size <= this.containerSize) {
++          containerInfo.updateLastUsedTime();
+-        ContainerState key = new ContainerState(owner,
+-            containerInfo.getReplicationType(),
+-            containerInfo.getReplicationFactor());
+-        lastUsedMap.put(key, containerInfo.containerID());
+-        return containerInfo;
++          final ContainerState key = new ContainerState(owner,
++              containerInfo.getReplicationType(),
++              containerInfo.getReplicationFactor());
++          lastUsedMap.put(key, containerInfo.containerID());
++          return containerInfo;
++        }
++    } catch (ContainerNotFoundException e) {
++      // This should not happen!
++      LOG.warn("Exception while finding container with space", e);
++  Set<ContainerID> getAllContainerIDs() {
++    return containers.getAllContainerIDs();
++  }
++
++  /**
++   * Returns Containers by State.
++   *
++   * @param state - State - Open, Closed etc.
++   * @return List of containers by state.
++   */
++  Set<ContainerID> getContainerIDsByState(final LifeCycleState state) {
++    return containers.getContainerIDsByState(state);
++  }
++
+-  public NavigableSet<ContainerID> getMatchingContainerIDs(
+-      String owner, ReplicationType type, ReplicationFactor factor,
+-      LifeCycleState state) {
++  NavigableSet<ContainerID> getMatchingContainerIDs(final String owner,
++      final ReplicationType type, final ReplicationFactor factor,
++      final LifeCycleState state) {
+-   * Returns the containerInfo with pipeline for the given container id.
+-   * @param selector -- Pipeline selector class.
+-   * @param containerID id of the container
+-   * @return ContainerInfo containerInfo
+-   * @throws IOException
+-   */
+-  public ContainerWithPipeline getContainer(PipelineSelector selector,
+-      ContainerID containerID) {
+-    ContainerInfo info = containers.getContainerInfo(containerID.getId());
+-    Pipeline pipeline = selector.getPipeline(info.getPipelineID());
+-    return new ContainerWithPipeline(info, pipeline);
+-  }
+-
+-  /**
+-  public ContainerInfo getContainer(ContainerID containerID) {
++  ContainerInfo getContainer(final ContainerID containerID)
++      throws ContainerNotFoundException {
+-  @Override
+-  public void close() throws IOException {
++  void close() throws IOException {
+-  public Set<DatanodeDetails> getContainerReplicas(ContainerID containerID)
+-      throws SCMException {
++  Set<ContainerReplica> getContainerReplicas(
++      final ContainerID containerID) throws ContainerNotFoundException {
+-   * @param dn
++   * @param replica
+-  public void addContainerReplica(ContainerID containerID, DatanodeDetails dn) {
+-    containers.addContainerReplica(containerID, dn);
++  void updateContainerReplica(final ContainerID containerID,
++      final ContainerReplica replica) throws ContainerNotFoundException {
++    containers.updateContainerReplica(containerID, replica);
+-   * @param dn
++   * @param replica
+-  public boolean removeContainerReplica(ContainerID containerID,
+-      DatanodeDetails dn) throws SCMException {
+-    return containers.removeContainerReplica(containerID, dn);
++  void removeContainerReplica(final ContainerID containerID,
++      final ContainerReplica replica)
++      throws ContainerNotFoundException, ContainerReplicaNotFoundException {
++    containers.removeContainerReplica(containerID, replica);
+-  /**
+-   * Compare the existing replication number with the expected one.
+-   */
+-  public ReplicationRequest checkReplicationState(ContainerID containerID)
+-      throws SCMException {
+-    int existingReplicas = getContainerReplicas(containerID).size();
+-    int expectedReplicas = getContainer(containerID)
+-        .getReplicationFactor().getNumber();
+-    if (existingReplicas != expectedReplicas) {
+-      return new ReplicationRequest(containerID.getId(), existingReplicas,
+-          expectedReplicas);
+-    }
+-    return null;
+-  }
+-
+-  /**
+-   * Checks if the container is open.
+-   */
+-  public boolean isOpen(ContainerID containerID) {
+-    Preconditions.checkNotNull(containerID);
+-    ContainerInfo container = Preconditions
+-        .checkNotNull(getContainer(containerID),
+-            "Container can't be found " + containerID);
+-    return container.isContainerOpen();
+-  }
+-
+-  @VisibleForTesting
+-  public ContainerStateMap getContainerStateMap() {
+-    return containers;
++  void removeContainer(final ContainerID containerID)
++      throws ContainerNotFoundException {
++    containers.removeContainer(containerID);

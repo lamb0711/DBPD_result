@@ -1,0 +1,182 @@
+HADOOP-13761. S3Guard: implement retries for DDB failures and throttling; translate exceptions.
+Contributed by Aaron Fabbri.
+
++import com.amazonaws.services.s3.model.GetObjectRequest;
++import com.amazonaws.services.s3.model.S3Object;
+-import static org.apache.hadoop.fs.s3a.Constants.*;
+-
+-  /**
+-   * Keys containing this substring will be subject to delayed visibility.
+-   */
+-  public static final String DEFAULT_DELAY_KEY_SUBSTRING = "DELAY_LISTING_ME";
+-
+-  /**
+-   * How many seconds affected keys will be delayed from appearing in listing.
+-   * This should probably be a config value.
+-   */
+-  public static final long DEFAULT_DELAY_KEY_MSEC = 5 * 1000;
+-
+-  public static final float DEFAULT_DELAY_KEY_PROBABILITY = 1.0f;
+-
+-  /** Special config value since we can't store empty strings in XML. */
+-  public static final String MATCH_ALL_KEYS = "*";
+-
+-  /** Empty string matches all keys. */
+-  private String delayKeySubstring;
+-
+-  /** Probability to delay visibility of a matching key. */
+-  private float delayKeyProbability;
+-
+-  /** Time in milliseconds to delay visibility of newly modified object. */
+-  private long delayKeyMsec;
+-
+-  /**
+-   * Probability of throttling a request.
+-   */
+-  private float throttleProbability;
++  private FailureInjectionPolicy policy;
+-   * limit for failures before operations succeed; if 0 then "no limit".
+-   */
+-  private int failureLimit = 0;
+-
+-  /**
+-    setupConfig(conf);
++    policy = new FailureInjectionPolicy(conf);
+-  protected void setupConfig(Configuration conf) {
+-    delayKeySubstring = conf.get(FAIL_INJECT_INCONSISTENCY_KEY,
+-        DEFAULT_DELAY_KEY_SUBSTRING);
+-    // "" is a substring of all strings, use it to match all keys.
+-    if (delayKeySubstring.equals(MATCH_ALL_KEYS)) {
+-      delayKeySubstring = "";
+-    }
+-    delayKeyProbability = validProbability(
+-        conf.getFloat(FAIL_INJECT_INCONSISTENCY_PROBABILITY,
+-            DEFAULT_DELAY_KEY_PROBABILITY));
+-    delayKeyMsec = conf.getLong(FAIL_INJECT_INCONSISTENCY_MSEC,
+-        DEFAULT_DELAY_KEY_MSEC);
+-    setThrottleProbability(conf.getFloat(FAIL_INJECT_THROTTLE_PROBABILITY,
+-        0.0f));
+-    LOG.info("{}", this);
++  /**
++   * Clear any accumulated inconsistency state. Used by tests to make paths
++   * visible again.
++   * @param fs S3AFileSystem under test
++   * @throws Exception on failure
++   */
++  public static void clearInconsistency(S3AFileSystem fs) throws Exception {
++    AmazonS3 s3 = fs.getAmazonS3ClientForTesting("s3guard");
++    InconsistentAmazonS3Client ic = InconsistentAmazonS3Client.castFrom(s3);
++    ic.clearInconsistency();
++  }
++
++  /**
++   * A way for tests to patch in a different fault injection policy at runtime.
++   * @param fs filesystem under test
++   *
++   */
++  public static void setFailureInjectionPolicy(S3AFileSystem fs,
++      FailureInjectionPolicy policy) throws Exception {
++    AmazonS3 s3 = fs.getAmazonS3ClientForTesting("s3guard");
++    InconsistentAmazonS3Client ic = InconsistentAmazonS3Client.castFrom(s3);
++    ic.replacePolicy(policy);
++  }
++
++  private void replacePolicy(FailureInjectionPolicy pol) {
++    this.policy = pol;
+-    return String.format(
+-        "Inconsistent S3 Client with"
+-            + " %s msec delay, substring %s, delay probability %s;"
+-            + " throttle probability %s"
+-            + "; failure limit %d, failure count %d",
+-        delayKeyMsec, delayKeySubstring, delayKeyProbability,
+-        throttleProbability, failureLimit, failureCounter.get());
++    return String.format("Inconsistent S3 Client: %s; failure count %d",
++        policy, failureCounter.get());
+-    long deadline = enqueueTime + delayKeyMsec;
++    long deadline = enqueueTime + policy.getDelayKeyMsec();
+-    if (shouldDelay(key)) {
++    if (policy.shouldDelay(key)) {
+-    if (shouldDelay(key)) {
++    if (policy.shouldDelay(key)) {
+-   * Should we delay listing visibility for this key?
+-   * @param key key which is being put
+-   * @return true if we should delay
+-   */
+-  private boolean shouldDelay(String key) {
+-    boolean delay = key.contains(delayKeySubstring);
+-    delay = delay && trueWithProbability(delayKeyProbability);
+-    LOG.debug("{} -> {}", key, delay);
+-    return delay;
+-  }
+-
+-
+-  private boolean trueWithProbability(float p) {
+-    return Math.random() < p;
+-  }
+-
+-  /**
+-  public float getDelayKeyProbability() {
+-    return delayKeyProbability;
+-  }
+-
+-    return delayKeyMsec;
+-  }
+-
+-  /**
+-   * Get the probability of the request being throttled.
+-   * @return a value 0 - 1.0f.
+-   */
+-  public float getThrottleProbability() {
+-    return throttleProbability;
++    return policy.getDelayKeyMsec();
+-    this.throttleProbability = validProbability(throttleProbability);
+-  }
+-
+-  /**
+-   * Validate a probability option.
+-   * @param p probability
+-   * @return the probability, if valid
+-   * @throws IllegalArgumentException if the probability is out of range.
+-   */
+-  private float validProbability(float p) {
+-    Preconditions.checkArgument(p >= 0.0f && p <= 1.0f,
+-        "Probability out of range 0 to 1 %s", p);
+-    return p;
++    policy.setThrottleProbability(throttleProbability);
++   * @param errorMsg description of failure
++   * @param statusCode http status code for error
+-  private void maybeFail() throws AmazonClientException {
++  private void maybeFail(String errorMsg, int statusCode)
++      throws AmazonClientException {
+-    if (trueWithProbability(throttleProbability)) {
++    if (policy.trueWithProbability(policy.getThrottleProbability())) {
+-      ex = new AmazonServiceException("throttled"
++      ex = new AmazonServiceException(errorMsg
+-      ex.setStatusCode(503);
++      ex.setStatusCode(statusCode);
++    int failureLimit = policy.getFailureLimit();
++  private void maybeFail() {
++    maybeFail("throttled", 503);
++  }
++
+-    this.failureLimit = limit;
++    policy.setFailureLimit(limit);
++  @Override
++  public S3Object getObject(GetObjectRequest var1) throws SdkClientException,
++      AmazonServiceException {
++    maybeFail("file not found", 404);
++    S3Object o = super.getObject(var1);
++    LOG.debug("Wrapping in InconsistentS3Object for key {}", var1.getKey());
++    return new InconsistentS3Object(o, policy);
++  }
++
++  @Override
++  public S3Object getObject(String bucketName, String key)
++      throws SdkClientException, AmazonServiceException {
++    S3Object o = super.getObject(bucketName, key);
++    LOG.debug("Wrapping in InconsistentS3Object for key {}", key);
++    return new InconsistentS3Object(o, policy);
++  }
++
+
+MOV26 INS26 MOV23 INS40 UPD40 INS31 INS31 INS31 INS31 INS31 INS31 INS31 UPD83 UPD43 INS29 INS83 INS83 INS39 INS42 INS44 INS43 INS8 INS29 INS83 UPD83 MOV83 MOV39 UPD42 MOV42 MOV44 INS44 INS43 INS8 INS83 INS39 INS42 INS44 INS8 INS83 INS39 INS42 INS8 INS44 INS44 MOV83 UPD39 MOV39 UPD42 MOV42 INS8 INS78 INS83 INS43 INS42 INS44 INS43 INS43 INS8 INS78 MOV83 INS43 INS42 INS44 MOV44 INS43 INS43 INS8 UPD42 UPD42 MOV65 INS65 INS65 INS43 INS42 INS42 INS60 INS60 INS21 MOV65 INS65 UPD43 UPD42 INS43 INS42 INS42 INS60 INS60 MOV21 INS43 INS42 MOV21 INS41 INS65 INS65 MOV43 INS42 INS39 INS42 INS60 INS21 INS42 INS42 INS43 INS42 INS42 INS42 INS21 INS60 MOV21 INS41 INS42 INS42 MOV43 INS42 INS42 INS42 INS60 MOV21 MOV41 INS7 UPD66 UPD66 INS42 INS66 INS42 INS66 INS42 INS43 INS59 INS43 INS59 INS32 UPD66 INS42 INS66 UPD42 INS42 INS43 INS59 INS43 INS59 INS32 INS42 INS7 INS32 INS32 INS42 INS66 INS42 INS66 INS39 INS59 INS32 INS32 INS42 INS32 INS43 INS59 INS14 INS43 INS59 INS14 INS42 INS14 INS42 UPD42 MOV42 INS32 INS42 UPD42 MOV42 INS32 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS32 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 INS22 INS42 INS45 UPD42 INS42 INS42 INS42 INS42 INS42 UPD42 MOV42 MOV42 INS42 INS32 INS42 INS32 INS42 INS45 INS34 INS42 INS42 INS42 INS42 INS45 INS34 INS42 INS42 INS48 UPD45 INS32 INS43 INS42 INS42 INS42 INS42 INS48 UPD42 UPD42 UPD45 UPD42 INS43 INS42 INS42 INS43 INS42 INS42 INS42 INS45 INS42 INS42 INS42 UPD42 MOV42 INS42 INS45 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 INS52 INS42 INS32 INS42 UPD42 MOV42 INS42 INS42 INS42 INS42 UPD42 MOV42 UPD42 MOV42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 DEL29 DEL83 DEL83 DEL83 DEL39 DEL42 DEL34 DEL34 DEL27 DEL59 DEL23 DEL83 DEL83 DEL83 DEL39 DEL42 DEL34 DEL59 DEL23 DEL66 DEL65 DEL29 DEL83 DEL83 DEL83 DEL45 DEL59 DEL23 DEL66 DEL65 DEL29 DEL83 DEL83 DEL45 DEL66 DEL65 DEL29 DEL83 DEL42 DEL59 DEL23 DEL66 DEL65 DEL29 DEL83 DEL39 DEL59 DEL23 DEL66 DEL65 DEL29 DEL83 DEL39 DEL42 DEL59 DEL23 DEL66 DEL65 DEL29 DEL83 DEL39 DEL42 DEL59 DEL23 DEL29 DEL83 DEL39 DEL42 DEL34 DEL59 DEL23 DEL42 DEL42 DEL32 DEL42 DEL42 DEL32 DEL7 DEL42 DEL42 DEL45 DEL52 DEL32 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL7 DEL21 DEL42 DEL42 DEL32 DEL42 DEL45 DEL7 DEL21 DEL8 DEL25 DEL42 DEL42 DEL42 DEL32 DEL32 DEL7 DEL21 DEL42 DEL42 DEL42 DEL42 DEL34 DEL32 DEL32 DEL21 DEL8 DEL31 DEL45 DEL45 DEL45 DEL45 DEL27 DEL42 DEL42 DEL42 DEL42 DEL42 DEL66 DEL65 DEL42 DEL66 DEL65 DEL66 DEL65 DEL29 DEL39 DEL42 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL42 DEL42 DEL42 DEL32 DEL27 DEL7 DEL21 DEL42 DEL41 DEL8 DEL31 DEL83 DEL39 DEL42 DEL39 DEL42 DEL44 DEL42 DEL42 DEL32 DEL42 DEL27 DEL41 DEL8 DEL31 DEL39 DEL42 DEL42 DEL41 DEL8 DEL31 DEL83 DEL39 DEL42 DEL42 DEL41 DEL8 DEL31 DEL66 DEL65 DEL66 DEL65 DEL29 DEL83 DEL39 DEL42 DEL42 DEL41 DEL8 DEL31 DEL52 DEL42 DEL22 DEL32 DEL7 DEL66 DEL65 DEL42 DEL66 DEL65 DEL66 DEL65 DEL42 DEL66 DEL65 DEL29 DEL83 DEL39 DEL42 DEL39 DEL42 DEL44 DEL8 DEL31 DEL45 DEL34 DEL52 DEL42 DEL22 DEL42 DEL7 DEL42 DEL34 DEL27 DEL42 DEL34 DEL27 DEL27 DEL42

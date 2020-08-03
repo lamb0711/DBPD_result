@@ -1,0 +1,182 @@
+HDFS-3810. Implement format() for BKJM. Contributed by Ivan Kelly.
+
+
+
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/trunk@1407182 13f79535-47bb-0310-9956-ffa450edef68
+
++import org.apache.zookeeper.ZKUtil;
++import java.util.concurrent.atomic.AtomicBoolean;
++  private final String basePath;
++  private final String versionPath;
++  private boolean initialized = false;
+-    String zkPath = uri.getPath();
++    basePath = uri.getPath();
+-    ledgerPath = zkPath + "/ledgers";
+-    String maxTxIdPath = zkPath + "/maxtxid";
+-    String currentInprogressNodePath = zkPath + "/CurrentInprogress";
+-    String versionPath = zkPath + "/version";
++    ledgerPath = basePath + "/ledgers";
++    String maxTxIdPath = basePath + "/maxtxid";
++    String currentInprogressNodePath = basePath + "/CurrentInprogress";
++    versionPath = basePath + "/version";
+-      if (zkc.exists(zkPath, false) == null) {
+-        zkc.create(zkPath, new byte[] {'0'},
+-            Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT);
+-      }
+-      Stat versionStat = zkc.exists(versionPath, false);
+-      if (versionStat != null) {
+-        byte[] d = zkc.getData(versionPath, false, versionStat);
+-        VersionProto.Builder builder = VersionProto.newBuilder();
+-        TextFormat.merge(new String(d, UTF_8), builder);
+-        if (!builder.isInitialized()) {
+-          throw new IOException("Invalid/Incomplete data in znode");
+-        }
+-        VersionProto vp = builder.build();
+-
+-        // There's only one version at the moment
+-        assert vp.getLayoutVersion() == BKJM_LAYOUT_VERSION;
+-
+-        NamespaceInfo readns = PBHelper.convert(vp.getNamespaceInfo());
+-
+-        if (nsInfo.getNamespaceID() != readns.getNamespaceID() ||
+-            !nsInfo.clusterID.equals(readns.getClusterID()) ||
+-            !nsInfo.getBlockPoolID().equals(readns.getBlockPoolID())) {
+-          String err = String.format("Environment mismatch. Running process %s"
+-                                     +", stored in ZK %s", nsInfo, readns);
+-          LOG.error(err);
+-          throw new IOException(err);
+-        }
+-      } else if (nsInfo.getNamespaceID() > 0) {
+-        VersionProto.Builder builder = VersionProto.newBuilder();
+-        builder.setNamespaceInfo(PBHelper.convert(nsInfo))
+-          .setLayoutVersion(BKJM_LAYOUT_VERSION);
+-        byte[] data = TextFormat.printToString(builder.build()).getBytes(UTF_8);
+-        zkc.create(versionPath, data,
+-                   Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT);
+-      }
+-
+-      if (zkc.exists(ledgerPath, false) == null) {
+-        zkc.create(ledgerPath, new byte[] {'0'},
+-            Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT);
+-      }
++    final AtomicBoolean success = new AtomicBoolean(false);
+-          zkPathLatch.countDown();
++          success.set(true);
+-          LOG
+-              .error("Error : "
++          LOG.error("Error : "
++        zkPathLatch.countDown();
+-      if (!zkPathLatch.await(zkc.getSessionTimeout(), TimeUnit.MILLISECONDS)) {
++      if (!zkPathLatch.await(zkc.getSessionTimeout(), TimeUnit.MILLISECONDS)
++          || !success.get()) {
+-    // Currently, BKJM automatically formats itself when first accessed.
+-    // TODO: change over to explicit formatting so that the admin can
+-    // clear out the BK storage when reformatting a cluster.
+-    LOG.info("Not formatting " + this + " - BKJM does not currently " +
+-        "support reformatting. If it has not been used before, it will" +
+-        "be formatted automatically upon first use.");
++    try {
++      // delete old info
++      Stat baseStat = null;
++      Stat ledgerStat = null;
++      if ((baseStat = zkc.exists(basePath, false)) != null) {
++        if ((ledgerStat = zkc.exists(ledgerPath, false)) != null) {
++          for (EditLogLedgerMetadata l : getLedgerList(true)) {
++            try {
++              bkc.deleteLedger(l.getLedgerId());
++            } catch (BKException.BKNoSuchLedgerExistsException bke) {
++              LOG.warn("Ledger " + l.getLedgerId() + " does not exist;"
++                       + " Cannot delete.");
++            }
++          }
++        }
++        ZKUtil.deleteRecursive(zkc, basePath);
++      }
++
++      // should be clean now.
++      zkc.create(basePath, new byte[] {'0'},
++          Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT);
++
++      VersionProto.Builder builder = VersionProto.newBuilder();
++      builder.setNamespaceInfo(PBHelper.convert(ns))
++        .setLayoutVersion(BKJM_LAYOUT_VERSION);
++
++      byte[] data = TextFormat.printToString(builder.build()).getBytes(UTF_8);
++      zkc.create(versionPath, data,
++                 Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT);
++
++      zkc.create(ledgerPath, new byte[] {'0'},
++                 Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT);
++    } catch (KeeperException ke) {
++      LOG.error("Error accessing zookeeper to format", ke);
++      throw new IOException("Error accessing zookeeper to format", ke);
++    } catch (InterruptedException ie) {
++      Thread.currentThread().interrupt();
++      throw new IOException("Interrupted during format", ie);
++    } catch (BKException bke) {
++      throw new IOException("Error cleaning up ledgers during format", bke);
++    }
+-    // Don't confirm format on BKJM, since format() is currently a
+-    // no-op anyway
+-    return false;
++    try {
++      return zkc.exists(basePath, false) != null;
++    } catch (KeeperException ke) {
++      throw new IOException("Couldn't contact zookeeper", ke);
++    } catch (InterruptedException ie) {
++      Thread.currentThread().interrupt();
++      throw new IOException("Interrupted while checking for data", ie);
++    }
++  }
++
++  synchronized private void checkEnv() throws IOException {
++    if (!initialized) {
++      try {
++        Stat versionStat = zkc.exists(versionPath, false);
++        if (versionStat == null) {
++          throw new IOException("Environment not initialized. "
++                                +"Have you forgotten to format?");
++        }
++        byte[] d = zkc.getData(versionPath, false, versionStat);
++
++        VersionProto.Builder builder = VersionProto.newBuilder();
++        TextFormat.merge(new String(d, UTF_8), builder);
++        if (!builder.isInitialized()) {
++          throw new IOException("Invalid/Incomplete data in znode");
++        }
++        VersionProto vp = builder.build();
++
++        // There's only one version at the moment
++        assert vp.getLayoutVersion() == BKJM_LAYOUT_VERSION;
++
++        NamespaceInfo readns = PBHelper.convert(vp.getNamespaceInfo());
++
++        if (nsInfo.getNamespaceID() != readns.getNamespaceID() ||
++            !nsInfo.clusterID.equals(readns.getClusterID()) ||
++            !nsInfo.getBlockPoolID().equals(readns.getBlockPoolID())) {
++          String err = String.format("Environment mismatch. Running process %s"
++                                     +", stored in ZK %s", nsInfo, readns);
++          LOG.error(err);
++          throw new IOException(err);
++        }
++
++        ci.init();
++        initialized = true;
++      } catch (KeeperException ke) {
++        throw new IOException("Cannot access ZooKeeper", ke);
++      } catch (InterruptedException ie) {
++        Thread.currentThread().interrupt();
++        throw new IOException("Interrupted while checking environment", ie);
++      }
++    }
++    checkEnv();
++
++    checkEnv();
++
++    checkEnv();
++
++    checkEnv();
++
+
+INS26 INS26 INS40 INS40 INS23 INS23 INS23 INS31 INS83 INS83 MOV43 INS59 INS83 INS83 MOV43 INS59 INS83 INS39 INS59 INS8 INS8 INS83 INS83 INS39 INS42 INS43 MOV8 INS42 INS42 INS42 INS9 INS21 INS21 INS60 INS54 INS54 INS42 INS21 INS21 INS21 INS21 INS7 MOV43 INS7 INS8 INS83 INS43 INS59 INS8 INS12 INS12 INS12 INS8 INS12 INS12 INS38 INS8 INS32 INS32 INS32 INS32 INS42 MOV32 INS42 INS27 MOV21 MOV21 MOV25 MOV21 MOV21 INS42 INS42 INS14 INS60 INS60 INS25 MOV21 MOV60 INS21 MOV60 MOV21 MOV21 INS44 INS8 INS44 INS8 INS44 INS8 MOV41 INS44 INS8 INS44 INS8 INS42 INS54 INS42 INS42 INS42 INS42 UPD42 UPD42 UPD42 UPD42 MOV42 MOV45 INS43 INS9 INS27 INS43 INS59 INS43 INS59 INS27 INS8 INS32 INS43 INS42 INS21 INS53 INS43 INS42 INS21 INS53 INS43 INS42 INS53 INS27 INS43 INS42 INS53 INS43 INS42 INS21 INS53 MOV8 INS12 INS12 INS42 MOV38 INS38 INS42 INS42 INS33 INS42 INS42 INS33 INS36 INS33 INS25 INS21 UPD42 INS32 INS42 INS42 INS42 INS32 INS14 INS42 INS32 INS14 INS42 INS14 INS32 INS33 INS42 INS14 INS42 INS32 INS14 MOV60 INS25 INS21 INS21 INS44 INS8 INS44 INS8 INS32 INS7 UPD27 MOV27 INS8 INS32 INS42 INS42 INS32 INS42 INS42 INS45 INS42 INS43 INS45 INS42 INS32 INS42 INS43 INS45 INS42 INS43 INS45 INS42 INS42 INS42 INS42 INS9 INS43 INS45 INS42 INS32 INS42 INS43 INS45 INS42 INS27 INS8 INS32 INS7 INS43 INS42 INS53 INS43 INS42 INS21 INS53 MOV21 INS42 INS42 INS42 INS32 INS36 INS70 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS33 INS53 INS42 INS42 INS42 INS9 INS42 INS14 INS42 INS32 INS14 INS42 INS42 INS42 INS9 INS7 INS44 INS32 INS8 INS14 INS43 INS45 INS42 INS32 UPD42 MOV42 INS43 INS45 INS42 INS21 INS42 MOV32 INS43 INS42 INS42 INS9 INS54 INS43 INS27 INS42 UPD42 MOV42 UPD42 MOV42 INS42 INS32 INS42 INS8 INS12 INS42 INS45 INS45 INS42 INS42 INS9 INS21 INS44 INS8 INS32 INS43 INS42 MOV21 INS42 INS42 INS32 INS40 INS42 INS42 UPD42 UPD45 INS32 UPD45 UPD45 INS42 INS42 DEL42 DEL59 DEL60 DEL42 DEL27 DEL59 DEL60 DEL52 DEL45 DEL8 DEL9 DEL8 DEL42 DEL42 DEL42 DEL9 DEL32 DEL33 DEL27 DEL8 DEL25 DEL42 DEL33 DEL27 DEL42 DEL42 DEL32 DEL34 DEL27 DEL42 DEL42 DEL32 DEL32 DEL42 DEL42 DEL32 DEL21 DEL8 DEL25 DEL8 DEL25

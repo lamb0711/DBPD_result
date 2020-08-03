@@ -1,0 +1,88 @@
+HADOOP-16430. S3AFilesystem.delete to incrementally update s3guard with deletions
+
+Contributed by Steve Loughran.
+
+This overlaps the scanning for directory entries with batched calls to S3 DELETE and updates of the S3Guard tables.
+It also uses S3Guard to list the files to delete, so find newly created files even when S3 listings are not use consistent.
+
+For path which the client considers S3Guard to be authoritative, we also do a recursive LIST of the store and delete files; this is to find unindexed files and do guarantee that the delete(path, true) call really does delete everything underneath.
+
+Change-Id: Ice2f6e940c506e0b3a78fa534a99721b1698708e
+
++import org.apache.hadoop.fs.RemoteIterator;
+- * {@link MetadataStore#deleteSubtree(Path)} and
++ * {@link MetadataStore#deleteSubtree(Path, BulkOperationState)} and
+-  public void delete(Path path)
++  public void delete(Path path,
++      final BulkOperationState operationState)
+-    innerDelete(path, true, null);
++    innerDelete(path, true,
++        extractOrCreate(operationState,
++            BulkOperationState.OperationType.Delete));
+-   * @param ancestorState ancestor state for logging
++   * @param ancestorState ancestor state for context.
+-  public void deleteSubtree(Path path)
++  public void deleteSubtree(Path path,
++      final BulkOperationState operationState)
++    deleteEntries(new InternalIterators.PathFromRemoteStatusIterator(
++        new DescendantsIterator(this, meta)),
++        operationState);
++  }
+-    try(AncestorState state = new AncestorState(this,
+-        BulkOperationState.OperationType.Delete, path)) {
+-      // Execute via the bounded threadpool.
+-      final List<CompletableFuture<Void>> futures = new ArrayList<>();
+-      for (DescendantsIterator desc = new DescendantsIterator(this, meta);
+-          desc.hasNext();) {
+-        final Path pathToDelete = desc.next().getPath();
+-        futures.add(submit(executor, () -> {
+-          innerDelete(pathToDelete, true, state);
+-          return null;
+-        }));
+-        if (futures.size() > S3GUARD_DDB_SUBMITTED_TASK_LIMIT) {
+-          // first batch done; block for completion.
+-          waitForCompletion(futures);
+-          futures.clear();
+-        }
++  @Override
++  @Retries.RetryTranslated
++  public void deletePaths(Collection<Path> paths,
++      final BulkOperationState operationState)
++      throws IOException {
++    deleteEntries(
++        new InternalIterators.RemoteIteratorFromIterator<>(paths.iterator()),
++        operationState);
++  }
++
++  /**
++   * Delete the entries under an iterator.
++   * There's no attempt to order the paths: they are
++   * deleted in the order passed in.
++   * @param entries entries to delete.
++   * @param operationState Nullable operation state
++   * @throws IOException failure
++   */
++  @Retries.RetryTranslated
++  private void deleteEntries(RemoteIterator<Path> entries,
++      final BulkOperationState operationState)
++      throws IOException {
++    final List<CompletableFuture<Void>> futures = new ArrayList<>();
++    AncestorState state = extractOrCreate(operationState,
++        BulkOperationState.OperationType.Delete);
++
++    while (entries.hasNext()) {
++      final Path pathToDelete = entries.next();
++      futures.add(submit(executor, () -> {
++        innerDelete(pathToDelete, true, state);
++        return null;
++      }));
++      if (futures.size() > S3GUARD_DDB_SUBMITTED_TASK_LIMIT) {
++        // first batch done; block for completion.
++        waitForCompletion(futures);
++        futures.clear();
+-      // now wait for the final set.
+-      waitForCompletion(futures);
++    // now wait for the final set.
++    waitForCompletion(futures);
+-        boolean tombstone = itemExists(item);
++        boolean tombstone = !itemExists(item);

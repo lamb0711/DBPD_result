@@ -1,0 +1,163 @@
+YARN-3955. Support for application priority ACLs in queues of CapacityScheduler. (Sunil G via wangda)
+
++import org.apache.hadoop.yarn.server.resourcemanager.security.AppPriorityACLsManager;
++  private AppPriorityACLsManager appPriorityACLManager;
++      this.appPriorityACLManager = new AppPriorityACLsManager(conf);
+-          this.labelManager);
++          this.labelManager, this.appPriorityACLManager);
+-  public Priority checkAndGetApplicationPriority(Priority priorityFromContext,
+-      String user, String queueName, ApplicationId applicationId)
+-      throws YarnException {
+-    Priority appPriority = null;
++  public Priority checkAndGetApplicationPriority(
++      Priority priorityRequestedByApp, UserGroupInformation user,
++      String queueName, ApplicationId applicationId) throws YarnException {
++    try {
++      readLock.lock();
++      Priority appPriority = priorityRequestedByApp;
+-    // ToDo: Verify against priority ACLs
++      // Verify the scenario where priority is null from submissionContext.
++      if (null == appPriority) {
++        // Verify whether submitted user has any default priority set. If so,
++        // user's default priority will get precedence over queue default.
++        // for updateApplicationPriority call flow, this check is done in
++        // CientRMService itself.
++        appPriority = this.appPriorityACLManager.getDefaultPriority(queueName,
++            user);
+-    // Verify the scenario where priority is null from submissionContext.
+-    if (null == priorityFromContext) {
+-      // Get the default priority for the Queue. If Queue is non-existent, then
+-      // use default priority
+-      priorityFromContext = this.queueManager.getDefaultPriorityForQueue(
+-          queueName);
++        // Get the default priority for the Queue. If Queue is non-existent,
++        // then
++        // use default priority. Do it only if user doesnt have any default.
++        if (null == appPriority) {
++          appPriority = this.queueManager.getDefaultPriorityForQueue(queueName);
++        }
+-      LOG.info("Application '" + applicationId
+-          + "' is submitted without priority "
+-          + "hence considering default queue/cluster priority: "
+-          + priorityFromContext.getPriority());
++        LOG.info(
++            "Application '" + applicationId + "' is submitted without priority "
++                + "hence considering default queue/cluster priority: "
++                + appPriority.getPriority());
++      }
++
++      // Verify whether submitted priority is lesser than max priority
++      // in the cluster. If it is out of found, defining a max cap.
++      if (appPriority.getPriority() > getMaxClusterLevelAppPriority()
++          .getPriority()) {
++        appPriority = Priority
++            .newInstance(getMaxClusterLevelAppPriority().getPriority());
++      }
++
++      // Lets check for ACLs here.
++      if (!appPriorityACLManager.checkAccess(user, queueName, appPriority)) {
++        throw new YarnException(new AccessControlException(
++            "User " + user + " does not have permission to submit/update "
++                + applicationId + " for " + appPriority));
++      }
++
++      LOG.info("Priority '" + appPriority.getPriority()
++          + "' is acceptable in queue : " + queueName + " for application: "
++          + applicationId);
++
++      return appPriority;
++    } finally {
++      readLock.unlock();
+-
+-    // Verify whether submitted priority is lesser than max priority
+-    // in the cluster. If it is out of found, defining a max cap.
+-    if (priorityFromContext.compareTo(getMaxClusterLevelAppPriority()) < 0) {
+-      priorityFromContext = Priority
+-          .newInstance(getMaxClusterLevelAppPriority().getPriority());
+-    }
+-
+-    appPriority = priorityFromContext;
+-
+-    LOG.info("Priority '" + appPriority.getPriority()
+-        + "' is acceptable in queue : " + queueName + " for application: "
+-        + applicationId + " for the user: " + user);
+-
+-    return appPriority;
+-      ApplicationId applicationId, SettableFuture<Object> future)
++      ApplicationId applicationId, SettableFuture<Object> future,
++      UserGroupInformation user)
+-    Priority appPriority = null;
+-    SchedulerApplication<FiCaSchedulerApp> application = applications
+-        .get(applicationId);
++    try {
++      writeLock.lock();
++      Priority appPriority = null;
++      SchedulerApplication<FiCaSchedulerApp> application = applications
++          .get(applicationId);
+-    if (application == null) {
+-      throw new YarnException("Application '" + applicationId
+-          + "' is not present, hence could not change priority.");
+-    }
++      if (application == null) {
++        throw new YarnException("Application '" + applicationId
++            + "' is not present, hence could not change priority.");
++      }
+-    RMApp rmApp = rmContext.getRMApps().get(applicationId);
++      RMApp rmApp = rmContext.getRMApps().get(applicationId);
+-    appPriority = checkAndGetApplicationPriority(newPriority, rmApp.getUser(),
+-        rmApp.getQueue(), applicationId);
++      appPriority = checkAndGetApplicationPriority(newPriority, user,
++          rmApp.getQueue(), applicationId);
+-    if (application.getPriority().equals(appPriority)) {
+-      future.set(null);
++      if (application.getPriority().equals(appPriority)) {
++        future.set(null);
++        return appPriority;
++      }
++
++      // Update new priority in Submission Context to update to StateStore.
++      rmApp.getApplicationSubmissionContext().setPriority(appPriority);
++
++      // Update to state store
++      ApplicationStateData appState = ApplicationStateData.newInstance(
++          rmApp.getSubmitTime(), rmApp.getStartTime(),
++          rmApp.getApplicationSubmissionContext(), rmApp.getUser(),
++          rmApp.getCallerContext());
++      appState.setApplicationTimeouts(rmApp.getApplicationTimeouts());
++      rmContext.getStateStore().updateApplicationStateSynchronously(appState,
++          false, future);
++
++      // As we use iterator over a TreeSet for OrderingPolicy, once we change
++      // priority then reinsert back to make order correct.
++      LeafQueue queue = (LeafQueue) getQueue(rmApp.getQueue());
++      queue.updateApplicationPriority(application, appPriority);
++
++      LOG.info("Priority '" + appPriority + "' is updated in queue :"
++          + rmApp.getQueue() + " for application: " + applicationId
++          + " for the user: " + rmApp.getUser());
++    } finally {
++      writeLock.unlock();
+-
+-    // Update new priority in Submission Context to update to StateStore.
+-    rmApp.getApplicationSubmissionContext().setPriority(appPriority);
+-
+-    // Update to state store
+-    ApplicationStateData appState = ApplicationStateData.newInstance(
+-        rmApp.getSubmitTime(), rmApp.getStartTime(),
+-        rmApp.getApplicationSubmissionContext(), rmApp.getUser(),
+-        rmApp.getCallerContext());
+-    appState.setApplicationTimeouts(rmApp.getApplicationTimeouts());
+-    rmContext.getStateStore().updateApplicationStateSynchronously(appState,
+-        false, future);
+-
+-    // As we use iterator over a TreeSet for OrderingPolicy, once we change
+-    // priority then reinsert back to make order correct.
+-    LeafQueue queue = (LeafQueue) getQueue(rmApp.getQueue());
+-    queue.updateApplicationPriority(application, appPriority);
+-
+-    LOG.info("Priority '" + appPriority + "' is updated in queue :"
+-        + rmApp.getQueue() + " for application: " + applicationId
+-        + " for the user: " + rmApp.getUser());
+-    return appPriority;
+
+INS26 INS40 INS23 INS83 INS43 INS59 INS8 INS44 INS8 INS42 INS42 UPD42 UPD43 INS54 INS43 INS42 INS54 UPD42 INS8 INS8 INS42 MOV8 INS8 INS21 INS21 MOV60 INS25 MOV25 INS25 MOV21 MOV41 INS21 INS21 INS21 INS7 INS32 INS27 INS8 UPD27 INS38 INS8 INS32 INS32 INS32 INS22 INS14 INS42 INS42 INS42 INS33 INS42 MOV21 MOV25 INS21 INS32 MOV42 INS32 INS53 INS42 INS42 INS42 INS42 INS42 INS42 INS52 INS42 INS43 INS42 INS22 INS32 INS42 INS42 UPD42 INS42 INS42 INS42 INS42 INS42 INS14 UPD42 MOV42 INS42 INS52 INS42 INS32 UPD42 INS42 INS42 INS27 UPD42 INS43 INS14 INS22 INS42 INS42 INS42 INS45 INS42 INS45 INS45 INS32 INS42 INS43 INS27 INS52 INS42 UPD42 INS42 INS42 INS42 INS45 INS42 INS45 INS42 INS45 INS42 DEL33 DEL42 DEL42 DEL42 DEL45 DEL42 DEL45 DEL45 DEL42 DEL42 DEL32 DEL27 DEL32 DEL21 DEL42 DEL34 DEL45 DEL42 DEL8 DEL42 DEL32

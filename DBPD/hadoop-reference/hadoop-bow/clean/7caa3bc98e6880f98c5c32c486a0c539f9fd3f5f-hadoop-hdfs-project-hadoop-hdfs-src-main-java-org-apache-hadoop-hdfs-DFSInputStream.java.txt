@@ -1,0 +1,322 @@
+HDFS-6735. A minor optimization to avoid pread() be blocked by read() inside the same DFSInputStream (Lars Hofhansl via stack)
+
+-  private BlockReader blockReader = null;
+-  private LocatedBlocks locatedBlocks = null;
+-  private long lastBlockBeingWrittenLength = 0;
+-  private FileEncryptionInfo fileEncryptionInfo = null;
++
++  // state by stateful read only:
++  // (protected by lock on this)
++  /////
++  private BlockReader blockReader = null;
++  ////
++
++  // state shared by stateful and positional read:
++  // (protected by lock on infoLock)
++  ////
++  private LocatedBlocks locatedBlocks = null;
++  private long lastBlockBeingWrittenLength = 0;
++  private FileEncryptionInfo fileEncryptionInfo = null;
++  ////
++
++  // lock for state shared between read and pread
++  // Note: Never acquire a lock on <this> with this lock held to avoid deadlocks
++  //       (it's OK to acquire this lock when the lock on <this> is held)
++  private final Object infoLock = new Object();
+-    this.cachingStrategy =
+-        dfsClient.getDefaultReadCachingStrategy();
++    synchronized (infoLock) {
++      this.cachingStrategy = dfsClient.getDefaultReadCachingStrategy();
++    }
+-  synchronized void openInfo() throws IOException, UnresolvedLinkException {
+-    lastBlockBeingWrittenLength = fetchLocatedBlocksAndGetLastBlockLength();
+-    int retriesForLastBlockLength = dfsClient.getConf().retryTimesForGetLastBlockLength;
+-    while (retriesForLastBlockLength > 0) {
+-      // Getting last block length as -1 is a special case. When cluster
+-      // restarts, DNs may not report immediately. At this time partial block
+-      // locations will not be available with NN for getting the length. Lets
+-      // retry for 3 times to get the length.
+-      if (lastBlockBeingWrittenLength == -1) {
+-        DFSClient.LOG.warn("Last block locations not available. "
+-            + "Datanodes might not have reported blocks completely."
+-            + " Will retry for " + retriesForLastBlockLength + " times");
+-        waitFor(dfsClient.getConf().retryIntervalForGetLastBlockLength);
+-        lastBlockBeingWrittenLength = fetchLocatedBlocksAndGetLastBlockLength();
+-      } else {
+-        break;
++  void openInfo() throws IOException, UnresolvedLinkException {
++    synchronized(infoLock) {
++      lastBlockBeingWrittenLength = fetchLocatedBlocksAndGetLastBlockLength();
++      int retriesForLastBlockLength = dfsClient.getConf().retryTimesForGetLastBlockLength;
++      while (retriesForLastBlockLength > 0) {
++        // Getting last block length as -1 is a special case. When cluster
++        // restarts, DNs may not report immediately. At this time partial block
++        // locations will not be available with NN for getting the length. Lets
++        // retry for 3 times to get the length.
++        if (lastBlockBeingWrittenLength == -1) {
++          DFSClient.LOG.warn("Last block locations not available. "
++              + "Datanodes might not have reported blocks completely."
++              + " Will retry for " + retriesForLastBlockLength + " times");
++          waitFor(dfsClient.getConf().retryIntervalForGetLastBlockLength);
++          lastBlockBeingWrittenLength = fetchLocatedBlocksAndGetLastBlockLength();
++        } else {
++          break;
++        }
++        retriesForLastBlockLength--;
+-      retriesForLastBlockLength--;
+-    }
+-    if (retriesForLastBlockLength == 0) {
+-      throw new IOException("Could not obtain the last block locations.");
++      if (retriesForLastBlockLength == 0) {
++        throw new IOException("Could not obtain the last block locations.");
++      }
+-    currentNode = null;
+-  public synchronized long getFileLength() {
+-    return locatedBlocks == null? 0:
+-        locatedBlocks.getFileLength() + lastBlockBeingWrittenLength;
++  public long getFileLength() {
++    synchronized(infoLock) {
++      return locatedBlocks == null? 0:
++          locatedBlocks.getFileLength() + lastBlockBeingWrittenLength;
++    }
+-  synchronized boolean shortCircuitForbidden() {
+-    return locatedBlocks.isUnderConstruction();
++  boolean shortCircuitForbidden() {
++    synchronized(infoLock) {
++      return locatedBlocks.isUnderConstruction();
++    }
+-  public DatanodeInfo getCurrentDatanode() {
++  public synchronized DatanodeInfo getCurrentDatanode() {
+-  private synchronized LocatedBlock getBlockAt(long offset,
++  private LocatedBlock getBlockAt(long offset,
+-    assert (locatedBlocks != null) : "locatedBlocks is null";
++    synchronized(infoLock) {
++      assert (locatedBlocks != null) : "locatedBlocks is null";
+-    final LocatedBlock blk;
++      final LocatedBlock blk;
+-    //check offset
+-    if (offset < 0 || offset >= getFileLength()) {
+-      throw new IOException("offset < 0 || offset >= getFileLength(), offset="
+-          + offset
+-          + ", updatePosition=" + updatePosition
+-          + ", locatedBlocks=" + locatedBlocks);
+-    }
+-    else if (offset >= locatedBlocks.getFileLength()) {
+-      // offset to the portion of the last block,
+-      // which is not known to the name-node yet;
+-      // getting the last block 
+-      blk = locatedBlocks.getLastLocatedBlock();
+-    }
+-    else {
+-      // search cached blocks first
+-      int targetBlockIdx = locatedBlocks.findBlock(offset);
+-      if (targetBlockIdx < 0) { // block is not cached
+-        targetBlockIdx = LocatedBlocks.getInsertIndex(targetBlockIdx);
+-        // fetch more blocks
+-        final LocatedBlocks newBlocks = dfsClient.getLocatedBlocks(src, offset);
+-        assert (newBlocks != null) : "Could not find target position " + offset;
+-        locatedBlocks.insertRange(targetBlockIdx, newBlocks.getLocatedBlocks());
++      //check offset
++      if (offset < 0 || offset >= getFileLength()) {
++        throw new IOException("offset < 0 || offset >= getFileLength(), offset="
++            + offset
++            + ", updatePosition=" + updatePosition
++            + ", locatedBlocks=" + locatedBlocks);
+-      blk = locatedBlocks.get(targetBlockIdx);
+-    }
++      else if (offset >= locatedBlocks.getFileLength()) {
++        // offset to the portion of the last block,
++        // which is not known to the name-node yet;
++        // getting the last block
++        blk = locatedBlocks.getLastLocatedBlock();
++      }
++      else {
++        // search cached blocks first
++        int targetBlockIdx = locatedBlocks.findBlock(offset);
++        if (targetBlockIdx < 0) { // block is not cached
++          targetBlockIdx = LocatedBlocks.getInsertIndex(targetBlockIdx);
++          // fetch more blocks
++          final LocatedBlocks newBlocks = dfsClient.getLocatedBlocks(src, offset);
++          assert (newBlocks != null) : "Could not find target position " + offset;
++          locatedBlocks.insertRange(targetBlockIdx, newBlocks.getLocatedBlocks());
++        }
++        blk = locatedBlocks.get(targetBlockIdx);
++      }
+-    // update current position
+-    if (updatePosition) {
+-      pos = offset;
+-      blockEnd = blk.getStartOffset() + blk.getBlockSize() - 1;
+-      currentLocatedBlock = blk;
++      // update current position
++      if (updatePosition) {
++        // synchronized not strictly needed, since we only get here
++        // from synchronized caller methods
++        synchronized(this) {
++          pos = offset;
++          blockEnd = blk.getStartOffset() + blk.getBlockSize() - 1;
++          currentLocatedBlock = blk;
++        }
++      }
++      return blk;
+-    return blk;
+-  private synchronized void fetchBlockAt(long offset) throws IOException {
+-    int targetBlockIdx = locatedBlocks.findBlock(offset);
+-    if (targetBlockIdx < 0) { // block is not cached
+-      targetBlockIdx = LocatedBlocks.getInsertIndex(targetBlockIdx);
++  private void fetchBlockAt(long offset) throws IOException {
++    synchronized(infoLock) {
++      int targetBlockIdx = locatedBlocks.findBlock(offset);
++      if (targetBlockIdx < 0) { // block is not cached
++        targetBlockIdx = LocatedBlocks.getInsertIndex(targetBlockIdx);
++      }
++      // fetch blocks
++      final LocatedBlocks newBlocks = dfsClient.getLocatedBlocks(src, offset);
++      if (newBlocks == null) {
++        throw new IOException("Could not find target position " + offset);
++      }
++      locatedBlocks.insertRange(targetBlockIdx, newBlocks.getLocatedBlocks());
+-    // fetch blocks
+-    final LocatedBlocks newBlocks = dfsClient.getLocatedBlocks(src, offset);
+-    if (newBlocks == null) {
+-      throw new IOException("Could not find target position " + offset);
+-    }
+-    locatedBlocks.insertRange(targetBlockIdx, newBlocks.getLocatedBlocks());
+-  private synchronized List<LocatedBlock> getBlockRange(long offset,
++  private List<LocatedBlock> getBlockRange(long offset,
++    synchronized(infoLock) {
++      final List<LocatedBlock> blocks;
++      final long lengthOfCompleteBlk = locatedBlocks.getFileLength();
++      final boolean readOffsetWithinCompleteBlk = offset < lengthOfCompleteBlk;
++      final boolean readLengthPastCompleteBlk = offset + length > lengthOfCompleteBlk;
+-    final List<LocatedBlock> blocks;
+-    final long lengthOfCompleteBlk = locatedBlocks.getFileLength();
+-    final boolean readOffsetWithinCompleteBlk = offset < lengthOfCompleteBlk;
+-    final boolean readLengthPastCompleteBlk = offset + length > lengthOfCompleteBlk;
++      if (readOffsetWithinCompleteBlk) {
++        //get the blocks of finalized (completed) block range
++        blocks = getFinalizedBlockRange(offset,
++          Math.min(length, lengthOfCompleteBlk - offset));
++      } else {
++        blocks = new ArrayList<LocatedBlock>(1);
++      }
+-    if (readOffsetWithinCompleteBlk) {
+-      //get the blocks of finalized (completed) block range
+-      blocks = getFinalizedBlockRange(offset, 
+-        Math.min(length, lengthOfCompleteBlk - offset));
+-    } else {
+-      blocks = new ArrayList<LocatedBlock>(1);
++      // get the blocks from incomplete block range
++      if (readLengthPastCompleteBlk) {
++         blocks.add(locatedBlocks.getLastLocatedBlock());
++      }
++
++      return blocks;
+-
+-    // get the blocks from incomplete block range
+-    if (readLengthPastCompleteBlk) {
+-       blocks.add(locatedBlocks.getLastLocatedBlock());
+-    }
+-
+-    return blocks;
+-  private synchronized List<LocatedBlock> getFinalizedBlockRange(
++  private List<LocatedBlock> getFinalizedBlockRange(
+-    assert (locatedBlocks != null) : "locatedBlocks is null";
+-    List<LocatedBlock> blockRange = new ArrayList<LocatedBlock>();
+-    // search cached blocks first
+-    int blockIdx = locatedBlocks.findBlock(offset);
+-    if (blockIdx < 0) { // block is not cached
+-      blockIdx = LocatedBlocks.getInsertIndex(blockIdx);
+-    }
+-    long remaining = length;
+-    long curOff = offset;
+-    while(remaining > 0) {
+-      LocatedBlock blk = null;
+-      if(blockIdx < locatedBlocks.locatedBlockCount())
+-        blk = locatedBlocks.get(blockIdx);
+-      if (blk == null || curOff < blk.getStartOffset()) {
+-        LocatedBlocks newBlocks;
+-        newBlocks = dfsClient.getLocatedBlocks(src, curOff, remaining);
+-        locatedBlocks.insertRange(blockIdx, newBlocks.getLocatedBlocks());
+-        continue;
++    synchronized(infoLock) {
++      assert (locatedBlocks != null) : "locatedBlocks is null";
++      List<LocatedBlock> blockRange = new ArrayList<LocatedBlock>();
++      // search cached blocks first
++      int blockIdx = locatedBlocks.findBlock(offset);
++      if (blockIdx < 0) { // block is not cached
++        blockIdx = LocatedBlocks.getInsertIndex(blockIdx);
+-      assert curOff >= blk.getStartOffset() : "Block not found";
+-      blockRange.add(blk);
+-      long bytesRead = blk.getStartOffset() + blk.getBlockSize() - curOff;
+-      remaining -= bytesRead;
+-      curOff += bytesRead;
+-      blockIdx++;
++      long remaining = length;
++      long curOff = offset;
++      while(remaining > 0) {
++        LocatedBlock blk = null;
++        if(blockIdx < locatedBlocks.locatedBlockCount())
++          blk = locatedBlocks.get(blockIdx);
++        if (blk == null || curOff < blk.getStartOffset()) {
++          LocatedBlocks newBlocks;
++          newBlocks = dfsClient.getLocatedBlocks(src, curOff, remaining);
++          locatedBlocks.insertRange(blockIdx, newBlocks.getLocatedBlocks());
++          continue;
++        }
++        assert curOff >= blk.getStartOffset() : "Block not found";
++        blockRange.add(blk);
++        long bytesRead = blk.getStartOffset() + blk.getBlockSize() - curOff;
++        remaining -= bytesRead;
++        curOff += bytesRead;
++        blockIdx++;
++      }
++      return blockRange;
+-    return blockRange;
++        CachingStrategy curCachingStrategy;
++        boolean shortCircuitForbidden;
++        synchronized(infoLock) {
++          curCachingStrategy = cachingStrategy;
++          shortCircuitForbidden = shortCircuitForbidden();
++        }
+-            setCachingStrategy(cachingStrategy).
+-            setAllowShortCircuitLocalReads(!shortCircuitForbidden()).
++            setCachingStrategy(curCachingStrategy).
++            setAllowShortCircuitLocalReads(!shortCircuitForbidden).
+-  private int readWithStrategy(ReaderStrategy strategy, int off, int len) throws IOException {
++  private synchronized int readWithStrategy(ReaderStrategy strategy, int off, int len) throws IOException {
+-          if (locatedBlocks.isLastBlockComplete()) {
+-            realLen = (int) Math.min(realLen,
+-                locatedBlocks.getFileLength() - pos);
++          synchronized(infoLock) {
++            if (locatedBlocks.isLastBlockComplete()) {
++              realLen = (int) Math.min(realLen,
++                  locatedBlocks.getFileLength() - pos);
++            }
+-      synchronized (this) {
+-        block = getBlockAt(block.getStartOffset(), false);
++      block = getBlockAt(block.getStartOffset(), false);
++      synchronized(infoLock) {
+-  private synchronized boolean seekToBlockSource(long targetPos)
++  private boolean seekToBlockSource(long targetPos)
+-  public synchronized FileEncryptionInfo getFileEncryptionInfo() {
+-    return fileEncryptionInfo;
++  public FileEncryptionInfo getFileEncryptionInfo() {
++    synchronized(infoLock) {
++      return fileEncryptionInfo;
++    }
+-  private synchronized void closeCurrentBlockReader() {
++  private void closeCurrentBlockReader() {
+-    this.cachingStrategy =
+-        new CachingStrategy.Builder(this.cachingStrategy).
+-            setReadahead(readahead).build();
++    synchronized (infoLock) {
++      this.cachingStrategy =
++          new CachingStrategy.Builder(this.cachingStrategy).setReadahead(readahead).build();
++    }
+-    this.cachingStrategy =
+-        new CachingStrategy.Builder(this.cachingStrategy).
+-            setDropBehind(dropBehind).build();
++    synchronized (infoLock) {
++      this.cachingStrategy =
++          new CachingStrategy.Builder(this.cachingStrategy).setDropBehind(dropBehind).build();
++    }

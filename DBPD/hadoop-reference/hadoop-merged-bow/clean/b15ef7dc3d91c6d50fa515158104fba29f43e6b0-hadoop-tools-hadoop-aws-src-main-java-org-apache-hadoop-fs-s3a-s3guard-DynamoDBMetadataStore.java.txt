@@ -1,0 +1,392 @@
+HADOOP-16384: S3A: Avoid inconsistencies between DDB and S3.
+
+Contributed by Steve Loughran
+
+Contains
+
+- HADOOP-16397. Hadoop S3Guard Prune command to support a -tombstone option.
+- HADOOP-16406. ITestDynamoDBMetadataStore.testProvisionTable times out intermittently
+
+This patch doesn't fix the underlying problem but it
+
+* changes some tests to clean up better
+* does a lot more in logging operations in against DDB, if enabled
+* adds an entry point to dump the state of the metastore and s3 tables (precursor to fsck)
+* adds a purge entry point to help clean up after a test run has got a store into a mess
+* s3guard prune command adds -tombstone option to only clear tombstones
+
+The outcome is that tests should pass consistently and if problems occur we have better diagnostics.
+
+Change-Id: I3eca3f5529d7f6fec398c0ff0472919f08f054eb
+
++import org.apache.hadoop.util.DurationInfo;
++  /**
++   * Name of the operations log.
++   */
++  public static final String OPERATIONS_LOG_NAME =
++      "org.apache.hadoop.fs.s3a.s3guard.Operations";
++
++  /**
++   * A log of all state changing operations to the store;
++   * only updated at debug level.
++   */
++  public static final Logger OPERATIONS_LOG = LoggerFactory.getLogger(
++      OPERATIONS_LOG_NAME);
++
+-    innerDelete(path, true, ttlTimeProvider);
++    innerDelete(path, true, ttlTimeProvider, null);
+-    innerDelete(path, false, null);
++    innerDelete(path, false, null, null);
++   * @param ancestorState ancestor state for logging
+-  private void innerDelete(final Path path, boolean tombstone,
+-      ITtlTimeProvider ttlTimeProvider)
++  private void innerDelete(final Path path,
++      final boolean tombstone,
++      final ITtlTimeProvider ttlTimeProvider,
++      final AncestorState ancestorState)
+-            LOG.debug("Adding tombstone to {}", path);
++            logPut(ancestorState, item);
+-            LOG.debug("Delete key {}", path);
++            logDelete(ancestorState, key);
+-    if (meta == null || meta.isDeleted()) {
++    if (meta == null) {
+-
+-    // Execute via the bounded threadpool.
+-    final List<CompletableFuture<Void>> futures = new ArrayList<>();
+-    for (DescendantsIterator desc = new DescendantsIterator(this, meta);
+-         desc.hasNext();) {
+-      final Path pathToDelete = desc.next().getPath();
+-      futures.add(submit(executor, () -> {
+-        innerDelete(pathToDelete, true, ttlTimeProvider);
+-        return null;
+-      }));
+-      if (futures.size() > S3GUARD_DDB_SUBMITTED_TASK_LIMIT) {
+-        // first batch done; block for completion.
+-        waitForCompletion(futures);
+-        futures.clear();
+-      }
++    if (meta.isDeleted()) {
++      LOG.debug("Subtree path {} is deleted; this will be a no-op", path);
++      return;
+-    // now wait for the final set.
+-    waitForCompletion(futures);
++
++    try(AncestorState state = new AncestorState(this,
++        BulkOperationState.OperationType.Delete, path)) {
++      // Execute via the bounded threadpool.
++      final List<CompletableFuture<Void>> futures = new ArrayList<>();
++      for (DescendantsIterator desc = new DescendantsIterator(this, meta);
++          desc.hasNext();) {
++        final Path pathToDelete = desc.next().getPath();
++        futures.add(submit(executor, () -> {
++          innerDelete(pathToDelete, true, ttlTimeProvider, state);
++          return null;
++        }));
++        if (futures.size() > S3GUARD_DDB_SUBMITTED_TASK_LIMIT) {
++          // first batch done; block for completion.
++          waitForCompletion(futures);
++          futures.clear();
++        }
++      }
++      // now wait for the final set.
++      waitForCompletion(futures);
++    }
+-    List<DDBPathMetadata> ancestorsToAdd = new ArrayList<>(0);
++    // Key on path to allow fast lookup
++    Map<Path, DDBPathMetadata> ancestry = new HashMap<>();
+-          // this should never occur outside tests explicitly crating it
++          // this should never occur outside tests explicitly creating it
+-      ancestorsToAdd.add(entry);
++      ancestry.put(path, entry);
+-      while (!parent.isRoot()) {
++      while (!parent.isRoot() && !ancestry.containsKey(parent)) {
+-          ancestorsToAdd.add(md);
++          ancestry.put(parent, md);
+-    return ancestorsToAdd;
++    return ancestry.values();
+-              "Cannot overwrite parent file: metadatstore is"
++              "Cannot overwrite parent file: metastore is"
+-    processBatchWriteRequest(null, pathMetadataToItem(newItems));
++    processBatchWriteRequest(ancestorState,
++        null, pathMetadataToItem(newItems));
+-   * batches are retried until all have been processed..
++   * batches are retried until all have been processed.
++   *
++   * @param ancestorState ancestor state for logging
+-  private int processBatchWriteRequest(PrimaryKey[] keysToDelete,
++  private int processBatchWriteRequest(
++      @Nullable AncestorState ancestorState,
++      PrimaryKey[] keysToDelete,
+-        writeItems.withPrimaryKeysToDelete(
+-            Arrays.copyOfRange(keysToDelete, count, count + numToDelete));
++        PrimaryKey[] toDelete = Arrays.copyOfRange(keysToDelete,
++            count, count + numToDelete);
++        LOG.debug("Deleting {} entries: {}", toDelete.length, toDelete);
++        writeItems.withPrimaryKeysToDelete(toDelete);
++      logPut(ancestorState, itemsToPut);
++      logDelete(ancestorState, keysToDelete);
++
+-    processBatchWriteRequest(null, items);
++    processBatchWriteRequest(ancestorState, null, items);
+-  private boolean itemExists(Item item) {
++  private static boolean itemExists(Item item) {
+-   * the call to {@link #processBatchWriteRequest(PrimaryKey[], Item[])}
++   * the call to
++   * {@link #processBatchWriteRequest(DynamoDBMetadataStore.AncestorState, PrimaryKey[], Item[])}
+-    LOG.debug("Saving to table {} in region {}: {}", tableName, region, meta);
+-
++    LOG.debug("Saving {} dir meta for {} to table {} in region {}: {}",
++        tableName,
++        meta.isAuthoritative() ? "auth" : "nonauth",
++        meta.getPath(),
++        tableName, region, meta);
+-    // put all its ancestors if not present; as an optimization we return at its
+-    // first existent ancestor
++    // put all its ancestors if not present
+-    processBatchWriteRequest(null, pathMetadataToItem(metasToPut));
++    processBatchWriteRequest(ancestorState,
++        null,
++        pathMetadataToItem(metasToPut));
+-    LOG.debug("Prune files under {} with age {}", keyPrefix, cutoff);
++    LOG.debug("Prune {} under {} with age {}",
++        pruneMode == PruneMode.ALL_BY_MODTIME
++            ? "files and tombstones" : "tombstones",
++        keyPrefix, cutoff);
+-        BulkOperationState.OperationType.Prune, null)) {
++        BulkOperationState.OperationType.Prune, null);
++         DurationInfo ignored =
++             new DurationInfo(LOG, "Pruning DynamoDB Store")) {
++        boolean tombstone = md.isDeleted();
++        LOG.debug("Prune entry {}", path);
+-        // add parent path of what we remove if it has not
+-        // already been processed
++        // add parent path of item so it can be marked as non-auth.
++        // this is only done if
++        // * it has not already been processed
++        // * the entry pruned is not a tombstone (no need to update)
++        // * the file is not in the root dir
+-        if (parentPath != null && !clearedParentPathSet.contains(parentPath)) {
++        if (!tombstone
++            && parentPath != null
++            && !clearedParentPathSet.contains(parentPath)) {
+-          processBatchWriteRequest(pathToKey(deletionBatch), null);
++          processBatchWriteRequest(state, pathToKey(deletionBatch), null);
+-        processBatchWriteRequest(pathToKey(deletionBatch), null);
++        processBatchWriteRequest(state, pathToKey(deletionBatch), null);
++   * <p>
++   * This operation is <i>only</i>for pruning; it does not raise an error
++   * if, during the prune phase, the table appears inconsistent.
++   * This is not unusual as it can happen in a number of ways
++   * <ol>
++   *   <li>The state of the table changes during a slow prune operation which
++   *   deliberately inserts pauses to avoid overloading prepaid IO capacity.
++   *   </li>
++   *   <li>Tombstone markers have been left in the table after many other
++   *   operations have taken place, including deleting/replacing
++   *   parents.</li>
++   * </ol>
++   * <p>
++   *
+-        if(ddbPathMetadata == null) {
++        if (ddbPathMetadata == null) {
++          // there is no entry.
++          LOG.debug("No parent {}; skipping", path);
+-        LOG.debug("Setting false isAuthoritativeDir on {}", ddbPathMetadata);
++        if (ddbPathMetadata.isDeleted()) {
++          // the parent itself is deleted
++          LOG.debug("Parent has been deleted {}; skipping", path);
++          return null;
++        }
++        if (!ddbPathMetadata.getFileStatus().isDirectory()) {
++          // the parent itself is deleted
++          LOG.debug("Parent is not a directory {}; skipping", path);
++          return null;
++        }
++        LOG.debug("Setting isAuthoritativeDir==false on {}", ddbPathMetadata);
+-        new AncestorState(BulkOperationState.OperationType.Rename, dest));
++        new AncestorState(this, BulkOperationState.OperationType.Rename, dest));
+-    return new AncestorState(operation, dest);
++    return new AncestorState(this, operation, dest);
++   * Username.
++   * @return the current username
++   */
++  String getUsername() {
++    return username;
++  }
++
++  /**
++   * Log a PUT into the operations log at debug level.
++   * @param state optional ancestor state.
++   * @param items items which have been PUT
++   */
++  private static void logPut(
++      @Nullable AncestorState state,
++      Item[] items) {
++    if (OPERATIONS_LOG.isDebugEnabled()) {
++      // log the operations
++      String stateStr = AncestorState.stateAsString(state);
++      for (Item item : items) {
++        boolean tombstone = itemExists(item);
++        OPERATIONS_LOG.debug("{} {} {}",
++            stateStr,
++            tombstone ? "TOMBSTONE" : "PUT",
++            itemPrimaryKeyToString(item));
++      }
++    }
++  }
++
++  /**
++   * Log a PUT into the operations log at debug level.
++   * @param state optional ancestor state.
++   * @param item item PUT.
++   */
++  private static void logPut(
++      @Nullable AncestorState state,
++      Item item) {
++    if (OPERATIONS_LOG.isDebugEnabled()) {
++      // log the operations
++      logPut(state, new Item[]{item});
++    }
++  }
++
++  /**
++   * Log a DELETE into the operations log at debug level.
++   * @param state optional ancestor state.
++   * @param keysDeleted keys which were deleted.
++   */
++  private static void logDelete(
++      @Nullable AncestorState state,
++      PrimaryKey[] keysDeleted) {
++    if (OPERATIONS_LOG.isDebugEnabled()) {
++      // log the operations
++      String stateStr = AncestorState.stateAsString(state);
++      for (PrimaryKey key : keysDeleted) {
++        OPERATIONS_LOG.debug("{} DELETE {}",
++            stateStr, primaryKeyToString(key));
++      }
++    }
++  }
++
++  /**
++   * Log a DELETE into the operations log at debug level.
++   * @param state optional ancestor state.
++   * @param key Deleted key
++   */
++  private static void logDelete(
++      @Nullable AncestorState state,
++      PrimaryKey key) {
++    if (OPERATIONS_LOG.isDebugEnabled()) {
++      logDelete(state, new PrimaryKey[]{key});
++    }
++  }
++
++  /**
+-  @VisibleForTesting
+-  static AncestorState extractOrCreate(@Nullable BulkOperationState state,
++  private AncestorState extractOrCreate(@Nullable BulkOperationState state,
+-      return new AncestorState(operation, null);
++      return new AncestorState(this, operation, null);
++    /**
++     * Counter of IDs issued.
++     */
++    private static final AtomicLong ID_COUNTER = new AtomicLong(0);
++
++    /** Owning store. */
++    private final DynamoDBMetadataStore store;
++
++    /** The ID of the state; for logging. */
++    private final long id;
++
++    /**
++     * Map of ancestors.
++     */
++    /**
++     * Destination path.
++     */
++     * @param store the store, for use in validation.
++     * If null: no validation (test only operation)
+-    AncestorState(final OperationType operation, @Nullable final Path dest) {
++    AncestorState(
++        @Nullable final DynamoDBMetadataStore store,
++        final OperationType operation,
++        @Nullable final Path dest) {
++      this.store = store;
++      this.id = ID_COUNTER.addAndGet(1);
++    long getId() {
++      return id;
++    }
++
++      sb.append("id=").append(id);
+-      return ancestry.containsKey(p);
++      return get(p) != null;
++
++    /**
++     * If debug logging is enabled, this does an audit of the store state.
++     * it only logs this; the error messages are created so as they could
++     * be turned into exception messages.
++     * Audit failures aren't being turned into IOEs is that
++     * rename operations delete the source entry and that ends up in the
++     * ancestor state as present
++     * @throws IOException failure
++     */
++    @Override
++    public void close() throws IOException {
++      if (LOG.isDebugEnabled() && store != null) {
++        LOG.debug("Auditing {}", stateAsString(this));
++        for (Map.Entry<Path, DDBPathMetadata> entry : ancestry
++            .entrySet()) {
++          Path path = entry.getKey();
++          DDBPathMetadata expected = entry.getValue();
++          if (expected.isDeleted()) {
++            // file was deleted in bulk op; we don't care about it
++            // any more
++            continue;
++          }
++          DDBPathMetadata actual;
++          try {
++            actual = store.get(path);
++          } catch (IOException e) {
++            LOG.debug("Retrieving {}", path, e);
++            // this is for debug; don't be ambitious
++            return;
++          }
++          if (actual == null || actual.isDeleted()) {
++            String message = "Metastore entry for path "
++                + path + " deleted during bulk "
++                + getOperation() + " operation";
++            LOG.debug(message);
++          } else {
++            if (actual.getFileStatus().isDirectory() !=
++                expected.getFileStatus().isDirectory()) {
++              // the type of the entry has changed
++              String message = "Metastore entry for path "
++                  + path + " changed during bulk "
++                  + getOperation() + " operation"
++                  + " from " + expected
++                  + " to " + actual;
++              LOG.debug(message);
++            }
++          }
++
++        }
++      }
++    }
++
++    /**
++     * Create a string from the state including operation and ID.
++     * @param state state to use -may be null
++     * @return a string for logging.
++     */
++    private static String stateAsString(@Nullable AncestorState state) {
++      String stateStr;
++      if (state != null) {
++        stateStr = String.format("#(%s-%04d)",
++            state.getOperation(),
++            state.getId());
++      } else {
++        stateStr = "#()";
++      }
++      return stateStr;
++    }
+
+INS26 INS40 INS23 INS23 INS31 INS31 INS31 INS31 INS31 INS29 INS83 INS83 INS83 INS43 INS59 INS29 INS83 INS83 INS83 INS43 INS59 INS44 INS44 INS83 INS29 INS43 INS42 INS8 INS29 INS83 INS83 INS39 INS42 INS44 INS44 INS8 INS29 INS83 INS83 INS39 INS42 INS44 INS44 INS8 INS29 INS83 INS83 INS39 INS42 INS44 INS44 INS8 INS29 INS83 INS83 INS39 INS42 INS44 INS44 INS8 UPD83 INS23 INS23 INS23 INS31 INS31 INS31 INS65 INS42 INS42 INS45 INS65 INS42 INS42 INS32 INS65 INS83 INS83 INS83 INS43 INS42 INS25 INS54 INS65 INS78 INS43 INS42 INS65 INS65 INS42 INS41 INS65 INS65 INS65 INS78 INS43 INS42 INS5 INS42 INS25 INS65 INS65 INS65 INS78 INS43 INS42 INS43 INS42 INS25 INS65 INS65 INS65 INS78 INS43 INS42 INS5 INS42 INS25 INS65 INS65 INS65 INS78 INS43 INS42 INS43 INS42 INS25 INS29 INS83 INS83 INS83 INS43 INS59 INS29 INS83 INS83 INS43 INS59 INS29 INS83 INS83 INS39 INS59 INS29 INS29 INS44 INS39 INS42 INS8 INS29 INS78 INS83 INS39 INS42 INS43 INS8 INS29 INS83 INS83 INS43 INS42 INS44 INS8 INS66 INS66 INS66 INS42 INS42 INS42 INS42 INS66 INS42 MOV27 MOV32 INS8 INS58 INS8 UPD74 INS32 UPD66 INS42 INS66 INS42 INS42 UPD66 INS58 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS42 INS66 INS42 INS66 INS42 INS66 INS42 INS42 INS43 INS85 INS32 INS8 INS66 INS42 INS66 INS42 INS66 INS42 INS42 INS42 INS32 INS8 INS66 INS42 INS66 INS42 INS66 INS42 INS42 INS43 INS85 INS32 INS8 INS66 INS42 INS66 INS42 INS66 INS42 INS42 INS42 INS32 INS8 INS65 INS42 INS42 INS14 INS65 INS42 INS42 INS65 INS42 INS65 INS65 INS65 INS78 INS83 INS43 INS42 INS21 INS21 INS41 INS21 INS65 INS65 INS42 INS42 INS25 INS65 INS65 INS65 INS42 INS78 INS43 INS42 INS60 INS25 INS41 INS33 INS33 INS21 INS41 INS43 INS59 MOV60 MOV24 MOV21 UPD43 INS43 INS43 UPD42 INS42 INS42 INS42 INS21 INS21 INS42 UPD45 INS16 INS32 INS42 INS42 UPD45 INS16 INS43 INS59 INS52 INS42 INS42 INS42 INS60 INS70 INS42 INS42 INS21 INS42 INS42 INS42 INS60 INS70 INS42 INS42 INS21 INS66 INS43 INS34 INS66 INS66 INS66 INS66 INS42 INS66 INS66 INS42 INS42 INS7 INS7 INS42 INS32 INS27 INS66 INS66 INS66 INS66 INS66 INS66 INS42 INS66 INS27 INS8 INS66 INS42 INS66 INS66 INS42 INS42 INS43 INS59 INS27 INS8 INS8 INS42 INS32 INS42 INS42 INS14 UPD42 INS42 INS42 UPD74 INS27 INS32 INS32 INS69 INS32 INS45 INS45 INS42 INS42 INS27 INS45 INS45 INS42 INS42 INS14 MOV43 INS52 INS43 INS59 INS44 INS42 INS8 INS32 INS43 INS59 INS44 INS42 INS8 INS32 INS42 INS22 INS42 INS22 INS32 INS32 INS42 INS42 INS32 INS33 INS32 INS27 INS21 INS70 INS42 INS42 INS42 INS33 INS21 INS21 INS42 INS42 INS45 INS42 INS43 INS52 INS40 INS42 UPD43 UPD42 UPD42 INS42 MOV38 INS38 INS60 INS21 INS42 INS42 INS42 INS42 INS42 INS42 INS43 INS42 INS42 INS42 INS40 INS43 INS42 INS45 INS60 INS21 MOV21 INS42 INS42 INS32 INS43 INS42 INS60 INS21 INS42 INS42 INS3 INS42 INS42 INS32 INS43 INS42 INS21 INS42 INS42 INS3 MOV43 INS52 INS52 INS42 INS52 INS42 INS42 INS42 INS34 INS42 INS42 INS45 UPD42 MOV42 MOV42 INS42 INS42 INS42 INS33 INS32 INS44 INS32 INS8 INS7 INS7 INS42 UPD42 INS32 INS5 INS59 INS32 INS40 INS42 INS39 INS59 INS32 INS42 INS42 INS42 INS42 INS39 INS59 INS32 INS5 INS4 INS42 INS42 INS42 INS42 INS32 INS5 INS4 INS42 INS42 INS45 INS32 INS74 INS42 INS42 INS42 INS60 INS60 INS25 INS60 INS54 INS25 INS42 INS32 INS42 INS45 INS42 INS42 INS42 INS43 INS85 INS42 MOV32 INS42 INS42 INS45 INS40 INS42 INS42 INS42 INS32 INS42 INS42 INS45 INS42 INS27 INS21 INS42 INS42 INS32 INS42 INS42 INS45 INS42 INS16 INS32 INS43 INS85 INS42 INS42 INS42 INS45 INS42 INS32 INS43 INS85 INS42 INS42 INS52 INS43 INS43 MOV43 INS43 INS59 INS43 INS59 INS32 INS8 INS43 INS59 INS8 INS12 INS27 INS8 INS8 INS42 INS42 INS45 INS32 INS32 INS42 INS42 INS42 INS38 MOV27 INS32 INS42 INS42 INS42 INS45 INS45 INS42 INS42 INS42 INS42 INS42 INS42 INS40 INS42 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS18 INS42 INS42 INS21 INS44 INS8 INS27 INS32 INS60 INS21 INS25 INS42 INS42 INS42 INS42 UPD42 UPD42 UPD42 UPD42 UPD42 UPD42 UPD42 UPD42 INS42 INS42 INS42 INS42 MOV32 INS33 INS42 INS42 INS42 INS42 INS7 INS43 INS42 INS21 INS41 INS42 INS33 INS42 INS42 INS43 INS59 INS32 INS27 INS8 UPD45 INS25 INS25 INS42 INS32 INS42 INS32 INS42 INS42 INS27 INS42 INS42 INS42 INS32 INS32 INS60 INS21 INS32 INS8 INS38 INS8 INS42 INS42 INS42 INS42 INS42 INS45 INS42 INS42 INS45 INS42 INS45 INS32 INS45 INS32 INS42 INS32 INS42 INS43 INS59 INS32 INS42 INS21 INS42 INS42 INS21 INS41 INS32 INS21 INS41 UPD45 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS27 INS42 INS42 INS42 INS32 INS32 INS33 INS32 INS42 INS32 INS33 INS45 INS42 INS45 INS32 INS45 INS45 INS42 INS45 INS42 INS42 INS42 INS45 INS42 INS42 INS42 INS45 INS42 INS42 INS42 INS42 INS42 INS45 INS42 INS42 DEL45 DEL45 DEL27 DEL34 DEL42 DEL42 DEL33 DEL32 DEL21 DEL42 DEL78 DEL42 DEL32

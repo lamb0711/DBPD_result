@@ -1,0 +1,259 @@
+Merge trunk into HA branch
+
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/branches/HDFS-1623@1173012 13f79535-47bb-0310-9956-ffa450edef68
+
++import org.apache.hadoop.mapreduce.v2.app.launcher.ContainerLauncherEvent;
++import org.apache.hadoop.mapreduce.v2.app.rm.ContainerAllocatorEvent;
++import org.apache.hadoop.yarn.service.AbstractService;
++  private JobEventDispatcher jobEventDispatcher;
+-    context = new RunningAppContext();
++    context = new RunningAppContext(conf);
+-    addIfService(historyService);
++    dispatcher.register(org.apache.hadoop.mapreduce.jobhistory.EventType.class,
++        historyService);
+-    JobEventDispatcher synchronousJobEventDispatcher = new JobEventDispatcher();
++    this.jobEventDispatcher = new JobEventDispatcher();
+-    dispatcher.register(JobEventType.class, synchronousJobEventDispatcher);
++    dispatcher.register(JobEventType.class, jobEventDispatcher);
+-    dispatcher.register(org.apache.hadoop.mapreduce.jobhistory.EventType.class,
+-        historyService);
+-        new SpeculatorEventDispatcher());
++        new SpeculatorEventDispatcher(conf));
++    // service to allocate containers from RM (if non-uber) or to fake it (uber)
++    containerAllocator = createContainerAllocator(clientService, context);
++    addIfService(containerAllocator);
++    dispatcher.register(ContainerAllocator.EventType.class, containerAllocator);
++
++    // corresponding service to launch allocated containers via NodeManager
++    containerLauncher = createContainerLauncher(context);
++    addIfService(containerLauncher);
++    dispatcher.register(ContainerLauncher.EventType.class, containerLauncher);
++
++    // Add the JobHistoryEventHandler last so that it is properly stopped first.
++    // This will guarantee that all history-events are flushed before AM goes
++    // ahead with shutdown.
++    // Note: Even though JobHistoryEventHandler is started last, if any
++    // component creates a JobHistoryEvent in the meanwhile, it will be just be
++    // queued inside the JobHistoryEventHandler 
++    addIfService(historyService);
++
++    super.init(conf);
++  } // end of init()
++
++  /** Create and initialize (but don't start) a single job. */
++  protected Job createJob(Configuration conf) {
++
++    // ////////// Obtain the tokens needed by the job. //////////
+-
+-
+-    super.init(conf);
+-
+-    //---- start of what used to be startJobs() code:
+-
+-    Configuration config = getConfig();
+-
+-    job = createJob(config, fsTokens, currentUser.getUserName());
+-
+-    /** create a job event for job intialization */
+-    JobEvent initJobEvent = new JobEvent(job.getID(), JobEventType.JOB_INIT);
+-    /** send init to the job (this does NOT trigger job execution) */
+-    synchronousJobEventDispatcher.handle(initJobEvent);
+-
+-    // send init to speculator. This won't yest start as dispatcher isn't
+-    // started yet.
+-    dispatcher.getEventHandler().handle(
+-        new SpeculatorEvent(job.getID(), clock.getTime()));
+-
+-    // JobImpl's InitTransition is done (call above is synchronous), so the
+-    // "uber-decision" (MR-1220) has been made.  Query job and switch to
+-    // ubermode if appropriate (by registering different container-allocator
+-    // and container-launcher services/event-handlers).
+-
+-    if (job.isUber()) {
+-      LOG.info("MRAppMaster uberizing job " + job.getID()
+-               + " in local container (\"uber-AM\").");
+-    } else {
+-      LOG.info("MRAppMaster launching normal, non-uberized, multi-container "
+-               + "job " + job.getID() + ".");
+-    }
+-
+-    // service to allocate containers from RM (if non-uber) or to fake it (uber)
+-    containerAllocator =
+-        createContainerAllocator(clientService, context, job.isUber());
+-    addIfService(containerAllocator);
+-    dispatcher.register(ContainerAllocator.EventType.class, containerAllocator);
+-    if (containerAllocator instanceof Service) {
+-      ((Service) containerAllocator).init(config);
+-    }
+-
+-    // corresponding service to launch allocated containers via NodeManager
+-    containerLauncher = createContainerLauncher(context, job.isUber());
+-    addIfService(containerLauncher);
+-    dispatcher.register(ContainerLauncher.EventType.class, containerLauncher);
+-    if (containerLauncher instanceof Service) {
+-      ((Service) containerLauncher).init(config);
+-    }
+-
+-  } // end of init()
+-
+-  /** Create and initialize (but don't start) a single job. 
+-   * @param fsTokens */
+-  protected Job createJob(Configuration conf, Credentials fsTokens, 
+-      String user) {
++    // ////////// End of obtaining the tokens needed by the job. //////////
+-        completedTasksFromPreviousRun, metrics, user);
++        completedTasksFromPreviousRun, metrics, currentUser.getUserName());
+-      ClientService clientService, AppContext context, boolean isLocal) {
+-    //return new StaticContainerAllocator(context);
+-    return isLocal
+-        ? new LocalContainerAllocator(clientService, context)
+-        : new RMContainerAllocator(clientService, context);
++      final ClientService clientService, final AppContext context) {
++    return new ContainerAllocatorRouter(clientService, context);
+-  protected ContainerLauncher createContainerLauncher(AppContext context,
+-                                                      boolean isLocal) {
+-    return isLocal
+-        ? new LocalContainerLauncher(context,
+-            (TaskUmbilicalProtocol) taskAttemptListener)
+-        : new ContainerLauncherImpl(context);
++  protected ContainerLauncher
++      createContainerLauncher(final AppContext context) {
++    return new ContainerLauncherRouter(context);
+-  class RunningAppContext implements AppContext {
++  /**
++   * By the time life-cycle of this router starts, job-init would have already
++   * happened.
++   */
++  private final class ContainerAllocatorRouter extends AbstractService
++      implements ContainerAllocator {
++    private final ClientService clientService;
++    private final AppContext context;
++    private ContainerAllocator containerAllocator;
+-    private Map<JobId, Job> jobs = new ConcurrentHashMap<JobId, Job>();
++    ContainerAllocatorRouter(ClientService clientService,
++        AppContext context) {
++      super(ContainerAllocatorRouter.class.getName());
++      this.clientService = clientService;
++      this.context = context;
++    }
++
++    @Override
++    public synchronized void start() {
++      if (job.isUber()) {
++        this.containerAllocator = new LocalContainerAllocator(
++            this.clientService, this.context);
++      } else {
++        this.containerAllocator = new RMContainerAllocator(
++            this.clientService, this.context);
++      }
++      ((Service)this.containerAllocator).init(getConfig());
++      ((Service)this.containerAllocator).start();
++      super.start();
++    }
++
++    @Override
++    public synchronized void stop() {
++      ((Service)this.containerAllocator).stop();
++      super.stop();
++    }
++
++    @Override
++    public void handle(ContainerAllocatorEvent event) {
++      this.containerAllocator.handle(event);
++    }
++  }
++
++  /**
++   * By the time life-cycle of this router starts, job-init would have already
++   * happened.
++   */
++  private final class ContainerLauncherRouter extends AbstractService
++      implements ContainerLauncher {
++    private final AppContext context;
++    private ContainerLauncher containerLauncher;
++
++    ContainerLauncherRouter(AppContext context) {
++      super(ContainerLauncherRouter.class.getName());
++      this.context = context;
++    }
++
++    @Override
++    public synchronized void start() {
++      if (job.isUber()) {
++        this.containerLauncher = new LocalContainerLauncher(context,
++            (TaskUmbilicalProtocol) taskAttemptListener);
++      } else {
++        this.containerLauncher = new ContainerLauncherImpl(context);
++      }
++      ((Service)this.containerLauncher).init(getConfig());
++      ((Service)this.containerLauncher).start();
++      super.start();
++    }
++
++    @Override
++    public void handle(ContainerLauncherEvent event) {
++        this.containerLauncher.handle(event);
++    }
++
++    @Override
++    public synchronized void stop() {
++      ((Service)this.containerLauncher).stop();
++      super.stop();
++    }
++  }
++
++  private class RunningAppContext implements AppContext {
++
++    private final Map<JobId, Job> jobs = new ConcurrentHashMap<JobId, Job>();
++    private final Configuration conf;
++
++    public RunningAppContext(Configuration config) {
++      this.conf = config;
++    }
+-      return getConfig().get(MRJobConfig.USER_NAME);
++      return this.conf.get(MRJobConfig.USER_NAME);
++
++    ///////////////////// Create the job itself.
++    job = createJob(getConfig());
++    // End of creating the job.
++
+-    startJobs();
++    /** create a job event for job intialization */
++    JobEvent initJobEvent = new JobEvent(job.getID(), JobEventType.JOB_INIT);
++    /** send init to the job (this does NOT trigger job execution) */
++    // This is a synchronous call, not an event through dispatcher. We want
++    // job-init to be done completely here.
++    jobEventDispatcher.handle(initJobEvent);
++
++    // send init to speculator. This won't yest start as dispatcher isn't
++    // started yet.
++    dispatcher.getEventHandler().handle(
++        new SpeculatorEvent(job.getID(), clock.getTime()));
++
++    // JobImpl's InitTransition is done (call above is synchronous), so the
++    // "uber-decision" (MR-1220) has been made.  Query job and switch to
++    // ubermode if appropriate (by registering different container-allocator
++    // and container-launcher services/event-handlers).
++
++    if (job.isUber()) {
++      LOG.info("MRAppMaster uberizing job " + job.getID()
++               + " in local container (\"uber-AM\").");
++    } else {
++      LOG.info("MRAppMaster launching normal, non-uberized, multi-container "
++               + "job " + job.getID() + ".");
++    }
++
++
++    // All components have started, start the job.
++    startJobs();
++    private final Configuration conf;
++    public SpeculatorEventDispatcher(Configuration config) {
++      this.conf = config;
++    }
+-      if (getConfig().getBoolean(MRJobConfig.MAP_SPECULATIVE, false)
+-          || getConfig().getBoolean(MRJobConfig.REDUCE_SPECULATIVE, false)) {
++      if (conf.getBoolean(MRJobConfig.MAP_SPECULATIVE, false)
++          || conf.getBoolean(MRJobConfig.REDUCE_SPECULATIVE, false)) {
+
+INS26 INS26 INS26 INS40 INS40 INS40 INS23 INS31 INS31 INS55 INS55 INS31 INS83 MOV43 INS59 MOV21 MOV21 MOV21 MOV21 MOV83 INS43 MOV42 INS44 INS44 INS8 INS83 INS43 INS42 INS44 INS8 INS29 INS83 INS83 INS42 INS43 MOV43 INS23 INS23 INS23 INS31 INS31 INS31 MOV31 INS29 INS83 INS83 INS42 INS43 MOV43 INS23 INS23 INS31 MOV31 INS31 INS31 INS83 INS23 INS31 MOV78 INS83 INS39 INS42 INS8 INS23 INS31 INS42 MOV60 MOV60 MOV54 INS42 INS83 INS43 INS42 INS83 INS43 INS42 INS41 INS42 INS83 INS43 INS42 INS41 INS65 INS42 INS83 INS83 INS43 INS59 INS83 INS83 INS43 INS59 INS83 INS43 INS59 INS42 MOV44 MOV44 INS8 INS78 INS83 INS83 INS39 INS42 MOV8 INS78 INS83 INS83 INS39 INS42 INS8 INS78 UPD83 INS39 UPD42 INS8 INS65 INS42 INS83 INS83 INS43 INS59 INS83 INS43 INS59 INS42 MOV44 INS8 INS78 INS83 INS8 INS78 INS83 INS39 INS42 INS44 INS8 INS78 INS83 INS83 INS39 INS42 INS8 INS83 INS83 INS83 INS43 INS59 INS83 INS42 INS44 INS8 INS21 MOV21 MOV60 INS21 MOV21 MOV25 MOV21 MOV21 INS83 INS83 INS43 INS59 INS83 INS42 INS44 INS8 INS42 INS42 INS14 INS42 INS14 INS66 INS66 INS42 INS42 INS42 INS42 INS42 INS42 INS46 INS21 INS21 INS42 INS25 MOV21 MOV21 INS21 INS42 INS21 INS21 INS42 INS43 INS42 INS21 INS66 INS66 INS42 INS42 INS42 INS42 INS46 INS21 INS42 INS25 INS21 INS21 INS21 INS42 INS43 INS42 INS21 INS42 INS21 INS21 INS42 INS42 MOV43 INS42 INS21 INS7 INS32 INS42 INS42 INS43 INS42 INS21 INS22 MOV14 UPD42 INS43 INS42 INS42 INS43 INS42 INS32 INS7 INS7 MOV32 INS8 INS8 INS48 INS32 INS48 INS42 INS32 INS32 INS7 MOV32 MOV8 INS8 INS32 INS32 INS48 INS42 INS32 INS32 INS48 INS7 INS42 INS32 INS42 INS42 INS42 INS42 INS7 INS42 INS52 INS42 INS42 MOV32 INS42 INS42 INS57 INS42 INS22 INS42 INS22 INS42 INS21 INS21 MOV32 UPD42 INS42 INS36 INS42 INS42 INS22 INS42 INS42 INS57 INS42 INS22 INS42 INS21 INS21 INS36 INS42 MOV32 INS36 INS42 INS42 INS22 INS42 INS42 INS36 INS42 INS42 INS22 INS42 INS22 INS42 MOV32 INS22 INS42 INS43 INS52 INS42 INS52 INS42 INS7 INS7 UPD42 MOV42 INS11 INS52 INS42 INS43 INS52 INS42 INS7 INS7 INS11 INS11 INS52 INS42 INS11 INS52 INS42 INS52 INS42 INS52 INS42 INS42 UPD42 MOV42 INS42 INS22 INS14 INS22 INS14 INS22 INS22 MOV43 INS22 INS42 INS22 MOV14 INS22 MOV14 MOV43 INS22 INS43 INS22 INS43 INS22 INS52 INS42 MOV43 INS22 INS22 INS52 INS42 MOV43 INS22 INS22 INS52 INS42 INS52 INS42 INS52 INS42 INS52 INS42 INS52 INS42 INS52 INS42 INS42 INS52 INS42 INS42 INS52 INS42 INS52 INS42 INS52 INS42 INS52 INS42 INS52 INS42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL42 DEL59 DEL60 DEL42 DEL59 DEL60 DEL42 DEL42 DEL42 DEL32 DEL21 DEL42 DEL62 DEL8 DEL25 DEL42 DEL62 DEL8 DEL25 DEL42 DEL66 DEL65 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL44 DEL42 DEL39 DEL42 DEL44 DEL31 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL14 DEL42 DEL42 DEL14 DEL16 DEL41 DEL39 DEL42 DEL42 DEL16 DEL41 DEL8 DEL42 DEL32

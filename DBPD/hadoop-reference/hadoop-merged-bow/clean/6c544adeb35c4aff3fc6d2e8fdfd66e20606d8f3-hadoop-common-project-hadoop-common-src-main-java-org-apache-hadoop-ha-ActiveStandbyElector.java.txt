@@ -1,0 +1,202 @@
+Merge HDFS-3042 (automatic failover) to trunk.
+
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/trunk@1342112 13f79535-47bb-0310-9956-ffa450edef68
+
++import org.apache.hadoop.ha.HAZKUtil.ZKAuthInfo;
+-     * This method is called when the app becomes the active leader
++     * This method is called when the app becomes the active leader.
++     * If the service fails to become active, it should throw
++     * ServiceFailedException. This will cause the elector to
++     * sleep for a short period, then re-join the election.
++     * 
++     * Callback implementations are expected to manage their own
++     * timeouts (e.g. when making an RPC to a remote node).
+-    void becomeActive();
++    void becomeActive() throws ServiceFailedException;
+-  private static final int NUM_RETRIES = 3;
++  static int NUM_RETRIES = 3;
++  private static final int SLEEP_AFTER_FAILURE_TO_BECOME_ACTIVE = 1000;
++  private final List<ZKAuthInfo> zkAuthInfo;
++   * @param authInfo a list of authentication credentials to add to the
++   *                 ZK connection
++      List<ZKAuthInfo> authInfo,
++    zkAuthInfo = authInfo;
+-    LOG.debug("Attempting active election");
+-
++    LOG.debug("Attempting active election for " + this);
++    Preconditions.checkState(!wantToBeInElection,
++        "ensureParentZNode() may not be called while in the election");
++
++    Preconditions.checkState(!wantToBeInElection,
++        "clearParentZNode() may not be called while in the election");
++
+-      return zkClient.getData(zkLockFilePath, false, stat);
++      return getDataWithRetries(zkLockFilePath, false, stat);
+-        + " connectionState: " + zkConnectionState);
++        + " connectionState: " + zkConnectionState +
++        "  for " + this);
+-      becomeActive();
+-      monitorActiveStatus();
++      if (becomeActive()) {
++        monitorActiveStatus();
++      } else {
++        reJoinElectionAfterFailureToBecomeActive();
++      }
++    
++    assert wantToBeInElection :
++        "Got a StatNode result after quitting election";
++    
+-        + " connectionState: " + zkConnectionState);
++        + " connectionState: " + zkConnectionState + " for " + this);
++        
+-        becomeActive();
++        if (!becomeActive()) {
++          reJoinElectionAfterFailureToBecomeActive();
++        }
++    } else if (isSessionExpired(code)) {
++      // This isn't fatal - the client Watcher will re-join the election
++      LOG.warn("Lock monitoring failed because session was lost");
++      return;
+-   * interface implementation of Zookeeper watch events (connection and node)
++   * We failed to become active. Re-join the election, but
++   * sleep for a few seconds after terminating our existing
++   * session, so that other nodes have a chance to become active.
++   * The failure to become active is already logged inside
++   * becomeActive().
++   */
++  private void reJoinElectionAfterFailureToBecomeActive() {
++    reJoinElection(SLEEP_AFTER_FAILURE_TO_BECOME_ACTIVE);
++  }
++
++  /**
++   * interface implementation of Zookeeper watch events (connection and node),
++   * proxied by {@link WatcherWithClientRef}.
+-        + " connectionState: " + zkConnectionState);
++        + " connectionState: " + zkConnectionState
++        + " for " + this);
+-        if (prevConnectionState == ConnectionState.DISCONNECTED) {
++        if (prevConnectionState == ConnectionState.DISCONNECTED &&
++            wantToBeInElection) {
+-        reJoinElection();
++        reJoinElection(0);
++    for (ZKAuthInfo auth : zkAuthInfo) {
++      zk.addAuthInfo(auth.getScheme(), auth.getAuth());
++    }
++    LOG.fatal(errorMessage);
+-    LOG.debug("Monitoring active leader");
++    assert wantToBeInElection;
++    LOG.debug("Monitoring active leader for " + this);
+-  private void reJoinElection() {
++  private void reJoinElection(int sleepTime) {
++      sleepFor(sleepTime);
++      
+-  
++
++  /**
++   * Sleep for the given number of milliseconds.
++   * This is non-static, and separated out, so that unit tests
++   * can override the behavior not to sleep.
++   */
++  @VisibleForTesting
++  protected void sleepFor(int sleepMs) {
++    if (sleepMs > 0) {
++      try {
++        Thread.sleep(sleepMs);
++      } catch (InterruptedException e) {
++        Thread.currentThread().interrupt();
++      }
++    }
++  }
++
+-  long getZKSessionIdForTests() {
+-    return zkClient.getSessionId();
++  synchronized long getZKSessionIdForTests() {
++    if (zkClient != null) {
++      return zkClient.getSessionId();
++    } else {
++      return -1;
++    }
+-      LOG.debug("Establishing zookeeper connection");
++      LOG.debug("Establishing zookeeper connection for " + this);
+-        try {
+-          Thread.sleep(5000);
+-        } catch(InterruptedException e1) {
+-          LOG.warn(e1);
+-        }
++        sleepFor(5000);
++    if (zkClient != null) {
++      try {
++        zkClient.close();
++      } catch (InterruptedException e) {
++        throw new IOException("Interrupted while closing ZK",
++            e);
++      }
++      zkClient = null;
++    }
++    LOG.debug("Created new connection for " + this);
+-  private void terminateConnection() {
++  void terminateConnection() {
+-    LOG.debug("Terminating ZK connection");
++    LOG.debug("Terminating ZK connection for " + this);
+-  private void becomeActive() {
++  private boolean becomeActive() {
+-    if (state != State.ACTIVE) {
+-      try {
+-        Stat oldBreadcrumbStat = fenceOldActive();
+-        writeBreadCrumbNode(oldBreadcrumbStat);
+-      } catch (Exception e) {
+-        LOG.warn("Exception handling the winning of election", e);
+-        reJoinElection();
+-        return;
+-      }
+-      LOG.debug("Becoming active");
+-      state = State.ACTIVE;
++    if (state == State.ACTIVE) {
++      // already active
++      return true;
++    }
++    try {
++      Stat oldBreadcrumbStat = fenceOldActive();
++      writeBreadCrumbNode(oldBreadcrumbStat);
++      
++      LOG.debug("Becoming active for " + this);
++      state = State.ACTIVE;
++      return true;
++    } catch (Exception e) {
++      LOG.warn("Exception handling the winning of election", e);
++      // Caller will handle quitting and rejoining the election.
++      return false;
+-      LOG.debug("Becoming standby");
++      LOG.debug("Becoming standby for " + this);
+-      LOG.debug("Entering neutral mode");
++      LOG.debug("Entering neutral mode for " + this);
++  private byte[] getDataWithRetries(final String path, final boolean watch,
++      final Stat stat) throws InterruptedException, KeeperException {
++    return zkDoWithRetries(new ZKAction<byte[]>() {
++      public byte[] run() throws KeeperException, InterruptedException {
++        return zkClient.getData(path, watch, stat);
++      }
++    });
++  }
++
+-      ActiveStandbyElector.this.processWatchEvent(
+-          zk, event);
++      try {
++        ActiveStandbyElector.this.processWatchEvent(
++            zk, event);
++      } catch (Throwable t) {
++        fatalError(
++            "Failed to process watcher event " + event + ": " +
++            StringUtils.stringifyException(t));
++      }
++  
++  @Override
++  public String toString() {
++    return "elector id=" + System.identityHashCode(this) +
++      " appData=" +
++      ((appData == null) ? "null" : StringUtils.byteToHexString(appData)) + 
++      " cb=" + appClient;
++  }
+
+INS26 INS40 INS23 INS23 INS31 INS31 INS31 INS31 INS83 INS83 INS83 INS39 INS59 INS83 INS83 INS74 INS59 INS44 MOV21 INS29 INS83 INS39 INS42 INS8 INS44 INS29 INS78 INS83 INS39 INS42 INS44 INS8 INS83 INS8 INS8 UPD39 MOV8 INS83 INS5 INS42 INS44 INS44 INS44 INS43 INS43 INS8 INS78 INS83 INS43 INS42 INS8 INS43 INS42 INS34 INS43 INS43 INS42 INS65 INS74 INS42 INS21 INS21 INS21 INS6 INS65 INS21 INS70 INS21 INS6 INS39 INS42 INS65 INS42 INS39 INS42 INS25 INS25 INS25 MOV21 INS21 MOV6 INS25 INS39 INS85 INS83 INS43 INS42 INS83 INS39 INS42 INS83 INS43 INS42 INS42 INS42 INS41 INS8 INS42 INS42 INS41 INS42 INS42 INS42 INS42 INS66 INS66 INS43 INS43 INS7 INS32 INS32 INS42 INS45 INS25 INS66 INS66 INS66 INS66 INS66 INS32 UPD66 INS66 INS65 INS66 INS44 INS42 INS8 INS32 INS42 INS66 INS66 INS66 INS27 INS8 INS27 MOV8 INS8 INS27 INS8 INS32 INS27 INS8 INS42 INS42 INS32 INS54 INS27 UPD66 INS66 INS66 INS66 INS66 INS66 INS42 INS42 INS42 INS42 INS27 INS42 INS42 INS38 INS45 INS42 INS42 INS38 INS45 INS25 INS32 INS8 INS42 INS42 INS42 INS43 INS42 INS21 INS42 INS42 INS42 INS27 INS21 INS42 INS34 INS54 INS42 INS33 INS41 INS42 INS33 INS54 INS21 INS42 INS42 INS27 INS27 INS42 INS40 INS41 INS21 MOV21 MOV21 INS41 INS42 INS14 MOV8 INS12 INS45 INS32 INS45 INS36 INS45 INS42 INS45 INS52 INS42 INS42 INS45 INS52 MOV32 INS8 INS8 INS45 INS52 INS8 INS42 INS42 INS21 INS41 INS45 INS52 INS42 INS32 INS45 INS52 INS32 INS8 INS12 INS38 INS8 INS12 INS7 INS45 INS52 INS45 INS52 INS9 INS32 INS9 INS74 INS1 INS44 INS8 INS42 INS42 INS52 INS16 UPD42 MOV21 MOV21 INS25 INS32 INS27 INS42 INS42 INS32 INS32 INS42 INS42 INS21 MOV44 INS8 INS34 INS27 INS8 INS21 INS44 INS8 INS42 INS33 INS42 INS42 INS27 INS9 INS27 INS27 INS43 INS5 INS31 INS43 INS42 INS21 INS36 INS45 INS32 INS32 INS38 MOV8 INS42 INS42 INS45 MOV27 INS42 INS34 INS42 INS42 INS42 INS42 INS32 UPD42 INS21 INS45 INS52 MOV21 MOV21 INS32 INS43 INS42 INS53 INS45 INS52 INS45 INS52 INS45 INS52 INS42 INS39 INS85 INS83 INS5 INS42 INS43 INS43 INS8 INS42 INS32 INS27 INS42 INS42 INS42 INS42 UPD42 MOV32 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS14 INS39 INS85 INS42 INS42 INS41 INS42 INS27 INS42 INS33 INS32 INS32 INS42 UPD42 INS43 INS45 INS42 INS32 INS45 INS42 INS45 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 DEL83 DEL83 DEL45 DEL42 DEL45 DEL45 DEL42 DEL8 DEL42 DEL42 DEL42 DEL32 DEL21 DEL8 DEL12 DEL54 DEL8 DEL8 DEL83 DEL45 DEL42 DEL32 DEL21 DEL42 DEL42 DEL45 DEL32 DEL21 DEL42 DEL40 DEL27 DEL25 DEL8 DEL45 DEL45

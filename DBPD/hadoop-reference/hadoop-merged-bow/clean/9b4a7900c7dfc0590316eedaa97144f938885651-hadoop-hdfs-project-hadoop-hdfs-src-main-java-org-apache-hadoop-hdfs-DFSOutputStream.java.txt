@@ -1,0 +1,181 @@
+HDFS-3637. Add support for encrypting the DataTransferProtocol. Contributed by Aaron T. Myers.
+
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/trunk@1370354 13f79535-47bb-0310-9956-ffa450edef68
+
++import java.io.InputStream;
++import java.io.OutputStream;
++import org.apache.hadoop.hdfs.protocol.datatransfer.DataTransferEncryptor;
++import org.apache.hadoop.hdfs.protocol.datatransfer.IOStreamPair;
++import org.apache.hadoop.hdfs.protocol.datatransfer.InvalidEncryptionKeyException;
+-        out = new DataOutputStream(new BufferedOutputStream(
+-            NetUtils.getOutputStream(sock, writeTimeout),
++        
++        OutputStream unbufOut = NetUtils.getOutputStream(sock, writeTimeout);
++        InputStream unbufIn = NetUtils.getInputStream(sock);
++        if (dfsClient.shouldEncryptData()) {
++          IOStreamPair encryptedStreams =
++              DataTransferEncryptor.getEncryptedStreams(
++                  unbufOut, unbufIn, dfsClient.getDataEncryptionKey());
++          unbufOut = encryptedStreams.out;
++          unbufIn = encryptedStreams.in;
++        }
++        out = new DataOutputStream(new BufferedOutputStream(unbufOut,
++        in = new DataInputStream(unbufIn);
++        out.flush();
+-        in = new DataInputStream(NetUtils.getInputStream(sock));
+-      boolean result = false;
+-      DataOutputStream out = null;
+-      try {
+-        assert null == s : "Previous socket unclosed";
+-        s = createSocketForPipeline(nodes[0], nodes.length, dfsClient);
+-        long writeTimeout = dfsClient.getDatanodeWriteTimeout(nodes.length);
+-
+-        //
+-        // Xmit header info to datanode
+-        //
+-        out = new DataOutputStream(new BufferedOutputStream(
+-            NetUtils.getOutputStream(s, writeTimeout),
+-            HdfsConstants.SMALL_BUFFER_SIZE));
+-        
+-        assert null == blockReplyStream : "Previous blockReplyStream unclosed";
+-        blockReplyStream = new DataInputStream(NetUtils.getInputStream(s));
+-
+-        // send the request
+-        new Sender(out).writeBlock(block, accessToken, dfsClient.clientName,
+-            nodes, null, recoveryFlag? stage.getRecoveryStage() : stage, 
+-            nodes.length, block.getNumBytes(), bytesSent, newGS, checksum);
+-
+-        // receive ack for connect
+-        BlockOpResponseProto resp = BlockOpResponseProto.parseFrom(
+-            HdfsProtoUtil.vintPrefixed(blockReplyStream));
+-        pipelineStatus = resp.getStatus();
+-        firstBadLink = resp.getFirstBadLink();
+-        
+-        if (pipelineStatus != SUCCESS) {
+-          if (pipelineStatus == Status.ERROR_ACCESS_TOKEN) {
+-            throw new InvalidBlockTokenException(
+-                "Got access token error for connect ack with firstBadLink as "
+-                    + firstBadLink);
+-          } else {
+-            throw new IOException("Bad connect ack with firstBadLink as "
+-                + firstBadLink);
++      int refetchEncryptionKey = 1;
++      while (true) {
++        boolean result = false;
++        DataOutputStream out = null;
++        try {
++          assert null == s : "Previous socket unclosed";
++          assert null == blockReplyStream : "Previous blockReplyStream unclosed";
++          s = createSocketForPipeline(nodes[0], nodes.length, dfsClient);
++          long writeTimeout = dfsClient.getDatanodeWriteTimeout(nodes.length);
++          
++          OutputStream unbufOut = NetUtils.getOutputStream(s, writeTimeout);
++          InputStream unbufIn = NetUtils.getInputStream(s);
++          if (dfsClient.shouldEncryptData()) {
++            IOStreamPair encryptedStreams =
++                DataTransferEncryptor.getEncryptedStreams(unbufOut,
++                    unbufIn, dfsClient.getDataEncryptionKey());
++            unbufOut = encryptedStreams.out;
++            unbufIn = encryptedStreams.in;
+-        }
+-        assert null == blockStream : "Previous blockStream unclosed";
+-        blockStream = out;
+-        result =  true; // success
+-
+-      } catch (IOException ie) {
+-
+-        DFSClient.LOG.info("Exception in createBlockOutputStream", ie);
+-
+-        // find the datanode that matches
+-        if (firstBadLink.length() != 0) {
+-          for (int i = 0; i < nodes.length; i++) {
+-            if (nodes[i].getXferAddr().equals(firstBadLink)) {
+-              errorIndex = i;
+-              break;
++          out = new DataOutputStream(new BufferedOutputStream(unbufOut,
++              HdfsConstants.SMALL_BUFFER_SIZE));
++          blockReplyStream = new DataInputStream(unbufIn);
++  
++          //
++          // Xmit header info to datanode
++          //
++  
++          // send the request
++          new Sender(out).writeBlock(block, accessToken, dfsClient.clientName,
++              nodes, null, recoveryFlag? stage.getRecoveryStage() : stage, 
++              nodes.length, block.getNumBytes(), bytesSent, newGS, checksum);
++  
++          // receive ack for connect
++          BlockOpResponseProto resp = BlockOpResponseProto.parseFrom(
++              HdfsProtoUtil.vintPrefixed(blockReplyStream));
++          pipelineStatus = resp.getStatus();
++          firstBadLink = resp.getFirstBadLink();
++          
++          if (pipelineStatus != SUCCESS) {
++            if (pipelineStatus == Status.ERROR_ACCESS_TOKEN) {
++              throw new InvalidBlockTokenException(
++                  "Got access token error for connect ack with firstBadLink as "
++                      + firstBadLink);
++            } else {
++              throw new IOException("Bad connect ack with firstBadLink as "
++                  + firstBadLink);
+-        } else {
+-          errorIndex = 0;
++          assert null == blockStream : "Previous blockStream unclosed";
++          blockStream = out;
++          result =  true; // success
++  
++        } catch (IOException ie) {
++          DFSClient.LOG.info("Exception in createBlockOutputStream", ie);
++          if (ie instanceof InvalidEncryptionKeyException && refetchEncryptionKey > 0) {
++            DFSClient.LOG.info("Will fetch a new encryption key and retry, " 
++                + "encryption key was invalid when connecting to "
++                + nodes[0].getXferAddr() + " : " + ie);
++            // The encryption key used is invalid.
++            refetchEncryptionKey--;
++            dfsClient.clearDataEncryptionKey();
++            // Don't close the socket/exclude this node just yet. Try again with
++            // a new encryption key.
++            continue;
++          }
++  
++          // find the datanode that matches
++          if (firstBadLink.length() != 0) {
++            for (int i = 0; i < nodes.length; i++) {
++              if (nodes[i].getXferAddr().equals(firstBadLink)) {
++                errorIndex = i;
++                break;
++              }
++            }
++          } else {
++            errorIndex = 0;
++          }
++          hasError = true;
++          setLastException(ie);
++          result =  false;  // error
++        } finally {
++          if (!result) {
++            IOUtils.closeSocket(s);
++            s = null;
++            IOUtils.closeStream(out);
++            out = null;
++            IOUtils.closeStream(blockReplyStream);
++            blockReplyStream = null;
++          }
+-        hasError = true;
+-        setLastException(ie);
+-        result =  false;  // error
+-      } finally {
+-        if (!result) {
+-          IOUtils.closeSocket(s);
+-          s = null;
+-          IOUtils.closeStream(out);
+-          out = null;
+-          IOUtils.closeStream(blockReplyStream);
+-          blockReplyStream = null;
+-        }
++        return result;
+-      return result;
+
+INS26 INS26 INS26 INS26 INS26 INS40 INS40 INS40 INS40 INS40 INS60 INS61 MOV21 INS39 INS59 INS9 INS8 INS60 INS60 INS25 INS21 INS42 INS34 MOV60 MOV60 MOV54 MOV41 INS43 INS59 INS43 INS59 INS32 INS8 INS32 MOV6 INS42 INS42 MOV32 INS42 INS42 MOV32 INS42 INS42 INS60 INS21 INS21 INS42 INS42 INS60 INS60 INS25 INS43 INS59 INS7 INS7 INS42 INS43 INS59 INS43 INS59 INS32 INS8 INS25 INS42 INS42 INS32 INS42 INS40 INS42 INS40 INS42 INS42 INS42 MOV32 INS42 INS42 MOV32 INS42 INS42 INS60 INS21 INS21 INS27 INS8 INS42 INS42 INS42 INS42 INS32 INS43 INS59 INS7 INS7 INS42 INS62 INS27 INS21 INS21 INS21 INS18 INS42 INS42 INS42 INS42 INS32 INS42 INS40 INS42 INS40 INS42 INS42 INS43 INS42 INS34 INS32 INS37 INS32 INS42 INS42 INS42 INS42 INS32 INS42 INS40 INS42 INS27 INS42 INS42 INS42 INS42 INS42 INS27 INS32 INS45 INS42 INS45 INS45 INS2 INS42 INS42 INS34

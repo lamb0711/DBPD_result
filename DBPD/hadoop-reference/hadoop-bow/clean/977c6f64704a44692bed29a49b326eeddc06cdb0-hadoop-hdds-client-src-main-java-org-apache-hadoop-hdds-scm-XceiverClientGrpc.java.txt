@@ -1,0 +1,194 @@
+HDDS-705. OS3Exception resource name should be the actual resource name.
+Contributed by Bharat Viswanadham.
+
++import org.apache.hadoop.hdds.protocol.datanode.proto.ContainerProtos;
++import java.util.UUID;
++import java.util.Map;
++import java.util.HashMap;
+-  private XceiverClientProtocolServiceStub asyncStub;
++  private Map<UUID, XceiverClientProtocolServiceStub> asyncStubs;
+-  private ManagedChannel channel;
++  private Map<UUID, ManagedChannel> channels;
++    this.channels = new HashMap<>();
++    this.asyncStubs = new HashMap<>();
+-    DatanodeDetails leader = this.pipeline.getLeader();
++    // leader by default is the 1st datanode in the datanode list of pipleline
++    DatanodeDetails leader = this.pipeline.getLeader();
++    // just make a connection to the 1st datanode at the beginning
++    connectToDatanode(leader);
++  }
++
++  private void connectToDatanode(DatanodeDetails dn) {
+-    int port = leader.getPort(DatanodeDetails.Port.Name.STANDALONE).getValue();
++    int port = dn.getPort(DatanodeDetails.Port.Name.STANDALONE).getValue();
+-    LOG.debug("Connecting to server Port : " + leader.getIpAddress());
+-    channel = NettyChannelBuilder.forAddress(leader.getIpAddress(), port)
+-        .usePlaintext()
+-        .maxInboundMessageSize(OzoneConfigKeys.DFS_CONTAINER_CHUNK_MAX_SIZE)
+-        .build();
+-    asyncStub = XceiverClientProtocolServiceGrpc.newStub(channel);
++    LOG.debug("Connecting to server Port : " + dn.getIpAddress());
++    ManagedChannel channel =
++        NettyChannelBuilder.forAddress(dn.getIpAddress(), port).usePlaintext()
++            .maxInboundMessageSize(OzoneConfigKeys.DFS_CONTAINER_CHUNK_MAX_SIZE)
++            .build();
++    XceiverClientProtocolServiceStub asyncStub =
++        XceiverClientProtocolServiceGrpc.newStub(channel);
++    asyncStubs.put(dn.getUuid(), asyncStub);
++    channels.put(dn.getUuid(), channel);
+-
+-   * Returns if the xceiver client connects to a server.
++   * Returns if the xceiver client connects to all servers in the pipeline.
+-  public boolean isConnected() {
+-    return !channel.isTerminated() && !channel.isShutdown();
++  public boolean isConnected(DatanodeDetails details) {
++    return isConnected(channels.get(details.getUuid()));
++  }
++
++  private boolean isConnected(ManagedChannel channel) {
++    return channel != null && !channel.isTerminated() && !channel.isShutdown();
+-    channel.shutdownNow();
+-    try {
+-      channel.awaitTermination(60, TimeUnit.MINUTES);
+-    } catch (Exception e) {
+-      LOG.error("Unexpected exception while waiting for channel termination",
+-          e);
++    for (ManagedChannel channel : channels.values()) {
++      channel.shutdownNow();
++      try {
++        channel.awaitTermination(60, TimeUnit.MINUTES);
++      } catch (Exception e) {
++        LOG.error("Unexpected exception while waiting for channel termination",
++            e);
++      }
++  @Override
++  public ContainerCommandResponseProto sendCommand(
++      ContainerCommandRequestProto request) throws IOException {
++    int size = pipeline.getMachines().size();
++    ContainerCommandResponseProto responseProto = null;
++    int dnIndex = 0;
++
++    // In case of an exception or an error, we will try to read from the
++    // datanodes in the pipeline in a round robin fashion.
++
++    // TODO: cache the correct leader info in here, so that any subsequent calls
++    // should first go to leader
++    for (DatanodeDetails dn : pipeline.getMachines()) {
++      try {
++
++        // In case the command gets retried on a 2nd datanode,
++        // sendCommandAsyncCall will create a new channel and async stub
++        // in case these don't exist for the specific datanode.
++        responseProto =
++            sendCommandAsync(request, dn).get();
++        dnIndex++;
++        if (responseProto.getResult() == ContainerProtos.Result.SUCCESS
++            || dnIndex == size) {
++          return responseProto;
++        }
++      } catch (ExecutionException | InterruptedException e) {
++        if (dnIndex < size) {
++          LOG.warn(
++              "Failed to execute command " + request + " on datanode " + dn
++                  .getUuidString() +". Retrying", e);
++        } else {
++          throw new IOException("Failed to execute command " + request, e);
++        }
++      }
++    }
++    return responseProto;
++  }
++
++  // TODO: for a true async API, once the waitable future while executing
++  // the command on one channel fails, it should be retried asynchronously
++  // on the future Task for all the remaining datanodes.
++
++  // Note: this Async api is not used currently used in any active I/O path.
++  // In case it gets used, the asynchronous retry logic needs to be plugged
++  // in here.
+-  public CompletableFuture<ContainerCommandResponseProto>
+-      sendCommandAsync(ContainerCommandRequestProto request)
++  public CompletableFuture<ContainerCommandResponseProto> sendCommandAsync(
++      ContainerCommandRequestProto request)
+-    if(closed){
++    return sendCommandAsync(request, pipeline.getLeader());
++  }
++
++  private CompletableFuture<ContainerCommandResponseProto> sendCommandAsync(
++      ContainerCommandRequestProto request, DatanodeDetails dn)
++      throws IOException, ExecutionException, InterruptedException {
++    if (closed) {
+-    if(channel == null || !isConnected()) {
+-      reconnect();
++    UUID dnId = dn.getUuid();
++    ManagedChannel channel = channels.get(dnId);
++    // If the channel doesn't exist for this specific datanode or the channel
++    // is closed, just reconnect
++    if (!isConnected(channel)) {
++      reconnect(dn);
+-    final StreamObserver<ContainerCommandRequestProto> requestObserver =
+-        asyncStub.send(new StreamObserver<ContainerCommandResponseProto>() {
+-          @Override
+-          public void onNext(ContainerCommandResponseProto value) {
+-            replyFuture.complete(value);
+-            metrics.decrPendingContainerOpsMetrics(request.getCmdType());
+-            metrics.addContainerOpsLatency(request.getCmdType(),
+-                Time.monotonicNowNanos() - requestTime);
+-            semaphore.release();
+-          }
+-          @Override
+-          public void onError(Throwable t) {
+-            replyFuture.completeExceptionally(t);
+-            metrics.decrPendingContainerOpsMetrics(request.getCmdType());
+-            metrics.addContainerOpsLatency(request.getCmdType(),
+-                Time.monotonicNowNanos() - requestTime);
+-            semaphore.release();
+-          }
+-          @Override
+-          public void onCompleted() {
+-            if (!replyFuture.isDone()) {
+-              replyFuture.completeExceptionally(
+-                  new IOException("Stream completed but no reply for request "
+-                      + request));
+-            }
+-          }
+-        });
++    // TODO: for async calls, we should reuse StreamObserver resources.
++    final StreamObserver<ContainerCommandRequestProto> requestObserver =
++        asyncStubs.get(dnId)
++            .send(new StreamObserver<ContainerCommandResponseProto>() {
++              @Override
++              public void onNext(ContainerCommandResponseProto value) {
++                replyFuture.complete(value);
++                metrics.decrPendingContainerOpsMetrics(request.getCmdType());
++                metrics.addContainerOpsLatency(request.getCmdType(),
++                    Time.monotonicNowNanos() - requestTime);
++                semaphore.release();
++              }
++
++              @Override
++              public void onError(Throwable t) {
++                replyFuture.completeExceptionally(t);
++                metrics.decrPendingContainerOpsMetrics(request.getCmdType());
++                metrics.addContainerOpsLatency(request.getCmdType(),
++                    Time.monotonicNowNanos() - requestTime);
++                semaphore.release();
++              }
++
++              @Override
++              public void onCompleted() {
++                if (!replyFuture.isDone()) {
++                  replyFuture.completeExceptionally(new IOException(
++                      "Stream completed but no reply for request " + request));
++                }
++              }
++            });
+-  private void reconnect() throws IOException {
++  private void reconnect(DatanodeDetails dn)
++      throws IOException {
++    ManagedChannel channel;
+-      connect();
++      connectToDatanode(dn);
++      channel = channels.get(dn.getUuid());
+-    if (channel == null || !isConnected()) {
++    if (channel == null || !isConnected(channel)) {

@@ -1,0 +1,200 @@
+Merge HDFS-3042 (automatic failover) to trunk.
+
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/trunk@1342112 13f79535-47bb-0310-9956-ffa450edef68
+
++import org.apache.hadoop.ha.HAZKUtil.ZKAuthInfo;
+-     * This method is called when the app becomes the active leader
++     * This method is called when the app becomes the active leader.
++     * If the service fails to become active, it should throw
++     * ServiceFailedException. This will cause the elector to
++     * sleep for a short period, then re-join the election.
++     * 
++     * Callback implementations are expected to manage their own
++     * timeouts (e.g. when making an RPC to a remote node).
+-    void becomeActive();
++    void becomeActive() throws ServiceFailedException;
+-  private static final int NUM_RETRIES = 3;
++  static int NUM_RETRIES = 3;
++  private static final int SLEEP_AFTER_FAILURE_TO_BECOME_ACTIVE = 1000;
++  private final List<ZKAuthInfo> zkAuthInfo;
++   * @param authInfo a list of authentication credentials to add to the
++   *                 ZK connection
++      List<ZKAuthInfo> authInfo,
++    zkAuthInfo = authInfo;
+-    LOG.debug("Attempting active election");
+-
++    LOG.debug("Attempting active election for " + this);
++    Preconditions.checkState(!wantToBeInElection,
++        "ensureParentZNode() may not be called while in the election");
++
++    Preconditions.checkState(!wantToBeInElection,
++        "clearParentZNode() may not be called while in the election");
++
+-      return zkClient.getData(zkLockFilePath, false, stat);
++      return getDataWithRetries(zkLockFilePath, false, stat);
+-        + " connectionState: " + zkConnectionState);
++        + " connectionState: " + zkConnectionState +
++        "  for " + this);
+-      becomeActive();
+-      monitorActiveStatus();
++      if (becomeActive()) {
++        monitorActiveStatus();
++      } else {
++        reJoinElectionAfterFailureToBecomeActive();
++      }
++    
++    assert wantToBeInElection :
++        "Got a StatNode result after quitting election";
++    
+-        + " connectionState: " + zkConnectionState);
++        + " connectionState: " + zkConnectionState + " for " + this);
++        
+-        becomeActive();
++        if (!becomeActive()) {
++          reJoinElectionAfterFailureToBecomeActive();
++        }
++    } else if (isSessionExpired(code)) {
++      // This isn't fatal - the client Watcher will re-join the election
++      LOG.warn("Lock monitoring failed because session was lost");
++      return;
+-   * interface implementation of Zookeeper watch events (connection and node)
++   * We failed to become active. Re-join the election, but
++   * sleep for a few seconds after terminating our existing
++   * session, so that other nodes have a chance to become active.
++   * The failure to become active is already logged inside
++   * becomeActive().
++   */
++  private void reJoinElectionAfterFailureToBecomeActive() {
++    reJoinElection(SLEEP_AFTER_FAILURE_TO_BECOME_ACTIVE);
++  }
++
++  /**
++   * interface implementation of Zookeeper watch events (connection and node),
++   * proxied by {@link WatcherWithClientRef}.
+-        + " connectionState: " + zkConnectionState);
++        + " connectionState: " + zkConnectionState
++        + " for " + this);
+-        if (prevConnectionState == ConnectionState.DISCONNECTED) {
++        if (prevConnectionState == ConnectionState.DISCONNECTED &&
++            wantToBeInElection) {
+-        reJoinElection();
++        reJoinElection(0);
++    for (ZKAuthInfo auth : zkAuthInfo) {
++      zk.addAuthInfo(auth.getScheme(), auth.getAuth());
++    }
++    LOG.fatal(errorMessage);
+-    LOG.debug("Monitoring active leader");
++    assert wantToBeInElection;
++    LOG.debug("Monitoring active leader for " + this);
+-  private void reJoinElection() {
++  private void reJoinElection(int sleepTime) {
++      sleepFor(sleepTime);
++      
+-  
++
++  /**
++   * Sleep for the given number of milliseconds.
++   * This is non-static, and separated out, so that unit tests
++   * can override the behavior not to sleep.
++   */
++  @VisibleForTesting
++  protected void sleepFor(int sleepMs) {
++    if (sleepMs > 0) {
++      try {
++        Thread.sleep(sleepMs);
++      } catch (InterruptedException e) {
++        Thread.currentThread().interrupt();
++      }
++    }
++  }
++
+-  long getZKSessionIdForTests() {
+-    return zkClient.getSessionId();
++  synchronized long getZKSessionIdForTests() {
++    if (zkClient != null) {
++      return zkClient.getSessionId();
++    } else {
++      return -1;
++    }
+-      LOG.debug("Establishing zookeeper connection");
++      LOG.debug("Establishing zookeeper connection for " + this);
+-        try {
+-          Thread.sleep(5000);
+-        } catch(InterruptedException e1) {
+-          LOG.warn(e1);
+-        }
++        sleepFor(5000);
++    if (zkClient != null) {
++      try {
++        zkClient.close();
++      } catch (InterruptedException e) {
++        throw new IOException("Interrupted while closing ZK",
++            e);
++      }
++      zkClient = null;
++    }
++    LOG.debug("Created new connection for " + this);
+-  private void terminateConnection() {
++  void terminateConnection() {
+-    LOG.debug("Terminating ZK connection");
++    LOG.debug("Terminating ZK connection for " + this);
+-  private void becomeActive() {
++  private boolean becomeActive() {
+-    if (state != State.ACTIVE) {
+-      try {
+-        Stat oldBreadcrumbStat = fenceOldActive();
+-        writeBreadCrumbNode(oldBreadcrumbStat);
+-      } catch (Exception e) {
+-        LOG.warn("Exception handling the winning of election", e);
+-        reJoinElection();
+-        return;
+-      }
+-      LOG.debug("Becoming active");
+-      state = State.ACTIVE;
++    if (state == State.ACTIVE) {
++      // already active
++      return true;
++    }
++    try {
++      Stat oldBreadcrumbStat = fenceOldActive();
++      writeBreadCrumbNode(oldBreadcrumbStat);
++      
++      LOG.debug("Becoming active for " + this);
++      state = State.ACTIVE;
++      return true;
++    } catch (Exception e) {
++      LOG.warn("Exception handling the winning of election", e);
++      // Caller will handle quitting and rejoining the election.
++      return false;
+-      LOG.debug("Becoming standby");
++      LOG.debug("Becoming standby for " + this);
+-      LOG.debug("Entering neutral mode");
++      LOG.debug("Entering neutral mode for " + this);
++  private byte[] getDataWithRetries(final String path, final boolean watch,
++      final Stat stat) throws InterruptedException, KeeperException {
++    return zkDoWithRetries(new ZKAction<byte[]>() {
++      public byte[] run() throws KeeperException, InterruptedException {
++        return zkClient.getData(path, watch, stat);
++      }
++    });
++  }
++
+-      ActiveStandbyElector.this.processWatchEvent(
+-          zk, event);
++      try {
++        ActiveStandbyElector.this.processWatchEvent(
++            zk, event);
++      } catch (Throwable t) {
++        fatalError(
++            "Failed to process watcher event " + event + ": " +
++            StringUtils.stringifyException(t));
++      }
++  
++  @Override
++  public String toString() {
++    return "elector id=" + System.identityHashCode(this) +
++      " appData=" +
++      ((appData == null) ? "null" : StringUtils.byteToHexString(appData)) + 
++      " cb=" + appClient;
++  }

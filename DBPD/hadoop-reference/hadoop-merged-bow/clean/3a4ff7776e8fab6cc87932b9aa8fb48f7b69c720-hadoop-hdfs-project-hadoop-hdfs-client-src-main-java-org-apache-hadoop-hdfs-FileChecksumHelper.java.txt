@@ -1,0 +1,191 @@
+HDFS-9694. Make existing DFSClient#getFileChecksum() work for striped blocks. Contributed by Kai Zheng
+
++import org.apache.hadoop.hdfs.protocol.ErasureCodingPolicy;
++import org.apache.hadoop.hdfs.protocol.LocatedStripedBlock;
++import org.apache.hadoop.hdfs.protocol.StripedBlockInfo;
+-    private boolean refetchBlocks = false;
++    private boolean isRefetchBlocks = false;
+-    void setBlockLocations(LocatedBlocks blockLocations) {
+-      this.blockLocations = blockLocations;
++    void refetchBlocks() throws IOException {
++      this.blockLocations = getClient().getBlockLocations(getSrc(),
++          getLength());
++      this.locatedBlocks = getBlockLocations().getLocatedBlocks();
++      this.isRefetchBlocks = false;
+-    void setLocatedBlocks(List<LocatedBlock> locatedBlocks) {
+-      this.locatedBlocks = locatedBlocks;
+-    }
+-
+-      return refetchBlocks;
++      return isRefetchBlocks;
+-      this.refetchBlocks = refetchBlocks;
++      this.isRefetchBlocks = refetchBlocks;
+-          setBlockLocations(getClient().getBlockLocations(getSrc(),
+-              getLength()));
+-          setLocatedBlocks(getBlockLocations().getLocatedBlocks());
+-          setRefetchBlocks(false);
++          refetchBlocks();
+-        final MD5Hash md5 = new MD5Hash(
+-            checksumData.getMd5().toByteArray());
++        final MD5Hash md5 = new MD5Hash(checksumData.getMd5().toByteArray());
+-          ct = PBHelperClient.convert(checksumData
+-              .getCrcType());
++          ct = PBHelperClient.convert(checksumData.getCrcType());
++
++  /**
++   * Striped file checksum computing.
++   */
++  static class StripedFileNonStripedChecksumComputer
++      extends FileChecksumComputer {
++    private final ErasureCodingPolicy ecPolicy;
++    private int bgIdx;
++
++    StripedFileNonStripedChecksumComputer(String src, long length,
++                                          LocatedBlocks blockLocations,
++                                          ClientProtocol namenode,
++                                          DFSClient client,
++                                          ErasureCodingPolicy ecPolicy)
++        throws IOException {
++      super(src, length, blockLocations, namenode, client);
++
++      this.ecPolicy = ecPolicy;
++    }
++
++    @Override
++    void checksumBlocks() throws IOException {
++      int tmpTimeout = 3000 * 1 + getClient().getConf().getSocketTimeout();
++      setTimeout(tmpTimeout);
++
++      for (bgIdx = 0;
++           bgIdx < getLocatedBlocks().size() && getRemaining() >= 0; bgIdx++) {
++        if (isRefetchBlocks()) {  // refetch to get fresh tokens
++          refetchBlocks();
++        }
++
++        LocatedBlock locatedBlock = getLocatedBlocks().get(bgIdx);
++        LocatedStripedBlock blockGroup = (LocatedStripedBlock) locatedBlock;
++
++        if (!checksumBlockGroup(blockGroup)) {
++          throw new IOException("Fail to get block MD5 for " + locatedBlock);
++        }
++      }
++    }
++
++
++    private boolean checksumBlockGroup(
++        LocatedStripedBlock blockGroup) throws IOException {
++      ExtendedBlock block = blockGroup.getBlock();
++      if (getRemaining() < block.getNumBytes()) {
++        block.setNumBytes(getRemaining());
++      }
++      setRemaining(getRemaining() - block.getNumBytes());
++
++      StripedBlockInfo stripedBlockInfo = new StripedBlockInfo(block,
++          blockGroup.getLocations(), blockGroup.getBlockTokens(), ecPolicy);
++      DatanodeInfo[] datanodes = blockGroup.getLocations();
++
++      //try each datanode in the block group.
++      boolean done = false;
++      for (int j = 0; !done && j < datanodes.length; j++) {
++        try {
++          tryDatanode(blockGroup, stripedBlockInfo, datanodes[j]);
++          done = true;
++        } catch (InvalidBlockTokenException ibte) {
++          if (bgIdx > getLastRetriedIndex()) {
++            LOG.debug("Got access token error in response to OP_BLOCK_CHECKSUM "
++                    + "for file {} for block {} from datanode {}. Will retry "
++                    + "the block once.",
++                getSrc(), block, datanodes[j]);
++            setLastRetriedIndex(bgIdx);
++            done = true; // actually it's not done; but we'll retry
++            bgIdx--; // repeat at bgIdx-th block
++            setRefetchBlocks(true);
++          }
++        } catch (IOException ie) {
++          LOG.warn("src={}" + ", datanodes[{}]={}",
++              getSrc(), j, datanodes[j], ie);
++        }
++      }
++
++      return done;
++    }
++
++    /**
++     * Return true when sounds good to continue or retry, false when severe
++     * condition or totally failed.
++     */
++    private void tryDatanode(LocatedStripedBlock blockGroup,
++                             StripedBlockInfo stripedBlockInfo,
++                             DatanodeInfo datanode) throws IOException {
++
++      try (IOStreamPair pair = getClient().connectToDN(datanode,
++          getTimeout(), blockGroup.getBlockToken())) {
++
++        LOG.debug("write to {}: {}, blockGroup={}",
++            datanode, Op.BLOCK_GROUP_CHECKSUM, blockGroup);
++
++        // get block MD5
++        createSender(pair).blockGroupChecksum(stripedBlockInfo,
++            blockGroup.getBlockToken());
++
++        BlockOpResponseProto reply = BlockOpResponseProto.parseFrom(
++            PBHelperClient.vintPrefixed(pair.in));
++
++        String logInfo = "for blockGroup " + blockGroup +
++            " from datanode " + datanode;
++        DataTransferProtoUtil.checkBlockOpStatus(reply, logInfo);
++
++        OpBlockChecksumResponseProto checksumData = reply.getChecksumResponse();
++
++        //read byte-per-checksum
++        final int bpc = checksumData.getBytesPerCrc();
++        if (bgIdx == 0) { //first block
++          setBytesPerCRC(bpc);
++        } else {
++          if (bpc != getBytesPerCRC()) {
++            throw new IOException("Byte-per-checksum not matched: bpc=" + bpc
++                + " but bytesPerCRC=" + getBytesPerCRC());
++          }
++        }
++
++        //read crc-per-block
++        final long cpb = checksumData.getCrcPerBlock();
++        if (getLocatedBlocks().size() > 1 && bgIdx == 0) { // first block
++          setCrcPerBlock(cpb);
++        }
++
++        //read md5
++        final MD5Hash md5 = new MD5Hash(
++            checksumData.getMd5().toByteArray());
++        md5.write(getMd5out());
++
++        // read crc-type
++        final DataChecksum.Type ct;
++        if (checksumData.hasCrcType()) {
++          ct = PBHelperClient.convert(checksumData.getCrcType());
++        } else {
++          LOG.debug("Retrieving checksum from an earlier-version DataNode: " +
++              "inferring checksum by reading first byte");
++          ct = getClient().inferChecksumTypeByReading(blockGroup, datanode);
++        }
++
++        if (bgIdx == 0) {
++          setCrcType(ct);
++        } else if (getCrcType() != DataChecksum.Type.MIXED &&
++            getCrcType() != ct) {
++          // if crc types are mixed in a file
++          setCrcType(DataChecksum.Type.MIXED);
++        }
++
++        if (LOG.isDebugEnabled()) {
++          if (bgIdx == 0) {
++            LOG.debug("set bytesPerCRC=" + getBytesPerCRC()
++                + ", crcPerBlock=" + getCrcPerBlock());
++          }
++          LOG.debug("got reply from " + datanode + ": md5=" + md5);
++        }
++      }
++    }
++  }
+
+INS26 INS26 INS26 INS40 INS40 INS40 INS55 INS29 INS83 INS42 INS43 INS23 INS23 INS31 INS31 INS31 INS31 UPD42 INS43 INS65 INS42 INS83 INS83 INS43 INS59 INS83 INS39 INS59 INS42 INS44 INS44 MOV44 INS44 INS44 INS44 INS43 INS8 INS78 INS39 INS42 INS43 INS8 INS83 INS39 INS42 INS44 INS43 INS8 INS29 INS83 INS39 INS42 INS44 INS44 INS44 INS43 INS8 UPD42 INS42 MOV21 INS21 INS66 INS42 INS42 INS42 INS43 INS42 INS39 INS42 INS43 INS42 INS43 INS42 INS43 INS42 INS42 INS46 INS21 INS42 INS42 INS60 INS21 INS24 INS43 INS42 INS42 INS60 INS25 INS21 INS60 INS60 INS60 INS24 INS41 INS65 INS43 INS42 INS43 INS42 INS43 INS42 INS42 INS54 INS7 UPD42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS7 INS39 INS59 INS32 INS7 INS27 INS37 INS8 INS42 INS43 INS59 INS27 INS8 INS32 INS43 INS59 INS5 INS59 INS39 INS59 INS58 INS27 INS37 INS8 INS42 INS66 INS66 INS42 INS42 INS42 INS58 INS8 MOV32 MOV32 INS22 INS9 INS22 INS42 INS42 INS27 INS42 INS42 INS42 INS34 INS27 INS27 INS42 INS25 INS60 INS60 INS25 INS42 INS42 INS32 INS32 INS32 INS21 INS42 INS27 INS42 INS42 INS14 INS43 INS85 INS42 INS32 INS42 INS9 INS39 INS59 INS38 INS27 INS42 INS54 INS43 INS59 INS21 INS21 INS60 INS60 INS21 INS60 INS60 INS25 INS60 INS25 INS60 INS21 INS60 INS25 INS25 INS25 INS52 INS42 UPD42 INS52 INS42 INS27 INS32 INS42 INS32 INS32 INS34 INS32 INS8 MOV43 INS59 INS43 INS59 INS38 INS8 INS42 INS42 INS42 INS42 INS42 INS32 INS32 INS32 INS43 INS42 INS32 INS32 INS42 INS42 INS42 INS42 INS42 INS34 INS42 INS42 INS40 INS8 INS12 INS12 INS42 INS42 INS32 INS32 INS32 INS43 INS59 INS43 INS59 INS32 INS43 INS59 INS83 INS39 INS59 INS27 INS8 INS8 INS83 INS39 INS59 INS27 INS8 INS83 INS43 INS59 INS32 INS83 INS43 INS59 INS32 INS8 INS8 INS27 INS8 INS25 INS32 INS8 INS34 INS34 INS32 INS42 INS32 INS42 INS42 INS42 INS21 INS42 INS32 INS42 INS42 INS11 INS32 INS53 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS21 INS21 INS44 INS8 INS44 INS8 INS32 INS42 INS42 INS32 INS32 INS42 INS42 INS45 INS42 INS40 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS27 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS32 INS42 INS34 INS21 INS25 INS42 INS32 INS27 INS27 INS21 INS42 INS42 INS14 INS42 INS42 INS32 INS40 INS42 INS42 INS42 INS21 INS21 INS21 INS42 INS34 INS21 INS27 INS8 INS42 INS42 INS25 INS21 INS32 INS42 INS42 INS32 INS32 INS42 INS42 INS43 INS42 INS42 INS42 INS14 INS42 INS32 INS7 INS43 INS42 INS25 INS43 INS42 INS21 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS45 INS42 INS45 INS42 INS42 INS42 INS42 INS42 INS32 INS27 INS8 INS42 INS42 INS32 INS34 INS42 INS34 INS32 INS43 INS32 INS42 INS7 INS32 INS7 INS32 INS27 INS27 INS21 INS27 INS8 INS32 UPD42 INS42 INS42 INS42 INS42 INS43 INS27 INS42 INS42 INS42 INS2 INS42 INS9 INS42 INS27 INS8 INS42 INS32 INS42 INS42 INS40 INS42 INS42 INS42 INS32 INS53 INS32 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS27 INS42 INS32 INS42 INS42 INS32 INS40 INS32 INS42 INS32 INS42 INS34 INS21 INS42 INS42 INS27 INS42 INS45 INS42 INS42 INS42 INS42 INS32 INS21 INS21 INS21 INS21 INS21 INS42 INS42 INS27 INS32 INS42 INS2 INS42 INS42 INS14 INS42 INS42 INS42 INS42 INS42 INS32 INS45 INS45 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS40 INS32 INS45 INS42 INS45 INS42 INS42 INS32 INS32 INS7 INS37 INS32 INS45 INS45 INS42 INS42 INS42 INS43 INS27 INS42 INS42 INS42 INS42 INS42 INS27 INS42 INS42 INS27 INS32 INS42 INS2 INS42 INS42 INS42 INS9 INS42 INS42 INS9 INS42 INS45 INS42 INS45 INS32 INS45 INS32 INS45 INS32 INS45 INS45 INS45 INS42 INS42 INS42 INS42 INS42 INS42 DEL42 DEL42 DEL39 DEL42 DEL42 DEL43 DEL74 DEL42 DEL44 DEL8 DEL31 DEL42 DEL32 DEL21 DEL42 DEL32 DEL21 DEL9

@@ -1,0 +1,193 @@
+HDFS-1623. High Availability Framework for HDFS NN. Contributed by Todd Lipcon, Aaron T. Myers, Eli Collins, Uma Maheswara Rao G, Bikas Saha, Suresh Srinivas, Jitendra Nath Pandey, Hari Mankude, Brandon Li, Sanjay Radia, Mingjie Lai, and Gregory Chanan
+
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/trunk@1296534 13f79535-47bb-0310-9956-ffa450edef68
+
++   * 
++   * In a non-HA setup:
++   * 
+-   * initialized, it is usually in IN_SEGMENT state, indicating that edits
+-   * may be written. In the middle of a roll, or while saving the namespace,
+-   * it briefly enters the BETWEEN_LOG_SEGMENTS state, indicating that the
+-   * previous segment has been closed, but the new one has not yet been opened.
++   * initialized, it is usually in IN_SEGMENT state, indicating that edits may
++   * be written. In the middle of a roll, or while saving the namespace, it
++   * briefly enters the BETWEEN_LOG_SEGMENTS state, indicating that the previous
++   * segment has been closed, but the new one has not yet been opened.
++   * 
++   * In an HA setup:
++   * 
++   * The log starts in UNINITIALIZED state upon construction. Once it's
++   * initialized, it sits in the OPEN_FOR_READING state the entire time that the
++   * NN is in standby. Upon the NN transition to active, the log will be CLOSED,
++   * and then move to being BETWEEN_LOG_SEGMENTS, much as if the NN had just
++   * started up, and then will move to IN_SEGMENT so it can begin writing to the
++   * log. The log states will then revert to behaving as they do in a non-HA
++   * setup.
++    OPEN_FOR_READING,
+-  private JournalSet journalSet;
++  private JournalSet journalSet = null;
+-  private Collection<URI> editsDirs;
++  private List<URI> editsDirs;
++  
++  /**
++   * The edit directories that are shared between primary and secondary.
++   */
++  private List<URI> sharedEditsDirs;
+-  FSEditLog(Configuration conf, NNStorage storage, Collection<URI> editsDirs) {
++  FSEditLog(Configuration conf, NNStorage storage, List<URI> editsDirs) {
+-  private void init(Configuration conf, NNStorage storage, Collection<URI> editsDirs) {
++  private void init(Configuration conf, NNStorage storage, List<URI> editsDirs) {
++
++    this.sharedEditsDirs = FSNamesystem.getSharedEditsDirs(conf);
++  }
++  
++  public synchronized void initJournalsForWrite() {
++    Preconditions.checkState(state == State.UNINITIALIZED ||
++        state == State.CLOSED, "Unexpected state: %s", state);
++    initJournals(this.editsDirs);
++    state = State.BETWEEN_LOG_SEGMENTS;
++  }
++  
++  public synchronized void initSharedJournalsForRead() {
++    if (state == State.OPEN_FOR_READING) {
++      LOG.warn("Initializing shared journals for READ, already open for READ",
++          new Exception());
++      return;
++    }
++    Preconditions.checkState(state == State.UNINITIALIZED ||
++        state == State.CLOSED);
++    
++    initJournals(this.sharedEditsDirs);
++    state = State.OPEN_FOR_READING;
++  }
++  
++  private synchronized void initJournals(List<URI> dirs) {
+-    for (URI u : this.editsDirs) {
++    for (URI u : dirs) {
+-          journalSet.add(new FileJournalManager(sd), required);
++          journalSet.add(new FileJournalManager(sd, storage), required);
+-    state = State.BETWEEN_LOG_SEGMENTS;
+-  synchronized void open() throws IOException {
+-    Preconditions.checkState(state == State.BETWEEN_LOG_SEGMENTS);
++  synchronized void openForWrite() throws IOException {
++    Preconditions.checkState(state == State.BETWEEN_LOG_SEGMENTS,
++        "Bad state: %s", state);
+-    startLogSegment(getLastWrittenTxId() + 1, true);
++    long segmentTxId = getLastWrittenTxId() + 1;
++    // Safety check: we should never start a segment if there are
++    // newer txids readable.
++    EditLogInputStream s = journalSet.getInputStream(segmentTxId, true);
++    try {
++      Preconditions.checkState(s == null,
++          "Cannot start writing at txid %s when there is a stream " +
++          "available for read: %s", segmentTxId, s);
++    } finally {
++      IOUtils.closeStream(s);
++    }
++    
++    startLogSegment(segmentTxId, true);
+-  synchronized boolean isOpen() {
++  /**
++   * @return true if the log is currently open in write mode, regardless
++   * of whether it actually has an open segment.
++   */
++  synchronized boolean isOpenForWrite() {
++    return state == State.IN_SEGMENT ||
++      state == State.BETWEEN_LOG_SEGMENTS;
++  }
++  
++  /**
++   * @return true if the log is open in write mode and has a segment open
++   * ready to take edits.
++   */
++  synchronized boolean isSegmentOpen() {
++   * @return true if the log is open in read mode.
++   */
++  public synchronized boolean isOpenForRead() {
++    return state == State.OPEN_FOR_READING;
++  }
++
++  /**
+-      assert state != State.CLOSED;
++      assert isOpenForWrite() :
++        "bad state: " + state;
+-  synchronized long getLastWrittenTxId() {
++  public synchronized long getLastWrittenTxId() {
+-    Preconditions.checkState(state == State.IN_SEGMENT,
++    Preconditions.checkState(isSegmentOpen(),
++  public void logUpdateBlocks(String path, INodeFileUnderConstruction file) {
++    UpdateBlocksOp op = UpdateBlocksOp.getInstance()
++      .setPath(path)
++      .setBlocks(file.getBlocks());
++    logEdit(op);
++  }
++  
+-  List<JournalAndStream> getJournals() {
++  synchronized List<JournalAndStream> getJournals() {
++   * Used only by tests.
++   */
++  @VisibleForTesting
++  synchronized public JournalSet getJournalSet() {
++    return journalSet;
++  }
++  
++  /**
++    this.journalSet.setRuntimeForTesting(runtime);
+-          segmentTxId + ": no journals successfully started.");
++          segmentTxId + ": too few journals successfully started.", ex);
+-    Preconditions.checkState(state == State.IN_SEGMENT,
++    Preconditions.checkState(isSegmentOpen(),
++        state = State.BETWEEN_LOG_SEGMENTS;
+-  public void purgeLogsOlderThan(final long minTxIdToKeep) {
+-    synchronized (this) {
+-      // synchronized to prevent findbugs warning about inconsistent
+-      // synchronization. This will be JIT-ed out if asserts are
+-      // off.
+-      assert curSegmentTxId == HdfsConstants.INVALID_TXID || // on format this is no-op
+-        minTxIdToKeep <= curSegmentTxId :
+-        "cannot purge logs older than txid " + minTxIdToKeep +
+-        " when current segment starts at " + curSegmentTxId;
+-    }
++  public synchronized void purgeLogsOlderThan(final long minTxIdToKeep) {
++    assert curSegmentTxId == HdfsConstants.INVALID_TXID || // on format this is no-op
++      minTxIdToKeep <= curSegmentTxId :
++      "cannot purge logs older than txid " + minTxIdToKeep +
++      " when current segment starts at " + curSegmentTxId;
++    // This could be improved to not need synchronization. But currently,
++    // journalSet is not threadsafe, so we need to synchronize this method.
+-  public void setOutputBufferCapacity(int size) {
+-      journalSet.setOutputBufferCapacity(size);
++  synchronized void setOutputBufferCapacity(int size) {
++    journalSet.setOutputBufferCapacity(size);
+-  void recoverUnclosedStreams() {
++  synchronized void recoverUnclosedStreams() {
++    Preconditions.checkState(
++        state == State.BETWEEN_LOG_SEGMENTS,
++        "May not recover segments - wrong state: %s", state);
++  
++  Collection<EditLogInputStream> selectInputStreams(long fromTxId,
++      long toAtLeastTxId) throws IOException {
++    return selectInputStreams(fromTxId, toAtLeastTxId, true);
++  }
++   * 
++   * @param inProgessOk set to true if in-progress streams are OK
+-  Collection<EditLogInputStream> selectInputStreams(long fromTxId,
+-      long toAtLeastTxId) throws IOException {
++  public synchronized Collection<EditLogInputStream> selectInputStreams(long fromTxId,
++      long toAtLeastTxId, boolean inProgressOk) throws IOException {
+-    EditLogInputStream stream = journalSet.getInputStream(fromTxId);
++    EditLogInputStream stream = journalSet.getInputStream(fromTxId, inProgressOk);
+-      fromTxId = stream.getLastTxId() + 1;
+-      stream = journalSet.getInputStream(fromTxId);
++      // We're now looking for a higher range, so reset the fromTxId
++      fromTxId = stream.getLastTxId() + 1;
++      stream = journalSet.getInputStream(fromTxId, inProgressOk);
++    
+-      throw new IOException("No non-corrupt logs for txid " 
+-                            + fromTxId);
++      throw new IOException(String.format("Gap in transactions. Expected to "
++          + "be able to read up until at least txid %d but unable to find any "
++          + "edit logs containing txid %d", toAtLeastTxId, fromTxId));
+
+INS23 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS72 UPD74 INS29 INS83 INS74 INS59 INS44 INS83 INS39 INS42 MOV44 MOV44 MOV44 INS8 INS83 INS83 INS39 INS42 INS8 INS83 INS83 INS39 INS42 INS8 INS83 UPD42 UPD42 INS29 INS83 INS39 INS42 INS8 INS29 UPD42 INS29 INS83 INS83 INS39 INS42 INS8 INS83 INS83 INS39 INS42 INS44 INS44 INS8 INS83 INS29 INS78 INS83 INS83 INS43 INS42 INS8 INS83 MOV8 UPD83 INS83 INS74 INS42 INS44 INS44 INS43 INS8 INS83 INS83 INS44 INS42 INS33 UPD43 INS65 INS43 INS43 INS42 INS74 INS42 UPD74 MOV21 MOV21 MOV21 MOV21 MOV21 MOV21 INS21 INS21 INS21 MOV21 INS25 INS21 INS21 INS21 UPD74 UPD42 INS21 INS60 INS60 INS54 INS65 INS41 INS65 INS65 INS41 INS43 INS42 INS43 INS42 INS60 INS21 INS65 INS42 INS42 INS41 INS21 MOV54 MOV21 INS43 INS43 INS39 INS42 INS39 INS42 INS42 INS41 INS65 INS39 INS42 INS66 UPD66 UPD66 UPD66 UPD66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 UPD42 INS66 INS42 INS42 INS43 INS43 UPD43 INS7 INS32 INS32 INS27 INS8 INS32 INS32 INS7 UPD43 INS42 INS32 INS39 INS59 INS43 INS59 INS8 INS8 INS66 INS66 INS27 INS66 INS66 INS66 INS27 INS42 INS42 INS43 INS59 INS32 INS66 INS42 INS32 INS42 INS42 INS32 INS42 INS66 MOV21 INS42 INS42 UPD42 INS22 INS32 INS42 INS42 INS27 INS45 INS42 INS42 MOV22 INS42 INS40 INS21 INS41 INS42 INS42 INS27 INS42 INS22 INS42 INS40 UPD42 INS42 INS42 INS27 INS45 INS42 INS42 MOV27 INS42 INS42 INS32 INS21 INS21 INS42 MOV27 INS27 INS42 INS40 INS32 INS42 INS42 INS32 INS42 INS42 INS22 INS42 INS42 INS32 INS45 INS42 INS42 INS42 INS42 INS9 INS52 INS42 INS42 INS42 INS42 INS27 INS27 INS32 INS27 INS27 INS52 INS42 INS42 INS40 INS42 INS42 INS42 INS9 INS32 INS32 INS42 INS40 INS32 UPD27 INS42 INS32 INS42 INS32 INS52 INS42 INS42 INS42 INS42 INS40 INS42 INS40 INS42 INS42 INS45 INS14 INS42 INS40 INS42 INS40 INS42 INS42 INS27 INS27 INS42 INS42 INS42 INS42 INS42 INS42 INS45 INS32 INS42 INS42 INS42 INS42 INS21 INS32 INS43 INS42 INS33 INS45 INS45 INS42 INS42 INS42 INS7 INS42 INS42 INS42 INS27 INS42 INS42 INS42 UPD45 INS42 INS40 INS45 INS45 UPD45 MOV45 INS42 DEL40 DEL42 DEL40 DEL27 DEL52 DEL51 DEL8 DEL42 DEL27

@@ -1,0 +1,253 @@
+Merge remote-tracking branch 'apache-commit/trunk' into HDDS-48
+
+-import org.apache.commons.lang.StringUtils;
++import org.apache.commons.lang3.StringUtils;
+-import java.util.Iterator;
+- * This is a local, in-memory, implementation of MetadataStore.
++ * This is a local, in-memory implementation of MetadataStore.
+- * Contains cache internally with time based eviction.
++ * Contains one cache internally with time based eviction.
+-  public static final int DEFAULT_MAX_RECORDS = 128;
++  public static final int DEFAULT_MAX_RECORDS = 256;
+-  /** Contains directories and files. */
+-  private Cache<Path, PathMetadata> fileCache;
+-
+-  /** Contains directory listings. */
+-  private Cache<Path, DirListingMetadata> dirCache;
++  /** Contains directory and file listings. */
++  private Cache<Path, LocalMetadataEntry> localCache;
+-    fileCache = builder.build();
+-    dirCache = builder.build();
++    localCache = builder.build();
+-      deleteEntryByAncestor(path, dirCache, tombstone);
+-      deleteEntryByAncestor(path, fileCache, tombstone);
++      deleteEntryByAncestor(path, localCache, tombstone);
+-      PathMetadata m = fileCache.getIfPresent(path);
++      PathMetadata m = getFileMeta(path);
+-    DirListingMetadata dirMeta = dirCache.getIfPresent(p);
+-    return dirMeta.withoutTombstones().isEmpty();
++    DirListingMetadata dlm = getDirListingMeta(p);
++    return dlm.withoutTombstones().isEmpty();
+-    DirListingMetadata listing = dirCache.getIfPresent(path);
++    DirListingMetadata listing = getDirListingMeta(path);
++    LOG.info("Move {} to {}", pathsToDelete, pathsToCreate);
+-      fileCache.put(path, meta);
++      LocalMetadataEntry entry = localCache.getIfPresent(path);
++      if(entry == null){
++        entry = new LocalMetadataEntry(meta);
++      } else {
++        entry.setPathMetadata(meta);
++      }
+-      if (status.isDirectory()) {
+-        DirListingMetadata dir = dirCache.getIfPresent(path);
+-        if (dir == null) {
+-          dirCache.put(path, new DirListingMetadata(path, DirListingMetadata
+-              .EMPTY_DIR, false));
+-        }
++      // only create DirListingMetadata if the entry does not have one
++      if (status.isDirectory() && !entry.hasDirMeta()) {
++        DirListingMetadata dlm =
++            new DirListingMetadata(path, DirListingMetadata.EMPTY_DIR, false);
++        entry.setDirListingMetadata(dlm);
++      localCache.put(path, entry);
+-        DirListingMetadata parent = dirCache.getIfPresent(parentPath);
+-        if (parent == null) {
+-        /* Track this new file's listing in parent.  Parent is not
+-         * authoritative, since there may be other items in it we don't know
+-         * about. */
+-          parent = new DirListingMetadata(parentPath,
+-              DirListingMetadata.EMPTY_DIR, false);
+-          dirCache.put(parentPath, parent);
++        LocalMetadataEntry parentMeta = localCache.getIfPresent(parentPath);
++        DirListingMetadata parentDirMeta =
++            new DirListingMetadata(parentPath, DirListingMetadata.EMPTY_DIR,
++                false);
++        parentDirMeta.put(status);
++
++        getDirListingMeta(parentPath);
++
++        if (parentMeta == null){
++          localCache.put(parentPath, new LocalMetadataEntry(parentDirMeta));
++        } else if (!parentMeta.hasDirMeta()) {
++          parentMeta.setDirListingMetadata(parentDirMeta);
++        } else {
++          parentMeta.getDirListingMeta().put(status);
+-        parent.put(status);
+-    dirCache.put(standardize(meta.getPath()), meta);
++    LocalMetadataEntry entry =
++        localCache.getIfPresent(standardize(meta.getPath()));
++    if(entry == null){
++      localCache.put(standardize(meta.getPath()), new LocalMetadataEntry(meta));
++    } else {
++      entry.setDirListingMetadata(meta);
++    }
+-    if (dirCache != null) {
+-      dirCache.invalidateAll();
++    if (localCache != null) {
++      localCache.invalidateAll();
+-  public synchronized void prune(long modTime, String keyPrefix)
+-      throws IOException {
+-    Iterator<Map.Entry<Path, PathMetadata>> files =
+-        fileCache.asMap().entrySet().iterator();
+-    while (files.hasNext()) {
+-      Map.Entry<Path, PathMetadata> entry = files.next();
+-      if (expired(entry.getValue().getFileStatus(), modTime, keyPrefix)) {
+-        files.remove();
+-      }
+-    }
+-    Iterator<Map.Entry<Path, DirListingMetadata>> dirs =
+-        dirCache.asMap().entrySet().iterator();
+-    while (dirs.hasNext()) {
+-      Map.Entry<Path, DirListingMetadata> entry = dirs.next();
+-      Path path = entry.getKey();
+-      DirListingMetadata metadata = entry.getValue();
+-      Collection<PathMetadata> oldChildren = metadata.getListing();
+-      Collection<PathMetadata> newChildren = new LinkedList<>();
++  public synchronized void prune(long modTime, String keyPrefix) {
++    // prune files
++    // filter path_metadata (files), filter expired, remove expired
++    localCache.asMap().entrySet().stream()
++        .filter(entry -> entry.getValue().hasPathMeta())
++        .filter(entry -> expired(
++            entry.getValue().getFileMeta().getFileStatus(), modTime, keyPrefix))
++        .forEach(entry -> localCache.invalidate(entry.getKey()));
+-      for (PathMetadata child : oldChildren) {
+-        FileStatus status = child.getFileStatus();
+-        if (!expired(status, modTime, keyPrefix)) {
+-          newChildren.add(child);
+-        }
+-      }
+-      if (newChildren.size() != oldChildren.size()) {
+-        dirCache.put(path, new DirListingMetadata(path, newChildren, false));
+-        if (!path.isRoot()) {
+-          DirListingMetadata parent = null;
+-          parent = dirCache.getIfPresent(path.getParent());
+-          if (parent != null) {
+-            parent.setAuthoritative(false);
++
++    // prune dirs
++    // filter DIR_LISTING_METADATA, remove expired, remove authoritative bit
++    localCache.asMap().entrySet().stream()
++        .filter(entry -> entry.getValue().hasDirMeta())
++        .forEach(entry -> {
++          Path path = entry.getKey();
++          DirListingMetadata metadata = entry.getValue().getDirListingMeta();
++          Collection<PathMetadata> oldChildren = metadata.getListing();
++          Collection<PathMetadata> newChildren = new LinkedList<>();
++
++          for (PathMetadata child : oldChildren) {
++            FileStatus status = child.getFileStatus();
++            if (!expired(status, modTime, keyPrefix)) {
++              newChildren.add(child);
++            }
+-        }
+-      }
+-    }
++          if (newChildren.size() != oldChildren.size()) {
++            DirListingMetadata dlm =
++                new DirListingMetadata(path, newChildren, false);
++            localCache.put(path, new LocalMetadataEntry(dlm));
++            if (!path.isRoot()) {
++              DirListingMetadata parent = getDirListingMeta(path.getParent());
++              if (parent != null) {
++                parent.setAuthoritative(false);
++              }
++            }
++          }
++        });
+-  static <T> void deleteEntryByAncestor(Path ancestor, Cache<Path, T> cache,
+-                                       boolean tombstone) {
+-    for (Iterator<Map.Entry<Path, T>> it = cache.asMap().entrySet().iterator();
+-         it.hasNext();) {
+-      Map.Entry<Path, T> entry = it.next();
+-      Path f = entry.getKey();
+-      T meta = entry.getValue();
+-      if (isAncestorOf(ancestor, f)) {
+-        if (tombstone) {
+-          if (meta instanceof PathMetadata) {
+-            cache.put(f, (T) PathMetadata.tombstone(f));
+-          } else if (meta instanceof DirListingMetadata) {
+-            it.remove();
++  static void deleteEntryByAncestor(Path ancestor,
++      Cache<Path, LocalMetadataEntry> cache, boolean tombstone) {
++
++    cache.asMap().entrySet().stream()
++        .filter(entry -> isAncestorOf(ancestor, entry.getKey()))
++        .forEach(entry -> {
++          LocalMetadataEntry meta = entry.getValue();
++          Path path = entry.getKey();
++          if(meta.hasDirMeta()){
++            cache.invalidate(path);
++          } else if(tombstone && meta.hasPathMeta()){
++            meta.setPathMetadata(PathMetadata.tombstone(path));
+-            throw new IllegalStateException("Unknown type in cache");
++            cache.invalidate(path);
+-        } else {
+-          it.remove();
+-        }
+-      }
+-    }
++        });
+-   * @return true iff 'ancestor' is ancestor dir in path 'f'.
++   * @return true if 'ancestor' is ancestor dir in path 'f'.
+-
+-    // Remove target file/dir
+-    LOG.debug("delete file entry for {}", path);
+-    if (tombstone) {
+-      fileCache.put(path, PathMetadata.tombstone(path));
+-    } else {
+-      fileCache.invalidate(path);
++    LocalMetadataEntry entry = localCache.getIfPresent(path);
++    // If there's no entry, delete should silently succeed
++    // (based on MetadataStoreTestBase#testDeleteNonExisting)
++    if(entry == null){
++      LOG.warn("Delete: path {} is missing from cache.", path);
++      return;
+-    // Update this and parent dir listing, if any
++    // Remove target file entry
++    LOG.debug("delete file entry for {}", path);
++    if(entry.hasPathMeta()){
++      if (tombstone) {
++        PathMetadata pmd = PathMetadata.tombstone(path);
++        entry.setPathMetadata(pmd);
++      } else {
++        entry.setPathMetadata(null);
++      }
++    }
+-    /* If this path is a dir, remove its listing */
+-    LOG.debug("removing listing of {}", path);
++    // If this path is a dir, remove its listing
++    if(entry.hasDirMeta()) {
++      LOG.debug("removing listing of {}", path);
++      entry.setDirListingMetadata(null);
++    }
+-    dirCache.invalidate(path);
++    // If the entry is empty (contains no dirMeta or pathMeta) remove it from
++    // the cache.
++    if(!entry.hasDirMeta() && !entry.hasPathMeta()){
++      localCache.invalidate(entry);
++    }
+-      DirListingMetadata dir = null;
+-      dir = dirCache.getIfPresent(parent);
++      DirListingMetadata dir = getDirListingMeta(parent);
++
++  PathMetadata getFileMeta(Path p){
++    LocalMetadataEntry entry = localCache.getIfPresent(p);
++    if(entry != null && entry.hasPathMeta()){
++      return entry.getFileMeta();
++    } else {
++      return null;
++    }
++  }
++
++  DirListingMetadata getDirListingMeta(Path p){
++    LocalMetadataEntry entry = localCache.getIfPresent(p);
++    if(entry != null && entry.hasDirMeta()){
++      return entry.getDirListingMeta();
++    } else {
++      return null;
++    }
++  }
++
+
+UPD40 INS31 INS31 INS31 UPD74 MOV78 MOV83 MOV39 MOV42 MOV44 MOV44 MOV44 INS8 MOV43 INS42 INS44 INS8 MOV43 INS42 INS44 INS8 UPD66 UPD66 UPD34 UPD43 UPD42 INS21 INS60 INS25 INS21 INS21 UPD74 INS21 INS60 INS25 INS25 INS25 INS25 INS43 INS42 INS60 INS25 INS43 INS42 INS60 INS25 UPD66 UPD42 MOV43 MOV43 INS32 INS43 INS59 INS27 INS8 INS8 INS32 INS32 MOV43 UPD43 INS32 UPD66 INS43 INS59 INS27 INS8 INS32 INS8 INS32 INS8 INS27 INS8 INS42 INS43 MOV59 INS27 INS8 INS8 INS42 INS43 INS59 INS27 MOV8 INS8 UPD42 UPD42 INS42 INS42 INS45 INS42 INS42 INS60 INS25 INS25 MOV21 INS42 INS42 MOV32 INS42 INS33 MOV21 INS21 UPD42 INS32 UPD42 MOV42 INS86 INS32 INS42 INS86 UPD42 INS32 INS42 INS86 INS42 INS42 INS32 INS42 INS33 INS21 INS41 INS42 INS42 INS25 INS42 INS42 MOV21 INS21 INS38 INS38 MOV21 INS60 UPD42 MOV42 INS27 INS32 INS41 INS41 UPD42 MOV42 INS42 INS32 INS27 INS32 INS41 INS41 UPD42 UPD42 UPD42 INS43 MOV59 MOV27 INS8 INS8 INS27 INS8 UPD42 UPD42 INS32 INS32 INS32 INS42 INS86 INS59 INS32 INS32 UPD42 MOV42 INS86 INS59 MOV8 MOV60 MOV32 INS42 INS86 INS59 INS8 INS42 INS42 INS42 INS32 INS42 INS8 INS8 INS32 INS32 INS32 MOV43 INS59 INS42 UPD42 UPD42 INS42 INS33 UPD42 MOV42 UPD42 MOV42 INS32 INS33 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 INS42 INS33 UPD42 MOV42 UPD42 MOV42 INS32 INS33 UPD42 INS42 UPD42 UPD42 INS21 INS21 MOV32 INS38 INS60 INS21 UPD42 INS42 INS60 INS21 INS21 INS25 INS42 INS42 INS32 INS14 INS42 INS42 INS42 UPD42 INS32 UPD42 MOV42 INS86 INS59 INS32 INS42 INS42 INS42 INS32 MOV32 UPD42 MOV42 INS59 INS32 INS42 UPD42 INS59 INS32 INS42 MOV60 INS60 INS25 INS42 INS42 INS45 INS42 INS60 INS21 INS21 INS42 INS42 INS33 INS42 INS42 INS42 INS42 UPD42 UPD42 MOV42 INS32 INS42 INS42 UPD42 MOV42 UPD42 MOV42 UPD42 UPD42 INS7 INS32 INS32 MOV43 INS59 INS32 INS43 MOV43 INS59 INS32 INS32 MOV27 MOV8 INS25 INS42 INS32 INS43 INS42 MOV32 UPD42 MOV42 INS59 MOV32 MOV42 INS42 INS32 MOV42 MOV42 INS42 INS42 INS42 MOV32 UPD42 MOV42 MOV43 INS59 INS42 INS42 INS42 MOV32 UPD43 INS43 INS59 INS32 INS8 MOV25 MOV43 INS59 INS32 INS32 UPD42 MOV42 MOV42 INS42 INS14 INS42 INS42 INS42 INS42 INS42 INS42 MOV14 INS42 INS42 INS42 INS42 UPD42 INS42 MOV14 INS42 INS42 INS42 INS42 INS42 UPD42 INS38 INS8 INS8 INS42 INS42 INS42 INS42 UPD42 INS32 INS42 UPD42 INS42 INS32 INS60 UPD42 MOV42 INS42 INS32 UPD42 MOV42 UPD42 MOV42 INS21 INS27 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS33 INS43 INS42 UPD42 INS32 INS21 MOV21 UPD42 INS32 UPD42 MOV42 INS32 UPD42 MOV42 MOV43 INS59 INS42 INS42 INS32 INS42 INS32 INS42 INS42 INS42 INS42 UPD42 INS14 INS42 INS42 INS32 UPD42 MOV42 UPD42 MOV42 INS42 UPD42 MOV42 INS42 MOV14 UPD42 INS14 INS42 INS42 INS42 INS42 INS42 INS43 INS42 INS42 INS42 INS42 INS32 INS43 INS42 MOV43 UPD42 UPD42 UPD42 INS42 UPD42 MOV42 INS42 INS42 MOV32 UPD42 DEL40 DEL26 DEL66 DEL65 DEL29 DEL83 DEL42 DEL43 DEL42 DEL43 DEL42 DEL43 DEL74 DEL42 DEL59 DEL23 DEL42 DEL42 DEL42 DEL32 DEL7 DEL21 DEL42 DEL42 DEL42 DEL42 DEL32 DEL21 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL21 DEL60 DEL8 DEL25 DEL8 DEL25 DEL42 DEL7 DEL21 DEL42 DEL25 DEL42 DEL42 DEL43 DEL40 DEL43 DEL42 DEL43 DEL74 DEL42 DEL32 DEL59 DEL42 DEL59 DEL60 DEL42 DEL33 DEL42 DEL7 DEL21 DEL42 DEL43 DEL40 DEL43 DEL42 DEL43 DEL42 DEL43 DEL74 DEL74 DEL42 DEL32 DEL59 DEL60 DEL42 DEL32 DEL40 DEL43 DEL42 DEL43 DEL74 DEL32 DEL59 DEL60 DEL32 DEL42 DEL32 DEL21 DEL8 DEL25 DEL8 DEL61 DEL42 DEL43 DEL40 DEL43 DEL42 DEL43 DEL42 DEL43 DEL74 DEL74 DEL42 DEL32 DEL59 DEL60 DEL32 DEL61 DEL42 DEL43 DEL42 DEL42 DEL42 DEL73 DEL42 DEL43 DEL40 DEL43 DEL43 DEL42 DEL43 DEL74 DEL74 DEL42 DEL59 DEL58 DEL32 DEL40 DEL43 DEL43 DEL74 DEL60 DEL42 DEL43 DEL42 DEL59 DEL60 DEL42 DEL32 DEL42 DEL42 DEL62 DEL42 DEL42 DEL42 DEL43 DEL32 DEL11 DEL32 DEL21 DEL8 DEL42 DEL62 DEL32 DEL21 DEL8 DEL42 DEL43 DEL45 DEL14 DEL53 DEL8 DEL25 DEL25 DEL8 DEL25 DEL8 DEL25 DEL8 DEL24 DEL8 DEL31 DEL33 DEL59 DEL60 DEL42 DEL42 DEL32 DEL7 DEL21 DEL32 DEL21

@@ -1,0 +1,225 @@
+Merge trunk into HDFS-3077 branch.
+
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/branches/HDFS-3077@1377092 13f79535-47bb-0310-9956-ffa450edef68
+
+-import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_ENCRYPT_DATA_TRANSFER_DEFAULT;
+-import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_ENCRYPT_DATA_TRANSFER_KEY;
++import java.util.LinkedHashMap;
++import org.apache.hadoop.fs.BlockStorageLocation;
++import org.apache.hadoop.fs.HdfsBlockLocation;
++import org.apache.hadoop.fs.MD5MD5CRC32CastagnoliFileChecksum;
++import org.apache.hadoop.fs.MD5MD5CRC32GzipFileChecksum;
++import org.apache.hadoop.fs.Options.ChecksumOpt;
++import org.apache.hadoop.fs.VolumeId;
++import org.apache.hadoop.hdfs.protocol.HdfsBlocksMetadata;
+-import org.apache.hadoop.hdfs.protocol.HdfsConstants.UpgradeAction;
+-import org.apache.hadoop.hdfs.security.token.block.DataEncryptionKey;
++import org.apache.hadoop.hdfs.security.token.block.DataEncryptionKey;
++import org.apache.hadoop.hdfs.security.token.block.InvalidBlockTokenException;
+-import org.apache.hadoop.hdfs.server.common.UpgradeStatusReport;
+-    final int checksumType;
+-    final int bytesPerChecksum;
++    final ChecksumOpt defaultChecksumOpt;
++    final boolean getHdfsBlocksMetadataEnabled;
++    final int getFileBlockStorageLocationsNumThreads;
++    final int getFileBlockStorageLocationsTimeout;
+-      checksumType = getChecksumType(conf);
+-      bytesPerChecksum = conf.getInt(DFS_BYTES_PER_CHECKSUM_KEY,
+-          DFS_BYTES_PER_CHECKSUM_DEFAULT);
++      defaultChecksumOpt = getChecksumOptFromConf(conf);
++      getHdfsBlocksMetadataEnabled = conf.getBoolean(
++          DFSConfigKeys.DFS_HDFS_BLOCKS_METADATA_ENABLED, 
++          DFSConfigKeys.DFS_HDFS_BLOCKS_METADATA_ENABLED_DEFAULT);
++      getFileBlockStorageLocationsNumThreads = conf.getInt(
++          DFSConfigKeys.DFS_CLIENT_FILE_BLOCK_STORAGE_LOCATIONS_NUM_THREADS,
++          DFSConfigKeys.DFS_CLIENT_FILE_BLOCK_STORAGE_LOCATIONS_NUM_THREADS_DEFAULT);
++      getFileBlockStorageLocationsTimeout = conf.getInt(
++          DFSConfigKeys.DFS_CLIENT_FILE_BLOCK_STORAGE_LOCATIONS_TIMEOUT,
++          DFSConfigKeys.DFS_CLIENT_FILE_BLOCK_STORAGE_LOCATIONS_TIMEOUT_DEFAULT);
+-    private int getChecksumType(Configuration conf) {
+-      String checksum = conf.get(DFSConfigKeys.DFS_CHECKSUM_TYPE_KEY,
++    private DataChecksum.Type getChecksumType(Configuration conf) {
++      final String checksum = conf.get(
++          DFSConfigKeys.DFS_CHECKSUM_TYPE_KEY,
+-      if ("CRC32".equals(checksum)) {
+-        return DataChecksum.CHECKSUM_CRC32;
+-      } else if ("CRC32C".equals(checksum)) {
+-        return DataChecksum.CHECKSUM_CRC32C;
+-      } else if ("NULL".equals(checksum)) {
+-        return DataChecksum.CHECKSUM_NULL;
+-      } else {
+-        LOG.warn("Bad checksum type: " + checksum + ". Using default.");
+-        return DataChecksum.CHECKSUM_CRC32C;
++      try {
++        return DataChecksum.Type.valueOf(checksum);
++      } catch(IllegalArgumentException iae) {
++        LOG.warn("Bad checksum type: " + checksum + ". Using default "
++            + DFSConfigKeys.DFS_CHECKSUM_TYPE_DEFAULT);
++        return DataChecksum.Type.valueOf(
++            DFSConfigKeys.DFS_CHECKSUM_TYPE_DEFAULT); 
+-    private DataChecksum createChecksum() {
+-      return DataChecksum.newDataChecksum(
+-          checksumType, bytesPerChecksum);
++    // Construct a checksum option from conf
++    private ChecksumOpt getChecksumOptFromConf(Configuration conf) {
++      DataChecksum.Type type = getChecksumType(conf);
++      int bytesPerChecksum = conf.getInt(DFS_BYTES_PER_CHECKSUM_KEY,
++          DFS_BYTES_PER_CHECKSUM_DEFAULT);
++      return new ChecksumOpt(type, bytesPerChecksum);
++    }
++
++    // create a DataChecksum with the default option.
++    private DataChecksum createChecksum() throws IOException {
++      return createChecksum(null);
++    }
++
++    private DataChecksum createChecksum(ChecksumOpt userOpt) 
++        throws IOException {
++      // Fill in any missing field with the default.
++      ChecksumOpt myOpt = ChecksumOpt.processChecksumOpt(
++          defaultChecksumOpt, userOpt);
++      DataChecksum dataChecksum = DataChecksum.newDataChecksum(
++          myOpt.getChecksumType(),
++          myOpt.getBytesPerChecksum());
++      if (dataChecksum == null) {
++        throw new IOException("Invalid checksum type specified: "
++            + myOpt.getChecksumType().name());
++      }
++      return dataChecksum;
+-    return DFSUtil.locatedBlocks2Locations(blocks);
++    BlockLocation[] locations =  DFSUtil.locatedBlocks2Locations(blocks);
++    HdfsBlockLocation[] hdfsLocations = new HdfsBlockLocation[locations.length];
++    for (int i = 0; i < locations.length; i++) {
++      hdfsLocations[i] = new HdfsBlockLocation(locations[i], blocks.get(i));
++    }
++    return hdfsLocations;
++  }
++  
++  /**
++   * Get block location information about a list of {@link HdfsBlockLocation}.
++   * Used by {@link DistributedFileSystem#getFileBlockStorageLocations(List)} to
++   * get {@link BlockStorageLocation}s for blocks returned by
++   * {@link DistributedFileSystem#getFileBlockLocations(org.apache.hadoop.fs.FileStatus, long, long)}
++   * .
++   * 
++   * This is done by making a round of RPCs to the associated datanodes, asking
++   * the volume of each block replica. The returned array of
++   * {@link BlockStorageLocation} expose this information as a
++   * {@link VolumeId}.
++   * 
++   * @param blockLocations
++   *          target blocks on which to query volume location information
++   * @return volumeBlockLocations original block array augmented with additional
++   *         volume location information for each replica.
++   */
++  public BlockStorageLocation[] getBlockStorageLocations(
++      List<BlockLocation> blockLocations) throws IOException,
++      UnsupportedOperationException, InvalidBlockTokenException {
++    if (!getConf().getHdfsBlocksMetadataEnabled) {
++      throw new UnsupportedOperationException("Datanode-side support for " +
++          "getVolumeBlockLocations() must also be enabled in the client " +
++          "configuration.");
++    }
++    // Downcast blockLocations and fetch out required LocatedBlock(s)
++    List<LocatedBlock> blocks = new ArrayList<LocatedBlock>();
++    for (BlockLocation loc : blockLocations) {
++      if (!(loc instanceof HdfsBlockLocation)) {
++        throw new ClassCastException("DFSClient#getVolumeBlockLocations " +
++            "expected to be passed HdfsBlockLocations");
++      }
++      HdfsBlockLocation hdfsLoc = (HdfsBlockLocation) loc;
++      blocks.add(hdfsLoc.getLocatedBlock());
++    }
++    
++    // Re-group the LocatedBlocks to be grouped by datanodes, with the values
++    // a list of the LocatedBlocks on the datanode.
++    Map<DatanodeInfo, List<LocatedBlock>> datanodeBlocks = 
++        new LinkedHashMap<DatanodeInfo, List<LocatedBlock>>();
++    for (LocatedBlock b : blocks) {
++      for (DatanodeInfo info : b.getLocations()) {
++        if (!datanodeBlocks.containsKey(info)) {
++          datanodeBlocks.put(info, new ArrayList<LocatedBlock>());
++        }
++        List<LocatedBlock> l = datanodeBlocks.get(info);
++        l.add(b);
++      }
++    }
++        
++    // Make RPCs to the datanodes to get volume locations for its replicas
++    List<HdfsBlocksMetadata> metadatas = BlockStorageLocationUtil
++        .queryDatanodesForHdfsBlocksMetadata(conf, datanodeBlocks,
++            getConf().getFileBlockStorageLocationsNumThreads,
++            getConf().getFileBlockStorageLocationsTimeout,
++            getConf().connectToDnViaHostname);
++    
++    // Regroup the returned VolumeId metadata to again be grouped by
++    // LocatedBlock rather than by datanode
++    Map<LocatedBlock, List<VolumeId>> blockVolumeIds = BlockStorageLocationUtil
++        .associateVolumeIdsWithBlocks(blocks, datanodeBlocks, metadatas);
++    
++    // Combine original BlockLocations with new VolumeId information
++    BlockStorageLocation[] volumeBlockLocations = BlockStorageLocationUtil
++        .convertToVolumeBlockLocations(blocks, blockVolumeIds);
++
++    return volumeBlockLocations;
+-        buffersize);
++        buffersize, null);
+-   * long, Progressable, int)} with <code>createParent</code> set to true.
++   * long, Progressable, int, ChecksumOpt)} with <code>createParent</code>
++   *  set to true.
+-                             int buffersize)
++                             int buffersize,
++                             ChecksumOpt checksumOpt)
+-        replication, blockSize, progress, buffersize);
++        replication, blockSize, progress, buffersize, checksumOpt);
++   * @param checksumOpt checksum options
+-                             int buffersize)
+-    throws IOException {
++                             int buffersize,
++                             ChecksumOpt checksumOpt) throws IOException {
+-        buffersize, dfsClientConf.createChecksum());
++        buffersize, dfsClientConf.createChecksum(checksumOpt));
+-                             int bytesPerChecksum)
++                             ChecksumOpt checksumOpt)
+-      DataChecksum checksum = DataChecksum.newDataChecksum(
+-          dfsClientConf.checksumType,
+-          bytesPerChecksum);
++      DataChecksum checksum = dfsClientConf.createChecksum(checksumOpt);
+-    int bytesPerCRC = 0;
++    int bytesPerCRC = -1;
++    DataChecksum.Type crcType = DataChecksum.Type.DEFAULT;
++          // read crc-type
++          final DataChecksum.Type ct = HdfsProtoUtil.
++              fromProto(checksumData.getCrcType());
++          if (i == 0) { // first block
++            crcType = ct;
++          } else if (crcType != DataChecksum.Type.MIXED
++              && crcType != ct) {
++            // if crc types are mixed in a file
++            crcType = DataChecksum.Type.MIXED;
++          }
++
+-    return new MD5MD5CRC32FileChecksum(bytesPerCRC, crcPerBlock, fileMD5);
++    switch (crcType) {
++      case CRC32:
++        return new MD5MD5CRC32GzipFileChecksum(bytesPerCRC,
++            crcPerBlock, fileMD5);
++      case CRC32C:
++        return new MD5MD5CRC32CastagnoliFileChecksum(bytesPerCRC,
++            crcPerBlock, fileMD5);
++      default:
++        // we should never get here since the validity was checked
++        // when getCrcType() was called above.
++        return null;
++    }
+-   * @see ClientProtocol#distributedUpgradeProgress(HdfsConstants.UpgradeAction)
+-   */
+-  public UpgradeStatusReport distributedUpgradeProgress(UpgradeAction action)
+-      throws IOException {
+-    return namenode.distributedUpgradeProgress(action);
+-  }
+-
+-  /**
+
+MOV26 MOV26 MOV26 MOV26 MOV26 INS26 INS26 INS26 INS26 INS26 MOV31 INS40 INS40 UPD40 INS40 INS40 INS40 UPD40 UPD40 UPD40 MOV23 MOV23 MOV43 INS23 INS23 INS31 INS31 INS5 INS42 INS44 UPD43 INS43 INS8 INS44 INS44 INS83 INS43 INS59 INS83 INS39 INS59 MOV21 INS43 INS83 INS43 INS42 INS44 INS8 INS83 MOV43 INS42 INS43 INS8 INS43 INS44 INS43 INS60 INS60 INS24 INS65 INS65 INS65 INS43 INS85 INS74 INS42 UPD42 INS42 INS25 INS60 INS70 INS60 INS70 INS60 INS60 INS60 INS41 INS43 INS42 INS65 INS43 INS42 INS43 INS42 INS60 INS50 INS42 INS42 INS42 UPD42 UPD42 INS21 INS21 INS40 INS54 INS42 INS43 INS42 INS60 INS60 INS41 INS42 INS41 INS42 INS43 INS42 INS42 INS60 INS60 INS25 INS41 INS5 INS59 INS5 INS59 INS58 INS27 INS37 INS8 INS42 INS66 INS65 INS66 INS66 INS65 INS66 INS66 INS65 INS66 INS65 INS66 INS66 INS66 INS65 INS66 INS65 INS66 INS42 INS66 INS66 INS66 INS42 INS43 INS43 INS38 INS8 INS74 INS59 INS44 INS42 INS8 INS74 INS59 INS44 INS42 INS8 INS74 INS59 INS74 INS59 INS5 INS59 INS42 UPD66 INS66 INS42 INS42 INS66 INS42 INS42 INS43 INS59 INS42 INS49 INS41 INS49 INS41 INS49 INS41 INS7 INS7 INS83 INS8 INS12 INS42 INS43 INS59 INS39 INS59 INS14 INS32 INS42 INS43 INS59 INS43 INS59 INS27 INS8 INS42 INS43 INS85 INS42 MOV32 INS43 INS85 INS42 INS3 INS39 INS59 INS42 INS40 INS42 INS21 INS42 INS68 INS42 MOV68 INS42 INS42 INS42 INS42 INS22 INS53 INS43 INS43 INS42 INS14 UPD43 MOV43 UPD42 MOV42 INS25 INS60 INS21 INS43 INS43 INS74 INS42 INS14 INS43 INS42 INS70 INS43 INS43 INS42 INS32 INS43 INS43 INS74 INS42 INS32 INS43 INS85 INS42 INS32 INS33 INS42 INS38 INS40 INS42 INS40 INS42 MOV14 INS42 INS14 INS33 UPD42 INS32 UPD42 INS32 INS42 INS32 INS42 INS32 INS41 INS44 INS8 INS40 INS42 MOV32 INS42 MOV32 INS43 INS42 INS42 INS42 INS33 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS33 INS53 INS42 INS42 INS5 INS40 INS42 INS34 INS7 INS42 INS42 INS69 UPD42 UPD42 INS69 INS69 INS32 INS42 INS14 INS42 INS42 INS74 UPD42 INS38 INS8 INS43 INS59 INS32 INS42 INS42 INS43 INS43 INS74 INS42 INS44 INS32 INS8 INS42 INS42 INS42 INS42 INS42 INS42 INS22 INS22 INS22 INS42 INS42 INS43 INS43 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS69 INS34 UPD43 INS43 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS40 INS40 INS42 INS42 INS40 INS40 INS42 INS42 INS40 INS40 INS32 INS43 INS42 MOV21 MOV41 INS42 INS42 INS42 INS42 INS42 MOV42 MOV42 INS32 INS32 INS14 INS43 INS85 INS2 INS14 INS43 UPD43 INS39 INS39 INS42 INS43 INS27 INS43 INS43 INS36 INS53 INS42 INS42 INS11 INS42 INS42 INS32 INS42 INS42 INS43 INS43 INS74 INS43 INS42 INS42 INS42 INS25 INS60 INS21 INS32 INS42 INS32 INS42 INS32 INS42 INS42 INS42 INS43 INS42 UPD42 INS42 INS40 UPD42 MOV42 MOV42 INS42 INS32 INS42 UPD42 MOV42 INS42 UPD42 MOV42 INS43 INS27 INS42 INS42 INS42 INS43 INS2 INS32 INS42 UPD40 INS42 INS45 INS45 INS45 INS42 INS42 INS62 INS14 INS43 INS42 INS42 INS42 INS42 INS42 INS43 INS43 INS42 INS38 INS8 INS74 INS59 INS32 INS42 INS42 INS42 INS42 UPD42 UPD42 UPD42 INS40 INS42 INS40 INS42 INS45 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS43 INS43 INS27 INS42 INS42 INS42 INS32 INS21 INS43 INS43 INS42 INS32 INS42 INS42 INS42 INS60 INS25 UPD45 INS40 INS32 INS42 INS42 INS42 INS45 INS45 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS83 INS43 INS59 INS27 INS8 INS25 INS42 INS42 UPD42 MOV42 INS42 INS42 INS14 INS40 INS42 INS32 INS42 INS34 INS21 INS27 INS8 INS74 INS42 INS42 INS32 INS7 INS27 INS27 INS21 INS43 INS43 INS42 INS42 INS42 INS42 INS42 INS40 INS42 INS42 INS7 INS42 INS42 INS42 INS40 DEL39 DEL40 DEL45 DEL42 DEL42 DEL32 DEL40 DEL41 DEL8 DEL45 DEL32 DEL40 DEL41 DEL8 DEL45 DEL42 DEL42 DEL32 DEL40 DEL41 DEL8 DEL8 DEL25 DEL25 DEL25 DEL32 DEL41 DEL65 DEL42 DEL44 DEL42 DEL42 DEL32 DEL41 DEL8 DEL39 DEL42 DEL40 DEL34 DEL41

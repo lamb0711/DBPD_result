@@ -1,0 +1,251 @@
+HDFS-14234. Limit WebHDFS to specifc user, host, directory triples.
+Contributed by Clay B.
+
+-/**
++/*
+-import static org.apache.hadoop.hdfs.client.HdfsClientConfigKeys.DFS_WEBHDFS_REST_CSRF_ENABLED_DEFAULT;
+-import static org.apache.hadoop.hdfs.client.HdfsClientConfigKeys.DFS_WEBHDFS_REST_CSRF_ENABLED_KEY;
+-
+-import java.util.Enumeration;
+-import java.util.Map;
+-import javax.servlet.FilterConfig;
+-import javax.servlet.ServletContext;
+-import javax.servlet.ServletException;
+-
++import io.netty.channel.ChannelHandler;
+-
+-import org.slf4j.Logger;
+-import org.slf4j.LoggerFactory;
+-import org.apache.hadoop.security.http.RestCsrfPreventionFilter;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++import javax.servlet.FilterConfig;
++import javax.servlet.ServletContext;
++import java.lang.reflect.Constructor;
++import java.lang.reflect.InvocationTargetException;
++import java.lang.reflect.Method;
++import java.util.Enumeration;
++import java.util.Map;
++import java.util.concurrent.ConcurrentHashMap;
++/**
++ * Data node HTTP Server Class.
++ */
++  static final Logger LOG = LoggerFactory.getLogger(DatanodeHttpServer.class);
++  private static final ConcurrentHashMap<Class<?>, Object> HANDLER_STATE
++      = new ConcurrentHashMap<Class<?>, Object>() {};
++  // HttpServer threads are only used for the web UI and basic servlets, so
++  // set them to the minimum possible
++  private static final int HTTP_SELECTOR_THREADS = 1;
++  private static final int HTTP_ACCEPTOR_THREADS = 1;
++  private static final int HTTP_MAX_THREADS =
++      HTTP_SELECTOR_THREADS + HTTP_ACCEPTOR_THREADS + 1;
+-  private final RestCsrfPreventionFilter restCsrfPreventionFilter;
+-  static final Logger LOG = LoggerFactory.getLogger(DatanodeHttpServer.class);
+-
+-  // HttpServer threads are only used for the web UI and basic servlets, so
+-  // set them to the minimum possible
+-  private static final int HTTP_SELECTOR_THREADS = 1;
+-  private static final int HTTP_ACCEPTOR_THREADS = 1;
+-  private static final int HTTP_MAX_THREADS =
+-      HTTP_SELECTOR_THREADS + HTTP_ACCEPTOR_THREADS + 1;
+-      final DataNode datanode,
+-      final ServerSocketChannel externalHttpChannel)
+-    throws IOException {
+-    this.restCsrfPreventionFilter = createRestCsrfPreventionFilter(conf);
++        final DataNode datanode,
++        final ServerSocketChannel externalHttpChannel)
++        throws IOException {
+-                               BlockScanner.Servlet.class);
++        BlockScanner.Servlet.class);
++    final ChannelHandler[] handlers = getFilterHandlers(conf);
+-        .childHandler(new ChannelInitializer<SocketChannel>() {
+-        @Override
+-        protected void initChannel(SocketChannel ch) throws Exception {
+-          ChannelPipeline p = ch.pipeline();
+-          p.addLast(new HttpRequestDecoder(),
+-            new HttpResponseEncoder());
+-          if (restCsrfPreventionFilter != null) {
+-            p.addLast(new RestCsrfPreventionFilterHandler(
+-                restCsrfPreventionFilter));
+-          }
+-          p.addLast(
+-              new ChunkedWriteHandler(),
+-              new URLDispatcher(jettyAddr, conf, confForCreate));
+-        }
+-      });
++            .childHandler(new ChannelInitializer<SocketChannel>() {
++              @Override
++              protected void initChannel(SocketChannel ch) throws Exception {
++                ChannelPipeline p = ch.pipeline();
++                p.addLast(new HttpRequestDecoder(),
++                    new HttpResponseEncoder());
++                if (handlers != null) {
++                  for (ChannelHandler c : handlers) {
++                    p.addLast(c);
++                  }
++                }
++                p.addLast(
++                    new ChunkedWriteHandler(),
++                    new URLDispatcher(jettyAddr, conf, confForCreate));
++              }
++            });
+-              protected void doBind(SocketAddress localAddress) throws Exception {}
++              protected void doBind(SocketAddress localAddress)
++                  throws Exception {
++              }
+-        .channel(NioServerSocketChannel.class)
+-        .childHandler(new ChannelInitializer<SocketChannel>() {
+-          @Override
+-          protected void initChannel(SocketChannel ch) throws Exception {
+-            ChannelPipeline p = ch.pipeline();
+-            p.addLast(
+-                new SslHandler(sslFactory.createSSLEngine()),
+-                new HttpRequestDecoder(),
+-                new HttpResponseEncoder());
+-            if (restCsrfPreventionFilter != null) {
+-              p.addLast(new RestCsrfPreventionFilterHandler(
+-                  restCsrfPreventionFilter));
++          .channel(NioServerSocketChannel.class)
++          .childHandler(new ChannelInitializer<SocketChannel>() {
++            @Override
++            protected void initChannel(SocketChannel ch) throws Exception {
++              ChannelPipeline p = ch.pipeline();
++              p.addLast(
++                  new SslHandler(sslFactory.createSSLEngine()),
++                  new HttpRequestDecoder(),
++                  new HttpResponseEncoder());
++              if (handlers != null) {
++                for (ChannelHandler c : handlers) {
++                  p.addLast(c);
++                }
++              }
++              p.addLast(
++                  new ChunkedWriteHandler(),
++                  new URLDispatcher(jettyAddr, conf, confForCreate));
+-            p.addLast(
+-                new ChunkedWriteHandler(),
+-                new URLDispatcher(jettyAddr, conf, confForCreate));
+-          }
+-        });
++          });
++  private static String getHostnameForSpnegoPrincipal(Configuration conf) {
++    String addr = conf.getTrimmed(DFS_DATANODE_HTTP_ADDRESS_KEY, null);
++    if (addr == null) {
++      addr = conf.getTrimmed(DFS_DATANODE_HTTPS_ADDRESS_KEY,
++          DFS_DATANODE_HTTPS_ADDRESS_DEFAULT);
++    }
++    InetSocketAddress inetSocker = NetUtils.createSocketAddr(addr);
++    return inetSocker.getHostString();
++  }
++
++  /* Get an array of ChannelHandlers specified in the conf
++   * @param conf configuration to read and pass
++   * @return array of ChannelHandlers ready to be used
++   * @throws NoSuchMethodException if the handler does not implement a method
++   *  initializeState(conf)
++   * @throws InvocationTargetException if the handler's initalizeState method
++   *  raises an exception
++   */
++  private ChannelHandler[] getFilterHandlers(Configuration configuration) {
++    if (configuration == null) {
++      return null;
++    }
++    // If the hdfs-site.xml has the proper configs for filter classes, use them.
++    Class<?>[] classes =
++        configuration.getClasses(
++            DFSConfigKeys.DFS_DATANODE_HTTPSERVER_FILTER_HANDLERS);
++
++    // else use the hard coded class from the default configuration.
++    if (classes == null) {
++      classes =
++          configuration.getClasses(
++              DFSConfigKeys.DFS_DATANODE_HTTPSERVER_FILTER_HANDLERS_DEFAULT);
++    }
++
++    // if we are not able to find any handlers, let us fail since running
++    // with Csrf will is a security hole. Let us abort the startup.
++    if(classes == null)  {
++      return null;
++    }
++
++    ChannelHandler[] handlers = new ChannelHandler[classes.length];
++    for (int i = 0; i < classes.length; i++) {
++      LOG.debug("Loading filter handler {}", classes[i].getName());
++      try {
++        Method initializeState = classes[i].getDeclaredMethod("initializeState",
++            Configuration.class);
++        Constructor constructor =
++            classes[i].getDeclaredConstructor(initializeState.getReturnType());
++        handlers[i] = (ChannelHandler) constructor.newInstance(
++            HANDLER_STATE.getOrDefault(classes[i],
++            initializeState.invoke(null, configuration)));
++      } catch (NoSuchMethodException | InvocationTargetException
++          | IllegalAccessException | InstantiationException
++          | IllegalArgumentException e) {
++        LOG.error("Failed to initialize handler {}", classes[i].toString());
++        throw new RuntimeException(e);
++      }
++    }
++    return (handlers);
++  }
++
+-  private static String getHostnameForSpnegoPrincipal(Configuration conf) {
+-    String addr = conf.getTrimmed(DFS_DATANODE_HTTP_ADDRESS_KEY, null);
+-    if (addr == null) {
+-      addr = conf.getTrimmed(DFS_DATANODE_HTTPS_ADDRESS_KEY,
+-                             DFS_DATANODE_HTTPS_ADDRESS_DEFAULT);
+-    }
+-    InetSocketAddress inetSocker = NetUtils.createSocketAddr(addr);
+-    return inetSocker.getHostString();
+-  }
+-
+-   * Creates the {@link RestCsrfPreventionFilter} for the DataNode.  Since the
+-   * DataNode HTTP server is not implemented in terms of the servlet API, it
+-   * takes some extra effort to obtain an instance of the filter.  This method
+-   * takes care of configuration and implementing just enough of the servlet API
+-   * and related interfaces so that the DataNode can get a fully initialized
+-   * instance of the filter.
+-   *
+-   * @param conf configuration to read
+-   * @return initialized filter, or null if CSRF protection not enabled
++   * Since the DataNode HTTP server is not implemented in terms of the
++   * servlet API, it
++   * takes some extra effort to obtain an instance of the filter.  This
++   * method provides
++   * a minimal {@link FilterConfig} implementation backed by a {@link Map}.
++   * Call this from
++   * your filter handler to initialize a servlet filter.
+-  private static RestCsrfPreventionFilter createRestCsrfPreventionFilter(
+-      Configuration conf) {
+-    if (!conf.getBoolean(DFS_WEBHDFS_REST_CSRF_ENABLED_KEY,
+-        DFS_WEBHDFS_REST_CSRF_ENABLED_DEFAULT)) {
+-      return null;
+-    }
+-    String restCsrfClassName = RestCsrfPreventionFilter.class.getName();
+-    Map<String, String> restCsrfParams = RestCsrfPreventionFilter
+-        .getFilterParams(conf, "dfs.webhdfs.rest-csrf.");
+-    RestCsrfPreventionFilter filter = new RestCsrfPreventionFilter();
+-    try {
+-      filter.init(new MapBasedFilterConfig(restCsrfClassName, restCsrfParams));
+-    } catch (ServletException e) {
+-      throw new IllegalStateException(
+-          "Failed to initialize RestCsrfPreventionFilter.", e);
+-    }
+-    return filter;
+-  }
+-
+-  /**
+-   * A minimal {@link FilterConfig} implementation backed by a {@link Map}.
+-   */
+-  private static final class MapBasedFilterConfig implements FilterConfig {
++  public static final class MapBasedFilterConfig implements FilterConfig {
+-    /**
++    /*
+-    /**
++    /*
+-     * implemented.  These should never be seen in practice, because it is only
+-     * used for methods that are not called by {@link RestCsrfPreventionFilter}.
++     * implemented. If you are building a handler it is possible you will
++     * need to make this interface more extensive.
+
+MOV26 MOV26 MOV26 MOV26 MOV26 MOV26 MOV26 MOV26 MOV26 MOV26 INS26 MOV23 MOV23 MOV23 MOV23 MOV23 MOV31 MOV31 UPD40 UPD40 UPD40 INS40 UPD40 INS29 INS65 INS83 INS74 INS5 UPD42 UPD83 INS66 INS43 INS74 INS43 INS42 INS14 INS60 INS43 INS85 INS43 UPD42 INS25 INS25 INS60 INS24 UPD42 MOV42 INS43 INS76 INS42 INS74 INS1 INS83 INS5 INS59 UPD42 MOV42 INS42 INS27 INS8 INS5 INS27 INS8 INS27 MOV8 INS5 INS59 INS58 INS27 INS37 INS8 INS36 INS66 INS66 INS66 INS66 UPD66 INS66 INS66 INS42 INS43 INS74 INS43 INS43 INS85 INS42 INS32 INS42 INS33 INS41 INS74 INS85 UPD42 INS42 INS33 INS21 INS42 INS33 INS43 INS85 INS42 INS3 INS39 INS59 INS42 INS40 INS42 INS21 INS54 INS42 INS42 INS43 INS76 INS42 INS42 UPD42 MOV42 MOV42 INS33 INS43 INS76 INS42 UPD42 INS40 INS7 UPD42 MOV42 INS5 INS40 INS42 INS34 INS32 INS8 MOV12 INS42 UPD42 MOV42 INS42 INS32 INS43 INS85 INS42 INS42 INS45 INS32 INS60 MOV60 MOV21 INS42 INS42 INS40 UPD42 MOV42 INS2 INS42 INS43 MOV59 UPD43 INS7 INS84 INS21 INS42 INS42 UPD42 MOV42 UPD42 UPD42 UPD42 INS32 INS2 INS11 INS43 INS43 INS43 INS43 INS43 INS32 INS2 UPD42 UPD45 INS57 INS2 INS42 INS32 INS42 INS42 INS43 INS32 INS42 UPD42 MOV42 INS42 INS42 INS42 INS42 INS42 INS45 INS32 UPD43 INS42 INS42 MOV43 INS42 INS42 INS42 INS42 INS42 UPD42 MOV42 INS42 INS32 INS2 INS42 UPD42 INS42 INS42 INS2 INS32 INS42 INS42 INS8 INS8 INS42 INS42 INS42 INS42 INS33 INS42 UPD42 INS70 UPD42 INS70 INS44 INS42 INS8 INS44 INS42 INS8 INS43 INS42 MOV21 INS43 INS42 MOV21 INS42 INS42 INS42 INS42 DEL66 DEL66 DEL66 DEL66 DEL66 DEL66 DEL66 DEL66 DEL66 DEL66 DEL66 DEL66 DEL66 DEL65 DEL29 DEL43 DEL42 DEL52 DEL42 DEL22 DEL32 DEL7 DEL21 DEL42 DEL43 DEL42 DEL14 DEL8 DEL42 DEL43 DEL42 DEL14 DEL8 DEL66 DEL42 DEL65 DEL66 DEL66 DEL66 DEL66 DEL66 DEL66 DEL65 DEL42 DEL66 DEL65 DEL66 DEL65 DEL29 DEL83 DEL43 DEL42 DEL42 DEL42 DEL42 DEL32 DEL38 DEL43 DEL42 DEL43 DEL57 DEL42 DEL42 DEL42 DEL43 DEL14 DEL42 DEL42 DEL43 DEL42 DEL42 DEL14 DEL32 DEL43 DEL45 DEL43 DEL43 DEL43 DEL74 DEL60 DEL8 DEL54 DEL42 DEL66 DEL65 DEL42 DEL66 DEL65 DEL42 DEL66 DEL65 DEL29 DEL66 DEL66 DEL66 DEL42 DEL65 DEL66 DEL65 DEL66 DEL65 DEL29

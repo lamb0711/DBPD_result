@@ -1,0 +1,151 @@
+HADOOP-15027. AliyunOSS: Support multi-thread pre-read to improve sequential read from Hadoop to Aliyun OSS performance. (Contributed by Jinhu Wu)
+
+-import java.io.InputStream;
++import java.util.ArrayDeque;
++import java.util.Queue;
++import java.util.concurrent.ExecutorService;
++import com.google.common.util.concurrent.MoreExecutors;
+-  private InputStream wrappedStream = null;
++  private byte[] buffer;
++  private int maxReadAheadPartNumber;
++  private long expectNextPos;
++  private long lastByteStart;
++
++  private ExecutorService readAheadExecutorService;
++  private Queue<ReadBuffer> readBufferQueue = new ArrayDeque<>();
++      ExecutorService readAheadExecutorService, int maxReadAheadPartNumber,
++    this.readAheadExecutorService =
++        MoreExecutors.listeningDecorator(readAheadExecutorService);
++    this.maxReadAheadPartNumber = maxReadAheadPartNumber;
++
++    this.expectNextPos = 0;
++    this.lastByteStart = -1;
+-    if (wrappedStream != null) {
++    if (this.buffer != null) {
+-      wrappedStream.close();
++      this.buffer = null;
+-    wrappedStream = store.retrieve(key, pos, pos + partSize -1);
+-    if (wrappedStream == null) {
++    boolean isRandomIO = true;
++    if (pos == this.expectNextPos) {
++      isRandomIO = false;
++    } else {
++      //new seek, remove cache buffers if its byteStart is not equal to pos
++      while (readBufferQueue.size() != 0) {
++        if (readBufferQueue.element().getByteStart() != pos) {
++          readBufferQueue.poll();
++        } else {
++          break;
++        }
++      }
++    }
++
++    this.expectNextPos = pos + partSize;
++
++    int currentSize = readBufferQueue.size();
++    if (currentSize == 0) {
++      //init lastByteStart to pos - partSize, used by for loop below
++      lastByteStart = pos - partSize;
++    } else {
++      ReadBuffer[] readBuffers = readBufferQueue.toArray(
++          new ReadBuffer[currentSize]);
++      lastByteStart = readBuffers[currentSize - 1].getByteStart();
++    }
++
++    int maxLen = this.maxReadAheadPartNumber - currentSize;
++    for (int i = 0; i < maxLen && i < (currentSize + 1) * 2; i++) {
++      if (lastByteStart + partSize * (i + 1) > contentLength) {
++        break;
++      }
++
++      long byteStart = lastByteStart + partSize * (i + 1);
++      long byteEnd = byteStart + partSize -1;
++      if (byteEnd >= contentLength) {
++        byteEnd = contentLength - 1;
++      }
++
++      ReadBuffer readBuffer = new ReadBuffer(byteStart, byteEnd);
++      if (readBuffer.getBuffer().length == 0) {
++        //EOF
++        readBuffer.setStatus(ReadBuffer.STATUS.SUCCESS);
++      } else {
++        this.readAheadExecutorService.execute(
++            new AliyunOSSFileReaderTask(key, store, readBuffer));
++      }
++      readBufferQueue.add(readBuffer);
++      if (isRandomIO) {
++        break;
++      }
++    }
++
++    ReadBuffer readBuffer = readBufferQueue.poll();
++    readBuffer.lock();
++    try {
++      readBuffer.await(ReadBuffer.STATUS.INIT);
++      if (readBuffer.getStatus() == ReadBuffer.STATUS.ERROR) {
++        this.buffer = null;
++      } else {
++        this.buffer = readBuffer.getBuffer();
++      }
++    } catch (InterruptedException e) {
++      LOG.warn("interrupted when wait a read buffer");
++    } finally {
++      readBuffer.unlock();
++    }
++
++    if (this.buffer == null) {
+-    int tries = MAX_RETRIES;
+-    boolean retry;
+-    do {
+-      retry = false;
+-      try {
+-        byteRead = wrappedStream.read();
+-      } catch (Exception e) {
+-        handleReadException(e, --tries);
+-        retry = true;
+-      }
+-    } while (retry);
++    if (partRemaining != 0) {
++      byteRead = this.buffer[this.buffer.length - (int)partRemaining] & 0xFF;
++    }
+-      int tries = MAX_RETRIES;
+-      boolean retry;
+-      int bytes = -1;
+-      do {
+-        retry = false;
+-        try {
+-          bytes = wrappedStream.read(buf, off + bytesRead, len - bytesRead);
+-        } catch (Exception e) {
+-          handleReadException(e, --tries);
+-          retry = true;
++      int bytes = 0;
++      for (int i = this.buffer.length - (int)partRemaining;
++           i < this.buffer.length; i++) {
++        buf[off + bytesRead] = this.buffer[i];
++        bytes++;
++        bytesRead++;
++        if (off + bytesRead >= len) {
++          break;
+-      } while (retry);
++      }
+-        bytesRead += bytes;
+-    if (wrappedStream != null) {
+-      wrappedStream.close();
+-    }
++    this.buffer = null;
+-      AliyunOSSUtils.skipFully(wrappedStream, len);
+-  private void handleReadException(Exception e, int tries) throws IOException{
+-    if (tries == 0) {
+-      throw new IOException(e);
+-    }
+-
+-    LOG.warn("Some exceptions occurred in oss connection, try to reopen oss" +
+-        " connection at position '" + position + "', " + e.getMessage());
+-    try {
+-      Thread.sleep(100);
+-    } catch (InterruptedException e2) {
+-      LOG.warn(e2.getMessage());
+-    }
+-    reopen(position);
++  public long getExpectNextPos() {
++    return this.expectNextPos;

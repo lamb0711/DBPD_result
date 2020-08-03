@@ -1,0 +1,281 @@
+HDFS-12291: [SPS]: Provide a mechanism to recursively iterate and satisfy storage policy of all the files under the given dir. Contributed by Surendra Singh Lilhore.
+
++import org.apache.hadoop.hdfs.protocol.HdfsFileStatus;
++import org.apache.hadoop.hdfs.server.namenode.FSTreeTraverser.TraverseInfo;
+-import org.apache.hadoop.hdfs.server.namenode.snapshot.Snapshot;
++import com.google.common.annotations.VisibleForTesting;
++
+-   * Map of rootId and number of child's. Number of child's indicate the number
+-   * of files pending to satisfy the policy.
++   * Map of startId and number of child's. Number of child's indicate the
++   * number of files pending to satisfy the policy.
+-  private final Map<Long, Integer> pendingWorkForDirectory =
+-      new HashMap<Long, Integer>();
++  private final Map<Long, DirPendingWorkInfo> pendingWorkForDirectory =
++      new HashMap<Long, DirPendingWorkInfo>();
+-  private Daemon fileInodeIdCollector;
++  private Daemon inodeIdCollector;
++
++  private final int maxQueuedItem;
+-      StoragePolicySatisfier sps) {
++      StoragePolicySatisfier sps, int queueLimit) {
++    this.maxQueuedItem = queueLimit;
+-   * @param rootId
+-   *            - root inode id
++   * @param startId
++   *            - start id
+-  private synchronized void addAll(Long rootId,
+-      List<ItemInfo> itemInfoList) {
++  @VisibleForTesting
++  public synchronized void addAll(long startId,
++      List<ItemInfo> itemInfoList, boolean scanCompleted) {
+-    pendingWorkForDirectory.put(rootId, itemInfoList.size());
++    DirPendingWorkInfo pendingWork = pendingWorkForDirectory.get(startId);
++    if (pendingWork == null) {
++      pendingWork = new DirPendingWorkInfo();
++      pendingWorkForDirectory.put(startId, pendingWork);
++    }
++    pendingWork.addPendingWorkCount(itemInfoList.size());
++    if (scanCompleted) {
++      pendingWork.markScanCompleted();
++    }
++  /**
++   * Returns queue remaining capacity.
++   */
++  public synchronized int remainingCapacity() {
++    int size = storageMovementNeeded.size();
++    if (size >= maxQueuedItem) {
++      return 0;
++    } else {
++      return (maxQueuedItem - size);
++    }
++  }
++
++  /**
++   * Returns queue size.
++   */
++  public synchronized int size() {
++    return storageMovementNeeded.size();
++  }
++
+-      // If track is part of some root then reduce the pending directory work
+-      // count.
+-      long rootId = trackInfo.getRootId();
+-      INode inode = namesystem.getFSDirectory().getInode(rootId);
++      // If track is part of some start inode then reduce the pending
++      // directory work count.
++      long startId = trackInfo.getStartId();
++      INode inode = namesystem.getFSDirectory().getInode(startId);
+-        this.pendingWorkForDirectory.remove(rootId);
++        this.pendingWorkForDirectory.remove(startId);
+-        if (pendingWorkForDirectory.get(rootId) != null) {
+-          Integer pendingWork = pendingWorkForDirectory.get(rootId) - 1;
+-          pendingWorkForDirectory.put(rootId, pendingWork);
+-          if (pendingWork <= 0) {
+-            namesystem.removeXattr(rootId, XATTR_SATISFY_STORAGE_POLICY);
+-            pendingWorkForDirectory.remove(rootId);
++        DirPendingWorkInfo pendingWork = pendingWorkForDirectory.get(startId);
++        if (pendingWork != null) {
++          pendingWork.decrementPendingWorkCount();
++          if (pendingWork.isDirWorkDone()) {
++            namesystem.removeXattr(startId, XATTR_SATISFY_STORAGE_POLICY);
++            pendingWorkForDirectory.remove(startId);
+-      if (next.getRootId() == trackId) {
++      if (next.getStartId() == trackId) {
+-  private class FileInodeIdCollector implements Runnable {
++  private class StorageMovementPendingInodeIdCollector extends FSTreeTraverser
++      implements Runnable {
++
++    private int remainingCapacity = 0;
++
++    private List<ItemInfo> currentBatch = new ArrayList<>(maxQueuedItem);
++
++    StorageMovementPendingInodeIdCollector(FSDirectory dir) {
++      super(dir);
++    }
++
+-            Long rootINodeId = spsDirsToBeTraveresed.poll();
+-            if (rootINodeId == null) {
++            Long startINodeId = spsDirsToBeTraveresed.poll();
++            if (startINodeId == null) {
+-              INode rootInode = fsd.getInode(rootINodeId);
+-              if (rootInode != null) {
+-                // TODO : HDFS-12291
+-                // 1. Implement an efficient recursive directory iteration
+-                // mechanism and satisfies storage policy for all the files
+-                // under the given directory.
+-                // 2. Process files in batches,so datanodes workload can be
+-                // handled.
+-                List<ItemInfo> itemInfoList =
+-                    new ArrayList<>();
+-                for (INode childInode : rootInode.asDirectory()
+-                    .getChildrenList(Snapshot.CURRENT_STATE_ID)) {
+-                  if (childInode.isFile()
+-                      && childInode.asFile().numBlocks() != 0) {
+-                    itemInfoList.add(
+-                        new ItemInfo(rootINodeId, childInode.getId()));
+-                  }
++              INode startInode = fsd.getInode(startINodeId);
++              if (startInode != null) {
++                try {
++                  remainingCapacity = remainingCapacity();
++                  readLock();
++                  traverseDir(startInode.asDirectory(), startINodeId,
++                      HdfsFileStatus.EMPTY_NAME,
++                      new SPSTraverseInfo(startINodeId));
++                } finally {
++                  readUnlock();
+-                if (itemInfoList.isEmpty()) {
+-                  // satisfy track info is empty, so remove the xAttr from the
+-                  // directory
+-                  namesystem.removeXattr(rootINodeId,
++                // Mark startInode traverse is done
++                addAll(startInode.getId(), currentBatch, true);
++                currentBatch.clear();
++
++                // check if directory was empty and no child added to queue
++                DirPendingWorkInfo dirPendingWorkInfo =
++                    pendingWorkForDirectory.get(startInode.getId());
++                if (dirPendingWorkInfo.isDirWorkDone()) {
++                  namesystem.removeXattr(startInode.getId(),
++                  pendingWorkForDirectory.remove(startInode.getId());
+-                addAll(rootINodeId, itemInfoList);
++
++    @Override
++    protected void checkPauseForTesting() throws InterruptedException {
++      // TODO implement if needed
++    }
++
++    @Override
++    protected boolean processFileInode(INode inode, TraverseInfo traverseInfo)
++        throws IOException, InterruptedException {
++      assert getFSDirectory().hasReadLock();
++      if (LOG.isTraceEnabled()) {
++        LOG.trace("Processing {} for statisy the policy",
++            inode.getFullPathName());
++      }
++      if (!inode.isFile()) {
++        return false;
++      }
++      if (inode.isFile() && inode.asFile().numBlocks() != 0) {
++        currentBatch.add(new ItemInfo(
++            ((SPSTraverseInfo) traverseInfo).getStartId(), inode.getId()));
++        remainingCapacity--;
++      }
++      return true;
++    }
++
++    @Override
++    protected boolean canSubmitCurrentBatch() {
++      return remainingCapacity <= 0;
++    }
++
++    @Override
++    protected void checkINodeReady(long startId) throws IOException {
++      FSNamesystem fsn = ((FSNamesystem) namesystem);
++      fsn.checkNameNodeSafeMode("NN is in safe mode,"
++          + "cannot satisfy the policy.");
++      // SPS work should be cancelled when NN goes to standby. Just
++      // double checking for sanity.
++      fsn.checkOperation(NameNode.OperationCategory.WRITE);
++    }
++
++    @Override
++    protected void submitCurrentBatch(long startId)
++        throws IOException, InterruptedException {
++      // Add current child's to queue
++      addAll(startId, currentBatch, false);
++      currentBatch.clear();
++    }
++
++    @Override
++    protected void throttle() throws InterruptedException {
++      assert !getFSDirectory().hasReadLock();
++      assert !namesystem.hasReadLock();
++      if (LOG.isDebugEnabled()) {
++        LOG.debug("StorageMovementNeeded queue remaining capacity is zero,"
++            + " waiting for some free slots.");
++      }
++      remainingCapacity = remainingCapacity();
++      // wait for queue to be free
++      while (remainingCapacity <= 0) {
++        if (LOG.isDebugEnabled()) {
++          LOG.debug("Waiting for storageMovementNeeded queue to be free!");
++        }
++        Thread.sleep(5000);
++        remainingCapacity = remainingCapacity();
++      }
++    }
++
++    @Override
++    protected boolean canTraverseDir(INode inode) throws IOException {
++      return true;
++    }
+-  public void start() {
+-    fileInodeIdCollector = new Daemon(new FileInodeIdCollector());
+-    fileInodeIdCollector.setName("FileInodeIdCollector");
+-    fileInodeIdCollector.start();
++  /**
++   * Info for directory recursive scan.
++   */
++  public static class DirPendingWorkInfo {
++
++    private int pendingWorkCount = 0;
++    private boolean fullyScanned = false;
++
++    /**
++     * Increment the pending work count for directory.
++     */
++    public synchronized void addPendingWorkCount(int count) {
++      this.pendingWorkCount = this.pendingWorkCount + count;
++    }
++
++    /**
++     * Decrement the pending work count for directory one track info is
++     * completed.
++     */
++    public synchronized void decrementPendingWorkCount() {
++      this.pendingWorkCount--;
++    }
++
++    /**
++     * Return true if all the pending work is done and directory fully
++     * scanned, otherwise false.
++     */
++    public synchronized boolean isDirWorkDone() {
++      return (pendingWorkCount <= 0 && fullyScanned);
++    }
++
++    /**
++     * Mark directory scan is completed.
++     */
++    public synchronized void markScanCompleted() {
++      this.fullyScanned = true;
++    }
+-  public void stop() {
+-    if (fileInodeIdCollector != null) {
+-      fileInodeIdCollector.interrupt();
++  public void init() {
++    inodeIdCollector = new Daemon(new StorageMovementPendingInodeIdCollector(
++        namesystem.getFSDirectory()));
++    inodeIdCollector.setName("FileInodeIdCollector");
++    inodeIdCollector.start();
++  }
++
++  public void close() {
++    if (inodeIdCollector != null) {
++      inodeIdCollector.interrupt();
++    }
++  }
++
++  class SPSTraverseInfo extends TraverseInfo {
++    private long startId;
++
++    SPSTraverseInfo(long startId) {
++      this.startId = startId;
++    }
++
++    public long getStartId() {
++      return startId;
+
+MOV26 INS26 INS26 INS40 UPD40 INS40 INS23 INS31 INS31 INS55 INS55 UPD74 INS83 INS83 INS39 INS59 INS44 INS78 UPD83 INS44 INS44 INS8 INS29 INS83 INS83 INS39 INS42 INS8 INS29 INS83 INS83 INS39 INS42 INS8 UPD42 INS43 INS23 INS23 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS29 INS83 INS83 INS42 INS23 INS23 INS31 INS31 INS31 INS31 UPD42 UPD42 INS42 INS43 INS23 INS31 INS31 UPD43 UPD42 INS42 INS39 INS42 INS21 INS42 INS39 INS42 INS39 INS42 MOV21 INS60 INS25 MOV21 INS25 INS65 INS60 INS25 INS65 INS41 INS42 INS83 INS39 INS59 INS83 MOV74 MOV59 INS42 INS44 INS8 MOV78 MOV83 MOV39 MOV42 INS8 INS78 INS83 INS39 INS42 INS43 INS8 INS78 INS83 INS39 INS42 INS44 INS44 INS43 INS43 INS8 INS78 INS83 INS39 INS42 INS8 INS78 INS83 INS39 INS42 INS44 INS43 INS8 INS78 INS83 INS39 INS42 INS44 INS43 INS43 INS8 INS78 INS83 INS39 INS42 INS43 INS8 INS78 INS83 INS39 INS42 INS44 INS43 INS8 INS65 INS83 INS39 INS59 INS83 INS39 INS59 INS29 INS83 INS83 INS39 INS42 INS44 INS8 INS29 INS83 INS83 INS39 INS42 INS8 INS29 INS83 INS83 INS39 INS42 INS8 INS29 INS83 INS83 INS39 INS42 INS8 INS42 INS83 INS39 INS59 INS42 INS44 INS8 INS83 INS39 INS42 INS8 UPD66 UPD66 UPD42 UPD74 INS7 UPD42 UPD66 INS43 INS59 INS27 INS8 INS42 INS8 INS66 INS39 INS59 INS27 INS8 INS8 INS66 INS32 INS42 INS34 UPD42 INS43 INS42 INS46 MOV21 INS61 INS42 INS42 INS42 MOV43 INS42 INS43 INS42 INS42 INS42 INS6 INS25 INS25 MOV25 INS41 INS42 INS41 INS42 INS39 INS42 INS42 INS60 INS21 INS21 INS42 INS39 INS42 INS42 INS42 MOV21 INS21 INS42 INS42 INS6 INS6 INS25 INS21 INS61 INS42 INS43 INS42 INS42 INS41 INS66 INS42 INS34 INS42 INS9 INS65 INS39 INS42 INS21 INS65 INS21 INS65 INS41 INS65 INS21 INS42 INS39 INS42 INS21 INS41 UPD43 INS22 INS42 UPD42 MOV42 INS42 INS32 INS42 INS33 INS21 INS21 UPD42 UPD42 INS21 INS42 INS32 INS42 INS42 INS41 INS41 INS42 INS42 MOV25 INS42 INS42 INS42 MOV27 INS8 INS42 INS32 INS32 INS8 INS38 INS8 INS9 INS27 INS43 INS59 INS32 INS32 INS32 INS38 INS38 INS32 INS8 INS7 INS27 INS8 INS42 INS9 INS66 INS7 INS66 INS66 INS37 INS66 INS66 INS36 INS66 INS7 UPD42 UPD42 UPD42 UPD42 INS7 INS42 UPD42 INS52 INS42 INS42 INS42 INS42 INS7 INS32 INS32 INS42 INS42 INS34 INS36 MOV27 MOV8 INS54 INS32 INS42 INS42 INS42 INS21 INS32 INS41 INS21 INS42 INS34 INS42 INS42 INS36 UPD42 MOV42 UPD42 MOV42 INS27 UPD42 MOV42 INS42 INS40 UPD42 UPD42 INS9 INS42 INS42 INS32 INS32 INS42 INS42 INS21 INS42 INS32 INS42 INS34 INS25 INS21 INS21 INS22 INS27 INS22 INS27 INS22 INS9 INS22 INS42 INS42 INS14 INS42 INS42 INS42 INS42 INS42 INS42 INS27 UPD42 INS25 INS8 MOV12 INS42 INS32 INS42 INS42 INS9 UPD42 INS37 INS11 INS45 INS45 INS32 INS42 INS42 INS42 INS32 INS42 INS32 INS8 INS32 INS7 INS52 INS42 INS22 INS42 INS52 INS42 INS27 INS42 INS52 INS42 UPD43 INS32 UPD42 INS52 INS42 INS43 INS42 INS42 UPD42 UPD42 UPD43 INS27 INS8 UPD42 INS25 INS42 INS42 INS45 INS32 UPD42 INS42 INS43 INS42 INS42 INS42 INS42 INS27 INS42 INS42 INS21 INS42 INS42 INS34 INS42 INS32 INS52 INS42 INS42 INS34 UPD42 INS42 INS42 INS42 UPD42 UPD42 INS32 INS42 INS33 MOV21 MOV25 MOV38 INS8 INS42 INS42 UPD42 INS32 INS42 INS45 INS45 INS32 INS42 MOV42 MOV42 UPD42 MOV42 INS32 MOV60 MOV60 INS25 INS36 INS42 UPD42 INS42 INS42 INS45 UPD42 UPD42 INS42 INS42 MOV27 MOV8 INS8 INS11 UPD42 UPD42 MOV60 INS25 INS43 INS42 UPD42 UPD42 MOV43 MOV27 INS8 INS42 UPD42 UPD42 INS54 INS21 INS21 INS60 INS25 UPD42 INS8 INS8 INS32 INS32 INS43 INS59 INS32 INS8 INS21 INS21 INS21 INS21 INS42 INS32 INS42 INS9 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS21 INS21 INS7 INS32 INS32 INS32 INS42 INS42 INS42 INS42 INS32 INS32 INS32 INS42 INS32 INS42 INS42 MOV32 UPD42 MOV42 UPD40 MOV40 INS14 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS32 INS42 UPD42 INS43 INS42 INS42 INS42 INS42 INS42 INS42 DEL43 DEL42 DEL44 DEL42 DEL8 DEL42 DEL42 DEL42 DEL32 DEL33 DEL27 DEL32 DEL34 DEL27 DEL42 DEL42 DEL42 DEL34 DEL27 DEL8 DEL25 DEL42 DEL60 DEL42 DEL44 DEL32 DEL8 DEL70 DEL42 DEL42 DEL32 DEL42 DEL32 DEL21 DEL8 DEL25 DEL8 DEL25 DEL8 DEL25 DEL8 DEL25 DEL8 DEL54 DEL8 DEL61 DEL8 DEL31

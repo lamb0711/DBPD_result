@@ -1,0 +1,512 @@
+HDFS-6305. WebHdfs response decoding may throw RuntimeExceptions (Daryn Sharp via jeagles)
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/trunk@1594273 13f79535-47bb-0310-9956-ffa450edef68
+
+-import org.apache.hadoop.hdfs.web.resources.AccessTimeParam;
+-import org.apache.hadoop.hdfs.web.resources.AclPermissionParam;
+-import org.apache.hadoop.hdfs.web.resources.BlockSizeParam;
+-import org.apache.hadoop.hdfs.web.resources.BufferSizeParam;
+-import org.apache.hadoop.hdfs.web.resources.ConcatSourcesParam;
+-import org.apache.hadoop.hdfs.web.resources.CreateParentParam;
+-import org.apache.hadoop.hdfs.web.resources.DelegationParam;
+-import org.apache.hadoop.hdfs.web.resources.DeleteOpParam;
+-import org.apache.hadoop.hdfs.web.resources.DestinationParam;
+-import org.apache.hadoop.hdfs.web.resources.DoAsParam;
+-import org.apache.hadoop.hdfs.web.resources.GetOpParam;
+-import org.apache.hadoop.hdfs.web.resources.GroupParam;
+-import org.apache.hadoop.hdfs.web.resources.HttpOpParam;
+-import org.apache.hadoop.hdfs.web.resources.LengthParam;
+-import org.apache.hadoop.hdfs.web.resources.ModificationTimeParam;
+-import org.apache.hadoop.hdfs.web.resources.OffsetParam;
+-import org.apache.hadoop.hdfs.web.resources.OverwriteParam;
+-import org.apache.hadoop.hdfs.web.resources.OwnerParam;
+-import org.apache.hadoop.hdfs.web.resources.Param;
+-import org.apache.hadoop.hdfs.web.resources.PermissionParam;
+-import org.apache.hadoop.hdfs.web.resources.PostOpParam;
+-import org.apache.hadoop.hdfs.web.resources.PutOpParam;
+-import org.apache.hadoop.hdfs.web.resources.RecursiveParam;
+-import org.apache.hadoop.hdfs.web.resources.RenameOptionSetParam;
+-import org.apache.hadoop.hdfs.web.resources.RenewerParam;
+-import org.apache.hadoop.hdfs.web.resources.ReplicationParam;
+-import org.apache.hadoop.hdfs.web.resources.TokenArgumentParam;
+-import org.apache.hadoop.hdfs.web.resources.UserParam;
++import org.apache.hadoop.hdfs.web.resources.*;
++import org.apache.hadoop.hdfs.web.resources.HttpOpParam.Op;
+-   * Run a http operation.
+-   * Connect to the http server, validate response, and obtain the JSON output.
+-   * 
+-   * @param op http operation
+-   * @param fspath file system path
+-   * @param parameters parameters for the operation
+-   * @return a JSON object, e.g. Object[], Map<?, ?>, etc.
+-   * @throws IOException
+-   */
+-  private Map<?, ?> run(final HttpOpParam.Op op, final Path fspath,
+-      final Param<?,?>... parameters) throws IOException {
+-    return new FsPathRunner(op, fspath, parameters).run().json;
+-  }
+-
+-  /**
+-  abstract class AbstractRunner {
++  abstract class AbstractRunner<T> {
+-    protected HttpURLConnection conn = null;
+-    private Map<?, ?> json = null;
+-    AbstractRunner run() throws IOException {
++    T run() throws IOException {
+-            new PrivilegedExceptionAction<AbstractRunner>() {
++            new PrivilegedExceptionAction<T>() {
+-              public AbstractRunner run() throws IOException {
++              public T run() throws IOException {
+-    
+-    private void init() throws IOException {
+-      checkRetry = !redirected;
+-      URL url = getUrl();
+-      conn = (HttpURLConnection) connectionFactory.openConnection(url);
+-    }
+-    
+-    private void connect() throws IOException {
+-      connect(op.getDoOutput());
++
++    /**
++     * Two-step requests redirected to a DN
++     * 
++     * Create/Append:
++     * Step 1) Submit a Http request with neither auto-redirect nor data. 
++     * Step 2) Submit another Http request with the URL from the Location header with data.
++     * 
++     * The reason of having two-step create/append is for preventing clients to
++     * send out the data before the redirect. This issue is addressed by the
++     * "Expect: 100-continue" header in HTTP/1.1; see RFC 2616, Section 8.2.3.
++     * Unfortunately, there are software library bugs (e.g. Jetty 6 http server
++     * and Java 6 http client), which do not correctly implement "Expect:
++     * 100-continue". The two-step create/append is a temporary workaround for
++     * the software library bugs.
++     * 
++     * Open/Checksum
++     * Also implements two-step connects for other operations redirected to
++     * a DN such as open and checksum
++     */
++    private HttpURLConnection connect(URL url) throws IOException {
++      // resolve redirects for a DN operation unless already resolved
++      if (op.getRedirect() && !redirected) {
++        final HttpOpParam.Op redirectOp =
++            HttpOpParam.TemporaryRedirectOp.valueOf(op);
++        final HttpURLConnection conn = connect(redirectOp, url);
++        // application level proxy like httpfs might not issue a redirect
++        if (conn.getResponseCode() == op.getExpectedHttpResponseCode()) {
++          return conn;
++        }
++        try {
++          validateResponse(redirectOp, conn, false);
++          url = new URL(conn.getHeaderField("Location"));
++        } finally {
++          conn.disconnect();
++        }
++      }
++      return connect(op, url);
+-    private void connect(boolean doOutput) throws IOException {
++    private HttpURLConnection connect(final HttpOpParam.Op op, final URL url)
++        throws IOException {
++      final HttpURLConnection conn =
++          (HttpURLConnection)connectionFactory.openConnection(url);
++      final boolean doOutput = op.getDoOutput();
++          } else {
++            conn.setRequestProperty("Content-Type",
++                MediaType.APPLICATION_OCTET_STREAM);
++            conn.setChunkedStreamingMode(32 << 10); //32kB-chunk
++      return conn;
+-    private void disconnect() {
+-      if (conn != null) {
+-        conn.disconnect();
+-        conn = null;
+-      }
+-    }
+-
+-    private AbstractRunner runWithRetry() throws IOException {
++    private T runWithRetry() throws IOException {
++        checkRetry = !redirected;
++        final URL url = getUrl();
+-          init();
+-          if (op.getDoOutput()) {
+-            twoStepWrite();
+-          } else {
+-            getResponse(op != GetOpParam.Op.OPEN);
++          final HttpURLConnection conn = connect(url);
++          // output streams will validate on close
++          if (!op.getDoOutput()) {
++            validateResponse(op, conn, false);
+-          return this;
+-        } catch(IOException ioe) {
++          return getResponse(conn);
++        } catch (IOException ioe) {
+-    /**
+-     * Two-step Create/Append:
+-     * Step 1) Submit a Http request with neither auto-redirect nor data. 
+-     * Step 2) Submit another Http request with the URL from the Location header with data.
+-     * 
+-     * The reason of having two-step create/append is for preventing clients to
+-     * send out the data before the redirect. This issue is addressed by the
+-     * "Expect: 100-continue" header in HTTP/1.1; see RFC 2616, Section 8.2.3.
+-     * Unfortunately, there are software library bugs (e.g. Jetty 6 http server
+-     * and Java 6 http client), which do not correctly implement "Expect:
+-     * 100-continue". The two-step create/append is a temporary workaround for
+-     * the software library bugs.
+-     */
+-    HttpURLConnection twoStepWrite() throws IOException {
+-      //Step 1) Submit a Http request with neither auto-redirect nor data. 
+-      connect(false);
+-      validateResponse(HttpOpParam.TemporaryRedirectOp.valueOf(op), conn, false);
+-      final String redirect = conn.getHeaderField("Location");
+-      disconnect();
+-      checkRetry = false;
+-      
+-      //Step 2) Submit another Http request with the URL from the Location header with data.
+-      conn = (HttpURLConnection) connectionFactory.openConnection(new URL(
+-          redirect));
+-      conn.setRequestProperty("Content-Type",
+-          MediaType.APPLICATION_OCTET_STREAM);
+-      conn.setChunkedStreamingMode(32 << 10); //32kB-chunk
+-      connect();
+-      return conn;
+-    }
+-
+-    FSDataOutputStream write(final int bufferSize) throws IOException {
+-      return WebHdfsFileSystem.this.write(op, conn, bufferSize);
+-    }
+-
+-    void getResponse(boolean getJsonAndDisconnect) throws IOException {
+-      try {
+-        connect();
+-        final int code = conn.getResponseCode();
+-        if (!redirected && op.getRedirect()
+-            && code != op.getExpectedHttpResponseCode()) {
+-          final String redirect = conn.getHeaderField("Location");
+-          json = validateResponse(HttpOpParam.TemporaryRedirectOp.valueOf(op),
+-              conn, false);
+-          disconnect();
+-  
+-          checkRetry = false;
+-          conn = (HttpURLConnection) connectionFactory.openConnection(new URL(
+-              redirect));
+-          connect();
+-        }
+-
+-        json = validateResponse(op, conn, false);
+-        if (json == null && getJsonAndDisconnect) {
+-          json = jsonParse(conn, false);
+-        }
+-      } finally {
+-        if (getJsonAndDisconnect) {
+-          disconnect();
+-        }
+-      }
+-    }
++    abstract T getResponse(HttpURLConnection conn) throws IOException;
+-  final class FsPathRunner extends AbstractRunner {
++  /**
++   * Abstract base class to handle path-based operations with params
++   */
++  abstract class AbstractFsPathRunner<T> extends AbstractRunner<T> {
+-    private final Param<?, ?>[] parameters;
+-
+-    FsPathRunner(final HttpOpParam.Op op, final Path fspath, final Param<?,?>... parameters) {
++    private final Param<?,?>[] parameters;
++    
++    AbstractFsPathRunner(final HttpOpParam.Op op, final Path fspath,
++        Param<?,?>... parameters) {
+-
++    
+-  final class URLRunner extends AbstractRunner {
++  /**
++   * Default path-based implementation expects no json response
++   */
++  class FsPathRunner extends AbstractFsPathRunner<Void> {
++    FsPathRunner(Op op, Path fspath, Param<?,?>... parameters) {
++      super(op, fspath, parameters);
++    }
++    
++    @Override
++    Void getResponse(HttpURLConnection conn) throws IOException {
++      return null;
++    }
++  }
++
++  /**
++   * Handle path-based operations with a json response
++   */
++  abstract class FsPathResponseRunner<T> extends AbstractFsPathRunner<T> {
++    FsPathResponseRunner(final HttpOpParam.Op op, final Path fspath,
++        Param<?,?>... parameters) {
++      super(op, fspath, parameters);
++    }
++    
++    @Override
++    final T getResponse(HttpURLConnection conn) throws IOException {
++      try {
++        final Map<?,?> json = jsonParse(conn, false);
++        if (json == null) {
++          // match exception class thrown by parser
++          throw new IllegalStateException("Missing response");
++        }
++        return decodeResponse(json);
++      } catch (IOException ioe) {
++        throw ioe;
++      } catch (Exception e) { // catch json parser errors
++        final IOException ioe =
++            new IOException("Response decoding failure: "+e.toString(), e);
++        if (LOG.isDebugEnabled()) {
++          LOG.debug(ioe);
++        }
++        throw ioe;
++      } finally {
++        conn.disconnect();
++      }
++    }
++    
++    abstract T decodeResponse(Map<?,?> json) throws IOException;
++  }
++
++  /**
++   * Handle path-based operations with json boolean response
++   */
++  class FsPathBooleanRunner extends FsPathResponseRunner<Boolean> {
++    FsPathBooleanRunner(Op op, Path fspath, Param<?,?>... parameters) {
++      super(op, fspath, parameters);
++    }
++    
++    @Override
++    Boolean decodeResponse(Map<?,?> json) throws IOException {
++      return (Boolean)json.get("boolean");
++    }
++  }
++
++  /**
++   * Handle create/append output streams
++   */
++  class FsPathOutputStreamRunner extends AbstractFsPathRunner<FSDataOutputStream> {
++    private final int bufferSize;
++    
++    FsPathOutputStreamRunner(Op op, Path fspath, int bufferSize,
++        Param<?,?>... parameters) {
++      super(op, fspath, parameters);
++      this.bufferSize = bufferSize;
++    }
++    
++    @Override
++    FSDataOutputStream getResponse(final HttpURLConnection conn)
++        throws IOException {
++      return new FSDataOutputStream(new BufferedOutputStream(
++          conn.getOutputStream(), bufferSize), statistics) {
++        @Override
++        public void close() throws IOException {
++          try {
++            super.close();
++          } finally {
++            try {
++              validateResponse(op, conn, true);
++            } finally {
++              conn.disconnect();
++            }
++          }
++        }
++      };
++    }
++  }
++  
++  /**
++   * Used by open() which tracks the resolved url itself
++   */
++  final class URLRunner extends AbstractRunner<HttpURLConnection> {
++
++    @Override
++    HttpURLConnection getResponse(HttpURLConnection conn) throws IOException {
++      return conn;
++    }
+-    final Map<?, ?> json = run(op, f);
+-    final HdfsFileStatus status = JsonUtil.toFileStatus(json, true);
++    HdfsFileStatus status = new FsPathResponseRunner<HdfsFileStatus>(op, f) {
++      @Override
++      HdfsFileStatus decodeResponse(Map<?,?> json) {
++        return JsonUtil.toFileStatus(json, true);
++      }
++    }.run();
+-    final Map<?, ?> json = run(op, f);
+-    AclStatus status = JsonUtil.toAclStatus(json);
++    AclStatus status = new FsPathResponseRunner<AclStatus>(op, f) {
++      @Override
++      AclStatus decodeResponse(Map<?,?> json) {
++        return JsonUtil.toAclStatus(json);
++      }
++    }.run();
+-    final Map<?, ?> json = run(op, f,
+-        new PermissionParam(applyUMask(permission)));
+-    return (Boolean)json.get("boolean");
++    return new FsPathBooleanRunner(op, f,
++        new PermissionParam(applyUMask(permission))
++    ).run();
+-    run(op, f, new DestinationParam(makeQualified(destination).toUri().getPath()),
+-        new CreateParentParam(createParent));
++    new FsPathRunner(op, f,
++        new DestinationParam(makeQualified(destination).toUri().getPath()),
++        new CreateParentParam(createParent)
++    ).run();
+-    final Map<?, ?> json = run(op, src,
+-        new DestinationParam(makeQualified(dst).toUri().getPath()));
+-    return (Boolean)json.get("boolean");
++    return new FsPathBooleanRunner(op, src,
++        new DestinationParam(makeQualified(dst).toUri().getPath())
++    ).run();
+-    run(op, src, new DestinationParam(makeQualified(dst).toUri().getPath()),
+-        new RenameOptionSetParam(options));
++    new FsPathRunner(op, src,
++        new DestinationParam(makeQualified(dst).toUri().getPath()),
++        new RenameOptionSetParam(options)
++    ).run();
+-    run(op, p, new OwnerParam(owner), new GroupParam(group));
++    new FsPathRunner(op, p,
++        new OwnerParam(owner), new GroupParam(group)
++    ).run();
+-    run(op, p, new PermissionParam(permission));
++    new FsPathRunner(op, p,new PermissionParam(permission)).run();
+-    run(op, path, new AclPermissionParam(aclSpec));
++    new FsPathRunner(op, path, new AclPermissionParam(aclSpec)).run();
+-    run(op, path, new AclPermissionParam(aclSpec));
++    new FsPathRunner(op, path, new AclPermissionParam(aclSpec)).run();
+-    run(op, path);
++    new FsPathRunner(op, path).run();
+-    run(op, path);
++    new FsPathRunner(op, path).run();
+-    run(op, p, new AclPermissionParam(aclSpec));
++    new FsPathRunner(op, p, new AclPermissionParam(aclSpec)).run();
+-    final Map<?, ?> json = run(op, p, new ReplicationParam(replication));
+-    return (Boolean)json.get("boolean");
++    return new FsPathBooleanRunner(op, p,
++        new ReplicationParam(replication)
++    ).run();
+-    run(op, p, new ModificationTimeParam(mtime), new AccessTimeParam(atime));
++    new FsPathRunner(op, p,
++        new ModificationTimeParam(mtime),
++        new AccessTimeParam(atime)
++    ).run();
+-  FSDataOutputStream write(final HttpOpParam.Op op,
+-      final HttpURLConnection conn, final int bufferSize) throws IOException {
+-    return new FSDataOutputStream(new BufferedOutputStream(
+-        conn.getOutputStream(), bufferSize), statistics) {
+-      @Override
+-      public void close() throws IOException {
+-        try {
+-          super.close();
+-        } finally {
+-          try {
+-            validateResponse(op, conn, true);
+-          } finally {
+-            conn.disconnect();
+-          }
+-        }
+-      }
+-    };
+-  }
+-
+-
+-    ConcatSourcesParam param = new ConcatSourcesParam(srcs);
+-    run(op, trg, param);
++    new FsPathRunner(op, trg, new ConcatSourcesParam(srcs)).run();
+-    return new FsPathRunner(op, f,
++    return new FsPathOutputStreamRunner(op, f, bufferSize,
+-        new BlockSizeParam(blockSize))
+-      .run()
+-      .write(bufferSize);
++        new BlockSizeParam(blockSize)
++    ).run();
+-    return new FsPathRunner(op, f, new BufferSizeParam(bufferSize))
+-      .run()
+-      .write(bufferSize);
++    return new FsPathOutputStreamRunner(op, f, bufferSize,
++        new BufferSizeParam(bufferSize)
++    ).run();
+-    final Map<?, ?> json = run(op, f, new RecursiveParam(recursive));
+-    return (Boolean)json.get("boolean");
++    return new FsPathBooleanRunner(op, f,
++        new RecursiveParam(recursive)
++    ).run();
+-      return new URLRunner(GetOpParam.Op.OPEN, offsetUrl, resolved).run().conn;
++      return new URLRunner(GetOpParam.Op.OPEN, offsetUrl, resolved).run();
+-    final Map<?, ?> json  = run(op, f);
+-    final Map<?, ?> rootmap = (Map<?, ?>)json.get(FileStatus.class.getSimpleName() + "es");
+-    final Object[] array = (Object[])rootmap.get(FileStatus.class.getSimpleName());
++    return new FsPathResponseRunner<FileStatus[]>(op, f) {
++      @Override
++      FileStatus[] decodeResponse(Map<?,?> json) {
++        final Map<?, ?> rootmap = (Map<?, ?>)json.get(FileStatus.class.getSimpleName() + "es");
++        final Object[] array = (Object[])rootmap.get(FileStatus.class.getSimpleName());
+-    //convert FileStatus
+-    final FileStatus[] statuses = new FileStatus[array.length];
+-    for(int i = 0; i < array.length; i++) {
+-      final Map<?, ?> m = (Map<?, ?>)array[i];
+-      statuses[i] = makeQualified(JsonUtil.toFileStatus(m, false), f);
+-    }
+-    return statuses;
++        //convert FileStatus
++        final FileStatus[] statuses = new FileStatus[array.length];
++        for (int i = 0; i < array.length; i++) {
++          final Map<?, ?> m = (Map<?, ?>)array[i];
++          statuses[i] = makeQualified(JsonUtil.toFileStatus(m, false), f);
++        }
++        return statuses;
++      }
++    }.run();
+-    final Map<?, ?> m = run(op, null, new RenewerParam(renewer));
+-    final Token<DelegationTokenIdentifier> token = JsonUtil.toDelegationToken(m);
++    Token<DelegationTokenIdentifier> token =
++        new FsPathResponseRunner<Token<DelegationTokenIdentifier>>(
++            op, null, new RenewerParam(renewer)) {
++      @Override
++      Token<DelegationTokenIdentifier> decodeResponse(Map<?,?> json)
++          throws IOException {
++        return JsonUtil.toDelegationToken(json);
++      }
++    }.run();
+-    TokenArgumentParam dtargParam = new TokenArgumentParam(
+-        token.encodeToUrlString());
+-    final Map<?, ?> m = run(op, null, dtargParam);
+-    return (Long) m.get("long");
++    return new FsPathResponseRunner<Long>(op, null,
++        new TokenArgumentParam(token.encodeToUrlString())) {
++      @Override
++      Long decodeResponse(Map<?,?> json) throws IOException {
++        return (Long) json.get("long");
++      }
++    }.run();
+-    TokenArgumentParam dtargParam = new TokenArgumentParam(
+-        token.encodeToUrlString());
+-    run(op, null, dtargParam);
++    new FsPathRunner(op, null,
++        new TokenArgumentParam(token.encodeToUrlString())
++    ).run();
+-    final Map<?, ?> m = run(op, p, new OffsetParam(offset),
+-        new LengthParam(length));
+-    return DFSUtil.locatedBlocks2Locations(JsonUtil.toLocatedBlocks(m));
++    return new FsPathResponseRunner<BlockLocation[]>(op, p,
++        new OffsetParam(offset), new LengthParam(length)) {
++      @Override
++      BlockLocation[] decodeResponse(Map<?,?> json) throws IOException {
++        return DFSUtil.locatedBlocks2Locations(
++            JsonUtil.toLocatedBlocks(json));
++      }
++    }.run();
+-    final Map<?, ?> m = run(op, p);
+-    return JsonUtil.toContentSummary(m);
++    return new FsPathResponseRunner<ContentSummary>(op, p) {
++      @Override
++      ContentSummary decodeResponse(Map<?,?> json) {
++        return JsonUtil.toContentSummary(json);        
++      }
++    }.run();
+-    final Map<?, ?> m = run(op, p);
+-    return JsonUtil.toMD5MD5CRC32FileChecksum(m);
++    return new FsPathResponseRunner<MD5MD5CRC32FileChecksum>(op, p) {
++      @Override
++      MD5MD5CRC32FileChecksum decodeResponse(Map<?,?> json) throws IOException {
++        return JsonUtil.toMD5MD5CRC32FileChecksum(json);
++      }
++    }.run();

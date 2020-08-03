@@ -1,0 +1,141 @@
+Merge branch 'HDFS-12943' into trunk
+
++import java.util.ArrayList;
++import org.apache.hadoop.hdfs.qjournal.protocol.QJournalProtocolProtos.GetJournaledEditsResponseProto;
++import org.apache.hadoop.log.LogThrottlingHelper;
++import org.apache.hadoop.log.LogThrottlingHelper.LogAction;
++  // This config is not publicly exposed
++  static final String QJM_RPC_MAX_TXNS_KEY =
++      "dfs.ha.tail-edits.qjm.rpc.max-txns";
++  static final int QJM_RPC_MAX_TXNS_DEFAULT = 5000;
++
++  // Maximum number of transactions to fetch at a time when using the
++  // RPC edit fetch mechanism
++  private final int maxTxnsPerRpc;
++  // Whether or not in-progress tailing is enabled in the configuration
++  private final boolean inProgressTailingEnabled;
++  /** Limit logging about input stream selection to every 5 seconds max. */
++  private static final long SELECT_INPUT_STREAM_LOG_INTERVAL_MS = 5000;
++  private final LogThrottlingHelper selectInputStreamLogHelper =
++      new LogThrottlingHelper(SELECT_INPUT_STREAM_LOG_INTERVAL_MS);
++
++    this.maxTxnsPerRpc =
++        conf.getInt(QJM_RPC_MAX_TXNS_KEY, QJM_RPC_MAX_TXNS_DEFAULT);
++    Preconditions.checkArgument(maxTxnsPerRpc > 0,
++        "Must specify %s greater than 0!", QJM_RPC_MAX_TXNS_KEY);
++    this.inProgressTailingEnabled = conf.getBoolean(
++        DFSConfigKeys.DFS_HA_TAILEDITS_INPROGRESS_KEY,
++        DFSConfigKeys.DFS_HA_TAILEDITS_INPROGRESS_DEFAULT);
+-    boolean updateCommittedTxId = conf.getBoolean(
+-        DFSConfigKeys.DFS_HA_TAILEDITS_INPROGRESS_KEY,
+-        DFSConfigKeys.DFS_HA_TAILEDITS_INPROGRESS_DEFAULT);
+-        writeTxnsTimeoutMs, updateCommittedTxId);
++        writeTxnsTimeoutMs);
++    // Some calls will use inProgressOK to get in-progress edits even if
++    // the cache used for RPC calls is not enabled; fall back to using the
++    // streaming mechanism to serve such requests
++    if (inProgressOk && inProgressTailingEnabled) {
++      if (LOG.isDebugEnabled()) {
++        LOG.debug("Tailing edits starting from txn ID " + fromTxnId +
++            " via RPC mechanism");
++      }
++      try {
++        Collection<EditLogInputStream> rpcStreams = new ArrayList<>();
++        selectRpcInputStreams(rpcStreams, fromTxnId, onlyDurableTxns);
++        streams.addAll(rpcStreams);
++        return;
++      } catch (IOException ioe) {
++        LOG.warn("Encountered exception while tailing edits >= " + fromTxnId +
++            " via RPC; falling back to streaming.", ioe);
++      }
++    }
++    selectStreamingInputStreams(streams, fromTxnId, inProgressOk,
++        onlyDurableTxns);
++  }
++  /**
++   * Select input streams from the journals, specifically using the RPC
++   * mechanism optimized for low latency.
++   *
++   * @param streams The collection to store the return streams into.
++   * @param fromTxnId Select edits starting from this transaction ID
++   * @param onlyDurableTxns Iff true, only include transactions which have been
++   *                        committed to a quorum of the journals.
++   * @throws IOException Upon issues, including cache misses on the journals.
++   */
++  private void selectRpcInputStreams(Collection<EditLogInputStream> streams,
++      long fromTxnId, boolean onlyDurableTxns) throws IOException {
++    QuorumCall<AsyncLogger, GetJournaledEditsResponseProto> q =
++        loggers.getJournaledEdits(fromTxnId, maxTxnsPerRpc);
++    Map<AsyncLogger, GetJournaledEditsResponseProto> responseMap =
++        loggers.waitForWriteQuorum(q, selectInputStreamsTimeoutMs,
++            "selectRpcInputStreams");
++    assert responseMap.size() >= loggers.getMajoritySize() :
++        "Quorum call returned without a majority";
++
++    List<Integer> responseCounts = new ArrayList<>();
++    for (GetJournaledEditsResponseProto resp : responseMap.values()) {
++      responseCounts.add(resp.getTxnCount());
++    }
++    Collections.sort(responseCounts);
++    int highestTxnCount = responseCounts.get(responseCounts.size() - 1);
++    if (LOG.isDebugEnabled() || highestTxnCount < 0) {
++      StringBuilder msg = new StringBuilder("Requested edits starting from ");
++      msg.append(fromTxnId).append("; got ").append(responseMap.size())
++          .append(" responses: <");
++      for (Map.Entry<AsyncLogger, GetJournaledEditsResponseProto> ent :
++          responseMap.entrySet()) {
++        msg.append("[").append(ent.getKey()).append(", ")
++            .append(ent.getValue().getTxnCount()).append("],");
++      }
++      msg.append(">");
++      if (highestTxnCount < 0) {
++        throw new IOException("Did not get any valid JournaledEdits " +
++            "responses: " + msg);
++      } else {
++        LOG.debug(msg.toString());
++      }
++    }
++
++    int maxAllowedTxns = !onlyDurableTxns ? highestTxnCount :
++        responseCounts.get(responseCounts.size() - loggers.getMajoritySize());
++    if (maxAllowedTxns == 0) {
++      LOG.debug("No new edits available in logs; requested starting from " +
++          "ID " + fromTxnId);
++      return;
++    }
++    LogAction logAction = selectInputStreamLogHelper.record(fromTxnId);
++    if (logAction.shouldLog()) {
++      LOG.info("Selected loggers with >= " + maxAllowedTxns + " transactions " +
++          "starting from lowest txn ID " + logAction.getStats(0).getMin() +
++          LogThrottlingHelper.getLogSupressionMessage(logAction));
++    }
++    PriorityQueue<EditLogInputStream> allStreams = new PriorityQueue<>(
++        JournalSet.EDIT_LOG_INPUT_STREAM_COMPARATOR);
++    for (GetJournaledEditsResponseProto resp : responseMap.values()) {
++      long endTxnId = fromTxnId - 1 +
++          Math.min(maxAllowedTxns, resp.getTxnCount());
++      allStreams.add(EditLogFileInputStream.fromByteString(
++          resp.getEditLog(), fromTxnId, endTxnId, true));
++    }
++    JournalSet.chainAndMakeRedundantStreams(streams, allStreams, fromTxnId);
++  }
++
++  /**
++   * Select input streams from the journals, specifically using the streaming
++   * mechanism optimized for resiliency / bulk load.
++   */
++  private void selectStreamingInputStreams(
++      Collection<EditLogInputStream> streams, long fromTxnId,
++      boolean inProgressOk, boolean onlyDurableTxns) throws IOException {
+-            "selectInputStreams");
+-    
+-    LOG.debug("selectInputStream manifests:\n" +
++            "selectStreamingInputStreams");
++
++    LOG.debug("selectStreamingInputStream manifests:\n" +
+-    
+-    final PriorityQueue<EditLogInputStream> allStreams = 
++
++    final PriorityQueue<EditLogInputStream> allStreams =
+
+INS26 INS26 INS26 INS26 INS40 INS40 INS40 INS40 INS23 INS23 INS23 INS23 INS23 INS23 INS31 INS31 INS83 INS83 INS43 INS59 INS83 INS83 INS39 INS59 INS83 INS83 INS39 INS59 INS83 INS83 INS39 INS59 INS29 INS83 INS83 INS83 INS39 INS59 INS83 INS83 INS43 INS59 MOV78 INS83 INS39 INS42 INS44 INS44 INS44 INS44 INS43 INS8 INS29 INS83 INS39 INS42 INS44 INS44 INS44 INS43 INS8 INS29 UPD83 UPD42 INS42 INS42 INS45 INS42 INS34 INS42 INS42 INS65 INS42 INS34 INS42 INS42 INS14 INS21 INS21 INS21 INS74 INS42 INS39 INS42 INS39 INS42 INS39 INS42 INS42 INS25 INS21 INS65 INS65 INS65 INS65 INS65 INS74 INS42 INS39 INS42 INS39 INS42 INS42 INS60 INS60 INS6 INS60 INS70 INS21 INS60 INS25 INS60 INS25 INS60 INS25 INS60 INS70 INS21 INS65 INS66 INS43 INS42 INS7 INS32 INS7 INS43 INS43 INS27 INS8 INS32 INS66 INS66 INS42 INS66 INS42 INS66 INS42 INS66 INS66 INS42 INS66 INS43 INS43 INS74 INS59 INS74 INS59 INS27 INS45 INS74 INS59 INS44 INS32 INS8 INS32 INS39 INS59 INS27 INS8 INS39 INS59 INS27 INS8 INS43 INS59 INS32 INS8 INS74 INS59 INS44 INS32 INS8 INS32 INS66 INS66 INS42 INS22 INS32 INS42 INS42 INS27 INS45 INS42 INS22 MOV32 INS42 INS42 INS42 INS42 INS25 INS54 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS43 INS43 INS43 INS42 INS32 INS43 INS43 INS43 INS42 INS32 INS32 INS32 INS43 INS43 INS42 INS14 INS43 INS42 INS42 INS42 INS21 INS42 INS42 INS42 INS42 INS32 INS32 INS27 INS60 INS21 INS70 INS21 INS25 INS42 INS16 INS42 INS34 INS21 INS41 INS42 INS42 INS32 INS42 INS42 INS21 INS43 INS43 INS42 INS14 INS43 INS42 INS42 INS42 INS60 INS21 INS42 INS42 INS42 INS42 INS42 INS52 INS42 INS42 INS42 INS42 INS42 INS42 INS34 INS52 INS42 INS32 INS8 INS8 INS12 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS45 INS42 INS42 INS42 INS42 INS42 INS42 INS74 INS42 INS32 INS42 INS42 INS27 INS42 INS42 INS42 INS34 INS43 INS59 INS32 INS44 INS32 INS8 INS32 INS27 INS8 INS8 INS38 INS42 INS32 INS32 INS42 INS42 INS42 INS32 INS42 INS42 INS74 INS40 INS42 INS39 INS59 INS32 UPD45 UPD45 INS42 INS42 INS21 INS60 INS21 INS21 INS41 INS44 INS8 INS43 INS42 INS42 INS32 INS32 INS34 INS42 INS42 INS14 INS32 INS42 INS45 INS74 INS42 INS42 INS42 INS21 INS42 INS42 INS45 INS42 INS34 INS53 INS21 INS42 INS42 INS42 INS27 INS42 INS42 INS27 INS42 INS42 INS27 INS43 INS42 INS27 INS42 INS42 INS32 INS32 INS74 INS59 INS32 INS32 INS43 INS42 INS21 INS42 INS42 INS42 INS42 INS42 INS43 INS45 INS32 INS42 INS32 INS43 INS43 INS43 INS32 INS14 INS32 INS32 INS32 INS45 INS45 INS42 INS45 INS42 INS45 INS45 INS32 INS32 INS42 INS27 INS32 INS42 INS42 INS32 INS42 INS42 INS9 INS42 INS42 INS27 INS43 INS43 INS42 INS14 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS32 INS42 INS45 INS42 INS42 INS40 INS42 INS42 INS32 INS42 INS45 INS43 INS27 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS34 INS42 INS42 INS42 INS32 INS42 INS42 INS45 INS42 INS45 INS42 INS42 INS74 INS42 INS42 INS27 INS42 INS42 INS42 INS42 INS32 INS42 INS32 INS42 INS45 INS45 INS42 INS42 INS42 INS42 INS42 INS34 INS42 INS42 INS43 INS45 INS42 INS45 INS32 INS42 INS45 INS32 INS42 INS42 INS32 INS42 INS32 INS42 INS42 INS42 INS42 INS45 INS42 INS42 DEL39 DEL42 DEL59 DEL60 DEL42

@@ -1,0 +1,281 @@
+YARN-6405. Improve configuring services through REST API. Contributed by Jian He
+
++import org.apache.hadoop.fs.FileSystem;
+-import org.apache.hadoop.io.IOUtils;
+-import org.apache.slider.api.InternalKeys;
++import java.io.OutputStream;
++import java.util.concurrent.ExecutionException;
++import static org.apache.slider.api.ServiceApiConstants.*;
++import static org.apache.slider.util.ServiceApiUtil.$;
++
+-   * @param provider provider to add
++   * @param providerClass provider to add
+-  // Build key -> value map
+-  // value will be substituted by corresponding data in tokenMap
+-  public Map<String, String> substituteConfigs(Map<String, String> configs,
++  public static String substituteStrWithTokens(String content,
++      Map<String, String> tokensForSubstitution) {
++    for (Map.Entry<String, String> token : tokensForSubstitution.entrySet()) {
++      content =
++          content.replaceAll(Pattern.quote(token.getKey()), token.getValue());
++    }
++    return content;
++  }
++
++  // configs will be substituted by corresponding env in tokenMap
++  public void substituteMapWithTokens(Map<String, String> configs,
+-    String format = "${%s}";
+-    Map<String, String> filteredOptions = new HashMap<>();
+-      String key = entry.getKey();
+-      filteredOptions.put(String.format(format, key), value);
++      entry.setValue(value);
+-
+-    return filteredOptions;
++  public static void addEnvForSubstitution(Map<String, String> env,
++      Map<String, String> tokensForSubstitution) {
++    if (env == null || env.isEmpty() || tokensForSubstitution == null
++        || tokensForSubstitution.isEmpty()) {
++      return;
++    }
++    for (Map.Entry<String, String> entry : env.entrySet()) {
++      tokensForSubstitution.put($(entry.getKey()), entry.getValue());
++    }
++  }
+-  //TODO handle Template format config file
+-  public void createConfigFileAndAddLocalResource(ContainerLauncher launcher,
+-      SliderFileSystem fs, Component component,
+-      Map<String, String> tokensForSubstitution,
+-      StateAccessForProviders amState) throws IOException {
++  public synchronized void createConfigFileAndAddLocalResource(
++      ContainerLauncher launcher, SliderFileSystem fs, Component component,
++      Map<String, String> tokensForSubstitution, RoleInstance roleInstance)
++      throws IOException {
+-    if (!fs.getFileSystem().exists(compDir)) {
+-      fs.getFileSystem().mkdirs(compDir,
++    Path compInstanceDir =
++        new Path(compDir, roleInstance.getCompInstanceName());
++    if (!fs.getFileSystem().exists(compInstanceDir)) {
++      fs.getFileSystem().mkdirs(compInstanceDir,
+-      log.info("Creating component dir: " + compDir);
++      roleInstance.compInstanceDir = compInstanceDir;
++      log.info("Creating component instance dir: " + compInstanceDir);
+-      log.info("Component conf dir already exists: " + compDir);
+-      return;
++      log.info("Component instance conf dir already exists: " + compInstanceDir);
+-    for (ConfigFile configFile : component.getConfiguration().getFiles()) {
+-      String fileName = configFile.getSrcFile();
++    // add Configuration#env into tokens substitution
++    addEnvForSubstitution(component.getConfiguration().getEnv(),
++        tokensForSubstitution);
++
++    log.info("Tokens substitution for component: " + roleInstance
++        .getCompInstanceName() + System.lineSeparator()
++        + tokensForSubstitution);
++
++    for (ConfigFile originalFile : component.getConfiguration().getFiles()) {
++      ConfigFile configFile = originalFile.copy();
++      String fileName = new Path(configFile.getDestFile()).getName();
++
+-      // substitute configs
+-      substituteConfigs(configFile.getProps(), tokensForSubstitution);
+-      // write configs onto hdfs
+-      PublishedConfiguration publishedConfiguration =
+-          new PublishedConfiguration(fileName,
+-              configFile.getProps().entrySet());
+-      Path remoteFile = new Path(compDir, fileName);
++      Path remoteFile = new Path(compInstanceDir, fileName);
+-        synchronized (this) {
+-          if (!fs.getFileSystem().exists(remoteFile)) {
+-            PublishedConfigurationOutputter configurationOutputter =
+-                PublishedConfigurationOutputter.createOutputter(
+-                    ConfigFormat.resolve(configFile.getType().toString()),
+-                    publishedConfiguration);
+-            FSDataOutputStream os = null;
+-            try {
+-              os = fs.getFileSystem().create(remoteFile);
+-              configurationOutputter.save(os);
+-              os.flush();
+-              log.info("Created config file on hdfs: " + remoteFile);
+-            } finally {
+-              IOUtils.closeStream(os);
+-            }
++        log.info("Saving config file on hdfs for component " + roleInstance
++            .getCompInstanceName() + ": " + configFile);
++
++        if (configFile.getSrcFile() != null) {
++          // Load config file template
++          switch (configFile.getType()) {
++          case HADOOP_XML:
++            // Hadoop_xml_template
++            resolveHadoopXmlTemplateAndSaveOnHdfs(fs.getFileSystem(),
++                tokensForSubstitution, configFile, remoteFile, roleInstance);
++            break;
++          case TEMPLATE:
++            // plain-template
++            resolvePlainTemplateAndSaveOnHdfs(fs.getFileSystem(),
++                tokensForSubstitution, configFile, remoteFile, roleInstance);
++            break;
++          default:
++            log.info("Not supporting loading src_file for " + configFile);
++            break;
++        } else {
++          // non-template
++          resolveNonTemplateConfigsAndSaveOnHdfs(fs, tokensForSubstitution,
++              roleInstance, configFile, fileName, remoteFile);
+-      // Publish configs
+-      amState.getPublishedSliderConfigurations()
+-          .put(configFile.getSrcFile(), publishedConfiguration);
+-
+-      //TODO why to we need to differetiate  RESOURCE_DIR vs APP_CONF_DIR
++      String symlink = APP_CONF_DIR + "/" + fileName;
+-        String symlink = RESOURCE_DIR + "/" + fileName;
+-        String symlink = APP_CONF_DIR + "/" + fileName;
++  private void resolveNonTemplateConfigsAndSaveOnHdfs(SliderFileSystem fs,
++      Map<String, String> tokensForSubstitution, RoleInstance roleInstance,
++      ConfigFile configFile, String fileName, Path remoteFile)
++      throws IOException {
++    // substitute non-template configs
++    substituteMapWithTokens(configFile.getProps(), tokensForSubstitution);
++
++    // write configs onto hdfs
++    PublishedConfiguration publishedConfiguration =
++        new PublishedConfiguration(fileName,
++            configFile.getProps().entrySet());
++    if (!fs.getFileSystem().exists(remoteFile)) {
++      PublishedConfigurationOutputter configurationOutputter =
++          PublishedConfigurationOutputter.createOutputter(
++              ConfigFormat.resolve(configFile.getType().toString()),
++              publishedConfiguration);
++      try (FSDataOutputStream os = fs.getFileSystem().create(remoteFile)) {
++        configurationOutputter.save(os);
++        os.flush();
++      }
++    } else {
++      log.info("Component instance = " + roleInstance.getCompInstanceName()
++              + ", config file already exists: " + remoteFile);
++    }
++  }
++
++  // 1. substitute config template - only handle hadoop_xml format
++  // 2. save on hdfs
++  @SuppressWarnings("unchecked")
++  private void resolveHadoopXmlTemplateAndSaveOnHdfs(FileSystem fs,
++      Map<String, String> tokensForSubstitution, ConfigFile configFile,
++      Path remoteFile, RoleInstance roleInstance) throws IOException {
++    Map<String, String> conf;
++    try {
++      conf = (Map<String, String>) roleInstance.providerRole.
++          appState.configFileCache.get(configFile);
++    } catch (ExecutionException e) {
++      log.info("Failed to load config file: " + configFile, e);
++      return;
++    }
++    // make a copy for substitution
++    org.apache.hadoop.conf.Configuration confCopy =
++        new org.apache.hadoop.conf.Configuration(false);
++    for (Map.Entry<String, String> entry : conf.entrySet()) {
++      confCopy.set(entry.getKey(), entry.getValue());
++    }
++    // substitute properties
++    for (Map.Entry<String, String> entry : configFile.getProps().entrySet()) {
++      confCopy.set(entry.getKey(), entry.getValue());
++    }
++    // substitute env variables
++    for (Map.Entry<String, String> entry : confCopy) {
++      String val = entry.getValue();
++      if (val != null) {
++        for (Map.Entry<String, String> token : tokensForSubstitution
++            .entrySet()) {
++          val = val.replaceAll(Pattern.quote(token.getKey()), token.getValue());
++          confCopy.set(entry.getKey(), val);
++        }
++      }
++    }
++    // save on hdfs
++    try (OutputStream output = fs.create(remoteFile)) {
++      confCopy.writeXml(output);
++      log.info("Reading config from: " + configFile.getSrcFile()
++          + ", writing to: " + remoteFile);
++    }
++  }
++
++  // 1) read the template as a string
++  // 2) do token substitution
++  // 3) save on hdfs
++  private void resolvePlainTemplateAndSaveOnHdfs(FileSystem fs,
++      Map<String, String> tokensForSubstitution, ConfigFile configFile,
++      Path remoteFile, RoleInstance roleInstance) {
++    String content;
++    try {
++      content = (String) roleInstance.providerRole.appState.configFileCache
++          .get(configFile);
++    } catch (ExecutionException e) {
++      log.info("Failed to load config file: " + configFile, e);
++      return;
++    }
++    // substitute tokens
++    substituteStrWithTokens(content, tokensForSubstitution);
++
++    try (OutputStream output = fs.create(remoteFile)) {
++      org.apache.commons.io.IOUtils.write(content, output);
++    } catch (IOException e) {
++      log.info("Failed to create " + remoteFile);
++    }
++  }
++
+-   * @param componentName component name
+-   * @param componentGroup component group
+-   * @param containerId container ID
+-  public Map<String, String> getStandardTokenMap(
+-      Configuration appConf, Configuration componentConf, String componentName,
+-      String componentGroup, String containerId, String clusterName) {
++  public Map<String, String> getStandardTokenMap(Configuration appConf,
++      RoleInstance roleInstance, String clusterName) {
+-    if (containerId != null) {
+-      tokens.put("${CONTAINER_ID}", containerId);
+-    }
++
+-    String prefix = componentConf.getProperty(ROLE_PREFIX);
+-    String dataDirSuffix = "";
+-    if (prefix == null) {
+-      prefix = "";
+-    } else {
+-      dataDirSuffix = "_" + SliderUtils.trimPrefix(prefix);
+-    }
+-    tokens.put("${DEFAULT_DATA_DIR}",
+-        appConf.getProperty(InternalKeys.INTERNAL_DATA_DIR_PATH)
+-            + dataDirSuffix);
+-    tokens.put("${JAVA_HOME}", appConf.getProperty(JAVA_HOME));
+-    tokens.put("${COMPONENT_NAME}", componentName);
+-    tokens.put("${COMPONENT_NAME.lc}", componentName.toLowerCase());
+-    tokens.put("${COMPONENT_PREFIX}", prefix);
+-    tokens.put("${COMPONENT_PREFIX.lc}", prefix.toLowerCase());
+-    if (!componentName.equals(componentGroup) &&
+-        componentName.startsWith(componentGroup)) {
+-      tokens.put("${COMPONENT_ID}",
+-          componentName.substring(componentGroup.length()));
+-    }
+-    if (clusterName != null) {
+-      tokens.put("${CLUSTER_NAME}", clusterName);
+-      tokens.put("${CLUSTER_NAME.lc}", clusterName.toLowerCase());
+-      tokens.put("${APP_NAME}", clusterName);
+-      tokens.put("${APP_NAME.lc}", clusterName.toLowerCase());
+-    }
+-    tokens.put("${APP_COMPONENT_NAME}", componentName);
+-    tokens.put("${APP_COMPONENT_NAME.lc}", componentName.toLowerCase());
++    tokens.put(SERVICE_NAME_LC, clusterName.toLowerCase());
++    tokens.put(SERVICE_NAME, clusterName);
++    tokens.put(COMPONENT_NAME, roleInstance.role);
++    tokens.put(COMPONENT_NAME_LC, roleInstance.role.toLowerCase());
++    tokens.put(COMPONENT_INSTANCE_NAME, roleInstance.getCompInstanceName());
++    tokens.put(CONTAINER_ID, roleInstance.getContainerId().toString());
++    tokens.put(COMPONENT_ID, String.valueOf(roleInstance.componentId));
+-  public void addRoleHostTokens(Map<String, String> tokens,
++  public void addComponentHostTokens(Map<String, String> tokens,
+-      tokens.put("${" + tokenName + "}", hosts);
++      tokens.put($(tokenName), hosts);
+-        record.description = roleName.replaceAll("_", "-");
++        String componentInstanceName = role.getCompInstanceName();
++        record.description = componentInstanceName.replaceAll("_", "-");
+
+MOV26 MOV26 INS26 INS26 INS26 UPD40 INS40 INS40 UPD40 INS40 INS31 INS31 INS31 INS31 INS31 INS83 INS83 MOV43 INS42 INS44 INS44 INS8 INS39 UPD42 INS83 INS83 INS39 INS42 INS44 INS44 INS8 INS83 INS83 INS39 INS42 INS44 INS44 INS44 MOV44 INS44 INS44 INS43 MOV8 INS79 INS83 INS39 INS42 INS44 INS44 INS44 INS44 INS44 INS43 INS8 INS83 INS39 INS42 INS44 INS44 INS44 INS44 INS44 INS8 UPD42 MOV43 INS42 INS74 INS42 INS70 INS41 MOV74 INS42 INS74 INS42 INS25 INS70 UPD43 UPD42 INS60 INS21 INS21 INS43 INS42 INS74 INS42 INS43 INS42 MOV43 INS42 INS43 INS42 INS42 MOV21 MOV60 INS42 INS45 INS43 INS42 INS74 INS42 INS43 INS42 INS43 INS42 INS43 INS42 INS42 INS60 INS54 INS60 INS70 INS70 INS70 INS54 INS43 INS42 INS74 INS42 INS43 INS42 INS43 INS42 INS43 INS42 INS60 INS54 INS21 INS54 UPD43 UPD42 MOV21 MOV21 INS21 UPD42 INS43 INS43 INS43 INS44 INS32 INS8 INS42 INS43 INS43 INS43 INS27 INS8 INS44 INS32 INS8 UPD42 MOV43 INS59 INS32 INS32 INS44 INS42 INS43 INS43 INS43 INS42 INS42 INS8 INS42 INS43 INS43 INS43 INS42 INS42 INS42 MOV74 INS59 INS8 INS12 INS43 INS59 INS44 INS32 INS8 INS44 INS32 INS8 INS44 INS42 INS8 INS58 INS8 INS42 INS43 INS43 INS43 INS42 INS42 INS42 MOV43 INS59 INS8 INS12 INS32 INS58 INS8 INS12 UPD42 INS32 INS42 INS42 INS42 INS74 INS42 INS42 INS42 INS21 INS42 INS42 INS42 INS27 INS32 INS41 INS74 INS42 INS42 INS42 INS21 INS42 INS14 INS21 INS42 INS32 INS42 INS42 INS42 INS27 INS43 INS42 INS60 INS25 MOV60 INS42 INS42 INS42 UPD42 INS21 INS42 INS42 INS42 INS42 INS21 INS44 INS8 INS40 INS42 INS14 INS74 INS42 INS42 INS42 INS21 INS74 INS42 INS32 INS42 INS21 INS74 INS42 INS60 INS25 INS43 INS59 INS21 INS21 INS42 INS42 INS42 INS42 INS21 INS44 INS8 INS42 INS42 INS42 INS43 INS59 INS21 INS44 INS8 INS42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 INS40 UPD42 MOV42 INS32 UPD42 MOV42 MOV32 MOV42 MOV42 UPD42 MOV42 INS32 INS42 INS43 INS43 INS43 INS7 INS27 INS27 INS42 INS42 INS43 INS43 INS43 INS32 MOV43 INS42 INS32 UPD42 INS7 INS32 INS42 INS45 INS32 INS32 INS42 INS42 INS43 INS59 MOV43 INS43 MOV38 INS8 INS58 INS32 INS7 INS43 INS42 INS21 INS41 INS43 INS9 INS43 INS43 INS43 INS32 INS43 INS43 INS43 INS42 INS42 INS32 INS43 INS43 INS43 MOV43 INS59 INS27 INS8 INS42 INS42 INS32 INS32 INS32 INS7 INS43 INS42 INS21 INS41 INS42 INS42 INS32 INS32 INS43 INS42 INS21 INS40 MOV42 UPD42 UPD42 MOV32 UPD42 MOV42 UPD42 UPD42 INS40 INS40 INS42 INS42 INS42 INS32 UPD42 UPD42 INS27 INS32 INS42 INS33 INS40 INS42 INS42 INS42 INS42 INS32 INS32 INS42 INS42 UPD42 INS40 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS32 INS42 INS21 INS25 MOV43 INS59 INS42 INS42 INS27 INS42 INS11 INS42 INS32 INS40 INS40 INS42 INS42 INS42 INS42 INS32 INS32 INS40 INS42 INS42 INS42 INS42 INS32 INS32 INS40 INS42 INS42 INS42 INS32 INS42 INS33 INS70 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS27 INS42 INS11 INS42 INS32 INS42 INS42 INS42 INS40 INS42 INS42 INS42 INS42 INS32 UPD42 UPD42 INS32 INS60 INS42 INS42 INS32 INS32 INS42 INS33 INS42 INS42 INS42 MOV32 INS42 INS42 UPD45 UPD42 UPD45 UPD42 INS42 INS42 INS14 INS42 INS43 UPD42 INS32 INS27 INS8 INS8 INS42 MOV32 INS45 INS32 INS45 INS42 INS74 INS32 INS42 INS42 INS27 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS44 INS32 INS8 INS45 MOV32 INS45 INS42 MOV43 INS32 INS42 INS42 INS27 INS42 INS42 INS42 INS27 INS42 INS42 MOV43 INS59 INS42 INS42 INS32 INS42 INS42 INS43 INS32 INS42 INS42 INS42 INS27 MOV32 INS33 INS50 INS21 INS42 INS42 INS43 INS43 INS43 INS40 INS42 INS42 INS45 INS42 INS74 INS42 INS42 INS42 INS21 INS21 INS40 INS42 INS42 INS45 INS42 INS45 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS45 INS32 INS45 INS42 INS32 INS49 INS21 INS10 INS49 INS21 INS10 INS49 INS21 INS10 INS32 INS42 INS42 INS42 INS43 INS43 INS43 INS7 INS32 INS42 INS42 UPD42 INS42 INS42 INS42 INS42 INS42 MOV32 INS42 INS32 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS40 INS42 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS42 UPD42 UPD42 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS27 INS42 INS42 INS32 INS32 INS42 INS42 UPD42 UPD42 INS42 INS42 INS45 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS42 DEL42 DEL45 DEL59 DEL60 DEL42 DEL42 DEL43 DEL74 DEL14 DEL59 DEL60 DEL42 DEL59 DEL60 DEL42 DEL42 DEL42 DEL42 DEL32 DEL42 DEL41 DEL41 DEL52 DEL51 DEL8 DEL25 DEL21 DEL42 DEL42 DEL45 DEL42 DEL27 DEL59 DEL60 DEL42 DEL33 DEL59 DEL60 DEL42 DEL7 DEL21 DEL42 DEL42 DEL45 DEL42 DEL27 DEL32 DEL21 DEL42 DEL42 DEL42 DEL32 DEL21 DEL8 DEL42 DEL66 DEL65 DEL42 DEL66 DEL65 DEL42 DEL66 DEL65 DEL42 DEL44 DEL42 DEL44 DEL42 DEL43 DEL42 DEL44 DEL42 DEL33 DEL27 DEL42 DEL42 DEL45 DEL42 DEL32 DEL21 DEL8 DEL25 DEL45 DEL42 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL45 DEL59 DEL60 DEL42 DEL33 DEL27 DEL42 DEL45 DEL7 DEL21 DEL8 DEL42 DEL45 DEL42 DEL42 DEL42 DEL32 DEL27 DEL7 DEL21 DEL8 DEL25 DEL45 DEL40 DEL32 DEL42 DEL27 DEL45 DEL42 DEL42 DEL32 DEL42 DEL42 DEL45 DEL42 DEL32 DEL21 DEL45 DEL32 DEL45 DEL42 DEL32 DEL42 DEL42 DEL45 DEL42 DEL32 DEL21 DEL42 DEL42 DEL45 DEL42 DEL42 DEL32 DEL32 DEL21 DEL42 DEL42 DEL42 DEL32 DEL38 DEL42 DEL42 DEL42 DEL32 DEL27 DEL8 DEL25 DEL42 DEL33 DEL27 DEL45 DEL32 DEL21 DEL42 DEL42 DEL45 DEL32 DEL21 DEL42 DEL45 DEL42 DEL32 DEL21 DEL8 DEL25 DEL42 DEL42 DEL45 DEL42 DEL32 DEL21 DEL45 DEL45 DEL42 DEL45 DEL27

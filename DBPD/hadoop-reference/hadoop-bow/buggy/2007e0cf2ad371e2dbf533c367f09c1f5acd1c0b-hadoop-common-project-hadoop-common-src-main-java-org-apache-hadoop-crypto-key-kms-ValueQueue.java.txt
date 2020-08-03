@@ -1,0 +1,119 @@
+HDFS-11210. Enhance key rolling to guarantee new KeyVersion is returned from generateEncryptedKeys after a key is rolled.
+
++import java.util.ArrayList;
+-import java.util.HashSet;
++import java.util.HashMap;
++import java.util.concurrent.atomic.AtomicBoolean;
++import java.util.concurrent.locks.ReadWriteLock;
++import java.util.concurrent.locks.ReentrantReadWriteLock;
++  private static final int LOCK_ARRAY_SIZE = 16;
++  // Using a mask assuming array size is the power of 2, of MAX_VALUE.
++  private static final int MASK = LOCK_ARRAY_SIZE == Integer.MAX_VALUE ?
++      LOCK_ARRAY_SIZE :
++      LOCK_ARRAY_SIZE - 1;
++  // Stripped rwlocks based on key name to synchronize the queue from
++  // the sync'ed rw-thread and the background async refill thread.
++  private final List<ReadWriteLock> lockArray =
++      new ArrayList<>(LOCK_ARRAY_SIZE);
++    private AtomicBoolean canceled = new AtomicBoolean(false);
++
++    public void cancel() {
++      canceled.set(true);
++    }
++
++    public boolean isCanceled() {
++      return canceled.get();
++    }
++  }
++
++  private void readLock(String keyName) {
++    getLock(keyName).readLock().lock();
++  }
++
++  private void readUnlock(String keyName) {
++    getLock(keyName).readLock().unlock();
++  }
++
++  private void writeUnlock(String keyName) {
++    getLock(keyName).writeLock().unlock();
++  }
++
++  private void writeLock(String keyName) {
++    getLock(keyName).writeLock().lock();
++  }
++
++  /**
++   * Get the stripped lock given a key name.
++   *
++   * @param keyName The key name.
++   */
++  private ReadWriteLock getLock(String keyName) {
++    return lockArray.get(indexFor(keyName));
++  }
++
++  private static int indexFor(String keyName) {
++    return keyName.hashCode() & MASK;
+-    private HashSet<String> keysInProgress = new HashSet<String>();
++    private HashMap<String, Runnable> keysInProgress = new HashMap<>();
+-      if (keysInProgress.add(((NamedRunnable)e).name)) {
++      if (!keysInProgress.containsKey(((NamedRunnable)e).name)) {
++        keysInProgress.put(((NamedRunnable)e).name, e);
++    public Runnable deleteByName(String name) {
++      NamedRunnable e = (NamedRunnable) keysInProgress.remove(name);
++      if (e != null) {
++        e.cancel();
++        super.remove(e);
++      }
++      return e;
++    }
++    for (int i = 0; i < LOCK_ARRAY_SIZE; ++i) {
++      lockArray.add(i, new ReentrantReadWriteLock());
++    }
+-  public void drain(String keyName ) {
++  public void drain(String keyName) {
+-      keyQueues.get(keyName).clear();
++      Runnable e;
++      while ((e = queue.deleteByName(keyName)) != null) {
++        executor.remove(e);
++      }
++      writeLock(keyName);
++      try {
++        keyQueues.get(keyName).clear();
++      } finally {
++        writeUnlock(keyName);
++      }
+-    // We can't do keyQueues.get(keyName).size() here,
+-    // since that will have the side effect of populating the cache.
+-    Map<String, LinkedBlockingQueue<E>> map =
+-        keyQueues.getAllPresent(Arrays.asList(keyName));
+-    if (map.get(keyName) == null) {
+-      return 0;
++    readLock(keyName);
++    try {
++      // We can't do keyQueues.get(keyName).size() here,
++      // since that will have the side effect of populating the cache.
++      Map<String, LinkedBlockingQueue<E>> map =
++          keyQueues.getAllPresent(Arrays.asList(keyName));
++      if (map.get(keyName) == null) {
++        return 0;
++      }
++      return map.get(keyName).size();
++    } finally {
++      readUnlock(keyName);
+-    return map.get(keyName).size();
++        readLock(keyName);
++        readUnlock(keyName);
+-              if (keyQueue.size() < threshold) {
+-                refiller.fillQueueForKey(name, keyQueue,
+-                    cacheSize - keyQueue.size());
++              writeLock(keyName);
++              try {
++                if (keyQueue.size() < threshold && !isCanceled()) {
++                  refiller.fillQueueForKey(name, keyQueue,
++                      cacheSize - keyQueue.size());
++                }
++                if (isCanceled()) {
++                  keyQueue.clear();
++                }
++              } finally {
++                writeUnlock(keyName);

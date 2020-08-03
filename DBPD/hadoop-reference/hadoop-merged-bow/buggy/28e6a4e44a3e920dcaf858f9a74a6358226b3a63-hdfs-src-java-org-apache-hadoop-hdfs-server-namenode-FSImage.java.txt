@@ -1,0 +1,1066 @@
+HDFS-1073. Redesign the NameNode's storage layout for image checkpoints and edit logs to introduce transaction IDs and be more robust. Contributed by Todd Lipcon and Ivan Kelly.
+
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/trunk@1152295 13f79535-47bb-0310-9956-ffa450edef68
+
+-import java.text.SimpleDateFormat;
+-import java.util.Date;
+-import java.util.HashSet;
+-import java.util.Set;
+-import org.apache.hadoop.hdfs.server.common.StorageInfo;
++import org.apache.hadoop.hdfs.server.namenode.FSImageStorageInspector.LoadPlan;
+-import org.apache.hadoop.hdfs.server.namenode.NNStorage.NNStorageListener;
++import org.apache.hadoop.hdfs.util.MD5FileUtils;
++import com.google.common.base.Joiner;
++import com.google.common.base.Preconditions;
++import com.google.common.collect.Lists;
++
+-public class FSImage implements NNStorageListener, Closeable {
++public class FSImage implements Closeable {
+-  private static final SimpleDateFormat DATE_FORM =
+-      new SimpleDateFormat("yyyy-MM-dd HH:mm:ss");
+-
+-  // checkpoint states
+-  enum CheckpointStates{START, ROLLED_EDITS, UPLOAD_START, UPLOAD_DONE; }
+-
+-  protected MD5Hash newImageDigest = null;
+-  protected NNStorage storage = null;
++  protected NNStorage storage;
++  
++  /**
++   * The last transaction ID that was either loaded from an image
++   * or loaded by loading edits files.
++   */
++  protected long lastAppliedTxId = 0;
+-  private Configuration conf;
++  final private Configuration conf;
++
++  private final NNStorageRetentionManager archivalManager; 
+-   * Can fs-image be rolled?
+-   */
+-  volatile protected CheckpointStates ckptState = FSImage.CheckpointStates.START; 
+-
+-  /**
+-   */
+-  FSImage() {
+-    this((FSNamesystem)null);
+-  }
+-
+-  /**
+-   * Constructor
++   * Construct an FSImage.
++   * @see #FSImage(Configuration conf, FSNamesystem ns, 
++   *               Collection imageDirs, Collection editsDirs) 
++   * @throws IOException if default directories are invalid.
+-  FSImage(Configuration conf) throws IOException {
+-    this();
+-    this.conf = conf; // TODO we have too many constructors, this is a mess
+-
+-    if(conf.getBoolean(DFSConfigKeys.DFS_NAMENODE_NAME_DIR_RESTORE_KEY, 
+-        DFSConfigKeys.DFS_NAMENODE_NAME_DIR_RESTORE_DEFAULT)) {
+-      NameNode.LOG.info("set FSImage.restoreFailedStorage");
+-      storage.setRestoreFailedStorage(true);
+-    }
+-    setCheckpointDirectories(FSImage.getCheckpointDirs(conf, null),
+-        FSImage.getCheckpointEditsDirs(conf, null));
++  public FSImage(Configuration conf) throws IOException {
++    this(conf, (FSNamesystem)null);
+-  private FSImage(FSNamesystem ns) {
+-    this.conf = new Configuration();
+-    
+-    storage = new NNStorage(conf);
++  /**
++   * Construct an FSImage
++   * @param conf Configuration
++   * @param ns The FSNamesystem using this image.
++   * @see #FSImage(Configuration conf, FSNamesystem ns, 
++   *               Collection imageDirs, Collection editsDirs) 
++   * @throws IOException if default directories are invalid.
++   */
++  private FSImage(Configuration conf, FSNamesystem ns) throws IOException {
++    this(conf, ns,
++         FSNamesystem.getNamespaceDirs(conf),
++         FSNamesystem.getNamespaceEditsDirs(conf));
++  }
++
++  /**
++   * Construct the FSImage. Set the default checkpoint directories.
++   *
++   * Setup storage and initialize the edit log.
++   *
++   * @param conf Configuration
++   * @param ns The FSNamesystem using this image.
++   * @param imageDirs Directories the image can be stored in.
++   * @param editsDirs Directories the editlog can be stored in.
++   * @throws IOException if directories are invalid.
++   */
++  protected FSImage(Configuration conf, FSNamesystem ns,
++                    Collection<URI> imageDirs, Collection<URI> editsDirs)
++      throws IOException {
++    this.conf = conf;
++    setCheckpointDirectories(FSImage.getCheckpointDirs(conf, null),
++                             FSImage.getCheckpointEditsDirs(conf, null));
++
++    storage = new NNStorage(conf, imageDirs, editsDirs);
+-    storage.registerListener(this);
++
++    if(conf.getBoolean(DFSConfigKeys.DFS_NAMENODE_NAME_DIR_RESTORE_KEY,
++                       DFSConfigKeys.DFS_NAMENODE_NAME_DIR_RESTORE_DEFAULT)) {
++      storage.setRestoreFailedStorage(true);
++    }
++    
++    archivalManager = new NNStorageRetentionManager(conf, storage, editLog);
+-  /**
+-   * @throws IOException 
+-   */
+-  FSImage(Collection<URI> fsDirs, Collection<URI> fsEditsDirs) 
+-      throws IOException {
+-    this();
+-    storage.setStorageDirectories(fsDirs, fsEditsDirs);
+-  }
+-
+-  public FSImage(StorageInfo storageInfo, String bpid) {
+-    storage = new NNStorage(storageInfo, bpid);
+-  }
+-
+-  /**
+-   * Represents an Image (image and edit file).
+-   * @throws IOException 
+-   */
+-  FSImage(URI imageDir) throws IOException {
+-    this();
+-    ArrayList<URI> dirs = new ArrayList<URI>(1);
+-    ArrayList<URI> editsDirs = new ArrayList<URI>(1);
+-    dirs.add(imageDir);
+-    editsDirs.add(imageDir);
+-    storage.setStorageDirectories(dirs, editsDirs);
+-  }
+-  
+-
++ 
++  void format(String clusterId) throws IOException {
++    storage.format(clusterId);
++    saveFSImageInAllDirs(0);    
++  }
++  
+-   * @param dataDirs
+-   * @param startOpt startup option
+-  boolean recoverTransitionRead(Collection<URI> dataDirs,
+-                                Collection<URI> editsDirs,
+-                                StartupOption startOpt)
++  boolean recoverTransitionRead(StartupOption startOpt)
++    Collection<URI> imageDirs = storage.getImageDirectories();
++    Collection<URI> editsDirs = storage.getEditsDirectories();
++
+-    if((dataDirs.size() == 0 || editsDirs.size() == 0) 
++    if((imageDirs.size() == 0 || editsDirs.size() == 0) 
+-    storage.setStorageDirectories(dataDirs, editsDirs);
+-    boolean isFormatted = false;
+-    for (Iterator<StorageDirectory> it = storage.dirIterator(); it.hasNext();) {
+-      StorageDirectory sd = it.next();
+-      StorageState curState;
+-      try {
+-        curState = sd.analyzeStorage(startOpt, storage);
+-        // sd is locked but not opened
+-        switch(curState) {
+-        case NON_EXISTENT:
+-          // name-node fails if any of the configured storage dirs are missing
+-          throw new InconsistentFSStateException(sd.getRoot(),
+-                      "storage directory does not exist or is not accessible.");
+-        case NOT_FORMATTED:
+-          break;
+-        case NORMAL:
+-          break;
+-        default:  // recovery is possible
+-          sd.doRecover(curState);      
+-        }
+-        if (curState != StorageState.NOT_FORMATTED 
+-            && startOpt != StartupOption.ROLLBACK) {
+-          // read and verify consistency with other directories
+-          storage.readProperties(sd);
+-          isFormatted = true;
+-        }
+-        if (startOpt == StartupOption.IMPORT && isFormatted)
+-          // import of a checkpoint is allowed only into empty image directories
+-          throw new IOException("Cannot import image from a checkpoint. " 
+-              + " NameNode already contains an image in "+ sd.getRoot());
+-      } catch (IOException ioe) {
+-        sd.unlock();
+-        throw ioe;
+-      }
+-      dataDirStates.put(sd,curState);
++    boolean isFormatted = recoverStorageDirs(startOpt, dataDirStates);
++
++    if (LOG.isTraceEnabled()) {
++      LOG.trace("Data dir states:\n  " +
++        Joiner.on("\n  ").withKeyValueSeparator(": ")
++        .join(dataDirStates));
+-                     && startOpt != StartupOption.IMPORT)
+-      throw new IOException("NameNode is not formatted.");
++                     && startOpt != StartupOption.IMPORT) {
++      throw new IOException("NameNode is not formatted.");      
++    }
++
++
+-    storage.setCheckpointTime(0L);
+-    boolean needToSave = loadFSImage();
+-
+-    assert editLog != null : "editLog must be initialized";
+-    if(!editLog.isOpen())
+-      editLog.open();
+-    
+-    return needToSave;
++    return loadFSImage();
++  }
++  
++  /**
++   * For each storage directory, performs recovery of incomplete transitions
++   * (eg. upgrade, rollback, checkpoint) and inserts the directory's storage
++   * state into the dataDirStates map.
++   * @param dataDirStates output of storage directory states
++   * @return true if there is at least one valid formatted storage directory
++   */
++  private boolean recoverStorageDirs(StartupOption startOpt,
++      Map<StorageDirectory, StorageState> dataDirStates) throws IOException {
++    boolean isFormatted = false;
++    for (Iterator<StorageDirectory> it = 
++                      storage.dirIterator(); it.hasNext();) {
++      StorageDirectory sd = it.next();
++      StorageState curState;
++      try {
++        curState = sd.analyzeStorage(startOpt, storage);
++        // sd is locked but not opened
++        switch(curState) {
++        case NON_EXISTENT:
++          // name-node fails if any of the configured storage dirs are missing
++          throw new InconsistentFSStateException(sd.getRoot(),
++                      "storage directory does not exist or is not accessible.");
++        case NOT_FORMATTED:
++          break;
++        case NORMAL:
++          break;
++        default:  // recovery is possible
++          sd.doRecover(curState);      
++        }
++        if (curState != StorageState.NOT_FORMATTED 
++            && startOpt != StartupOption.ROLLBACK) {
++          // read and verify consistency with other directories
++          storage.readProperties(sd);
++          isFormatted = true;
++        }
++        if (startOpt == StartupOption.IMPORT && isFormatted)
++          // import of a checkpoint is allowed only into empty image directories
++          throw new IOException("Cannot import image from a checkpoint. " 
++              + " NameNode already contains an image in " + sd.getRoot());
++      } catch (IOException ioe) {
++        sd.unlock();
++        throw ioe;
++      }
++      dataDirStates.put(sd,curState);
++    }
++    return isFormatted;
+-    storage.setCheckpointTime(now());
+-    List<Thread> saveThreads = new ArrayList<Thread>();
+-    File curDir, prevDir, tmpDir;
+-        curDir = sd.getCurrentDir();
+-        prevDir = sd.getPreviousDir();
+-        tmpDir = sd.getPreviousTmp();
++        File curDir = sd.getCurrentDir();
++        File prevDir = sd.getPreviousDir();
++        File tmpDir = sd.getPreviousTmp();
+-        // launch thread to save new image
+-        FSImageSaver saver = new FSImageSaver(sd, errorSDs);
+-        Thread saveThread = new Thread(saver, saver.toString());
+-        saveThreads.add(saveThread);
+-        saveThread.start();
+-        
++        if (!curDir.mkdir()) {
++          throw new IOException("Cannot create directory " + curDir);
++        }
+-        LOG.error("Failed upgrade of image directory " + sd.getRoot(), e);
++        LOG.error("Failed to move aside pre-upgrade storage " +
++            "in image directory " + sd.getRoot(), e);
+-    waitForThreads(saveThreads);
+-    saveThreads.clear();
++    storage.reportErrorsOnDirectories(errorSDs);
++    errorSDs.clear();
++
++    saveFSImageInAllDirs(editLog.getLastWrittenTxId());
+-      if (errorSDs.contains(sd)) continue;
+-        prevDir = sd.getPreviousDir();
+-        tmpDir = sd.getPreviousTmp();
++        // Write the version file, since saveFsImage above only makes the
++        // fsimage_<txid>, and the directory is otherwise empty.
++        storage.writeProperties(sd);
++        
++        File prevDir = sd.getPreviousDir();
++        File tmpDir = sd.getPreviousTmp();
++    storage.reportErrorsOnDirectories(errorSDs);
++
+-    if (!errorSDs.isEmpty()) {
+-      storage.reportErrorsOnDirectories(errorSDs);
++    if (!storage.getRemovedStorageDirs().isEmpty()) {
+-      throw new IOException("Upgrade failed in " + errorSDs.size()
++      throw new IOException("Upgrade failed in "
++          + storage.getRemovedStorageDirs().size()
+-    editLog.open();
+-    FSImage prevState = new FSImage(getFSNamesystem());
++    FSImage prevState = new FSImage(conf, getFSNamesystem());
+-    FSImage ckptImage = new FSImage(fsNamesys);
++    FSImage ckptImage = new FSImage(conf, fsNamesys,
++                                    checkpointDirs, checkpointEditsDirs);
+-      ckptImage.recoverTransitionRead(checkpointDirs, checkpointEditsDirs,
+-                                              StartupOption.REGULAR);
++      ckptImage.recoverTransitionRead(StartupOption.REGULAR);
+-    storage.setCheckpointTime(ckptImage.getStorage().getCheckpointTime());
++    realImage.getEditLog().setNextTxId(ckptImage.getEditLog().getLastWrittenTxId()+1);
++
+-    saveNamespace(false);
++    saveNamespace();
++    getStorage().writeAll();
+-  //
+-  // Atomic move sequence, to recover from interrupted checkpoint
+-  //
+-  boolean recoverInterruptedCheckpoint(StorageDirectory nameSD,
+-                                       StorageDirectory editsSD) 
+-                                       throws IOException {
+-    boolean needToSave = false;
+-    File curFile = NNStorage.getStorageFile(nameSD, NameNodeFile.IMAGE);
+-    File ckptFile = NNStorage.getStorageFile(nameSD, NameNodeFile.IMAGE_NEW);
++  void openEditLog() throws IOException {
++    assert editLog != null : "editLog must be initialized";
++    Preconditions.checkState(!editLog.isOpen(),
++        "edit log should not yet be open");
++    editLog.open();
++    storage.writeTransactionIdFileToStorage(editLog.getCurSegmentTxId());
++  };
++  
++  /**
++   * Toss the current image and namesystem, reloading from the specified
++   * file.
++   */
++  void reloadFromImageFile(File file) throws IOException {
++    namesystem.dir.reset();
+-    //
+-    // If we were in the midst of a checkpoint
+-    //
+-    if (ckptFile.exists()) {
+-      needToSave = true;
+-      if (NNStorage.getStorageFile(editsSD, NameNodeFile.EDITS_NEW).exists()) {
+-        //
+-        // checkpointing migth have uploaded a new
+-        // merged image, but we discard it here because we are
+-        // not sure whether the entire merged image was uploaded
+-        // before the namenode crashed.
+-        //
+-        if (!ckptFile.delete()) {
+-          throw new IOException("Unable to delete " + ckptFile);
+-        }
+-      } else {
+-        //
+-        // checkpointing was in progress when the namenode
+-        // shutdown. The fsimage.ckpt was created and the edits.new
+-        // file was moved to edits. We complete that checkpoint by
+-        // moving fsimage.new to fsimage. There is no need to 
+-        // update the fstime file here. renameTo fails on Windows
+-        // if the destination file already exists.
+-        //
+-        if (!ckptFile.renameTo(curFile)) {
+-          if (!curFile.delete())
+-            LOG.warn("Unable to delete dir " + curFile + " before rename");
+-          if (!ckptFile.renameTo(curFile)) {
+-            throw new IOException("Unable to rename " + ckptFile +
+-                                  " to " + curFile);
+-          }
+-        }
+-      }
+-    }
+-    return needToSave;
++    LOG.debug("Reloading namespace from " + file);
++    loadFSImage(file);
+-    long latestNameCheckpointTime = Long.MIN_VALUE;
+-    long latestEditsCheckpointTime = Long.MIN_VALUE;
+-    boolean needToSave = false;
+-    isUpgradeFinalized = true;
++    FSImageStorageInspector inspector = storage.readAndInspectDirs();
+-    StorageDirectory latestNameSD = null;
+-    StorageDirectory latestEditsSD = null;
++    isUpgradeFinalized = inspector.isUpgradeFinalized();
+-    Collection<String> imageDirs = new ArrayList<String>();
+-    Collection<String> editsDirs = new ArrayList<String>();
++    boolean needToSave = inspector.needToSave();
+-    // Set to determine if all of storageDirectories share the same checkpoint
+-    Set<Long> checkpointTimes = new HashSet<Long>();
++    // Plan our load. This will throw if it's impossible to load from the
++    // data that's available.
++    LoadPlan loadPlan = inspector.createLoadPlan();    
++    LOG.debug("Planning to load image using following plan:\n" + loadPlan);
+-    // Process each of the storage directories to find the pair of
+-    // newest image file and edit file
+-    for (Iterator<StorageDirectory> it = storage.dirIterator(); it.hasNext();) {
+-      StorageDirectory sd = it.next();
+-
+-      // Was the file just formatted?
+-      if (!sd.getVersionFile().exists()) {
+-        needToSave |= true;
+-        continue;
+-      }
+-      
+-      boolean imageExists = false;
+-      boolean editsExists = false;
+-      
+-      // Determine if sd is image, edits or both
+-      if (sd.getStorageDirType().isOfType(NameNodeDirType.IMAGE)) {
+-        imageExists = NNStorage.getStorageFile(sd, NameNodeFile.IMAGE).exists();
+-        imageDirs.add(sd.getRoot().getCanonicalPath());
+-      }
+-      
+-      if (sd.getStorageDirType().isOfType(NameNodeDirType.EDITS)) {
+-        editsExists = NNStorage.getStorageFile(sd, NameNodeFile.EDITS).exists();
+-        editsDirs.add(sd.getRoot().getCanonicalPath());
+-      }
+-      
+-      long checkpointTime = storage.readCheckpointTime(sd);
+-
+-      checkpointTimes.add(checkpointTime);
+-      
+-      if (sd.getStorageDirType().isOfType(NameNodeDirType.IMAGE) && 
+-         (latestNameCheckpointTime < checkpointTime) && imageExists) {
+-        latestNameCheckpointTime = checkpointTime;
+-        latestNameSD = sd;
+-      }
+-      
+-      if (sd.getStorageDirType().isOfType(NameNodeDirType.EDITS) && 
+-           (latestEditsCheckpointTime < checkpointTime) && editsExists) {
+-        latestEditsCheckpointTime = checkpointTime;
+-        latestEditsSD = sd;
+-      }
+-      
+-      // check that we have a valid, non-default checkpointTime
+-      if (checkpointTime <= 0L)
+-        needToSave |= true;
+-      
+-      // set finalized flag
+-      isUpgradeFinalized = isUpgradeFinalized && !sd.getPreviousDir().exists();
+-    }
+-
+-    // We should have at least one image and one edits dirs
+-    if (latestNameSD == null)
+-      throw new IOException("Image file is not found in " + imageDirs);
+-    if (latestEditsSD == null)
+-      throw new IOException("Edits file is not found in " + editsDirs);
+-
+-    // Make sure we are loading image and edits from same checkpoint
+-    if (latestNameCheckpointTime > latestEditsCheckpointTime
+-        && latestNameSD != latestEditsSD
+-        && latestNameSD.getStorageDirType() == NameNodeDirType.IMAGE
+-        && latestEditsSD.getStorageDirType() == NameNodeDirType.EDITS) {
+-      // This is a rare failure when NN has image-only and edits-only
+-      // storage directories, and fails right after saving images,
+-      // in some of the storage directories, but before purging edits.
+-      // See -NOTE- in saveNamespace().
+-      LOG.error("This is a rare failure scenario!!!");
+-      LOG.error("Image checkpoint time " + latestNameCheckpointTime +
+-                " > edits checkpoint time " + latestEditsCheckpointTime);
+-      LOG.error("Name-node will treat the image as the latest state of " +
+-                "the namespace. Old edits will be discarded.");
+-    } else if (latestNameCheckpointTime != latestEditsCheckpointTime)
+-      throw new IOException("Inconsistent storage detected, " +
+-                      "image and edits checkpoint times do not match. " +
+-                      "image checkpoint time = " + latestNameCheckpointTime +
+-                      "edits checkpoint time = " + latestEditsCheckpointTime);
+-    
+-    // If there was more than one checkpointTime recorded we should save
+-    needToSave |= checkpointTimes.size() != 1;
+-    needToSave |= recoverInterruptedCheckpoint(latestNameSD, latestEditsSD);
++    needToSave |= loadPlan.doRecovery();
+-    storage.readProperties(latestNameSD);
+-    needToSave |= loadFSImage(NNStorage.getStorageFile(latestNameSD,
+-                                                       NameNodeFile.IMAGE));
++    StorageDirectory sdForProperties =
++      loadPlan.getStorageDirectoryForProperties();
++    storage.readProperties(sdForProperties);
++    File imageFile = loadPlan.getImageFile();
++
++    try {
++      if (LayoutVersion.supports(Feature.TXID_BASED_LAYOUT,
++                                 getLayoutVersion())) {
++        // For txid-based layout, we should have a .md5 file
++        // next to the image file
++        loadFSImage(imageFile);
++      } else if (LayoutVersion.supports(Feature.FSIMAGE_CHECKSUM,
++                                        getLayoutVersion())) {
++        // In 0.22, we have the checksum stored in the VERSION file.
++        String md5 = storage.getDeprecatedProperty(
++            NNStorage.DEPRECATED_MESSAGE_DIGEST_PROPERTY);
++        if (md5 == null) {
++          throw new InconsistentFSStateException(sdForProperties.getRoot(),
++              "Message digest property " +
++              NNStorage.DEPRECATED_MESSAGE_DIGEST_PROPERTY +
++              " not set for storage directory " + sdForProperties.getRoot());
++        }
++        loadFSImage(imageFile, new MD5Hash(md5));
++      } else {
++        // We don't have any record of the md5sum
++        loadFSImage(imageFile, null);
++      }
++    } catch (IOException ioe) {
++      throw new IOException("Failed to load image from " + loadPlan.getImageFile(), ioe);
++    }
+-    // Load latest edits
+-    if (latestNameCheckpointTime > latestEditsCheckpointTime)
+-      // the image is already current, discard edits
+-      needToSave |= true;
+-    else // latestNameCheckpointTime == latestEditsCheckpointTime
+-      needToSave |= (loadFSEdits(latestEditsSD) > 0);
++    long numLoaded = loadEdits(loadPlan.getEditsFiles());
++    needToSave |= needsResaveBasedOnStaleCheckpoint(imageFile, numLoaded);
++    // update the txid for the edit log
++    editLog.setNextTxId(storage.getMostRecentCheckpointTxId() + numLoaded + 1);
++
++  /**
++   * @param imageFile the image file that was loaded
++   * @param numEditsLoaded the number of edits loaded from edits logs
++   * @return true if the NameNode should automatically save the namespace
++   * when it is started, due to the latest checkpoint being too old.
++   */
++  private boolean needsResaveBasedOnStaleCheckpoint(
++      File imageFile, long numEditsLoaded) {
++    final long checkpointPeriod = conf.getLong(
++        DFSConfigKeys.DFS_NAMENODE_CHECKPOINT_PERIOD_KEY, 
++        DFSConfigKeys.DFS_NAMENODE_CHECKPOINT_PERIOD_DEFAULT);
++    final long checkpointTxnCount = conf.getLong(
++        DFSConfigKeys.DFS_NAMENODE_CHECKPOINT_TXNS_KEY, 
++        DFSConfigKeys.DFS_NAMENODE_CHECKPOINT_TXNS_DEFAULT);
++    long checkpointAge = System.currentTimeMillis() - imageFile.lastModified();
++
++    return (checkpointAge > checkpointPeriod * 1000) ||
++           (numEditsLoaded > checkpointTxnCount);
++  }
++  
++  /**
++   * Load the specified list of edit files into the image.
++   * @return the number of transactions loaded
++   */
++  protected long loadEdits(List<File> editLogs) throws IOException {
++    LOG.debug("About to load edits:\n  " + Joiner.on("\n  ").join(editLogs));
++
++    long startingTxId = getLastAppliedTxId() + 1;
++    
++    FSEditLogLoader loader = new FSEditLogLoader(namesystem);
++    int numLoaded = 0;
++    // Load latest edits
++    for (File edits : editLogs) {
++      LOG.debug("Reading " + edits + " expecting start txid #" + startingTxId);
++      EditLogFileInputStream editIn = new EditLogFileInputStream(edits);
++      int thisNumLoaded = loader.loadFSEdits(editIn, startingTxId);
++      startingTxId += thisNumLoaded;
++      numLoaded += thisNumLoaded;
++      lastAppliedTxId += thisNumLoaded;
++      editIn.close();
++    }
++
++    // update the counts
++    getFSNamesystem().dir.updateCountForINodeWithQuota();    
++    return numLoaded;
++  }
++
++
++  /**
++   * Load the image namespace from the given image file, verifying
++   * it against the MD5 sum stored in its associated .md5 file.
++   */
++  private void loadFSImage(File imageFile) throws IOException {
++    MD5Hash expectedMD5 = MD5FileUtils.readStoredMd5ForFile(imageFile);
++    if (expectedMD5 == null) {
++      throw new IOException("No MD5 file found corresponding to image file "
++          + imageFile);
++    }
++    loadFSImage(imageFile, expectedMD5);
++  }
++  
+-  boolean loadFSImage(File curFile) throws IOException {
++  private void loadFSImage(File curFile, MD5Hash expectedMd5) throws IOException {
+-    if (storage.getImageDigest() == null) {
+-      storage.setImageDigest(readImageMd5); // set this fsimage's checksum
+-    } else if (!storage.getImageDigest().equals(readImageMd5)) {
++    if (expectedMd5 != null &&
++        !expectedMd5.equals(readImageMd5)) {
+-          " but expecting " + storage.getImageDigest());
++          " but expecting " + expectedMd5);
+-    storage.namespaceID = loader.getLoadedNamespaceID();
+-    storage.layoutVersion = loader.getLoadedImageVersion();
+-
+-    boolean needToSave =
+-      loader.getLoadedImageVersion() != FSConstants.LAYOUT_VERSION;
+-    return needToSave;
+-  }
+-
+-  /**
+-   * Load and merge edits from two edits files
+-   * 
+-   * @param sd storage directory
+-   * @return number of edits loaded
+-   * @throws IOException
+-   */
+-  int loadFSEdits(StorageDirectory sd) throws IOException {
+-    FSEditLogLoader loader = new FSEditLogLoader(namesystem);
+-    
+-    int numEdits = 0;
+-    EditLogFileInputStream edits =
+-      new EditLogFileInputStream(NNStorage.getStorageFile(sd,
+-                                                          NameNodeFile.EDITS));
+-    
+-    numEdits = loader.loadFSEdits(edits);
+-    edits.close();
+-    File editsNew = NNStorage.getStorageFile(sd, NameNodeFile.EDITS_NEW);
+-    
+-    if (editsNew.exists() && editsNew.length() > 0) {
+-      edits = new EditLogFileInputStream(editsNew);
+-      numEdits += loader.loadFSEdits(edits);
+-      edits.close();
+-    }
+-    if (numEdits == 0 && editsNew.exists()) {
+-      numEdits++;
+-    }
+-    // update the counts.
+-    getFSNamesystem().dir.updateCountForINodeWithQuota();    
+-    
+-    return numEdits;
++    long txId = loader.getLoadedImageTxId();
++    LOG.info("Loaded image for txid " + txId + " from " + curFile);
++    lastAppliedTxId = txId;
++    storage.setMostRecentCheckpointTxId(txId);
+-  void saveFSImage(File newFile) throws IOException {
++  void saveFSImage(StorageDirectory sd, long txid) throws IOException {
++    File newFile = NNStorage.getStorageFile(sd, NameNodeFile.IMAGE_NEW, txid);
++    File dstFile = NNStorage.getStorageFile(sd, NameNodeFile.IMAGE, txid);
++    
+-    saver.save(newFile, getFSNamesystem(), compression);
+-    storage.setImageDigest(saver.getSavedDigest());
++    saver.save(newFile, txid, getFSNamesystem(), compression);
++    
++    MD5FileUtils.saveMD5File(dstFile, saver.getSavedDigest());
++    storage.setMostRecentCheckpointTxId(txid);
++    private final long txid;
+-    FSImageSaver(StorageDirectory sd, List<StorageDirectory> errorSDs) {
++    FSImageSaver(StorageDirectory sd, List<StorageDirectory> errorSDs, long txid) {
++      this.txid = txid;
+-        saveCurrent(sd);
++        saveFSImage(sd, txid);
+-   * Save the contents of the FS image and create empty edits.
+-   * 
+-   * In order to minimize the recovery effort in case of failure during
+-   * saveNamespace the algorithm reduces discrepancy between directory states
+-   * by performing updates in the following order:
+-   * <ol>
+-   * <li> rename current to lastcheckpoint.tmp for all of them,</li>
+-   * <li> save image and recreate edits for all of them,</li>
+-   * <li> rename lastcheckpoint.tmp to previous.checkpoint.</li>
+-   * </ol>
+-   * On stage (2) we first save all images, then recreate edits.
+-   * Otherwise the name-node may purge all edits and fail,
+-   * in which case the journal will be lost.
++   * Save the contents of the FS image to a new image file in each of the
++   * current storage directories.
+-  void saveNamespace(boolean renewCheckpointTime) throws IOException {
+- 
+-    // try to restore all failed edit logs here
++  void saveNamespace() throws IOException {
+-    editLog.close();
+-    if(renewCheckpointTime)
+-      storage.setCheckpointTime(now());
+-    List<StorageDirectory> errorSDs =
+-      Collections.synchronizedList(new ArrayList<StorageDirectory>());
+-
+-    // mv current -> lastcheckpoint.tmp
+-    for (Iterator<StorageDirectory> it = storage.dirIterator(); it.hasNext();) {
+-      StorageDirectory sd = it.next();
+-      try {
+-        storage.moveCurrent(sd);
+-      } catch(IOException ie) {
+-        LOG.error("Unable to move current for " + sd.getRoot(), ie);
+-        errorSDs.add(sd);
++    boolean editLogWasOpen = editLog.isOpen();
++    
++    if (editLogWasOpen) {
++      editLog.endCurrentLogSegment(true);
++    }
++    long imageTxId = editLog.getLastWrittenTxId();
++    try {
++      saveFSImageInAllDirs(imageTxId);
++      storage.writeAll();
++    } finally {
++      if (editLogWasOpen) {
++        editLog.startLogSegment(imageTxId + 1, true);
++        // Take this opportunity to note the current transaction
++        storage.writeTransactionIdFileToStorage(imageTxId + 1);
++    
++  }
++  
++  protected void saveFSImageInAllDirs(long txid) throws IOException {
++    if (storage.getNumStorageDirs(NameNodeDirType.IMAGE) == 0) {
++      throw new IOException("No image directories available!");
++    }
++    
++    List<StorageDirectory> errorSDs =
++      Collections.synchronizedList(new ArrayList<StorageDirectory>());
+-      if (errorSDs.contains(sd)) {
+-        continue;
+-      }
+-      try {
+-        FSImageSaver saver = new FSImageSaver(sd, errorSDs);
+-        Thread saveThread = new Thread(saver, saver.toString());
+-        saveThreads.add(saveThread);
+-        saveThread.start();
+-      } catch (Exception e) {
+-        LOG.error("Failed save to image directory " + sd.getRoot(), e);
+-        errorSDs.add(sd);
+-        continue;
+-      }
++      FSImageSaver saver = new FSImageSaver(sd, errorSDs, txid);
++      Thread saveThread = new Thread(saver, saver.toString());
++      saveThreads.add(saveThread);
++      saveThread.start();
++    storage.reportErrorsOnDirectories(errorSDs);
+-    // -NOTE-
+-    // If NN has image-only and edits-only storage directories and fails here
+-    // the image will have the latest namespace state.
+-    // During startup the image-only directories will recover by discarding
+-    // lastcheckpoint.tmp, while
+-    // the edits-only directories will recover by falling back
+-    // to the old state contained in their lastcheckpoint.tmp.
+-    // The edits directories should be discarded during startup because their
+-    // checkpointTime is older than that of image directories.
+-    // recreate edits in current
+-    for (Iterator<StorageDirectory> it
+-           = storage.dirIterator(NameNodeDirType.EDITS); it.hasNext();) {
+-      StorageDirectory sd = it.next();
+-      if (errorSDs.contains(sd)) {
+-        continue;
+-      }
+-
+-      // if this directory already stores the image and edits, then it was
+-      // already processed in the earlier loop.
+-      if (sd.getStorageDirType() == NameNodeDirType.IMAGE_AND_EDITS) {
+-        continue;
+-      }
+-
+-      try {
+-        FSImageSaver saver = new FSImageSaver(sd, errorSDs);
+-        Thread saveThread = new Thread(saver, saver.toString());
+-        saveThreads.add(saveThread);
+-        saveThread.start();
+-      } catch (Exception e) {
+-        LOG.error("Failed save to edits directory " + sd.getRoot(), e);
+-        errorSDs.add(sd);
+-        continue;
+-      }
++    if (storage.getNumStorageDirs(NameNodeDirType.IMAGE) == 0) {
++      throw new IOException(
++        "Failed to save in any storage directories while saving namespace.");
+-    waitForThreads(saveThreads);
+-    // mv lastcheckpoint.tmp -> previous.checkpoint
+-    for (Iterator<StorageDirectory> it = storage.dirIterator(); it.hasNext();) {
+-      StorageDirectory sd = it.next();
+-      if (errorSDs.contains(sd)) {
+-        continue;
+-      }
+-      try {
+-        storage.moveLastCheckpoint(sd);
+-      } catch(IOException ie) {
+-        LOG.error("Unable to move last checkpoint for " + sd.getRoot(), ie);
+-        errorSDs.add(sd);
+-        continue;
+-      }
+-    }
++    renameCheckpoint(txid);
++    // Since we now have a new checkpoint, we can clean up some
++    // old edit logs and checkpoints.
++    purgeOldStorage();
++  }
++
++  /**
++   * Purge any files in the storage directories that are no longer
++   * necessary.
++   */
++  public void purgeOldStorage() {
+-      storage.reportErrorsOnDirectories(errorSDs);
+-      
+-      // If there was an error in every storage dir, each one will have been
+-      // removed from the list of storage directories.
+-      if (storage.getNumStorageDirs(NameNodeDirType.IMAGE) == 0 ||
+-          storage.getNumStorageDirs(NameNodeDirType.EDITS) == 0) {
+-        throw new IOException("Failed to save any storage directories while saving namespace");
+-      }
+-      
+-      if(!editLog.isOpen()) editLog.open();
+-    } finally {
+-      ckptState = CheckpointStates.UPLOAD_DONE;
++      archivalManager.purgeOldStorage();
++    } catch (Exception e) {
++      LOG.warn("Unable to purge old storage", e);
+-   * Save current image and empty journal into {@code current} directory.
+-   */
+-  protected void saveCurrent(StorageDirectory sd) throws IOException {
+-    if (storage.getLayoutVersion() != FSConstants.LAYOUT_VERSION) {
+-      throw new IllegalStateException(
+-        "NN with storage version " + FSConstants.LAYOUT_VERSION  +
+-        "cannot save an image with version " + storage.getLayoutVersion());
+-    }
+-    File curDir = sd.getCurrentDir();
+-    NameNodeDirType dirType = (NameNodeDirType)sd.getStorageDirType();
+-    // save new image or new edits
+-    if (!curDir.exists() && !curDir.mkdir())
+-      throw new IOException("Cannot create directory " + curDir);
+-    if (dirType.isOfType(NameNodeDirType.IMAGE))
+-      saveFSImage(NNStorage.getStorageFile(sd, NameNodeFile.IMAGE));
+-    if (dirType.isOfType(NameNodeDirType.EDITS))
+-      editLog.createEditLogFile(NNStorage.getStorageFile(sd,
+-                                                         NameNodeFile.EDITS));
+-    // write version and time files
+-    storage.writeProperties(sd);
+-  }
+-
+-
+-  /**
+-   * Moves fsimage.ckpt to fsImage and edits.new to edits
+-   * Reopens the new edits file.
+-   */
+-  void rollFSImage(CheckpointSignature sig, 
+-      boolean renewCheckpointTime) throws IOException {
+-    sig.validateStorageInfo(this);
+-    rollFSImage(true);
+-  }
+-
+-  private void rollFSImage(boolean renewCheckpointTime)
+-  throws IOException {
+-    if (ckptState != CheckpointStates.UPLOAD_DONE
+-      && !(ckptState == CheckpointStates.ROLLED_EDITS
+-      && storage.getNumStorageDirs(NameNodeDirType.IMAGE) == 0)) {
+-      throw new IOException("Cannot roll fsImage before rolling edits log.");
+-    }
+-
+-    for (Iterator<StorageDirectory> it 
+-           = storage.dirIterator(NameNodeDirType.IMAGE); it.hasNext();) {
+-      StorageDirectory sd = it.next();
+-      File ckpt = NNStorage.getStorageFile(sd, NameNodeFile.IMAGE_NEW);
+-      if (!ckpt.exists()) {
+-        throw new IOException("Checkpoint file " + ckpt +
+-                              " does not exist");
+-      }
+-    }
+-    editLog.purgeEditLog(); // renamed edits.new to edits
+-    if(LOG.isDebugEnabled()) {
+-      LOG.debug("rollFSImage after purgeEditLog: storageList=" 
+-                + storage.listStorageDirectories());
+-    }
+-    //
+-    // Renames new image
+-    //
+-    renameCheckpoint();
+-    resetVersion(renewCheckpointTime, newImageDigest);
+-  }
+-
+-  /**
+-  void renameCheckpoint() throws IOException {
++  private void renameCheckpoint(long txid) throws IOException {
+-    for (Iterator<StorageDirectory> it 
+-           = storage.dirIterator(NameNodeDirType.IMAGE); it.hasNext();) {
+-      StorageDirectory sd = it.next();
+-      File ckpt = NNStorage.getStorageFile(sd, NameNodeFile.IMAGE_NEW);
+-      File curFile = NNStorage.getStorageFile(sd, NameNodeFile.IMAGE);
+-      // renameTo fails on Windows if the destination file 
+-      // already exists.
+-      if(LOG.isDebugEnabled()) {
+-        LOG.debug("renaming  " + ckpt.getAbsolutePath() 
+-                  + " to " + curFile.getAbsolutePath());
+-      }
+-      if (!ckpt.renameTo(curFile)) {
+-        if (!curFile.delete() || !ckpt.renameTo(curFile)) {
+-          LOG.warn("renaming  " + ckpt.getAbsolutePath() + " to "  + 
+-              curFile.getAbsolutePath() + " FAILED");
+-          if(al == null) al = new ArrayList<StorageDirectory> (1);
+-          al.add(sd);
++    for (StorageDirectory sd : storage.dirIterable(NameNodeDirType.IMAGE)) {
++      try {
++        renameCheckpointInDir(sd, txid);
++      } catch (IOException ioe) {
++        LOG.warn("Unable to rename checkpoint in " + sd, ioe);
++        if (al == null) {
++          al = Lists.newArrayList();
++        al.add(sd);
+-  /**
+-   * Updates version and fstime files in all directories (fsimage and edits).
+-   */
+-  void resetVersion(boolean renewCheckpointTime, MD5Hash newImageDigest) 
++  private void renameCheckpointInDir(StorageDirectory sd, long txid)
+-    storage.layoutVersion = FSConstants.LAYOUT_VERSION;
+-    if(renewCheckpointTime)
+-      storage.setCheckpointTime(now());
+-    storage.setImageDigest(newImageDigest);
+-    
+-    ArrayList<StorageDirectory> al = null;
+-    for (Iterator<StorageDirectory> it = storage.dirIterator(); it.hasNext();) {
+-      StorageDirectory sd = it.next();
+-      // delete old edits if sd is the image only the directory
+-      if (!sd.getStorageDirType().isOfType(NameNodeDirType.EDITS)) {
+-        File editsFile = NNStorage.getStorageFile(sd, NameNodeFile.EDITS);
+-        if(editsFile.exists() && !editsFile.delete())
+-          throw new IOException("Cannot delete edits file " 
+-                                + editsFile.getCanonicalPath());
+-      }
+-      // delete old fsimage if sd is the edits only the directory
+-      if (!sd.getStorageDirType().isOfType(NameNodeDirType.IMAGE)) {
+-        File imageFile = NNStorage.getStorageFile(sd, NameNodeFile.IMAGE);
+-        if(imageFile.exists() && !imageFile.delete())
+-          throw new IOException("Cannot delete image file " 
+-                                + imageFile.getCanonicalPath());
+-      }
+-      try {
+-        storage.writeProperties(sd);
+-      } catch (IOException e) {
+-        LOG.error("Cannot write file " + sd.getRoot(), e);
+-        
+-        if(al == null) al = new ArrayList<StorageDirectory> (1);
+-        al.add(sd);       
+-      }
++    File ckpt = NNStorage.getStorageFile(sd, NameNodeFile.IMAGE_NEW, txid);
++    File curFile = NNStorage.getStorageFile(sd, NameNodeFile.IMAGE, txid);
++    // renameTo fails on Windows if the destination file 
++    // already exists.
++    if(LOG.isDebugEnabled()) {
++      LOG.debug("renaming  " + ckpt.getAbsolutePath() 
++                + " to " + curFile.getAbsolutePath());
+-    if(al != null) storage.reportErrorsOnDirectories(al);
+-    ckptState = FSImage.CheckpointStates.START;
++    if (!ckpt.renameTo(curFile)) {
++      if (!curFile.delete() || !ckpt.renameTo(curFile)) {
++        throw new IOException("renaming  " + ckpt.getAbsolutePath() + " to "  + 
++            curFile.getAbsolutePath() + " FAILED");
++      }
++    }    
+-    ckptState = CheckpointStates.ROLLED_EDITS;
+-    // If checkpoint fails this should be the most recent image, therefore
+-    storage.incrementCheckpointTime();
++    // Record this log segment ID in all of the storage directories, so
++    // we won't miss this log segment on a restart if the edits directories
++    // go missing.
++    storage.writeTransactionIdFileToStorage(getEditLog().getCurSegmentTxId());
+-   * This is called just before a new checkpoint is uploaded to the
+-   * namenode.
+-   */
+-  void validateCheckpointUpload(CheckpointSignature sig) throws IOException {
+-    if (ckptState != CheckpointStates.ROLLED_EDITS) {
+-      throw new IOException("Namenode is not expecting an new image " +
+-                             ckptState);
+-    } 
+-    // verify token
+-    long modtime = getEditLog().getFsEditTime();
+-    if (sig.editsTime != modtime) {
+-      throw new IOException("Namenode has an edit log with timestamp of " +
+-                            DATE_FORM.format(new Date(modtime)) +
+-                            " but new checkpoint was created using editlog " +
+-                            " with timestamp " + 
+-                            DATE_FORM.format(new Date(sig.editsTime)) + 
+-                            ". Checkpoint Aborted.");
+-    }
+-    sig.validateStorageInfo(this);
+-    ckptState = FSImage.CheckpointStates.UPLOAD_START;
+-  }
+-
+-  /**
+-            && bnReg.getCTime() > storage.getCTime())
+-        || (bnReg.getLayoutVersion() == storage.getLayoutVersion()
+-            && bnReg.getCTime() == storage.getCTime()
+-            && bnReg.getCheckpointTime() > storage.getCheckpointTime()))
++            && bnReg.getCTime() > storage.getCTime()))
+-            + " checkpointTime = " + bnReg.getCheckpointTime()
+-            + " cTime = " + storage.getCTime()
+-            + " checkpointTime = " + storage.getCheckpointTime();
++            + " cTime = " + storage.getCTime();
+-    boolean isImgObsolete = true;
+-    if(bnReg.getLayoutVersion() == storage.getLayoutVersion()
+-        && bnReg.getCTime() == storage.getCTime()
+-        && bnReg.getCheckpointTime() == storage.getCheckpointTime())
+-      isImgObsolete = false;
+-    getEditLog().logJSpoolStart(bnReg, nnReg);
+-    return new CheckpointCommand(sig, isImgObsolete, needToReturnImg);
++    return new CheckpointCommand(sig, needToReturnImg);
+-    // Renew checkpoint time for the active if the other is a checkpoint-node.
+-    // The checkpoint-node should have older image for the next checkpoint 
+-    // to take effect.
+-    // The backup-node always has up-to-date image and will have the same
+-    // checkpoint time as the active node.
+-    boolean renewCheckpointTime = remoteNNRole.equals(NamenodeRole.CHECKPOINT);
+-    rollFSImage(sig, renewCheckpointTime);
+-  }
+-
+-  CheckpointStates getCheckpointState() {
+-    return ckptState;
+-  }
+-
+-  void setCheckpointState(CheckpointStates cs) {
+-    ckptState = cs;
+-   * This is called when a checkpoint upload finishes successfully.
++   * This is called by the 2NN after having downloaded an image, and by
++   * the NN after having received a new image from the 2NN. It
++   * renames the image from fsimage_N.ckpt to fsimage_N and also
++   * saves the related .md5 file into place.
+-  synchronized void checkpointUploadDone() {
+-    ckptState = CheckpointStates.UPLOAD_DONE;
++  synchronized void saveDigestAndRenameCheckpointImage(
++      long txid, MD5Hash digest) throws IOException {
++    renameCheckpoint(txid);
++    List<StorageDirectory> badSds = Lists.newArrayList();
++    
++    for (StorageDirectory sd : storage.dirIterable(NameNodeDirType.IMAGE)) {
++      File imageFile = NNStorage.getImageFile(sd, txid);
++      try {
++        MD5FileUtils.saveMD5File(imageFile, digest);
++      } catch (IOException ioe) {
++        badSds.add(sd);
++      }
++    }
++    storage.reportErrorsOnDirectories(badSds);
++    
++    // So long as this is the newest image available,
++    // advertise it as such to other checkpointers
++    // from now on
++    if (txid > storage.getMostRecentCheckpointTxId()) {
++      storage.setMostRecentCheckpointTxId(txid);
++    }
+-    getEditLog().close();
++    if (editLog != null) { // 2NN doesn't have any edit log
++      getEditLog().close();
++    }
+-  @Override // NNStorageListener
+-  public void errorOccurred(StorageDirectory sd) throws IOException {
+-    // do nothing,
+-  }
+-
+-  @Override // NNStorageListener
+-  public void formatOccurred(StorageDirectory sd) throws IOException {
+-    if (sd.getStorageDirType().isOfType(NameNodeDirType.IMAGE)) {
+-      sd.lock();
+-      try {
+-        saveCurrent(sd);
+-      } finally {
+-        sd.unlock();
+-      }
+-      LOG.info("Storage directory " + sd.getRoot()
+-               + " has been successfully formatted.");
+-    }
+-  };
+-
+-  @Override // NNStorageListener
+-  public void directoryAvailable(StorageDirectory sd) throws IOException {
+-    // do nothing
+-  }
+-
++
++  public synchronized long getLastAppliedTxId() {
++    return lastAppliedTxId;
++  }
+
+MOV26 MOV26 MOV26 MOV26 MOV26 MOV31 MOV55 MOV31 MOV31 UPD40 UPD40 UPD40 UPD40 UPD40 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS31 MOV43 INS29 INS39 INS83 UPD83 UPD83 UPD43 INS29 MOV83 MOV42 MOV44 MOV43 MOV8 INS29 INS83 MOV42 MOV44 INS44 MOV43 INS8 INS29 INS83 INS42 MOV44 MOV44 MOV44 MOV44 MOV43 MOV8 MOV25 INS39 INS42 MOV44 MOV43 INS8 MOV60 MOV25 INS29 INS83 MOV39 UPD42 MOV42 MOV44 MOV44 MOV43 INS8 MOV21 MOV21 INS39 INS42 MOV43 INS8 INS29 INS39 INS42 INS44 MOV43 INS8 INS83 UPD39 UPD42 INS44 INS44 INS8 INS83 UPD39 INS42 INS44 MOV43 INS8 UPD83 INS42 INS44 MOV43 INS8 MOV29 UPD42 MOV44 MOV43 MOV44 INS23 MOV29 MOV39 UPD42 MOV42 MOV43 INS8 INS83 INS39 INS42 INS44 MOV43 INS8 INS29 INS83 INS39 INS42 INS8 MOV29 INS83 INS39 INS42 INS44 MOV43 INS8 INS83 UPD42 MOV44 INS44 MOV8 MOV8 MOV29 INS83 MOV39 INS42 INS44 MOV44 MOV43 INS8 INS83 UPD39 UPD42 INS8 UPD42 INS65 UPD42 INS34 UPD42 UPD42 MOV65 INS65 INS65 MOV65 UPD43 UPD42 INS65 MOV65 INS65 INS65 MOV65 UPD43 UPD42 INS43 INS42 INS17 INS65 INS65 INS65 INS65 INS65 INS65 UPD42 INS21 MOV25 MOV21 MOV21 INS21 UPD42 MOV21 INS21 INS60 INS60 INS65 INS65 INS65 UPD43 UPD42 INS74 UPD42 MOV60 MOV24 INS41 MOV21 INS21 INS21 MOV6 INS21 MOV21 INS21 INS65 MOV43 INS42 INS21 INS21 INS21 INS21 INS60 MOV60 INS21 MOV21 INS60 MOV21 INS60 INS54 INS60 INS21 UPD65 INS43 INS42 INS39 INS42 MOV60 MOV60 INS60 INS41 INS65 INS65 INS74 INS42 MOV21 MOV60 MOV60 MOV60 INS70 MOV21 INS41 MOV43 INS42 MOV60 MOV25 INS21 INS43 INS42 MOV60 MOV21 MOV21 MOV60 INS25 INS60 MOV21 INS39 UPD42 INS60 INS60 INS21 INS83 INS83 INS39 INS59 INS44 MOV6 MOV21 INS60 INS25 INS60 INS54 INS39 INS42 INS25 MOV60 MOV60 MOV24 MOV21 MOV21 MOV21 INS25 INS21 INS21 INS65 INS54 INS39 INS42 MOV60 INS70 MOV25 INS39 INS42 INS39 INS42 UPD42 INS21 INS60 INS70 MOV21 INS25 INS25 INS41 INS66 INS66 UPD66 INS42 INS66 INS68 INS66 UPD66 UPD42 INS42 INS66 INS42 INS66 INS68 UPD66 MOV66 UPD66 UPD42 UPD42 MOV42 INS42 INS42 INS32 INS32 INS66 INS66 INS42 INS66 INS42 INS66 INS42 INS66 INS42 INS66 INS42 INS66 INS7 INS7 INS32 MOV74 INS59 MOV74 INS59 INS32 INS8 INS8 MOV32 INS66 INS66 INS66 INS42 INS66 INS66 UPD42 INS43 MOV43 INS43 INS42 INS32 MOV43 MOV43 INS32 INS32 INS32 INS66 INS66 INS32 MOV32 INS32 INS43 INS7 INS39 INS59 UPD43 INS32 MOV43 INS59 INS32 MOV43 INS59 INS8 INS12 INS39 INS59 INS32 INS42 UPD66 UPD42 UPD66 UPD66 INS66 INS42 INS83 INS39 INS83 INS39 INS39 INS59 INS27 UPD66 MOV66 UPD66 MOV66 UPD43 MOV43 UPD43 MOV43 INS39 INS39 INS44 INS42 INS8 INS42 UPD66 UPD66 UPD43 UPD27 INS8 MOV32 INS42 INS27 MOV8 INS39 INS59 INS7 MOV43 INS59 MOV43 INS59 INS32 INS42 INS39 INS42 INS21 INS66 UPD66 INS39 INS59 INS42 INS8 INS39 INS59 INS8 INS8 MOV27 INS8 MOV32 MOV8 MOV27 INS8 INS32 INS32 INS66 INS66 INS8 INS12 MOV44 INS32 INS8 MOV43 MOV43 UPD66 INS66 INS66 UPD66 INS32 UPD74 MOV74 INS59 MOV44 INS32 INS8 INS27 INS8 INS27 INS8 INS42 INS42 INS69 INS69 INS69 INS69 INS42 INS69 INS69 INS69 INS69 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS14 INS42 INS14 UPD42 UPD42 INS42 INS34 INS42 INS32 INS42 INS32 UPD42 INS32 INS42 INS42 INS21 MOV53 INS42 UPD42 MOV42 UPD42 UPD42 INS42 INS32 UPD42 UPD42 INS42 INS32 UPD42 INS27 INS32 INS42 UPD42 MOV42 UPD42 MOV42 MOV38 INS45 UPD42 MOV42 UPD42 MOV42 INS32 INS40 UPD42 MOV42 UPD42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 UPD42 INS32 INS42 INS32 UPD42 MOV42 MOV32 UPD42 UPD42 UPD42 MOV42 UPD42 MOV42 INS27 INS32 UPD42 MOV42 INS32 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 INS42 INS32 INS25 INS44 INS8 INS42 INS32 INS32 INS42 INS42 INS27 UPD42 INS32 UPD42 INS42 INS27 INS36 INS36 UPD42 UPD42 UPD42 UPD42 INS27 INS42 INS34 MOV43 INS42 MOV21 INS60 MOV60 MOV21 MOV21 MOV21 INS21 UPD42 UPD42 INS32 INS42 INS33 INS53 UPD42 UPD42 MOV42 UPD42 MOV42 MOV27 INS38 INS42 INS32 UPD42 INS42 INS42 UPD42 UPD42 UPD42 INS42 INS32 INS42 INS32 INS42 INS42 UPD42 UPD42 INS42 INS42 INS42 INS7 INS42 INS32 MOV21 UPD42 MOV42 MOV32 INS21 INS21 INS25 MOV53 MOV60 INS53 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 INS21 MOV44 INS8 UPD42 MOV42 UPD42 MOV42 INS40 MOV54 INS42 INS32 UPD42 MOV42 UPD42 MOV42 UPD43 INS42 INS32 UPD42 MOV42 INS42 INS40 INS60 INS54 UPD42 UPD42 INS42 INS42 INS32 MOV21 INS42 INS33 MOV21 INS43 INS42 INS43 INS42 INS43 INS42 INS43 INS42 MOV43 INS42 INS43 INS42 MOV43 INS42 MOV43 INS42 MOV43 INS42 INS42 INS42 INS43 INS42 INS42 INS42 MOV42 UPD42 MOV42 MOV42 UPD42 MOV42 INS42 INS42 INS42 INS32 MOV60 UPD42 MOV42 UPD42 MOV42 INS32 MOV43 INS42 MOV43 INS42 INS42 INS42 UPD42 MOV42 INS42 INS32 INS34 INS42 UPD42 MOV42 UPD42 MOV42 UPD45 UPD42 INS42 INS42 INS42 INS42 UPD42 UPD42 UPD42 UPD42 INS45 INS42 INS42 INS42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 MOV32 INS8 INS25 MOV43 INS42 INS53 UPD42 MOV42 INS32 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 MOV32 INS42 UPD34 MOV34 UPD42 MOV42 UPD42 MOV42 UPD40 MOV40 INS40 UPD42 UPD42 UPD40 INS40 MOV32 MOV32 INS27 INS27 UPD45 INS32 INS32 INS34 MOV43 INS59 INS39 INS7 INS7 INS7 MOV32 UPD42 MOV42 UPD42 MOV42 INS42 MOV14 UPD42 INS33 MOV32 UPD42 MOV42 UPD42 MOV42 UPD45 INS42 INS45 INS42 INS42 INS42 INS42 INS40 INS42 INS42 INS42 INS42 INS40 INS42 INS22 INS42 INS42 UPD42 MOV42 UPD42 UPD42 INS32 INS32 INS42 INS8 MOV43 MOV14 INS32 INS21 INS42 INS42 MOV32 UPD42 MOV42 MOV27 UPD42 UPD42 MOV42 UPD42 MOV42 MOV43 INS59 INS8 INS12 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 INS42 UPD42 MOV42 INS42 UPD42 MOV42 INS42 INS42 INS42 INS42 INS42 INS27 MOV60 INS60 INS25 INS21 INS60 INS60 INS42 UPD42 MOV42 MOV32 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 INS40 INS32 MOV21 INS32 INS8 INS8 MOV14 UPD42 MOV42 UPD42 MOV42 UPD42 UPD42 UPD42 UPD42 UPD42 UPD42 INS42 UPD27 MOV27 INS42 INS42 INS32 INS42 INS42 UPD42 MOV42 UPD42 UPD42 MOV42 INS14 UPD42 INS42 INS42 INS42 INS42 INS42 INS42 UPD42 UPD42 MOV43 UPD42 UPD42 INS42 MOV43 INS52 INS42 UPD42 UPD42 INS9 UPD42 MOV42 UPD42 MOV42 INS42 INS42 INS21 INS21 INS45 MOV43 INS45 UPD42 MOV42 UPD42 MOV42 INS32 INS53 INS42 INS42 INS32 INS21 INS44 INS8 UPD42 UPD42 UPD42 MOV42 INS45 INS32 MOV43 INS59 UPD43 MOV38 INS8 INS32 INS43 INS59 INS43 INS59 UPD42 UPD42 MOV42 INS32 UPD42 MOV42 UPD42 MOV42 INS40 MOV32 MOV60 INS25 MOV21 MOV21 MOV43 INS42 UPD42 UPD34 UPD42 MOV42 UPD42 MOV42 INS45 UPD45 INS42 INS45 INS42 MOV43 INS42 UPD42 UPD42 INS42 INS42 UPD45 UPD42 UPD45 UPD42 INS45 INS42 UPD45 INS42 UPD42 INS42 INS32 INS32 MOV43 INS42 UPD42 MOV42 INS42 INS45 UPD42 MOV42 MOV43 UPD42 MOV21 INS14 UPD42 MOV42 INS42 INS42 INS42 INS32 MOV43 INS42 INS21 UPD42 INS32 INS42 INS42 INS42 MOV32 UPD42 UPD42 MOV32 MOV53 INS42 INS42 INS42 INS42 INS42 MOV32 INS42 INS42 MOV32 INS32 UPD42 MOV42 UPD42 MOV42 UPD42 MOV43 MOV27 INS8 UPD45 MOV45 INS32 UPD42 MOV42 UPD42 MOV42 INS27 INS9 UPD42 MOV42 UPD42 MOV42 INS27 UPD42 UPD42 UPD42 MOV27 INS8 MOV43 MOV27 INS42 INS42 INS42 INS42 INS32 INS32 INS42 INS45 MOV42 MOV42 INS14 INS42 UPD42 MOV42 UPD42 UPD42 INS53 UPD42 INS42 INS14 UPD42 UPD42 INS33 INS42 INS42 INS42 INS34 INS42 INS34 UPD42 UPD42 INS21 INS42 INS42 MOV42 INS42 INS42 INS45 MOV43 INS27 INS45 UPD45 UPD42 INS40 INS14 MOV43 INS42 UPD45 INS42 MOV7 UPD42 MOV42 INS45 INS42 UPD43 MOV43 INS32 INS27 INS32 UPD42 UPD42 MOV42 UPD42 MOV42 INS45 UPD40 MOV40 INS45 MOV32 INS42 INS42 UPD42 UPD42 DEL40 DEL26 DEL42 DEL43 DEL83 DEL83 DEL83 DEL42 DEL43 DEL42 DEL42 DEL43 DEL45 DEL14 DEL59 DEL23 DEL42 DEL42 DEL72 DEL42 DEL72 DEL42 DEL72 DEL42 DEL72 DEL71 DEL33 DEL33 DEL66 DEL65 DEL29 DEL40 DEL17 DEL40 DEL42 DEL45 DEL32 DEL21 DEL29 DEL42 DEL31 DEL29 DEL42 DEL31 DEL83 DEL42 DEL52 DEL42 DEL22 DEL14 DEL7 DEL21 DEL42 DEL43 DEL42 DEL14 DEL7 DEL21 DEL42 DEL42 DEL52 DEL32 DEL21 DEL8 DEL31 DEL29 DEL42 DEL42 DEL44 DEL17 DEL42 DEL42 DEL42 DEL42 DEL32 DEL21 DEL8 DEL31 DEL42 DEL42 DEL42 DEL14 DEL7 DEL21 DEL8 DEL31 DEL65 DEL29 DEL17 DEL43 DEL42 DEL43 DEL74 DEL42 DEL42 DEL43 DEL42 DEL43 DEL74 DEL34 DEL14 DEL59 DEL60 DEL42 DEL43 DEL42 DEL43 DEL74 DEL42 DEL42 DEL43 DEL42 DEL43 DEL74 DEL34 DEL14 DEL59 DEL60 DEL42 DEL42 DEL42 DEL32 DEL21 DEL42 DEL42 DEL42 DEL32 DEL21 DEL8 DEL31 DEL42 DEL42 DEL65 DEL42 DEL66 DEL65 DEL42 DEL44 DEL42 DEL42 DEL32 DEL21 DEL34 DEL32 DEL21 DEL42 DEL43 DEL42 DEL43 DEL42 DEL43 DEL74 DEL42 DEL42 DEL43 DEL42 DEL43 DEL74 DEL14 DEL59 DEL60 DEL42 DEL59 DEL42 DEL59 DEL42 DEL59 DEL60 DEL42 DEL43 DEL42 DEL42 DEL14 DEL42 DEL32 DEL7 DEL21 DEL42 DEL7 DEL21 DEL42 DEL7 DEL21 DEL42 DEL43 DEL42 DEL42 DEL42 DEL42 DEL32 DEL14 DEL59 DEL60 DEL42 DEL42 DEL42 DEL32 DEL21 DEL42 DEL42 DEL32 DEL21 DEL42 DEL32 DEL32 DEL21 DEL42 DEL42 DEL42 DEL32 DEL18 DEL25 DEL42 DEL7 DEL21 DEL42 DEL7 DEL21 DEL42 DEL42 DEL32 DEL21 DEL42 DEL42 DEL32 DEL9 DEL45 DEL39 DEL42 DEL9 DEL59 DEL60 DEL42 DEL42 DEL40 DEL32 DEL59 DEL60 DEL42 DEL42 DEL40 DEL32 DEL59 DEL60 DEL42 DEL42 DEL32 DEL42 DEL9 DEL7 DEL21 DEL42 DEL42 DEL40 DEL32 DEL32 DEL42 DEL42 DEL32 DEL38 DEL45 DEL42 DEL27 DEL14 DEL53 DEL8 DEL25 DEL8 DEL42 DEL42 DEL32 DEL38 DEL42 DEL42 DEL32 DEL38 DEL21 DEL25 DEL42 DEL32 DEL38 DEL45 DEL42 DEL45 DEL42 DEL27 DEL14 DEL53 DEL8 DEL25 DEL8 DEL25 DEL8 DEL25 DEL8 DEL25 DEL42 DEL41 DEL8 DEL31 DEL39 DEL42 DEL40 DEL59 DEL60 DEL39 DEL42 DEL40 DEL59 DEL60 DEL39 DEL42 DEL9 DEL59 DEL60 DEL42 DEL9 DEL7 DEL21 DEL42 DEL33 DEL59 DEL60 DEL42 DEL43 DEL42 DEL33 DEL59 DEL60 DEL74 DEL42 DEL42 DEL43 DEL42 DEL43 DEL74 DEL14 DEL59 DEL60 DEL43 DEL74 DEL42 DEL43 DEL42 DEL43 DEL74 DEL14 DEL9 DEL42 DEL40 DEL32 DEL42 DEL32 DEL7 DEL32 DEL40 DEL42 DEL42 DEL40 DEL32 DEL42 DEL32 DEL7 DEL42 DEL39 DEL42 DEL42 DEL45 DEL42 DEL45 DEL42 DEL27 DEL45 DEL45 DEL27 DEL45 DEL45 DEL27 DEL42 DEL45 DEL42 DEL42 DEL43 DEL42 DEL43 DEL74 DEL42 DEL42 DEL43 DEL42 DEL43 DEL74 DEL14 DEL59 DEL60 DEL42 DEL43 DEL42 DEL43 DEL74 DEL59 DEL58 DEL42 DEL42 DEL32 DEL32 DEL42 DEL32 DEL38 DEL18 DEL8 DEL25 DEL39 DEL9 DEL59 DEL60 DEL39 DEL42 DEL9 DEL59 DEL60 DEL32 DEL42 DEL40 DEL32 DEL42 DEL42 DEL32 DEL42 DEL32 DEL32 DEL21 DEL8 DEL25 DEL42 DEL32 DEL32 DEL21 DEL8 DEL25 DEL42 DEL42 DEL42 DEL32 DEL21 DEL42 DEL42 DEL32 DEL42 DEL40 DEL32 DEL42 DEL42 DEL27 DEL36 DEL42 DEL27 DEL42 DEL42 DEL7 DEL21 DEL42 DEL42 DEL7 DEL21 DEL8 DEL25 DEL42 DEL42 DEL32 DEL42 DEL40 DEL32 DEL42 DEL42 DEL27 DEL36 DEL42 DEL27 DEL42 DEL42 DEL7 DEL21 DEL42 DEL42 DEL7 DEL21 DEL8 DEL25 DEL42 DEL34 DEL27 DEL42 DEL9 DEL7 DEL21 DEL25 DEL42 DEL42 DEL42 DEL42 DEL32 DEL42 DEL32 DEL38 DEL27 DEL7 DEL21 DEL8 DEL24 DEL45 DEL42 DEL27 DEL14 DEL53 DEL25 DEL42 DEL33 DEL27 DEL25 DEL42 DEL42 DEL27 DEL42 DEL42 DEL27 DEL27 DEL32 DEL27 DEL27 DEL40 DEL27 DEL27 DEL42 DEL42 DEL45 DEL32 DEL21 DEL8 DEL42 DEL42 DEL27 DEL53 DEL25 DEL25 DEL42 DEL42 DEL42 DEL32 DEL34 DEL27 DEL7 DEL21 DEL42 DEL42 DEL42 DEL32 DEL7 DEL21 DEL42 DEL32 DEL21 DEL42 DEL40 DEL32 DEL32 DEL42 DEL42 DEL27 DEL42 DEL9 DEL7 DEL21 DEL42 DEL27 DEL36 DEL7 DEL21 DEL25 DEL39 DEL42 DEL42 DEL42 DEL32 DEL33 DEL27 DEL42 DEL42 DEL42 DEL32 DEL21 DEL8 DEL42 DEL42 DEL32 DEL42 DEL42 DEL32 DEL38 DEL45 DEL42 DEL45 DEL42 DEL45 DEL42 DEL42 DEL32 DEL27 DEL14 DEL53 DEL8 DEL25 DEL25 DEL40 DEL42 DEL42 DEL32 DEL7 DEL21 DEL40 DEL42 DEL42 DEL32 DEL7 DEL21 DEL39 DEL42 DEL42 DEL42 DEL32 DEL40 DEL27 DEL59 DEL60 DEL42 DEL41 DEL8 DEL31 DEL42 DEL65 DEL42 DEL32 DEL14 DEL42 DEL39 DEL42 DEL34 DEL59 DEL60 DEL42 DEL42 DEL42 DEL42 DEL32 DEL7 DEL21 DEL42 DEL42 DEL32 DEL21 DEL34 DEL27 DEL27 DEL42 DEL42 DEL43 DEL42 DEL14 DEL7 DEL21 DEL42 DEL42 DEL42 DEL42 DEL32 DEL7 DEL21 DEL42 DEL42 DEL32 DEL21 DEL8 DEL25 DEL42 DEL42 DEL32 DEL27 DEL42 DEL37 DEL21 DEL8 DEL25 DEL42 DEL41 DEL8 DEL66 DEL66 DEL66 DEL66 DEL66 DEL66 DEL66 DEL66 DEL66 DEL66 DEL65 DEL32 DEL42 DEL42 DEL43 DEL42 DEL32 DEL42 DEL43 DEL42 DEL42 DEL43 DEL42 DEL42 DEL14 DEL42 DEL42 DEL32 DEL42 DEL42 DEL43 DEL42 DEL42 DEL42 DEL32 DEL42 DEL42 DEL45 DEL42 DEL42 DEL32 DEL27 DEL42 DEL32 DEL42 DEL42 DEL42 DEL32 DEL42 DEL39 DEL42 DEL44 DEL42 DEL42 DEL32 DEL21 DEL42 DEL42 DEL42 DEL42 DEL32 DEL32 DEL21 DEL25 DEL74 DEL42 DEL42 DEL42 DEL32 DEL59 DEL58 DEL42 DEL42 DEL42 DEL32 DEL21 DEL8 DEL42 DEL44 DEL42 DEL42 DEL42 DEL32 DEL21 DEL8 DEL12 DEL54 DEL8 DEL24 DEL42 DEL43 DEL74 DEL42 DEL42 DEL42 DEL40 DEL32 DEL59 DEL58 DEL42 DEL42 DEL32 DEL42 DEL42 DEL42 DEL32 DEL18 DEL8 DEL25 DEL42 DEL42 DEL32 DEL40 DEL27 DEL18 DEL8 DEL25 DEL42 DEL43 DEL42 DEL42 DEL43 DEL42 DEL42 DEL42 DEL32 DEL14 DEL59 DEL60 DEL42 DEL42 DEL42 DEL32 DEL21 DEL42 DEL42 DEL32 DEL21 DEL8 DEL42 DEL43 DEL42 DEL44 DEL42 DEL42 DEL42 DEL32 DEL21 DEL18 DEL8 DEL12 DEL54 DEL8 DEL24 DEL42 DEL42 DEL32 DEL21 DEL42 DEL43 DEL42 DEL43 DEL74 DEL42 DEL42 DEL32 DEL59 DEL58 DEL42 DEL42 DEL32 DEL42 DEL42 DEL42 DEL32 DEL18 DEL8 DEL25 DEL8 DEL42 DEL44 DEL18 DEL8 DEL12 DEL54 DEL8 DEL24 DEL42 DEL42 DEL40 DEL32 DEL34 DEL27 DEL27 DEL45 DEL14 DEL53 DEL8 DEL25 DEL42 DEL42 DEL32 DEL38 DEL21 DEL25 DEL8 DEL42 DEL40 DEL7 DEL21 DEL8 DEL54 DEL8 DEL66 DEL65 DEL42 DEL43 DEL32 DEL11 DEL42 DEL42 DEL32 DEL38 DEL42 DEL40 DEL32 DEL42 DEL42 DEL42 DEL32 DEL40 DEL27 DEL42 DEL43 DEL45 DEL40 DEL45 DEL42 DEL42 DEL32 DEL27 DEL14 DEL53 DEL8 DEL25 DEL42 DEL42 DEL40 DEL32 DEL21 DEL25 DEL42 DEL42 DEL40 DEL32 DEL42 DEL42 DEL42 DEL42 DEL42 DEL40 DEL32 DEL32 DEL21 DEL25 DEL42 DEL42 DEL42 DEL32 DEL21 DEL8 DEL66 DEL66 DEL65 DEL29 DEL39 DEL42 DEL42 DEL43 DEL42 DEL44 DEL39 DEL42 DEL44 DEL31 DEL39 DEL42 DEL40 DEL42 DEL43 DEL42 DEL42 DEL32 DEL42 DEL40 DEL27 DEL27 DEL36 DEL38 DEL27 DEL45 DEL14 DEL53 DEL8 DEL25 DEL42 DEL43 DEL42 DEL43 DEL74 DEL42 DEL42 DEL42 DEL40 DEL32 DEL59 DEL58 DEL42 DEL42 DEL32 DEL42 DEL43 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL42 DEL42 DEL42 DEL40 DEL32 DEL59 DEL60 DEL38 DEL25 DEL8 DEL24 DEL42 DEL42 DEL32 DEL21 DEL32 DEL8 DEL25 DEL42 DEL32 DEL42 DEL45 DEL42 DEL27 DEL42 DEL42 DEL32 DEL42 DEL43 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL42 DEL42 DEL32 DEL18 DEL8 DEL25 DEL42 DEL42 DEL45 DEL42 DEL42 DEL32 DEL27 DEL42 DEL32 DEL21 DEL42 DEL42 DEL42 DEL32 DEL21 DEL18 DEL8 DEL12 DEL54 DEL8 DEL42 DEL43 DEL45 DEL42 DEL42 DEL32 DEL27 DEL42 DEL43 DEL42 DEL42 DEL32 DEL42 DEL43 DEL42 DEL43 DEL74 DEL34 DEL14 DEL42 DEL33 DEL27 DEL21 DEL42 DEL42 DEL42 DEL32 DEL21 DEL42 DEL43 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL42 DEL32 DEL21 DEL42 DEL34 DEL14 DEL7 DEL21 DEL25 DEL42 DEL43 DEL42 DEL43 DEL74 DEL42 DEL42 DEL42 DEL40 DEL32 DEL59 DEL58 DEL42 DEL42 DEL32 DEL24 DEL8 DEL39 DEL42 DEL44 DEL40 DEL40 DEL7 DEL21 DEL42 DEL42 DEL42 DEL32 DEL32 DEL21 DEL25 DEL42 DEL43 DEL42 DEL43 DEL74 DEL42 DEL33 DEL59 DEL60 DEL42 DEL43 DEL42 DEL43 DEL74 DEL59 DEL58 DEL32 DEL42 DEL43 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL32 DEL42 DEL40 DEL32 DEL38 DEL42 DEL42 DEL40 DEL32 DEL59 DEL60 DEL42 DEL42 DEL32 DEL42 DEL42 DEL32 DEL38 DEL27 DEL53 DEL25 DEL8 DEL25 DEL32 DEL40 DEL32 DEL38 DEL42 DEL42 DEL40 DEL32 DEL59 DEL60 DEL32 DEL42 DEL42 DEL32 DEL38 DEL27 DEL42 DEL43 DEL45 DEL32 DEL27 DEL14 DEL53 DEL25 DEL8 DEL25 DEL8 DEL24 DEL42 DEL33 DEL27 DEL42 DEL42 DEL42 DEL32 DEL21 DEL25 DEL42 DEL40 DEL7 DEL21 DEL8 DEL31 DEL42 DEL40 DEL7 DEL21 DEL42 DEL42 DEL43 DEL42 DEL44 DEL42 DEL40 DEL27 DEL42 DEL43 DEL45 DEL42 DEL27 DEL14 DEL53 DEL8 DEL25 DEL39 DEL42 DEL32 DEL59 DEL60 DEL40 DEL42 DEL27 DEL42 DEL43 DEL45 DEL42 DEL43 DEL42 DEL14 DEL32 DEL45 DEL45 DEL42 DEL42 DEL43 DEL40 DEL14 DEL32 DEL45 DEL27 DEL14 DEL53 DEL8 DEL25 DEL42 DEL52 DEL32 DEL21 DEL42 DEL40 DEL7 DEL21 DEL8 DEL31 DEL42 DEL42 DEL32 DEL42 DEL42 DEL32 DEL27 DEL42 DEL42 DEL32 DEL42 DEL42 DEL32 DEL27 DEL27 DEL42 DEL42 DEL32 DEL42 DEL42 DEL32 DEL27 DEL27 DEL36 DEL27 DEL45 DEL42 DEL42 DEL32 DEL45 DEL42 DEL42 DEL32 DEL39 DEL42 DEL9 DEL59 DEL60 DEL42 DEL42 DEL32 DEL42 DEL42 DEL32 DEL27 DEL42 DEL42 DEL32 DEL42 DEL42 DEL32 DEL27 DEL27 DEL42 DEL42 DEL32 DEL42 DEL42 DEL32 DEL27 DEL27 DEL42 DEL9 DEL7 DEL21 DEL25 DEL42 DEL32 DEL42 DEL42 DEL42 DEL32 DEL21 DEL42 DEL42 DEL9 DEL32 DEL21 DEL42 DEL42 DEL52 DEL32 DEL21 DEL39 DEL42 DEL42 DEL42 DEL40 DEL32 DEL59 DEL60 DEL42 DEL42 DEL42 DEL32 DEL21 DEL8 DEL45 DEL42 DEL32 DEL45 DEL27 DEL42 DEL43 DEL42 DEL42 DEL41 DEL8 DEL31 DEL39 DEL42 DEL42 DEL43 DEL42 DEL44 DEL42 DEL42 DEL7 DEL21 DEL8 DEL31 DEL66 DEL65 DEL29 DEL83 DEL39 DEL42 DEL42 DEL40 DEL7 DEL21 DEL8 DEL31 DEL42 DEL78 DEL83 DEL39 DEL42 DEL8 DEL31 DEL42 DEL78 DEL83 DEL39 DEL42 DEL42 DEL32 DEL42 DEL40 DEL32 DEL42 DEL42 DEL32 DEL21 DEL8 DEL32 DEL21 DEL8 DEL54 DEL8 DEL25 DEL8 DEL31 DEL42 DEL78 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL8

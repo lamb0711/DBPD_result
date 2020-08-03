@@ -1,0 +1,180 @@
+Merge remote-tracking branch 'apache/trunk' into HDFS-7285
+
++import org.apache.commons.logging.Log;
++import org.apache.commons.logging.LogFactory;
++import org.apache.commons.logging.impl.Log4JLogger;
++import org.apache.log4j.Appender;
++import org.apache.log4j.AsyncAppender;
++import javax.management.Attribute;
++import javax.management.AttributeList;
++import javax.management.MBeanAttributeInfo;
++import javax.management.MBeanInfo;
++import javax.management.MBeanServer;
++import javax.management.MalformedObjectNameException;
++import java.lang.management.ManagementFactory;
++import java.util.Collections;
++import java.util.HashSet;
++import java.util.Set;
++import java.util.concurrent.ScheduledThreadPoolExecutor;
++import java.util.concurrent.TimeUnit;
++import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_NAMENODE_METRICS_LOGGER_PERIOD_SECONDS_DEFAULT;
++import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_NAMENODE_METRICS_LOGGER_PERIOD_SECONDS_KEY;
+-  
++
++  public static final Log MetricsLog =
++      LogFactory.getLog("NameNodeMetricsLog");
++
++  ScheduledThreadPoolExecutor metricsLoggerTimer;
++
++    startMetricsLogger(conf);
++  }
++
++  /**
++   * Start a timer to periodically write NameNode metrics to the log
++   * file. This behavior can be disabled by configuration.
++   * @param conf
++   */
++  protected void startMetricsLogger(Configuration conf) {
++    long metricsLoggerPeriodSec =
++        conf.getInt(DFS_NAMENODE_METRICS_LOGGER_PERIOD_SECONDS_KEY,
++            DFS_NAMENODE_METRICS_LOGGER_PERIOD_SECONDS_DEFAULT);
++
++    if (metricsLoggerPeriodSec <= 0) {
++      return;
++    }
++
++    makeMetricsLoggerAsync();
++
++    // Schedule the periodic logging.
++    metricsLoggerTimer = new ScheduledThreadPoolExecutor(1);
++    metricsLoggerTimer.setExecuteExistingDelayedTasksAfterShutdownPolicy(
++        false);
++    metricsLoggerTimer.scheduleWithFixedDelay(new MetricsLoggerTask(),
++        metricsLoggerPeriodSec,
++        metricsLoggerPeriodSec,
++        TimeUnit.SECONDS);
++  }
++
++  /**
++   * Make the metrics logger async and add all pre-existing appenders
++   * to the async appender.
++   */
++  private static void makeMetricsLoggerAsync() {
++    if (!(MetricsLog instanceof Log4JLogger)) {
++      LOG.warn(
++          "Metrics logging will not be async since the logger is not log4j");
++      return;
++    }
++    org.apache.log4j.Logger logger = ((Log4JLogger) MetricsLog).getLogger();
++    logger.setAdditivity(false);  // Don't pollute NN logs with metrics dump
++
++    @SuppressWarnings("unchecked")
++    List<Appender> appenders = Collections.list(logger.getAllAppenders());
++    // failsafe against trying to async it more than once
++    if (!appenders.isEmpty() && !(appenders.get(0) instanceof AsyncAppender)) {
++      AsyncAppender asyncAppender = new AsyncAppender();
++      // change logger to have an async appender containing all the
++      // previously configured appenders
++      for (Appender appender : appenders) {
++        logger.removeAppender(appender);
++        asyncAppender.addAppender(appender);
++      }
++      logger.addAppender(asyncAppender);
++    }
++  }
++
++  protected void stopMetricsLogger() {
++    if (metricsLoggerTimer != null) {
++      metricsLoggerTimer.shutdown();
++      metricsLoggerTimer = null;
++    }
++      stopMetricsLogger();
++
++  private static class MetricsLoggerTask implements Runnable {
++    private static final int MAX_LOGGED_VALUE_LEN = 128;
++    private static ObjectName OBJECT_NAME = null;
++
++    static {
++      try {
++        OBJECT_NAME = new ObjectName("Hadoop:*");
++      } catch (MalformedObjectNameException m) {
++        // This should not occur in practice since we pass
++        // a valid pattern to the constructor above.
++      }
++    }
++
++    /**
++     * Write NameNode metrics to the metrics appender when invoked.
++     */
++    @Override
++    public void run() {
++      // Skip querying metrics if there are no known appenders.
++      if (!MetricsLog.isInfoEnabled() ||
++          !hasAppenders(MetricsLog) ||
++          OBJECT_NAME == null) {
++        return;
++      }
++
++      MetricsLog.info(" >> Begin NameNode metrics dump");
++      final MBeanServer server = ManagementFactory.getPlatformMBeanServer();
++
++      // Iterate over each MBean.
++      for (final ObjectName mbeanName : server.queryNames(OBJECT_NAME, null)) {
++        try {
++          MBeanInfo mBeanInfo = server.getMBeanInfo(mbeanName);
++          final String mBeanNameName = MBeans.getMbeanNameName(mbeanName);
++          final Set<String> attributeNames = getFilteredAttributes(mBeanInfo);
++
++          final AttributeList attributes =
++              server.getAttributes(mbeanName,
++                  attributeNames.toArray(new String[attributeNames.size()]));
++
++          for (Object o : attributes) {
++            final Attribute attribute = (Attribute) o;
++            final Object value = attribute.getValue();
++            final String valueStr =
++                (value != null) ? value.toString() : "null";
++            // Truncate the value if it is too long
++            MetricsLog.info(mBeanNameName + ":" + attribute.getName() + "=" +
++                (valueStr.length() < MAX_LOGGED_VALUE_LEN ? valueStr :
++                    valueStr.substring(0, MAX_LOGGED_VALUE_LEN) + "..."));
++          }
++        } catch (Exception e) {
++          MetricsLog.error("Failed to get NameNode metrics for mbean " +
++              mbeanName.toString(), e);
++        }
++      }
++      MetricsLog.info(" << End NameNode metrics dump");
++    }
++
++    private static boolean hasAppenders(Log logger) {
++      if (!(logger instanceof Log4JLogger)) {
++        // Don't bother trying to determine the presence of appenders.
++        return true;
++      }
++      Log4JLogger log4JLogger = ((Log4JLogger) MetricsLog);
++      return log4JLogger.getLogger().getAllAppenders().hasMoreElements();
++    }
++
++    /**
++     * Get the list of attributes for the MBean, filtering out a few
++     * attribute types.
++     */
++    private static Set<String> getFilteredAttributes(
++        MBeanInfo mBeanInfo) {
++      Set<String> attributeNames = new HashSet<>();
++      for (MBeanAttributeInfo attributeInfo : mBeanInfo.getAttributes()) {
++        if (!attributeInfo.getType().equals(
++                "javax.management.openmbean.TabularData") &&
++            !attributeInfo.getType().equals(
++                "javax.management.openmbean.CompositeData") &&
++            !attributeInfo.getType().equals(
++                "[Ljavax.management.openmbean.CompositeData;")) {
++          attributeNames.add(attributeInfo.getName());
++        }
++      }
++      return attributeNames;
++    }
++  }
+
+INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS23 INS23 INS31 INS31 INS31 INS55 INS83 INS83 INS83 INS43 INS59 INS43 INS59 INS29 INS83 INS39 INS42 INS44 INS8 INS29 INS83 INS83 INS39 INS42 INS8 INS83 INS39 INS42 INS8 INS83 INS83 INS42 INS43 INS23 INS23 INS28 INS31 INS31 INS31 INS42 INS42 INS32 INS42 INS42 INS21 INS65 INS65 INS43 INS42 INS60 INS25 INS21 INS21 INS21 INS21 INS65 INS25 INS60 INS21 INS60 INS25 INS25 INS42 INS83 INS83 INS83 INS39 INS59 INS83 INS83 INS43 INS59 INS83 INS8 INS29 INS78 INS83 INS39 INS42 INS8 INS83 INS83 INS39 INS42 INS44 INS8 INS29 INS83 INS83 INS74 INS42 INS44 INS8 INS42 INS42 INS45 INS32 INS66 INS66 INS42 INS42 INS39 INS59 INS27 INS8 INS32 INS7 INS32 INS32 INS66 INS66 INS38 INS8 INS43 INS59 INS32 INS79 INS74 INS59 INS27 INS8 INS27 INS8 INS42 INS34 INS42 INS42 INS33 INS54 INS65 INS42 INS25 INS21 INS60 INS70 INS21 INS43 INS42 INS25 INS60 INS41 INS65 INS43 INS43 INS43 INS42 INS60 INS70 INS41 INS42 INS42 INS42 INS32 INS42 INS34 INS41 INS42 INS42 INS14 INS42 INS42 INS9 INS42 INS42 INS14 INS42 INS42 INS40 INS36 INS21 INS41 INS40 INS42 INS32 INS42 INS42 INS9 INS42 INS45 INS43 INS43 INS42 INS32 INS38 INS38 INS60 INS70 INS21 INS42 INS33 INS21 INS21 INS21 INS8 INS12 INS66 INS27 INS8 INS32 INS83 INS43 INS59 INS44 INS32 INS8 INS32 INS42 INS38 INS8 INS43 INS59 INS32 INS66 INS66 INS42 INS42 INS42 INS74 INS59 INS44 INS32 INS8 INS42 INS42 INS42 INS42 INS42 INS43 INS34 INS43 INS62 INS32 INS36 INS42 INS42 INS42 INS42 INS42 INS32 INS32 INS36 INS43 INS59 INS44 INS42 INS8 INS32 INS32 INS7 INS32 INS21 INS44 INS8 INS38 INS38 INS27 INS41 INS42 INS42 INS45 INS42 INS42 INS32 INS83 INS43 INS42 INS42 INS42 INS42 INS33 INS54 INS42 INS42 INS45 INS36 INS41 INS42 INS42 INS36 INS32 INS42 INS43 INS43 INS42 INS14 INS43 INS42 INS42 INS42 INS25 INS42 INS42 INS42 INS43 INS42 INS42 INS45 INS11 INS42 INS42 INS42 INS42 INS62 INS42 INS42 INS14 INS43 INS42 INS21 INS21 INS42 INS42 INS42 INS42 INS42 INS42 INS33 INS42 INS7 INS43 INS42 INS32 INS32 INS42 INS33 INS42 INS42 INS42 INS8 INS12 INS62 INS9 INS11 INS32 INS42 INS42 INS42 INS74 INS42 INS27 INS8 INS42 INS43 INS42 INS32 INS43 INS43 INS42 INS32 INS32 INS42 INS14 INS42 INS42 INS42 INS42 INS42 INS60 INS60 INS60 INS60 INS70 INS44 INS8 INS42 INS43 INS43 INS42 INS42 INS42 INS43 INS38 INS38 INS38 INS21 INS42 INS42 INS42 INS34 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS43 INS45 INS43 INS59 INS83 INS43 INS59 INS83 INS74 INS59 INS83 INS43 INS59 INS44 INS42 INS8 INS43 INS42 INS21 INS42 INS42 INS42 INS32 INS32 INS32 INS32 INS42 INS42 INS42 INS32 INS42 INS42 INS32 INS43 INS43 INS42 INS32 INS42 INS42 INS32 INS43 INS42 INS60 INS60 INS60 INS21 INS42 INS32 INS32 INS42 INS45 INS32 INS42 INS45 INS32 INS42 INS45 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS83 INS43 INS59 INS83 INS43 INS59 INS83 INS43 INS59 INS32 INS42 INS42 INS27 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS3 INS42 INS42 INS11 INS42 INS42 INS32 INS42 INS42 INS16 INS42 INS42 INS27 INS45 INS32 INS5 INS32 INS43 INS42 INS42 INS42 INS36 INS32 INS45 INS42 INS45 INS32 INS45 INS36 INS42 INS42 INS43 INS85 INS42 INS42 INS42 INS27 INS42 INS42 INS42 INS42 INS16 INS42 INS42 INS33 INS27 INS42 INS27 INS32 INS42 INS32 INS45 INS42 INS42 INS42 INS42 INS34 INS42

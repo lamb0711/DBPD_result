@@ -1,0 +1,190 @@
+merge the rest of trunk to branch HDFS-4949
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/branches/HDFS-4949@1532967 13f79535-47bb-0310-9956-ffa450edef68
+
++import java.util.HashMap;
++import java.util.Map;
++import org.apache.hadoop.yarn.api.records.QueueACL;
++import org.apache.hadoop.yarn.api.records.YarnApplicationState;
+-import org.apache.hadoop.yarn.server.resourcemanager.rmapp.RMAppState;
++import org.apache.hadoop.yarn.server.resourcemanager.security.QueueACLsManager;
++import org.apache.hadoop.yarn.server.resourcemanager.webapp.dao.ApplicationStatisticsInfo;
++import org.apache.hadoop.yarn.server.resourcemanager.webapp.dao.StatisticsItemInfo;
++  private static final String ANY = "*";
++  private final QueueACLsManager queueACLsManager;
+-      final ApplicationACLsManager aclsManager) {
++      final ApplicationACLsManager aclsManager,
++      final QueueACLsManager queueACLsManager) {
++    this.queueACLsManager = queueACLsManager;
+-        && !this.aclsManager.checkAccess(callerUGI,
++        && !(this.aclsManager.checkAccess(callerUGI,
+-            app.getApplicationId())) {
++            app.getApplicationId()) || this.queueACLsManager.checkAccess(
++            callerUGI, QueueACL.ADMINISTER_QUEUE, app.getQueue()))) {
+-    Set<String> appTypes = new HashSet<String>();
+-    if (!applicationTypes.isEmpty()) {
+-      for (String applicationType : applicationTypes) {
+-        if (applicationType != null && !applicationType.trim().isEmpty()) {
+-          if (applicationType.indexOf(",") == -1) {
+-            appTypes.add(applicationType.trim());
+-          } else {
+-            String[] types = applicationType.split(",");
+-            for (String type : types) {
+-              if (!type.trim().isEmpty()) {
+-                appTypes.add(type.trim());
+-              }
+-            }
+-          }
+-        }
+-      }
+-    }
++    Set<String> appTypes = parseQueries(applicationTypes, false);
+-    String allAppStates;
+-    RMAppState[] stateArray = RMAppState.values();
+-    allAppStates = Arrays.toString(stateArray);
+-
+-    Set<String> appStates = new HashSet<String>();
+-    if (!statesQuery.isEmpty()) {
+-      for (String applicationState : statesQuery) {
+-        if (applicationState != null && !applicationState.isEmpty()) {
+-          String[] states = applicationState.split(",");
+-          for (String state : states) {
+-            try {
+-              RMAppState.valueOf(state.trim());
+-            } catch (IllegalArgumentException iae) {
+-              throw new BadRequestException(
+-                  "Invalid application-state " + state
+-                  + " specified. It should be one of " + allAppStates);
+-            }
+-            appStates.add(state.trim().toLowerCase());
+-          }
+-        }
+-      }
+-    }
++    Set<String> appStates = parseQueries(statesQuery, true);
+-      if (checkAppStates
+-          && !appStates.contains(rmapp.getState().toString().toLowerCase())) {
++      if (checkAppStates && !appStates.contains(
++          rmapp.createApplicationState().toString().toLowerCase())) {
+-      if (checkAppTypes
+-          && !appTypes.contains(rmapp.getApplicationType())) {
++      if (checkAppTypes && !appTypes.contains(
++          rmapp.getApplicationType().trim().toLowerCase())) {
++  @Path("/appstatistics")
++  @Produces({ MediaType.APPLICATION_JSON, MediaType.APPLICATION_XML })
++  public ApplicationStatisticsInfo getAppStatistics(
++      @Context HttpServletRequest hsr,
++      @QueryParam("states") Set<String> stateQueries,
++      @QueryParam("applicationTypes") Set<String> typeQueries) {
++    init();
++
++    // parse the params and build the scoreboard
++    // converting state/type name to lowercase
++    Set<String> states = parseQueries(stateQueries, true);
++    Set<String> types = parseQueries(typeQueries, false);
++    // if no types, counts the applications of any types
++    if (types.size() == 0) {
++      types.add(ANY);
++    } else if (types.size() != 1) {
++      throw new BadRequestException("# of applicationTypes = " + types.size()
++          + ", we temporarily support at most one applicationType");
++    }
++    // if no states, returns the counts of all RMAppStates
++    if (states.size() == 0) {
++      for (YarnApplicationState state : YarnApplicationState.values()) {
++        states.add(state.toString().toLowerCase());
++      }
++    }
++    // in case we extend to multiple applicationTypes in the future
++    Map<YarnApplicationState, Map<String, Long>> scoreboard =
++        buildScoreboard(states, types);
++
++    // go through the apps in RM to count the numbers, ignoring the case of
++    // the state/type name
++    ConcurrentMap<ApplicationId, RMApp> apps = rm.getRMContext().getRMApps();
++    for (RMApp rmapp : apps.values()) {
++      YarnApplicationState state = rmapp.createApplicationState();
++      String type = rmapp.getApplicationType().trim().toLowerCase();
++      if (states.contains(state.toString().toLowerCase())) {
++        if (types.contains(ANY)) {
++          countApp(scoreboard, state, ANY);
++        } else if (types.contains(type)) {
++          countApp(scoreboard, state, type);
++        }
++      }
++    }
++
++    // fill the response object
++    ApplicationStatisticsInfo appStatInfo = new ApplicationStatisticsInfo();
++    for (Map.Entry<YarnApplicationState, Map<String, Long>> partScoreboard
++        : scoreboard.entrySet()) {
++      for (Map.Entry<String, Long> statEntry
++          : partScoreboard.getValue().entrySet()) {
++        StatisticsItemInfo statItem = new StatisticsItemInfo(
++            partScoreboard.getKey(), statEntry.getKey(), statEntry.getValue());
++        appStatInfo.add(statItem);
++      }
++    }
++    return appStatInfo;
++  }
++
++  private static Set<String> parseQueries(
++      Set<String> queries, boolean isState) {
++    Set<String> params = new HashSet<String>();
++    if (!queries.isEmpty()) {
++      for (String query : queries) {
++        if (query != null && !query.trim().isEmpty()) {
++          String[] paramStrs = query.split(",");
++          for (String paramStr : paramStrs) {
++            if (paramStr != null && !paramStr.trim().isEmpty()) {
++              if (isState) {
++                try {
++                  // enum string is in the uppercase
++                  YarnApplicationState.valueOf(paramStr.trim().toUpperCase());
++                } catch (RuntimeException e) {
++                  YarnApplicationState[] stateArray =
++                      YarnApplicationState.values();
++                  String allAppStates = Arrays.toString(stateArray);
++                  throw new BadRequestException(
++                      "Invalid application-state " + paramStr.trim()
++                      + " specified. It should be one of " + allAppStates);
++                }
++              }
++              params.add(paramStr.trim().toLowerCase());
++            }
++          }
++        }
++      }
++    }
++    return params;
++  }
++
++  private static Map<YarnApplicationState, Map<String, Long>> buildScoreboard(
++     Set<String> states, Set<String> types) {
++    Map<YarnApplicationState, Map<String, Long>> scoreboard
++        = new HashMap<YarnApplicationState, Map<String, Long>>();
++    // default states will result in enumerating all YarnApplicationStates
++    assert !states.isEmpty();
++    for (String state : states) {
++      Map<String, Long> partScoreboard = new HashMap<String, Long>();
++      scoreboard.put(
++          YarnApplicationState.valueOf(state.toUpperCase()), partScoreboard);
++      // types is verified no to be empty
++      for (String type : types) {
++        partScoreboard.put(type, 0L);
++      }
++    }
++    return scoreboard;
++  }
++
++  private static void countApp(
++      Map<YarnApplicationState, Map<String, Long>> scoreboard,
++      YarnApplicationState state, String type) {
++    Map<String, Long> partScoreboard = scoreboard.get(state);
++    Long count = partScoreboard.get(type);
++    partScoreboard.put(type, count + 1L);
++  }
++
++  @GET
+
+MOV26 INS26 INS26 INS26 INS26 INS26 INS26 INS40 INS40 INS40 INS40 INS40 INS40 UPD40 INS23 INS23 INS31 INS31 INS31 INS31 INS83 INS83 INS83 INS43 INS59 INS83 INS83 INS43 INS59 INS44 INS78 INS79 INS79 INS83 INS43 INS42 INS44 INS44 INS44 INS8 INS83 INS83 INS74 INS42 INS44 INS44 INS8 INS83 INS83 INS74 INS42 INS44 INS44 INS8 INS83 INS83 INS39 INS42 INS44 INS44 INS44 INS8 INS42 INS42 INS45 INS42 INS42 INS83 INS43 INS42 INS21 MOV60 MOV60 INS42 INS42 INS45 INS42 INS4 INS42 INS78 INS43 INS42 INS79 INS74 INS42 INS79 INS74 INS42 INS21 INS60 INS60 INS25 INS25 INS60 INS60 INS70 INS60 INS70 INS41 INS43 INS43 INS74 INS42 INS39 INS42 MOV60 INS25 INS41 INS43 INS43 INS74 INS74 INS42 INS74 INS42 INS60 INS6 INS70 INS41 INS74 INS42 INS43 INS42 INS43 INS42 INS60 INS60 INS21 INS42 INS7 MOV74 MOV74 INS40 INS40 INS42 INS42 INS42 INS45 INS43 INS43 INS42 INS45 INS43 INS43 INS32 INS74 INS59 INS74 INS59 INS27 INS8 INS25 INS27 INS8 INS74 INS59 INS74 INS59 INS44 INS32 INS8 INS43 INS59 INS44 INS32 INS8 INS42 INS42 INS42 INS43 INS43 INS74 INS38 INS8 INS42 INS42 INS42 INS43 INS43 INS43 INS43 INS43 INS43 INS43 INS74 INS59 INS38 MOV44 INS42 INS8 INS42 INS43 INS43 INS74 INS42 INS42 INS74 INS59 INS43 INS59 INS32 INS22 INS42 UPD42 UPD42 INS42 INS42 INS42 INS42 INS42 INS43 INS43 INS42 INS32 INS43 INS43 INS42 INS32 INS32 INS34 INS21 INS27 INS8 INS32 INS34 INS70 INS43 INS43 INS74 INS42 INS32 INS43 INS43 INS43 INS42 INS32 INS43 INS42 INS42 INS42 INS60 INS60 INS25 INS42 INS42 INS14 INS74 INS42 INS42 INS42 INS70 INS42 INS42 INS43 INS43 UPD42 INS32 INS70 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS43 INS43 INS74 INS42 INS14 INS32 INS60 INS21 INS70 INS42 INS42 INS43 INS43 INS43 INS43 INS43 INS43 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS42 INS27 INS52 INS42 INS36 UPD42 UPD42 INS9 UPD42 UPD42 INS9 MOV8 MOV8 INS42 INS42 INS42 INS42 INS9 INS42 INS42 INS42 INS42 INS9 INS42 INS42 INS32 INS32 INS34 INS53 INS42 INS42 INS44 INS32 INS8 INS42 INS42 INS43 INS43 INS43 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS43 INS59 MOV43 INS59 INS32 INS8 INS43 INS43 INS43 INS74 INS44 INS32 INS8 INS42 INS42 INS42 INS42 INS44 INS42 INS8 INS42 INS42 INS43 INS43 INS43 INS74 INS42 INS42 INS74 INS59 INS32 MOV44 INS42 INS8 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS34 INS27 INS42 INS42 INS42 INS42 INS42 INS14 INS43 INS42 INS42 INS42 INS21 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS32 INS42 INS42 INS32 INS25 INS42 INS40 INS42 INS43 INS43 INS43 INS74 INS42 INS32 INS42 INS60 INS21 MOV43 INS42 INS25 INS42 INS42 INS42 INS43 INS43 INS74 INS43 INS43 INS43 INS42 INS14 INS42 INS42 INS32 INS42 INS21 MOV32 INS32 INS32 MOV43 INS27 INS42 INS32 INS42 INS42 MOV32 MOV42 INS42 INS32 INS42 INS32 INS8 INS25 INS42 INS42 INS42 INS43 INS43 INS43 INS42 INS42 INS43 INS59 INS32 INS27 INS8 INS42 INS42 INS43 INS43 INS43 INS42 INS42 INS42 INS74 INS42 INS42 INS32 INS32 INS22 INS42 INS42 INS40 INS32 INS42 INS42 INS32 INS45 INS32 INS45 INS42 INS42 INS32 UPD42 INS42 INS42 INS42 INS42 INS42 INS21 INS32 INS8 INS40 INS42 INS42 INS42 INS42 INS14 INS42 INS42 INS42 INS27 INS38 INS60 INS70 INS42 INS42 INS42 INS43 INS43 INS43 INS42 INS42 INS42 INS42 INS42 INS34 INS52 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS32 INS42 INS32 INS42 INS42 INS42 INS21 INS43 INS32 INS32 INS32 INS42 INS33 INS32 MOV5 INS59 MOV44 INS42 INS8 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS32 UPD42 INS25 UPD42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS45 INS27 INS8 INS27 INS38 INS25 INS21 INS42 INS33 INS32 INS42 INS8 INS32 INS32 INS42 INS54 INS42 INS42 INS32 INS42 INS42 INS8 INS12 INS32 INS42 INS21 INS44 INS8 INS42 INS42 INS32 INS43 INS42 INS60 INS60 INS53 INS42 INS42 INS32 INS42 INS5 INS59 INS43 INS59 INS14 INS32 INS42 INS43 INS85 INS42 INS32 INS42 INS42 MOV32 INS43 INS27 INS42 INS42 INS42 INS42 INS42 INS42 INS45 INS32 INS45 INS42 INS42 INS42 DEL42 DEL43 DEL85 DEL5 DEL45 DEL42 DEL42 DEL43 DEL42 DEL43 DEL74 DEL14 DEL59 DEL60 DEL42 DEL42 DEL32 DEL38 DEL42 DEL42 DEL33 DEL27 DEL42 DEL42 DEL32 DEL42 DEL32 DEL38 DEL27 DEL42 DEL42 DEL45 DEL32 DEL34 DEL38 DEL27 DEL42 DEL42 DEL42 DEL42 DEL32 DEL32 DEL21 DEL8 DEL42 DEL42 DEL42 DEL32 DEL42 DEL32 DEL38 DEL42 DEL42 DEL42 DEL42 DEL32 DEL32 DEL21 DEL8 DEL25 DEL8 DEL70 DEL8 DEL25 DEL8 DEL25 DEL8 DEL70 DEL8 DEL25 DEL42 DEL59 DEL60 DEL42 DEL43 DEL85 DEL5 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL7 DEL21 DEL45 DEL42 DEL42 DEL32 DEL38 DEL42 DEL44 DEL42 DEL42 DEL33 DEL27 DEL42 DEL42 DEL32 DEL38 DEL27 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL32 DEL21 DEL8 DEL42 DEL43 DEL42 DEL44 DEL45 DEL42 DEL45 DEL42 DEL27 DEL14 DEL53 DEL8 DEL12 DEL54 DEL42 DEL42 DEL42 DEL42 DEL32 DEL42 DEL32 DEL32 DEL21 DEL8 DEL70 DEL8 DEL25 DEL8 DEL70 DEL8 DEL25 DEL42

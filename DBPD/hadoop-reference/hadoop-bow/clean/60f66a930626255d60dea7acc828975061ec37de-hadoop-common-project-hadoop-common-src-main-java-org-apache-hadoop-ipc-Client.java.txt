@@ -1,0 +1,182 @@
+Merge branch 'trunk' into HADOOP-12756
+
++import org.apache.hadoop.io.WritableUtils;
+-    private DataInputStream in;
+-    private DataOutputStream out;
++    private IpcStreams ipcStreams;
++    private final int maxResponseLength;
+-    private ResponseBuffer pingRequest; // ping message
+-    
++    private byte[] pingRequest; // ping message
++
++      this.maxResponseLength = remoteId.conf.getInt(
++          CommonConfigurationKeys.IPC_MAXIMUM_RESPONSE_LENGTH,
++          CommonConfigurationKeys.IPC_MAXIMUM_RESPONSE_LENGTH_DEFAULT);
+-        pingRequest = new ResponseBuffer();
++        ResponseBuffer buf = new ResponseBuffer();
+-        pingHeader.writeDelimitedTo(pingRequest);
++        pingHeader.writeDelimitedTo(buf);
++        pingRequest = buf.toByteArray();
+-    
+-    private synchronized AuthMethod setupSaslConnection(final InputStream in2, 
+-        final OutputStream out2) throws IOException {
++
++    private synchronized AuthMethod setupSaslConnection(IpcStreams streams)
++        throws IOException {
+-      return saslRpcClient.saslConnect(in2, out2);
++      return saslRpcClient.saslConnect(streams);
+-          InputStream inStream = NetUtils.getInputStream(socket);
+-          OutputStream outStream = NetUtils.getOutputStream(socket);
+-          writeConnectionHeader(outStream);
++          ipcStreams = new IpcStreams(socket, maxResponseLength);
++          writeConnectionHeader(ipcStreams);
+-            final InputStream in2 = inStream;
+-            final OutputStream out2 = outStream;
+-                      return setupSaslConnection(in2, out2);
++                      return setupSaslConnection(ipcStreams);
+-              inStream = saslRpcClient.getInputStream(inStream);
+-              outStream = saslRpcClient.getOutputStream(outStream);
++              ipcStreams.setSaslClient(saslRpcClient);
+-        
+-          if (doPing) {
+-            inStream = new PingInputStream(inStream);
+-          }
+-          this.in = new DataInputStream(new BufferedInputStream(inStream));
+-          // SASL may have already buffered the stream
+-          if (!(outStream instanceof BufferedOutputStream)) {
+-            outStream = new BufferedOutputStream(outStream);
++          if (doPing) {
++            ipcStreams.setInputStream(new PingInputStream(ipcStreams.in));
+-          this.out = new DataOutputStream(outStream);
+-          
++
+-    private void writeConnectionHeader(OutputStream outStream)
++    private void writeConnectionHeader(IpcStreams streams)
+-      DataOutputStream out = new DataOutputStream(new BufferedOutputStream(outStream));
+-      // Write out the header, version and authentication method
+-      out.write(RpcConstants.HEADER.array());
+-      out.write(RpcConstants.CURRENT_VERSION);
+-      out.write(serviceClass);
+-      out.write(authProtocol.callId);
+-      out.flush();
++      // Write out the header, version and authentication method.
++      // The output stream is buffered but we must not flush it yet.  The
++      // connection setup protocol requires the client to send multiple
++      // messages before reading a response.
++      //
++      //   insecure: send header+context+call, read
++      //   secure  : send header+negotiate, read, (sasl), context+call, read
++      //
++      // The client must flush only when it's prepared to read.  Otherwise
++      // "broken pipe" exceptions occur if the server closes the connection
++      // before all messages are sent.
++      final DataOutputStream out = streams.out;
++      synchronized (out) {
++        out.write(RpcConstants.HEADER.array());
++        out.write(RpcConstants.CURRENT_VERSION);
++        out.write(serviceClass);
++        out.write(authProtocol.callId);
++      }
+-    
++
++      // do not flush.  the context and first ipc call request must be sent
++      // together to avoid possibility of broken pipes upon authz failure.
++      // see writeConnectionHeader
+-      buf.writeTo(out);
++      synchronized (ipcStreams.out) {
++        ipcStreams.sendRequest(buf.toByteArray());
++      }
+-    
++
+-        synchronized (out) {
+-          pingRequest.writeTo(out);
+-          out.flush();
++        synchronized (ipcStreams.out) {
++          ipcStreams.sendRequest(pingRequest);
++          ipcStreams.flush();
+-              synchronized (Connection.this.out) {
++              synchronized (ipcStreams.out) {
+-                buf.writeTo(out); // RpcRequestHeader + RpcRequest
+-                out.flush();
++                // RpcRequestHeader + RpcRequest
++                ipcStreams.sendRequest(buf.toByteArray());
++                ipcStreams.flush();
+-        int totalLen = in.readInt();
+-        ByteBuffer bb = ByteBuffer.allocate(totalLen);
+-        in.readFully(bb.array());
+-
++        ByteBuffer bb = ipcStreams.readResponse();
+-      IOUtils.closeStream(out);
+-      IOUtils.closeStream(in);
++      IOUtils.closeStream(ipcStreams);
++
++  /** Manages the input and output streams for an IPC connection.
++   *  Only exposed for use by SaslRpcClient.
++   */
++  @InterfaceAudience.Private
++  public static class IpcStreams implements Closeable, Flushable {
++    private DataInputStream in;
++    public DataOutputStream out;
++    private int maxResponseLength;
++    private boolean firstResponse = true;
++
++    IpcStreams(Socket socket, int maxResponseLength) throws IOException {
++      this.maxResponseLength = maxResponseLength;
++      setInputStream(
++          new BufferedInputStream(NetUtils.getInputStream(socket)));
++      setOutputStream(
++          new BufferedOutputStream(NetUtils.getOutputStream(socket)));
++    }
++
++    void setSaslClient(SaslRpcClient client) throws IOException {
++      setInputStream(client.getInputStream(in));
++      setOutputStream(client.getOutputStream(out));
++    }
++
++    private void setInputStream(InputStream is) {
++      this.in = (is instanceof DataInputStream)
++          ? (DataInputStream)is : new DataInputStream(is);
++    }
++
++    private void setOutputStream(OutputStream os) {
++      this.out = (os instanceof DataOutputStream)
++          ? (DataOutputStream)os : new DataOutputStream(os);
++    }
++
++    public ByteBuffer readResponse() throws IOException {
++      int length = in.readInt();
++      if (firstResponse) {
++        firstResponse = false;
++        // pre-rpcv9 exception, almost certainly a version mismatch.
++        if (length == -1) {
++          in.readInt(); // ignore fatal/error status, it's fatal for us.
++          throw new RemoteException(WritableUtils.readString(in),
++                                    WritableUtils.readString(in));
++        }
++      }
++      if (length <= 0) {
++        throw new RpcException("RPC response has invalid length");
++      }
++      if (maxResponseLength > 0 && length > maxResponseLength) {
++        throw new RpcException("RPC response exceeds maximum data length");
++      }
++      ByteBuffer bb = ByteBuffer.allocate(length);
++      in.readFully(bb.array());
++      return bb;
++    }
++
++    public void sendRequest(byte[] buf) throws IOException {
++      out.write(buf);
++    }
++
++    @Override
++    public void flush() throws IOException {
++      out.flush();
++    }
++
++    @Override
++    public void close() {
++      IOUtils.closeStream(out);
++      IOUtils.closeStream(in);
++    }
++  }

@@ -1,0 +1,165 @@
+HADOOP-16085. S3Guard: use object version or etags to protect against inconsistent read after replace/overwrite.
+
+Contributed by Ben Roling.
+
+S3Guard will now track the etag of uploaded files and, if an S3
+bucket is versioned, the object version.
+
+You can then control how to react to a mismatch between the data
+in the DynamoDB table and that in the store: warn, fail, or, when
+using versions, return the original value.
+
+This adds two new columns to the table: etag and version.
+This is transparent to older S3A clients -but when such clients
+add/update data to the S3Guard table, they will not add these values.
+As a result, the etag/version checks will not work with files uploaded by older clients.
+
+For a consistent experience, upgrade all clients to use the latest hadoop version.
+
++import com.amazonaws.AmazonServiceException;
++import com.amazonaws.SdkBaseException;
++import com.amazonaws.services.s3.model.CopyObjectRequest;
++import com.amazonaws.services.s3.model.GetObjectMetadataRequest;
++import com.amazonaws.services.s3.transfer.model.CopyResult;
+-import org.apache.hadoop.fs.s3a.NoVersionAttributeException;
++import org.apache.hadoop.fs.s3a.NoVersionAttributeException;
++import org.apache.hadoop.fs.s3a.S3ObjectAttributes;
++import static org.apache.http.HttpStatus.SC_PRECONDITION_FAILED;
+- * Change tracking for input streams: the revision ID/etag
+- * the previous request is recorded and when the next request comes in,
+- * it is compared.
++ * Change tracking for input streams: the version ID or etag of the object is
++ * tracked and compared on open/re-open.  An initial version ID or etag may or
++ * may not be available, depending on usage (e.g. if S3Guard is utilized).
++ *
+-  public static final String CHANGE_REPORTED_BY_S3 = "reported by S3";
++  public static final String CHANGE_REPORTED_BY_S3 = "Change reported by S3";
++   * @param s3ObjectAttributes attributes of the object, potentially including
++   * an eTag or versionId to match depending on {@code policy}
+-      final AtomicLong versionMismatches) {
++      final AtomicLong versionMismatches,
++      final S3ObjectAttributes s3ObjectAttributes) {
++    this.revisionId = policy.getRevisionId(s3ObjectAttributes);
++    if (revisionId != null) {
++      LOG.debug("Revision ID for object at {}: {}", uri, revisionId);
++    }
++  /**
++   * Apply any revision control set by the policy if it is to be
++   * enforced on the server.
++   * @param request request to modify
++   * @return true iff a constraint was added.
++   */
++  public boolean maybeApplyConstraint(
++      final CopyObjectRequest request) {
++
++    if (policy.getMode() == ChangeDetectionPolicy.Mode.Server
++        && revisionId != null) {
++      policy.applyRevisionConstraint(request, revisionId);
++      return true;
++    }
++    return false;
++  }
++
++  public boolean maybeApplyConstraint(
++      final GetObjectMetadataRequest request) {
++
++    if (policy.getMode() == ChangeDetectionPolicy.Mode.Server
++        && revisionId != null) {
++      policy.applyRevisionConstraint(request, revisionId);
++      return true;
++    }
++    return false;
++  }
+-            String.format("%s change "
+-                    + CHANGE_REPORTED_BY_S3
+-                    + " while reading"
++            String.format(CHANGE_REPORTED_BY_S3
++                    + " during %s"
+-                    + " Version %s was unavailable",
+-                getSource(),
++                    + " %s %s was unavailable",
++                operation,
++                getSource(),
+-    final ObjectMetadata metadata = object.getObjectMetadata();
++    processMetadata(object.getObjectMetadata(), operation);
++  }
++
++  /**
++   * Process the response from the server for validation against the
++   * change policy.
++   * @param copyResult result of a copy operation
++   * @throws PathIOException raised on failure
++   * @throws RemoteFileChangedException if the remote file has changed.
++   */
++  public void processResponse(final CopyResult copyResult)
++      throws PathIOException {
++    // ETag (sometimes, depending on encryption and/or multipart) is not the
++    // same on the copied object as the original.  Version Id seems to never
++    // be the same on the copy.  As such, there isn't really anything that
++    // can be verified on the response, except that a revision ID is present
++    // if required.
++    String newRevisionId = policy.getRevisionId(copyResult);
++    LOG.debug("Copy result {}: {}", policy.getSource(), newRevisionId);
++    if (newRevisionId == null && policy.isRequireVersion()) {
++      throw new NoVersionAttributeException(uri, String.format(
++          "Change detection policy requires %s",
++          policy.getSource()));
++    }
++  }
++
++  /**
++   * Process an exception generated against the change policy.
++   * If the exception indicates the file has changed, this method throws
++   * {@code RemoteFileChangedException} with the original exception as the
++   * cause.
++   * @param e the exception
++   * @param operation the operation performed when the exception was
++   * generated (e.g. "copy", "read", "select").
++   * @throws RemoteFileChangedException if the remote file has changed.
++   */
++  public void processException(SdkBaseException e, String operation) throws
++      RemoteFileChangedException {
++    if (e instanceof AmazonServiceException) {
++      AmazonServiceException serviceException = (AmazonServiceException) e;
++      // This isn't really going to be hit due to
++      // https://github.com/aws/aws-sdk-java/issues/1644
++      if (serviceException.getStatusCode() == SC_PRECONDITION_FAILED) {
++        versionMismatches.incrementAndGet();
++        throw new RemoteFileChangedException(uri, operation, String.format(
++            RemoteFileChangedException.PRECONDITIONS_FAILED
++                + " on %s."
++                + " Version %s was unavailable",
++            getSource(),
++            getRevisionId()),
++            serviceException);
++      }
++    }
++  }
++
++  /**
++   * Process metadata response from server for validation against the change
++   * policy.
++   * @param metadata metadata returned from server
++   * @param operation operation in progress
++   * @throws PathIOException raised on failure
++   * @throws RemoteFileChangedException if the remote file has changed.
++   */
++  public void processMetadata(final ObjectMetadata metadata,
++      final String operation) throws PathIOException {
++    processNewRevision(newRevisionId, operation, -1);
++  }
++
++  /**
++   * Validate a revision from the server against our expectations.
++   * @param newRevisionId new revision.
++   * @param operation operation in progress
++   * @param pos offset in the file; -1 for "none"
++   * @throws PathIOException raised on failure
++   * @throws RemoteFileChangedException if the remote file has changed.
++   */
++  private void processNewRevision(final String newRevisionId,
++      final String operation, final long pos) throws PathIOException {
+-      // revisionId is null on first (re)open. Pin it so change can be detected
+-      // if object has been updated
++      // revisionId may be null on first (re)open. Pin it so change can be
++      // detected if object has been updated

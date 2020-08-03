@@ -1,0 +1,198 @@
+JCR-2026 DbDataStore: garbage collection deadlock (fix and test case)
+
+git-svn-id: https://svn.apache.org/repos/asf/jackrabbit/trunk@1102270 13f79535-47bb-0310-9956-ffa450edef68
+
++import java.sql.SQLException;
+-        "UPDATE ${tablePrefix}${table} SET ID=?, LENGTH=?, LAST_MODIFIED=?"
+-        + " WHERE ID=? AND NOT EXISTS(SELECT ID FROM ${tablePrefix}${table} WHERE ID=?)";
++        "UPDATE ${tablePrefix}${table} SET ID=?, LENGTH=?, LAST_MODIFIED=? " +
++        "WHERE ID=? AND LAST_MODIFIED=?";
+-    /**
+-     * {@inheritDoc}
+-     */
+-    /**
+-     * {@inheritDoc}
+-     */
+-        ResultSet rs = null;
+-        String id = null, tempId = null;
++        String tempId = null;
++        ResultSet rs = null;
+-            long now;
++            long tempModified;
+-                    now = System.currentTimeMillis();
+-                    id = UUID.randomUUID().toString();
++                    tempModified = System.currentTimeMillis();
++                    String id = UUID.randomUUID().toString();
++                    temporaryInUse.add(tempId);
+-                    rs = conHelper.exec(selectMetaSQL, new Object[]{tempId}, false, 0);
+-                    if (rs.next()) {
++                    rs = conHelper.query(selectMetaSQL, tempId);
++                    boolean hasNext = rs.next();
++                    rs.close();
++                    rs = null;
++                    if (hasNext) {
+-                    conHelper.exec(insertTempSQL, new Object[]{tempId, new Long(now)});
++                    conHelper.exec(insertTempSQL, tempId, tempModified);
++                    // prevent that rs.close() is called again
++                    rs = null;
+-            if (id == null) {
+-                String msg = "Can not create new record";
+-                log.error(msg);
+-                throw new DataStoreException(msg);
+-            }
+-            temporaryInUse.add(tempId);
+-            conHelper.exec(updateDataSQL, new Object[]{wrapper, tempId});
+-            now = System.currentTimeMillis();
++            conHelper.exec(updateDataSQL, wrapper, tempId);
+-            id = identifier.toString();
+-            // UPDATE DATASTORE SET ID=?, LENGTH=?, LAST_MODIFIED=?
+-            // WHERE ID=?
+-            // AND NOT EXISTS(SELECT ID FROM DATASTORE WHERE ID=?)
+-            int count = conHelper.update(updateSQL, new Object[]{
+-                    id, new Long(length), new Long(now),
+-                    tempId, id});
+-            rs = null; // prevent that rs.close() is called in finally block if count != 0 (rs is closed above)
+-            if (count == 0) {
+-                // update count is 0, meaning such a row already exists
+-                // DELETE FROM DATASTORE WHERE ID=?
+-                conHelper.exec(deleteSQL, new Object[]{tempId});
+-                // SELECT LENGTH, LAST_MODIFIED FROM DATASTORE WHERE ID=?
+-                rs = conHelper.exec(selectMetaSQL, new Object[]{id}, false, 0);
+-                if (rs.next()) {
+-                    long oldLength = rs.getLong(1);
+-                    long lastModified = rs.getLong(2);
+-                    if (oldLength != length) {
+-                        String msg =
+-                            DIGEST + " collision: temp=" + tempId
+-                            + " id=" + id + " length=" + length
+-                            + " oldLength=" + oldLength;
+-                        log.error(msg);
+-                        throw new DataStoreException(msg);
+-                    }
+-                    touch(identifier, lastModified);
++            String id = identifier.toString();
++            long newModified;
++            while (true) {
++                newModified = System.currentTimeMillis();
++                if (checkExisting(tempId, length, identifier)) {
++                    touch(identifier, newModified);
++                    conHelper.exec(deleteSQL, tempId);
++                    break;
++                try {
++                    // UPDATE DATASTORE SET ID=?, LENGTH=?, LAST_MODIFIED=?
++                    // WHERE ID=? AND LAST_MODIFIED=?
++                    int count = conHelper.update(updateSQL,
++                            id, length, newModified, tempId, tempModified);
++                    if (count == 0) {
++                        // update count is 0, meaning the last modified time of the
++                        // temporary row was changed - which means we need to
++                        // re-try using a new last modified date (a later one)
++                        // because we need to ensure the new last modified date
++                        // is _newer_ than the old (otherwise the garbage collection
++                        // could delete rows)
++                    } else {
++                        // update was successful
++                        break;
++                    }
++                } catch (SQLException e) {
++                    // duplicate key (the row already exists) - repeat
++                    // we use exception handling for flow control here, which is bad,
++                    // but the alternative is to use UPDATE ... WHERE ... (SELECT ...)
++                    // which could cause a deadlock in some databases - also,
++                    // duplicate key will only occur if somebody else concurrently
++                    // added the same record (which is very unlikely)
++                }
++                // SELECT LENGTH, LAST_MODIFIED FROM DATASTORE WHERE ID=?
++                rs = conHelper.query(selectMetaSQL, tempId);
++                if (!rs.next()) {
++                    // the row was deleted, which is unexpected / not allowed
++                    String msg =
++                        DIGEST + " temporary entry deleted: " +
++                            " id=" + tempId + " length=" + length;
++                    log.error(msg);
++                    throw new DataStoreException(msg);
++                }
++                tempModified = rs.getLong(2);
++                DbUtility.close(rs);
++                rs = null;
+-            DbDataRecord record = new DbDataRecord(this, identifier, length, now);
++            DbDataRecord record = new DbDataRecord(this, identifier, length, newModified);
++     * Check if a row with this ID already exists.
++     *
++     * @return true if the row exists and the length matches
++     * @throw DataStoreException if a row exists, but the length is different
++     */
++    private boolean checkExisting(String tempId, long length, DataIdentifier identifier) throws DataStoreException, SQLException {
++        String id = identifier.toString();
++        // SELECT LENGTH, LAST_MODIFIED FROM DATASTORE WHERE ID=?
++        ResultSet rs = null;
++        try {
++            rs = conHelper.query(selectMetaSQL, id);
++            if (rs.next()) {
++                long oldLength = rs.getLong(1);
++                long lastModified = rs.getLong(2);
++                if (oldLength != length) {
++                    String msg =
++                        DIGEST + " collision: temp=" + tempId
++                        + " id=" + id + " length=" + length
++                        + " oldLength=" + oldLength;
++                    log.error(msg);
++                    throw new DataStoreException(msg);
++                }
++                touch(identifier, lastModified);
++                // row already exists
++                conHelper.exec(deleteSQL, tempId);
++                return true;
++            }
++        } finally {
++            DbUtility.close(rs);
++        }
++        return false;
++    }
++
++    /**
+-    /**
+-     * {@inheritDoc}
+-     */
+-            return conHelper.update(deleteOlderSQL, new Long[]{new Long(min)});
++            return conHelper.update(deleteOlderSQL, min);
+-    /**
+-     * {@inheritDoc}
+-     */
+-            rs = conHelper.exec(selectAllSQL, new Object[0], false, 0);
++            rs = conHelper.query(selectAllSQL);
+-    /**
+-     * {@inheritDoc}
+-     */
+-    /**
+-     * {@inheritDoc}
+-     */
+-            rs = conHelper.exec(selectMetaSQL, new Object[]{id}, false, 0);
++            rs = conHelper.query(selectMetaSQL, id);
+-    /**
+-     * {@inheritDoc}
+-     */
+-            rs = conHelper.exec(selectDataSQL, new Object[]{identifier.toString()}, false, 0);
++            rs = conHelper.query(selectDataSQL, identifier.toString());
+-    /**
+-     * {@inheritDoc}
+-     */
++            // ok
++            // ok
++            // ok
+-    /**
+-     * {@inheritDoc}
+-     */
+-            Long n = new Long(now);
+-                conHelper.exec(updateLastModifiedSQL, new Object[]{
+-                        n, key, n
+-                });
++                conHelper.update(updateLastModifiedSQL, now, key, now);
+-    /**
+-     * {@inheritDoc}
+-     */
++        // nothing to do
+-    /**
+-     * {@inheritDoc}
+-     */
++        // no effect

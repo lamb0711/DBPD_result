@@ -1,0 +1,269 @@
+HADOOP-13345 HS3Guard: Improved Consistency for S3A.
+Contributed by: Chris Nauroth, Aaron Fabbri, Mingliang Liu, Lei (Eddy) Xu,
+Sean Mackrory, Steve Loughran and others.
+
++import com.google.common.annotations.VisibleForTesting;
++
++import com.google.common.base.Preconditions;
++import java.util.Collections;
++import java.util.HashSet;
++import java.util.Iterator;
++import java.util.Set;
+-   * Create a FileStatus iterator against a path, with a given
+-   * list object request.
++   * Create a FileStatus iterator against a provided list of file status, with
++   * a given status filter.
++   *
++   * @param fileStatuses the provided list of file status. NO remote calls.
++   * @param filter file path filter on which paths to accept
++   * @param acceptor the file status acceptor
++   * @return the file status iterator
++   */
++  ProvidedFileStatusIterator createProvidedFileStatusIterator(
++      FileStatus[] fileStatuses,
++      PathFilter filter,
++      FileStatusAcceptor acceptor) {
++    return new ProvidedFileStatusIterator(fileStatuses, filter, acceptor);
++  }
++
++  /**
++   * Create a FileStatus iterator against a path, with a given list object
++   * request.
++   *
++    return createFileStatusListingIterator(listPath, request, filter, acceptor,
++        null);
++  }
++
++  /**
++   * Create a FileStatus iterator against a path, with a given
++   * list object request.
++   * @param listPath path of the listing
++   * @param request initial request to make
++   * @param filter the filter on which paths to accept
++   * @param acceptor the class/predicate to decide which entries to accept
++   * in the listing based on the full file status.
++   * @param providedStatus the provided list of file status, which may contain
++   *                       items that are not listed from source.
++   * @return the iterator
++   * @throws IOException IO Problems
++   */
++  FileStatusListingIterator createFileStatusListingIterator(
++      Path listPath,
++      ListObjectsRequest request,
++      PathFilter filter,
++      Listing.FileStatusAcceptor acceptor,
++      RemoteIterator<FileStatus> providedStatus) throws IOException {
+-        acceptor);
++        acceptor,
++        providedStatus);
++  @VisibleForTesting
++   * Create an located status iterator that wraps another to filter out a set
++   * of recently deleted items.
++   * @param iterator an iterator over the remote located status entries.
++   * @param tombstones set of paths that are recently deleted and should be
++   *                   filtered.
++   * @return a new remote iterator.
++   */
++  @VisibleForTesting
++  TombstoneReconcilingIterator createTombstoneReconcilingIterator(
++      RemoteIterator<LocatedFileStatus> iterator, Set<Path> tombstones) {
++    return new TombstoneReconcilingIterator(iterator, tombstones);
++  }
++
++  /**
++
++    /**
++     * Predicate to decide whether or not to accept a file status.
++     * @param status file status containing file path information
++     * @return true if the status is accepted else false
++     */
++    boolean accept(FileStatus status);
+-   * This iterator is used to handle {@link listStatus()} calls where the path
+-   * handed in refers to a file, not a directory: this is the iterator
+-   * returned.
++   * This iterator is used to handle {@link S3AFileSystem#listStatus} calls
++   * where the path handed in refers to a file, not a directory: this is the
++   * iterator returned.
++   * This wraps up a provided non-null list of file status as a remote iterator.
++   *
++   * It firstly filters the provided list and later {@link #next} call will get
++   * from the filtered list. This suffers from scalability issues if the
++   * provided list is too large.
++   *
++   * There is no remote data to fetch.
++   */
++  static class ProvidedFileStatusIterator
++      implements RemoteIterator<FileStatus> {
++    private final ArrayList<FileStatus> filteredStatusList;
++    private int index = 0;
++
++    ProvidedFileStatusIterator(FileStatus[] fileStatuses, PathFilter filter,
++        FileStatusAcceptor acceptor) {
++      Preconditions.checkArgument(fileStatuses != null, "Null status list!");
++
++      filteredStatusList = new ArrayList<>(fileStatuses.length);
++      for (FileStatus status : fileStatuses) {
++        if (filter.accept(status.getPath()) && acceptor.accept(status)) {
++          filteredStatusList.add(status);
++        }
++      }
++      filteredStatusList.trimToSize();
++    }
++
++    @Override
++    public boolean hasNext() throws IOException {
++      return index < filteredStatusList.size();
++    }
++
++    @Override
++    public FileStatus next() throws IOException {
++      if (!hasNext()) {
++        throw new NoSuchElementException();
++      }
++      return filteredStatusList.get(index++);
++    }
++  }
++
++  /**
+-   * declaring that if the {@link S3AFileSystem.ObjectListingIterator#hasNext()}
++   * declaring that if the {@link ObjectListingIterator#hasNext()}
++    private final Set<FileStatus> providedStatus;
++    private Iterator<FileStatus> providedStatusIterator;
++
++     * @param providedStatus the provided list of file status, which may contain
++     *                       items that are not listed from source.
+-        FileStatusAcceptor acceptor) throws IOException {
++        FileStatusAcceptor acceptor,
++        RemoteIterator<FileStatus> providedStatus) throws IOException {
++      this.providedStatus = new HashSet<>();
++      for (; providedStatus != null && providedStatus.hasNext();) {
++        final FileStatus status = providedStatus.next();
++        if (filter.accept(status.getPath()) && acceptor.accept(status)) {
++          this.providedStatus.add(status);
++        }
++      }
++     * Lastly, return true if the {@code providedStatusIterator}
++     * has left items.
+-      return statusBatchIterator.hasNext() || requestNextBatch();
++      return sourceHasNext() || providedStatusIterator.hasNext();
++    }
++
++    private boolean sourceHasNext() throws IOException {
++      if (statusBatchIterator.hasNext() || requestNextBatch()) {
++        return true;
++      } else {
++        // turn to file status that are only in provided list
++        if (providedStatusIterator == null) {
++          LOG.debug("Start iterating the provided status.");
++          providedStatusIterator = providedStatus.iterator();
++        }
++        return false;
++      }
+-      if (!hasNext()) {
+-        throw new NoSuchElementException();
++      final FileStatus status;
++      if (sourceHasNext()) {
++        status = statusBatchIterator.next();
++        // We remove from provided list the file status listed by S3 so that
++        // this does not return duplicate items.
++        LOG.debug("Removing the status from provided file status {}", status);
++        providedStatus.remove(status);
++      } else {
++        if (providedStatusIterator.hasNext()) {
++          status = providedStatusIterator.next();
++          LOG.debug("Returning provided file status {}", status);
++        } else {
++          throw new NoSuchElementException();
++        }
+-      return statusBatchIterator.next();
++      return status;
+-     * {@link S3AFileSystem.ObjectListingIterator} does not generate a request;
++     * {@link ObjectListingIterator} does not generate a request;
+-          FileStatus status = new S3AFileStatus(false, keyPath,
++          FileStatus status = new S3AFileStatus(Tristate.FALSE, keyPath,
+-   * calling {@link #continueListObjects(ObjectListing)} to request the next
++   * calling {@link S3AFileSystem#continueListObjects} to request the next
++
++    @Override
++    public boolean accept(FileStatus status) {
++      return (status != null) && status.isFile();
++    }
++   * Wraps another iterator and filters out files that appear in the provided
++   * set of tombstones.  Will read ahead in the iterator when necessary to
++   * ensure that emptiness is detected early enough if only deleted objects
++   * remain in the source iterator.
++   */
++  static class TombstoneReconcilingIterator implements
++      RemoteIterator<LocatedFileStatus> {
++    private LocatedFileStatus next = null;
++    private final RemoteIterator<LocatedFileStatus> iterator;
++    private final Set<Path> tombstones;
++
++    /**
++     * @param iterator Source iterator to filter
++     * @param tombstones set of tombstone markers to filter out of results
++     */
++    TombstoneReconcilingIterator(RemoteIterator<LocatedFileStatus>
++        iterator, Set<Path> tombstones) {
++      this.iterator = iterator;
++      if (tombstones != null) {
++        this.tombstones = tombstones;
++      } else {
++        this.tombstones = Collections.EMPTY_SET;
++      }
++    }
++
++    private boolean fetch() throws IOException {
++      while (next == null && iterator.hasNext()) {
++        LocatedFileStatus candidate = iterator.next();
++        if (!tombstones.contains(candidate.getPath())) {
++          next = candidate;
++          return true;
++        }
++      }
++      return false;
++    }
++
++    public boolean hasNext() throws IOException {
++      if (next != null) {
++        return true;
++      }
++      return fetch();
++    }
++
++    public LocatedFileStatus next() throws IOException {
++      if (hasNext()) {
++        LocatedFileStatus result = next;
++        next = null;
++        fetch();
++        return result;
++      }
++      throw new NoSuchElementException();
++    }
++  }
++
++  /**
++   * Accept all entries except those which map to S3N pseudo directory markers.
++   */
++  static class AcceptAllButS3nDirs implements FileStatusAcceptor {
++
++    public boolean accept(Path keyPath, S3ObjectSummary summary) {
++      return !summary.getKey().endsWith(S3N_FOLDER_SUFFIX);
++    }
++
++    public boolean accept(Path keyPath, String prefix) {
++      return !keyPath.toString().endsWith(S3N_FOLDER_SUFFIX);
++    }
++
++    public boolean accept(FileStatus status) {
++      return !status.getPath().toString().endsWith(S3N_FOLDER_SUFFIX);
++    }
++
++  }
++
++  /**
++
++    @Override
++    public boolean accept(FileStatus status) {
++      return (status != null) && !status.getPath().equals(qualifiedPath);
++    }

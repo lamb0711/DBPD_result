@@ -1,0 +1,422 @@
+HDFS-6474. Namenode needs to get the actual keys and iv from the KeyProvider. (wang)
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/branches/fs-encryption@1609833 13f79535-47bb-0310-9956-ffa450edef68
+
++import java.util.HashSet;
++import java.util.concurrent.Executors;
++import java.util.concurrent.Future;
++import java.util.concurrent.ScheduledExecutorService;
++import java.util.concurrent.TimeUnit;
++import java.util.concurrent.locks.ReentrantReadWriteLock;
++import com.google.common.annotations.VisibleForTesting;
++import com.google.common.collect.Maps;
++import com.google.common.collect.Sets;
++import com.google.common.util.concurrent.ThreadFactoryBuilder;
++import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.crypto.key.KeyProvider;
++import org.apache.hadoop.hdfs.DFSConfigKeys;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++import static org.apache.hadoop.crypto.key.KeyProvider.KeyVersion;
+- * Manages the list of encryption zones in the filesystem. Relies on the
+- * FSDirectory lock for synchronization.
++ * Manages the list of encryption zones in the filesystem.
++ * <p/>
++ * The EncryptionZoneManager has its own lock, but relies on the FSDirectory
++ * lock being held for many operations. The FSDirectory lock should not be
++ * taken if the manager lock is already held.
++  public static Logger LOG = LoggerFactory.getLogger(EncryptionZoneManager
++      .class);
++
++    private final HashSet<KeyVersion> keyVersions;
++    private KeyVersion latestVersion;
++
++      keyVersions = Sets.newHashSet();
++      latestVersion = null;
++    }
++
++    KeyVersion getLatestKeyVersion() {
++      return latestVersion;
++    }
++
++    void addKeyVersion(KeyVersion version) {
++      Preconditions.checkNotNull(version);
++      if (!keyVersions.contains(version)) {
++        LOG.debug("Key {} has new key version {}", keyId, version);
++        keyVersions.add(version);
++      }
++      // Always set the latestVersion to not get stuck on an old version in
++      // racy situations. Should eventually converge thanks to the
++      // monitor.
++      latestVersion = version;
+-    String getFullPathName() {
+-      return dir.getInode(inodeId).getFullPathName();
+-    }
++  }
++
++  /**
++   * Protects the <tt>encryptionZones</tt> map and its contents.
++   */
++  private final ReentrantReadWriteLock lock;
++
++  private void readLock() {
++    lock.readLock().lock();
++  }
++
++  private void readUnlock() {
++    lock.readLock().unlock();
++  }
++
++  private void writeLock() {
++    lock.writeLock().lock();
++  }
++
++  private void writeUnlock() {
++    lock.writeLock().unlock();
++  }
++
++  public boolean hasWriteLock() {
++    return lock.isWriteLockedByCurrentThread();
++  }
++
++  public boolean hasReadLock() {
++    return lock.getReadHoldCount() > 0 || hasWriteLock();
+-
++  private final ScheduledExecutorService monitor;
++  private final KeyProvider provider;
+-  public EncryptionZoneManager(FSDirectory dir) {
++  public EncryptionZoneManager(FSDirectory dir, Configuration conf,
++      KeyProvider provider) {
++
++    this.provider = provider;
++    lock = new ReentrantReadWriteLock();
++
++    monitor = Executors.newScheduledThreadPool(1,
++        new ThreadFactoryBuilder()
++            .setDaemon(true)
++            .setNameFormat(EncryptionZoneMonitor.class.getSimpleName() + "-%d")
++            .build());
++    final int refreshMs = conf.getInt(
++        DFSConfigKeys.DFS_NAMENODE_KEY_VERSION_REFRESH_INTERVAL_MS_KEY,
++        DFSConfigKeys.DFS_NAMENODE_KEY_VERSION_REFRESH_INTERVAL_MS_DEFAULT
++    );
++    Preconditions.checkArgument(refreshMs >= 0, "%s cannot be negative",
++        DFSConfigKeys.DFS_NAMENODE_KEY_VERSION_REFRESH_INTERVAL_MS_KEY);
++    monitor.scheduleAtFixedRate(new EncryptionZoneMonitor(), 0, refreshMs,
++        TimeUnit.MILLISECONDS);
++  }
++
++  /**
++   * Periodically wakes up to fetch the latest version of each encryption
++   * zone key.
++   */
++  private class EncryptionZoneMonitor implements Runnable {
++    @Override
++    public void run() {
++      LOG.debug("Monitor waking up to refresh encryption zone key versions");
++      HashMap<Long, String> toFetch = Maps.newHashMap();
++      HashMap<Long, KeyVersion> toUpdate =
++          Maps.newHashMap();
++      // Determine the keyIds to fetch
++      readLock();
++      try {
++        for (EncryptionZoneInt ezi : encryptionZones.values()) {
++          toFetch.put(ezi.getINodeId(), ezi.getKeyId());
++        }
++      } finally {
++        readUnlock();
++      }
++      LOG.trace("Found {} keys to check", toFetch.size());
++      // Fetch the key versions while not holding the lock
++      for (Map.Entry<Long, String> entry : toFetch.entrySet()) {
++        try {
++          KeyVersion version = provider.getCurrentKey(entry.getValue());
++          toUpdate.put(entry.getKey(), version);
++        } catch (IOException e) {
++          LOG.warn("Error while getting the current key for {} {}",
++              entry.getValue(), e);
++        }
++      }
++      LOG.trace("Fetched {} key versions from KeyProvider", toUpdate.size());
++      // Update the key versions for each encryption zone
++      writeLock();
++      try {
++        for (Map.Entry<Long, KeyVersion> entry : toUpdate.entrySet()) {
++          EncryptionZoneInt ezi = encryptionZones.get(entry.getKey());
++          // zone might have been removed in the intervening time
++          if (ezi == null) {
++            continue;
++          }
++          ezi.addKeyVersion(entry.getValue());
++        }
++      } finally {
++        writeUnlock();
++      }
++    }
++  }
++
++  /**
++   * Forces the EncryptionZoneMonitor to run, waiting until completion.
++   */
++  @VisibleForTesting
++  public void kickMonitor() throws Exception {
++    Future future = monitor.submit(new EncryptionZoneMonitor());
++    future.get();
++  }
++
++  /**
++   * Immediately fetches the latest KeyVersion for an encryption zone,
++   * also updating the encryption zone.
++   *
++   * @param iip of the encryption zone
++   * @return latest KeyVersion
++   * @throws IOException on KeyProvider error
++   */
++  KeyVersion updateLatestKeyVersion(INodesInPath iip) throws IOException {
++    EncryptionZoneInt ezi;
++    readLock();
++    try {
++      ezi = getEncryptionZoneForPath(iip);
++    } finally {
++      readUnlock();
++    }
++    if (ezi == null) {
++      throw new IOException("Cannot update KeyVersion since iip is not within" +
++          " an encryption zone");
++    }
++
++    // Do not hold the lock while doing KeyProvider operations
++    KeyVersion version = provider.getCurrentKey(ezi.getKeyId());
++
++    writeLock();
++    try {
++      ezi.addKeyVersion(version);
++      return version;
++    } finally {
++      writeUnlock();
++    }
++   * <p/>
++   * Called while holding the FSDirectory lock.
++    assert dir.hasWriteLock();
+-    encryptionZones.put(inodeId, ez);
++    writeLock();
++    try {
++      encryptionZones.put(inodeId, ez);
++    } finally {
++      writeUnlock();
++    }
++  /**
++   * Remove an encryption zone.
++   * <p/>
++   * Called while holding the FSDirectory lock.
++   */
+-    encryptionZones.remove(inodeId);
++    assert dir.hasWriteLock();
++    writeLock();
++    try {
++      encryptionZones.remove(inodeId);
++    } finally {
++      writeUnlock();
++    }
++   * <p/>
++   * Called while holding the FSDirectory lock.
+-    return (getEncryptionZoneForPath(iip) != null);
++    assert dir.hasReadLock();
++    readLock();
++    try {
++      return (getEncryptionZoneForPath(iip) != null);
++    } finally {
++      readUnlock();
++    }
++  /**
++   * Returns the path of the EncryptionZoneInt.
++   * <p/>
++   * Called while holding the FSDirectory lock.
++   */
++  private String getFullPathName(EncryptionZoneInt ezi) {
++    assert dir.hasReadLock();
++    return dir.getInode(ezi.getINodeId()).getFullPathName();
++  }
++
++  KeyVersion getLatestKeyVersion(final INodesInPath iip) {
++    readLock();
++    try {
++      EncryptionZoneInt ezi = getEncryptionZoneForPath(iip);
++      if (ezi == null) {
++        return null;
++      }
++      return ezi.getLatestKeyVersion();
++    } finally {
++      readUnlock();
++    }
++  }
++
++  /**
++   * @return true if the provided <tt>keyVersionName</tt> is the name of a
++   * valid KeyVersion for the encryption zone of <tt>iip</tt>,
++   * and <tt>iip</tt> is within an encryption zone.
++   */
++  boolean isValidKeyVersion(final INodesInPath iip, String keyVersionName) {
++    readLock();
++    try {
++      EncryptionZoneInt ezi = getEncryptionZoneForPath(iip);
++      if (ezi == null) {
++        return false;
++      }
++      for (KeyVersion ezVersion : ezi.keyVersions) {
++        if (keyVersionName.equals(ezVersion.getVersionName())) {
++          return true;
++        }
++      }
++      return false;
++    } finally {
++      readUnlock();
++    }
++  }
++
++  /**
++   * Looks up the EncryptionZoneInt for a path within an encryption zone.
++   * Returns null if path is not within an EZ.
++   * <p/>
++   * Must be called while holding the manager lock.
++   */
++    assert hasReadLock();
+-   * Throws an exception if the provided inode cannot be renamed into the
++   * Throws an exception if the provided path cannot be renamed into the
++   * <p/>
++   * Called while holding the FSDirectory lock.
+-    final boolean srcInEZ = (getEncryptionZoneForPath(srcIIP) != null);
+-    final boolean dstInEZ = (getEncryptionZoneForPath(dstIIP) != null);
+-    if (srcInEZ) {
+-      if (!dstInEZ) {
+-        throw new IOException(src + " can't be moved from an encryption zone.");
+-      }
+-    } else {
+-      if (dstInEZ) {
+-        throw new IOException(src + " can't be moved into an encryption zone.");
+-      }
+-    }
+-
+-    if (srcInEZ || dstInEZ) {
++    assert dir.hasReadLock();
++    readLock();
++    try {
+-      Preconditions.checkArgument(srcEZI != null, "couldn't find src EZ?");
+-      Preconditions.checkArgument(dstEZI != null, "couldn't find dst EZ?");
+-      if (srcEZI != dstEZI) {
+-        final String srcEZPath = srcEZI.getFullPathName();
+-        final String dstEZPath = dstEZI.getFullPathName();
+-        final StringBuilder sb = new StringBuilder(src);
+-        sb.append(" can't be moved from encryption zone ");
+-        sb.append(srcEZPath);
+-        sb.append(" to encryption zone ");
+-        sb.append(dstEZPath);
+-        sb.append(".");
+-        throw new IOException(sb.toString());
++      final boolean srcInEZ = (srcEZI != null);
++      final boolean dstInEZ = (dstEZI != null);
++      if (srcInEZ) {
++        if (!dstInEZ) {
++          throw new IOException(
++              src + " can't be moved from an encryption zone.");
++        }
++      } else {
++        if (dstInEZ) {
++          throw new IOException(
++              src + " can't be moved into an encryption zone.");
++        }
++
++      if (srcInEZ || dstInEZ) {
++        Preconditions.checkState(srcEZI != null, "couldn't find src EZ?");
++        Preconditions.checkState(dstEZI != null, "couldn't find dst EZ?");
++        if (srcEZI != dstEZI) {
++          final String srcEZPath = getFullPathName(srcEZI);
++          final String dstEZPath = getFullPathName(dstEZI);
++          final StringBuilder sb = new StringBuilder(src);
++          sb.append(" can't be moved from encryption zone ");
++          sb.append(srcEZPath);
++          sb.append(" to encryption zone ");
++          sb.append(dstEZPath);
++          sb.append(".");
++          throw new IOException(sb.toString());
++        }
++      }
++    } finally {
++      readUnlock();
+-  XAttr createEncryptionZone(String src, String keyId) throws IOException {
+-    if (dir.isNonEmptyDirectory(src)) {
+-      throw new IOException(
+-          "Attempt to create an encryption zone for a non-empty directory.");
+-    }
++  /**
++   * Create a new encryption zone.
++   * <p/>
++   * Called while holding the FSDirectory lock.
++   */
++  XAttr createEncryptionZone(String src, String keyId, KeyVersion keyVersion)
++      throws IOException {
++    assert dir.hasWriteLock();
++    writeLock();
++    try {
++      if (dir.isNonEmptyDirectory(src)) {
++        throw new IOException(
++            "Attempt to create an encryption zone for a non-empty directory.");
++      }
+-    final INodesInPath srcIIP = dir.getINodesInPath4Write(src, false);
+-    final EncryptionZoneInt ezi = getEncryptionZoneForPath(srcIIP);
+-    if (ezi != null) {
+-      throw new IOException("Directory " + src +
+-          " is already in an encryption zone. (" + ezi.getFullPathName() + ")");
+-    }
++      final INodesInPath srcIIP = dir.getINodesInPath4Write(src, false);
++      EncryptionZoneInt ezi = getEncryptionZoneForPath(srcIIP);
++      if (ezi != null) {
++        throw new IOException("Directory " + src + " is already in an " +
++            "encryption zone. (" + getFullPathName(ezi) + ")");
++      }
+-    final XAttr keyIdXAttr =
+-        XAttrHelper.buildXAttr(CRYPTO_XATTR_ENCRYPTION_ZONE, keyId.getBytes());
+-    final List<XAttr> xattrs = Lists.newArrayListWithCapacity(1);
+-    xattrs.add(keyIdXAttr);
+-    final INode inode =
+-        dir.unprotectedSetXAttrs(src, xattrs, EnumSet.of(XAttrSetFlag.CREATE));
+-    addEncryptionZone(inode.getId(), keyId);
+-    return keyIdXAttr;
++      final XAttr keyIdXAttr = XAttrHelper
++          .buildXAttr(CRYPTO_XATTR_ENCRYPTION_ZONE, keyId.getBytes());
++
++      final List<XAttr> xattrs = Lists.newArrayListWithCapacity(1);
++      xattrs.add(keyIdXAttr);
++      // updating the xattr will call addEncryptionZone,
++      // done this way to handle edit log loading
++      dir.unprotectedSetXAttrs(src, xattrs, EnumSet.of(XAttrSetFlag.CREATE));
++      // Re-get the new encryption zone add the latest key version
++      ezi = getEncryptionZoneForPath(srcIIP);
++      ezi.addKeyVersion(keyVersion);
++      return keyIdXAttr;
++    } finally {
++      writeUnlock();
++    }
++  /**
++   * Return the current list of encryption zones.
++   * <p/>
++   * Called while holding the FSDirectory lock.
++   */
+-    final List<EncryptionZone> ret =
+-        Lists.newArrayListWithExpectedSize(encryptionZones.size());
+-    for (EncryptionZoneInt ezi : encryptionZones.values()) {
+-      ret.add(new EncryptionZone(ezi.getFullPathName(), ezi.getKeyId()));
++    assert dir.hasReadLock();
++    readLock();
++    try {
++      final List<EncryptionZone> ret =
++          Lists.newArrayListWithExpectedSize(encryptionZones.size());
++      for (EncryptionZoneInt ezi : encryptionZones.values()) {
++        ret.add(new EncryptionZone(getFullPathName(ezi), ezi.getKeyId()));
++      }
++      return ret;
++    } finally {
++      readUnlock();
+-    return ret;
+
+INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS23 MOV31 INS23 INS31 INS31 INS31 INS31 INS31 INS31 INS23 INS23 INS55 INS31 INS31 INS31 INS31 INS31 INS83 INS83 INS43 INS59 INS23 INS23 INS31 INS29 INS83 INS83 INS43 INS59 INS83 INS39 INS42 INS8 INS83 INS39 INS42 INS8 INS83 INS39 INS42 INS8 INS83 INS39 INS42 INS8 INS83 INS39 INS42 INS8 INS83 INS39 INS42 INS8 INS83 INS83 INS43 INS59 INS83 INS83 INS43 INS59 INS44 INS44 INS29 INS83 INS42 INS43 INS31 INS29 INS78 INS83 INS39 INS42 INS43 INS8 INS29 INS43 INS42 INS44 INS43 INS8 INS29 INS8 INS8 INS29 INS83 INS43 INS42 INS44 INS8 INS43 INS42 INS44 INS8 INS29 INS39 INS42 INS44 INS44 INS8 INS29 INS8 INS29 INS44 INS8 INS29 INS8 UPD66 INS66 INS66 UPD66 INS66 INS42 INS42 INS32 INS83 INS83 INS74 INS59 INS83 INS43 INS59 INS43 INS42 INS8 INS39 INS42 INS44 INS8 INS65 INS42 INS42 INS21 INS21 INS21 INS21 INS41 INS41 INS42 INS42 INS42 INS42 INS43 INS42 INS43 INS42 INS21 INS21 INS21 INS60 INS21 INS21 INS65 INS42 INS78 INS83 INS39 INS42 INS8 INS65 INS42 INS42 INS60 INS21 INS65 INS65 INS65 INS65 INS42 INS43 INS42 INS42 INS60 INS21 INS54 INS25 INS60 INS21 INS54 INS6 INS21 INS54 INS65 INS6 INS21 INS54 INS6 INS21 INS54 INS65 INS42 INS43 INS42 INS6 INS41 INS42 INS83 INS43 INS42 INS21 INS54 INS65 INS83 INS43 INS42 MOV43 INS42 INS21 INS54 INS65 INS6 INS6 INS21 INS54 INS65 INS43 INS42 INS6 INS21 INS54 INS65 INS6 INS21 INS54 INS42 INS42 INS57 INS43 INS43 INS42 INS42 INS42 INS21 INS21 INS42 INS41 INS43 INS42 INS21 INS25 INS21 INS66 INS32 INS32 INS32 INS32 INS32 INS27 INS42 INS42 INS7 INS7 INS7 INS83 INS39 INS59 INS32 INS32 INS66 INS66 INS42 INS21 INS60 INS60 INS21 INS54 INS21 INS70 INS21 INS21 INS54 INS66 INS43 INS59 INS32 INS66 INS66 INS42 INS66 INS66 INS42 INS66 INS42 INS43 INS59 INS32 INS8 INS8 INS27 INS8 INS43 INS59 INS32 INS8 INS8 INS66 INS66 INS32 INS32 INS8 INS8 INS66 INS66 INS66 INS32 INS32 MOV8 INS8 INS66 INS66 INS32 INS32 MOV8 INS8 INS66 INS66 INS66 INS42 INS32 INS32 INS42 INS32 INS8 INS8 INS66 INS66 INS66 INS42 INS32 INS8 INS8 INS66 INS66 INS66 INS66 INS32 UPD66 INS66 INS66 INS32 INS32 MOV8 INS8 INS66 INS66 INS66 INS42 INS32 INS32 MOV8 INS8 INS66 INS66 INS66 INS32 INS32 MOV8 INS8 INS43 INS42 INS42 INS7 INS7 INS42 INS42 INS32 INS38 INS8 INS7 INS32 INS42 INS32 INS42 INS32 INS42 INS32 INS42 INS42 INS42 INS27 INS32 INS22 INS42 INS42 INS14 INS42 INS32 INS42 INS32 INS42 INS42 INS27 INS45 INS40 INS42 INS42 INS14 INS34 INS42 INS40 INS32 INS74 INS59 INS74 INS59 INS32 INS8 INS8 INS32 INS44 INS32 INS8 INS32 INS32 INS8 INS8 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS21 INS21 INS42 INS33 INS53 INS42 INS42 INS32 INS42 INS21 INS41 INS21 INS42 INS42 INS42 MOV21 INS21 INS42 INS42 INS42 INS21 INS42 INS42 INS42 INS21 INS42 INS42 INS32 INS42 INS42 INS60 INS25 INS41 INS21 INS42 INS60 INS25 INS70 INS41 INS21 INS42 INS42 INS42 INS42 MOV60 MOV60 INS21 INS42 INS42 INS42 INS21 INS21 INS21 INS42 INS42 INS42 INS21 INS42 INS42 INS32 INS42 INS33 INS42 INS42 INS42 INS32 INS21 INS21 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS34 INS42 INS52 INS42 INS43 INS42 INS42 INS34 INS32 INS42 INS42 INS40 INS40 INS42 INS34 INS43 INS42 INS42 INS45 INS43 INS43 INS43 INS42 INS32 INS43 INS43 INS43 INS42 INS32 INS42 INS70 INS21 INS42 INS42 INS45 INS32 INS74 INS42 INS42 INS42 INS54 INS42 INS42 INS45 INS32 INS42 INS70 INS21 INS42 INS42 INS14 INS7 INS32 INS14 INS42 INS42 INS32 INS32 INS42 INS32 INS32 INS32 INS32 INS42 INS42 INS32 INS43 INS59 INS27 INS8 INS32 INS32 INS43 INS59 INS27 INS8 INS44 INS40 INS8 INS9 INS32 INS32 MOV32 INS7 INS32 INS32 INS42 INS42 INS42 INS42 INS42 INS32 INS32 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS44 INS32 INS8 INS32 INS42 INS42 INS43 INS43 INS43 INS8 INS12 INS42 INS42 INS44 INS32 INS8 INS32 INS43 INS42 INS32 INS42 INS43 INS27 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS33 INS41 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS33 INS41 INS43 INS42 INS25 INS42 INS42 INS42 MOV32 UPD42 UPD42 MOV42 UPD42 INS42 INS42 UPD42 MOV42 UPD42 MOV42 INS45 UPD42 MOV42 INS42 UPD42 MOV42 INS42 INS42 INS32 INS42 INS27 INS43 INS42 INS42 INS42 INS21 INS42 INS40 INS42 INS42 INS60 INS21 INS44 INS8 INS74 INS42 INS42 INS42 INS60 INS25 INS21 INS42 INS42 INS42 INS42 INS42 INS45 INS45 INS42 INS42 INS33 INS42 INS42 INS9 INS42 INS32 INS8 INS14 INS42 INS9 INS32 INS45 INS42 INS32 INS43 INS59 INS32 MOV43 INS42 INS21 INS43 INS43 INS43 INS43 INS59 INS27 INS8 INS32 INS42 INS42 INS32 INS41 INS42 INS42 UPD42 UPD42 INS43 INS43 INS57 INS42 INS42 INS42 INS32 INS32 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS32 INS40 INS42 INS42 INS42 INS42 INS32 INS42 INS33 INS18 INS42 INS42 INS32 INS42 INS42 INS9 MOV43 MOV43 INS42 UPD45 INS45 INS42 INS43 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS45 INS32 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 DEL42 DEL32 DEL32 DEL41 DEL8 DEL42 DEL42 DEL32 DEL42 DEL42 DEL83 DEL42 DEL83 DEL42 DEL43 DEL42 DEL59 DEL60 DEL42 DEL32 DEL42

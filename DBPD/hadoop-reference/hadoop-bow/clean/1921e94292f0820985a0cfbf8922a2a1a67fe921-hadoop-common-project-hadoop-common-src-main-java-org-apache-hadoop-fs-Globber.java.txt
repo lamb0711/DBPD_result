@@ -1,0 +1,224 @@
+HADOOP-16458. LocatedFileStatusFetcher.getFileStatuses failing intermittently with S3
+
+Contributed by Steve Loughran.
+
+Includes
+-S3A glob scans don't bother trying to resolve symlinks
+-stack traces don't get lost in getFileStatuses() when exceptions are wrapped
+-debug level logging of what is up in Globber
+-Contains HADOOP-13373. Add S3A implementation of FSMainOperationsBaseTest.
+-ITestRestrictedReadAccess tests incomplete read access to files.
+
+This adds a builder API for constructing globbers which other stores can use
+so that they too can skip symlink resolution when not needed.
+
+Change-Id: I23bcdb2783d6bd77cf168fdc165b1b4b334d91c7
+
++import org.apache.hadoop.util.DurationInfo;
++import static com.google.common.base.Preconditions.checkNotNull;
++
++/**
++ * Implementation of {@link FileSystem#globStatus(Path, PathFilter)}.
++ * This has historically been package-private; it has been opened
++ * up for object stores within the {@code hadoop-*} codebase ONLY.
++ * It could be expanded for external store implementations in future.
++ */
+-class Globber {
++public class Globber {
+-  
+-  public Globber(FileSystem fs, Path pathPattern, PathFilter filter) {
++  private final boolean resolveSymlinks;
++
++  Globber(FileSystem fs, Path pathPattern, PathFilter filter) {
++    this.resolveSymlinks = true;
+-  public Globber(FileContext fc, Path pathPattern, PathFilter filter) {
++  Globber(FileContext fc, Path pathPattern, PathFilter filter) {
++    this.resolveSymlinks = true;
++  }
++
++  /**
++   * Filesystem constructor for use by {@link GlobBuilder}.
++   * @param fs filesystem
++   * @param pathPattern path pattern
++   * @param filter optional filter
++   * @param resolveSymlinks should symlinks be resolved.
++   */
++  private Globber(FileSystem fs, Path pathPattern, PathFilter filter,
++      boolean resolveSymlinks) {
++    this.fs = fs;
++    this.fc = null;
++    this.pathPattern = pathPattern;
++    this.filter = filter;
++    this.resolveSymlinks = resolveSymlinks;
++    this.tracer = FsTracer.get(fs.getConf());
++    LOG.debug("Created Globber for path={}, symlinks={}",
++        pathPattern, resolveSymlinks);
++  }
++
++  /**
++   * File Context constructor for use by {@link GlobBuilder}.
++   * @param fc file context
++   * @param pathPattern path pattern
++   * @param filter optional filter
++   * @param resolveSymlinks should symlinks be resolved.
++   */
++  private Globber(FileContext fc, Path pathPattern, PathFilter filter,
++      boolean resolveSymlinks) {
++    this.fs = null;
++    this.fc = fc;
++    this.pathPattern = pathPattern;
++    this.filter = filter;
++    this.resolveSymlinks = resolveSymlinks;
++    this.tracer = fc.getTracer();
++    LOG.debug("Created Globber path={}, symlinks={}",
++        pathPattern, resolveSymlinks);
++      LOG.debug("getFileStatus({}) failed; returning null", path, e);
++      LOG.debug("listStatus({}) failed; returning empty array", path, e);
+-    ArrayList<String> ret = new ArrayList<String>();
++    ArrayList<String> ret = new ArrayList<>();
+-    try {
++    try (DurationInfo ignored = new DurationInfo(LOG, false,
++        "glob %s", pathPattern)) {
++    LOG.debug("Filesystem glob {}", pathPatternString);
+-        new ArrayList<FileStatus>(flattenedPatterns.size());
++        new ArrayList<>(flattenedPatterns.size());
++      LOG.debug("Pattern: {}", absPattern);
+-      ArrayList<FileStatus> candidates = new ArrayList<FileStatus>(1);
++      ArrayList<FileStatus> candidates = new ArrayList<>(1);
+-            new ArrayList<FileStatus>(candidates.size());
++            new ArrayList<>(candidates.size());
++        LOG.debug("Component {}, patterned={}", component, sawWildcard);
+-              Path path = candidate.getPath();
+-              FileStatus status = getFileStatus(path);
+-              if (status == null) {
+-                // null means the file was not found
+-                LOG.warn("File/directory {} not found:"
+-                    + " it may have been deleted."
+-                    + " If this is an object store, this can be a sign of"
+-                    + " eventual consistency problems.",
+-                    path);
+-                continue;
+-              }
+-              if (!status.isDirectory()) {
+-                continue;
++              if (resolveSymlinks) {
++                LOG.debug("listStatus found one entry; disambiguating {}",
++                    children[0]);
++                Path path = candidate.getPath();
++                FileStatus status = getFileStatus(path);
++                if (status == null) {
++                  // null means the file was not found
++                  LOG.warn("File/directory {} not found:"
++                      + " it may have been deleted."
++                      + " If this is an object store, this can be a sign of"
++                      + " eventual consistency problems.",
++                      path);
++                  continue;
++                }
++                if (!status.isDirectory()) {
++                  LOG.debug("Resolved entry is a file; skipping: {}", status);
++                  continue;
++                }
++              } else {
++                // there's no symlinks in this store, so no need to issue
++                // another call, just see if the result is a directory or a file
++                if (children[0].getPath().equals(candidate.getPath())) {
++                  // the listing status is of a file
++                  continue;
++                }
++      LOG.debug("No matches found and there was no wildcard in the path {}",
++          pathPattern);
++
++  /**
++   * Create a builder for a Globber, bonded to the specific filesystem.
++   * @param filesystem filesystem
++   * @return the builder to finish configuring.
++   */
++  public static GlobBuilder createGlobber(FileSystem filesystem) {
++    return new GlobBuilder(filesystem);
++  }
++
++  /**
++   * Create a builder for a Globber, bonded to the specific file
++   * context.
++   * @param fileContext file context.
++   * @return the builder to finish configuring.
++   */
++  public static GlobBuilder createGlobber(FileContext fileContext) {
++    return new GlobBuilder(fileContext);
++  }
++
++  /**
++   * Builder for Globber instances.
++   */
++  @InterfaceAudience.Private
++  public static class GlobBuilder {
++
++    private final FileSystem fs;
++
++    private final FileContext fc;
++
++    private Path pathPattern;
++
++    private PathFilter filter;
++
++    private boolean resolveSymlinks = true;
++
++    /**
++     * Construct bonded to a file context.
++     * @param fc file context.
++     */
++    public GlobBuilder(final FileContext fc) {
++      this.fs = null;
++      this.fc = checkNotNull(fc);
++    }
++
++    /**
++     * Construct bonded to a filesystem.
++     * @param fs file system.
++     */
++    public GlobBuilder(final FileSystem fs) {
++      this.fs = checkNotNull(fs);
++      this.fc = null;
++    }
++
++    /**
++     * Set the path pattern.
++     * @param pattern pattern to use.
++     * @return the builder
++     */
++    public GlobBuilder withPathPattern(Path pattern) {
++      pathPattern = pattern;
++      return this;
++    }
++
++    /**
++     * Set the path filter.
++     * @param pathFilter filter
++     * @return the builder
++     */
++    public GlobBuilder withPathFiltern(PathFilter pathFilter) {
++      filter = pathFilter;
++      return this;
++    }
++
++    /**
++     * Set the symlink resolution policy.
++     * @param resolve resolution flag.
++     * @return the builder
++     */
++    public GlobBuilder withResolveSymlinks(boolean resolve) {
++      resolveSymlinks = resolve;
++      return this;
++    }
++
++    /**
++     * Build the Globber.
++     * @return a new instance.
++     */
++    public Globber build() {
++      return fs != null
++          ? new Globber(fs, pathPattern, filter, resolveSymlinks)
++          : new Globber(fc, pathPattern, filter, resolveSymlinks);
++    }
++  }

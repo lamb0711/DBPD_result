@@ -1,0 +1,268 @@
+YARN-2704. Changed ResourceManager to optionally obtain tokens itself for the sake of localization and log-aggregation for long-running services. Contributed by Jian He.
+
++import java.nio.ByteBuffer;
++import java.security.PrivilegedAction;
++import org.apache.hadoop.fs.FileSystem;
++import org.apache.hadoop.io.DataOutputBuffer;
++import org.apache.hadoop.io.Text;
++import org.apache.hadoop.security.token.delegation.AbstractDelegationTokenIdentifier;
++import org.apache.hadoop.util.Time;
++import org.apache.hadoop.yarn.exceptions.YarnRuntimeException;
+-  
+-  // managing the list of tokens using Map
+-  // appId=>List<tokens>
+-  private Set<DelegationTokenToRenew> delegationTokens = 
+-    Collections.synchronizedSet(new HashSet<DelegationTokenToRenew>());
+-  
++
++  private ConcurrentMap<ApplicationId, Set<DelegationTokenToRenew>> appTokens =
++      new ConcurrentHashMap<ApplicationId, Set<DelegationTokenToRenew>>();
++
+-  
++  private boolean hasProxyUserPrivileges;
++  private long credentialsValidTimeRemaining;
++
++  // this config is supposedly not used by end-users.
++  public static final String RM_SYSTEM_CREDENTIALS_VALID_TIME_REMAINING =
++      YarnConfiguration.RM_PREFIX + "system-credentials.valid-time-remaining";
++  public static final long DEFAULT_RM_SYSTEM_CREDENTIALS_VALID_TIME_REMAINING =
++      10800000; // 3h
++
+-  protected synchronized void serviceInit(Configuration conf) throws Exception {
++  protected void serviceInit(Configuration conf) throws Exception {
++    this.hasProxyUserPrivileges =
++        conf.getBoolean(YarnConfiguration.RM_PROXY_USER_PRIVILEGES_ENABLED,
++          YarnConfiguration.DEFAULT_RM_PROXY_USER_PRIVILEGES_ENABLED);
+-
++    this.credentialsValidTimeRemaining =
++        conf.getLong(RM_SYSTEM_CREDENTIALS_VALID_TIME_REMAINING,
++          DEFAULT_RM_SYSTEM_CREDENTIALS_VALID_TIME_REMAINING);
+-    delegationTokens.clear();
++    appTokens.clear();
+-    
+-    public DelegationTokenToRenew(
+-        ApplicationId jId, Token<?> token, 
+-        Configuration conf, long expirationDate, boolean shouldCancelAtEnd) {
++    public long maxDate;
++    public String user;
++
++    public DelegationTokenToRenew(ApplicationId jId, Token<?> token,
++        Configuration conf, long expirationDate, boolean shouldCancelAtEnd,
++        String user) {
++      this.user = user;
++      if (token.getKind().equals(new Text("HDFS_DELEGATION_TOKEN"))) {
++        try {
++          AbstractDelegationTokenIdentifier identifier =
++              (AbstractDelegationTokenIdentifier) token.decodeIdentifier();
++          maxDate = identifier.getMaxDate();
++        } catch (IOException e) {
++          throw new YarnRuntimeException(e);
++        }
++      }
+-      if (this.token==null || this.applicationId==null || this.conf==null) {
+-        throw new IllegalArgumentException("Invalid params to renew token" +
+-            ";token=" + this.token +
+-            ";appId=" + this.applicationId +
+-            ";conf=" + this.conf);
+-      }
+-  //adding token
+-  private void addTokenToList(DelegationTokenToRenew t) {
+-    delegationTokens.add(t);
+-  }
+-    for(DelegationTokenToRenew delegationToken : delegationTokens) {
+-      tokens.add(delegationToken.token);
++    for (Set<DelegationTokenToRenew> tokenList : appTokens.values()) {
++      for (DelegationTokenToRenew token : tokenList) {
++        tokens.add(token.token);
++      }
++   * @param user user
+-      boolean shouldCancelAtEnd) {
++      boolean shouldCancelAtEnd, String user) {
+-      applicationId, ts, shouldCancelAtEnd));
++      applicationId, ts, shouldCancelAtEnd, user));
++   * @param user user
+-      boolean shouldCancelAtEnd) throws IOException{
++      boolean shouldCancelAtEnd, String user) throws IOException,
++      InterruptedException {
+-      applicationId, ts, shouldCancelAtEnd));
++      applicationId, ts, shouldCancelAtEnd, user));
+-      throws IOException {
++      throws IOException, InterruptedException {
+-    List<DelegationTokenToRenew> tokenList =
+-        new ArrayList<DelegationTokenRenewer.DelegationTokenToRenew>();
++    appTokens.put(applicationId,
++      Collections.synchronizedSet(new HashSet<DelegationTokenToRenew>()));
++    Set<DelegationTokenToRenew> tokenList = new HashSet<DelegationTokenToRenew>();
++    boolean hasHdfsToken = false;
+-            token, getConfig(), now, shouldCancelAtEnd));
++            token, getConfig(), now, shouldCancelAtEnd, evt.getUser()));
++        if (token.getKind().equals(new Text("HDFS_DELEGATION_TOKEN"))) {
++          LOG.info(applicationId + " found existing hdfs token " + token);
++          hasHdfsToken = true;
++        }
++
+-        addTokenToList(dtr);
++        appTokens.get(applicationId).add(dtr);
+-        if (LOG.isDebugEnabled()) {
+-          LOG.debug("Registering token for renewal for:" + " service = "
+-              + dtr.token.getService() + " for appId = " + dtr.applicationId);
+-        }
++
++    if (!hasHdfsToken) {
++      requestNewHdfsDelegationToken(applicationId, evt.getUser(),
++        shouldCancelAtEnd);
++    }
++
+-        renewToken(dttr);
+-        if (LOG.isDebugEnabled()) {
+-          LOG.debug("Renewing delegation-token for:" + token.getService() + 
+-              "; new expiration;" + dttr.expirationDate);
++        requestNewHdfsDelegationTokenIfNeeded(dttr);
++        // if the token is not replaced by a new token, renew the token
++        if (appTokens.get(dttr.applicationId).contains(dttr)) {
++          renewToken(dttr);
++          setTimerForTokenRenewal(dttr);// set the next one
++        } else {
++          LOG.info("The token was removed already. Token = [" +dttr +"]");
+-        
+-        setTimerForTokenRenewal(dttr);// set the next one
+-    
++
++    LOG.info("Renew " + token + " in " + expiresIn + " ms, appId = "
++        + token.applicationId);
+-      dttr.expirationDate = UserGroupInformation.getLoginUser().doAs(
+-          new PrivilegedExceptionAction<Long>(){          
+-            @Override
+-            public Long run() throws Exception {
+-              return dttr.token.renew(dttr.conf);
+-            }
+-          });
++      dttr.expirationDate =
++          UserGroupInformation.getLoginUser().doAs(
++            new PrivilegedExceptionAction<Long>() {
++              @Override
++              public Long run() throws Exception {
++                return dttr.token.renew(dttr.conf);
++              }
++            });
++    LOG.info("Renewed delegation-token= [" + dttr + "], for "
++        + dttr.applicationId);
++  }
++
++  // Request new hdfs token if the token is about to expire, and remove the old
++  // token from the tokenToRenew list
++  private void requestNewHdfsDelegationTokenIfNeeded(
++      final DelegationTokenToRenew dttr) throws IOException,
++      InterruptedException {
++
++    if (hasProxyUserPrivileges
++        && dttr.maxDate - dttr.expirationDate < credentialsValidTimeRemaining
++        && dttr.token.getKind().equals(new Text("HDFS_DELEGATION_TOKEN"))) {
++
++      // remove all old expiring hdfs tokens for this application.
++      Set<DelegationTokenToRenew> tokenSet = appTokens.get(dttr.applicationId);
++      if (tokenSet != null && !tokenSet.isEmpty()) {
++        Iterator<DelegationTokenToRenew> iter = tokenSet.iterator();
++        synchronized (tokenSet) {
++          while (iter.hasNext()) {
++            DelegationTokenToRenew t = iter.next();
++            if (t.token.getKind().equals(new Text("HDFS_DELEGATION_TOKEN"))) {
++              iter.remove();
++              if (t.timerTask != null) {
++                t.timerTask.cancel();
++              }
++              LOG.info("Removed expiring token " + t);
++            }
++          }
++        }
++      }
++      LOG.info("Token= (" + dttr + ") is expiring, request new token.");
++      requestNewHdfsDelegationToken(dttr.applicationId, dttr.user,
++        dttr.shouldCancelAtEnd);
++    }
++  }
++
++  private void requestNewHdfsDelegationToken(ApplicationId applicationId,
++      String user, boolean shouldCancelAtEnd) throws IOException,
++      InterruptedException {
++    // Get new hdfs tokens for this user
++    Credentials credentials = new Credentials();
++    Token<?>[] newTokens = obtainSystemTokensForUser(user, credentials);
++
++    // Add new tokens to the toRenew list.
++    LOG.info("Received new tokens for " + applicationId + ". Received "
++        + newTokens.length + " tokens.");
++    if (newTokens.length > 0) {
++      for (Token<?> token : newTokens) {
++        if (token.isManaged()) {
++          DelegationTokenToRenew tokenToRenew =
++              new DelegationTokenToRenew(applicationId, token, getConfig(),
++                Time.now(), shouldCancelAtEnd, user);
++          // renew the token to get the next expiration date.
++          renewToken(tokenToRenew);
++          setTimerForTokenRenewal(tokenToRenew);
++          appTokens.get(applicationId).add(tokenToRenew);
++          LOG.info("Received new token " + token);
++        }
++      }
++    }
++    DataOutputBuffer dob = new DataOutputBuffer();
++    credentials.writeTokenStorageToStream(dob);
++    ByteBuffer byteBuffer = ByteBuffer.wrap(dob.getData(), 0, dob.getLength());
++    rmContext.getSystemCredentialsForApps().put(applicationId, byteBuffer);
++  }
++
++  protected Token<?>[] obtainSystemTokensForUser(String user,
++      final Credentials credentials) throws IOException, InterruptedException {
++    // Get new hdfs tokens on behalf of this user
++    UserGroupInformation proxyUser =
++        UserGroupInformation.createProxyUser(user,
++          UserGroupInformation.getLoginUser());
++    Token<?>[] newTokens =
++        proxyUser.doAs(new PrivilegedExceptionAction<Token<?>[]>() {
++          @Override
++          public Token<?>[] run() throws Exception {
++            return FileSystem.get(getConfig()).addDelegationTokens(
++              UserGroupInformation.getLoginUser().getUserName(), credentials);
++          }
++        });
++    return newTokens;
+-    if (LOG.isDebugEnabled())
+-      LOG.debug("removing failed delegation token for appid=" + applicationId + 
+-          ";t=" + t.token.getService());
+-    delegationTokens.remove(t);
++    LOG.error("removing failed delegation token for appid=" + applicationId
++        + ";t=" + t.token.getService());
++    appTokens.get(applicationId).remove(t);
+-    if(t.timerTask!=null)
++    if (t.timerTask != null) {
++    }
+-    synchronized (delegationTokens) {
+-      Iterator<DelegationTokenToRenew> it = delegationTokens.iterator();
+-      while(it.hasNext()) {
+-        DelegationTokenToRenew dttr = it.next();
+-        if (dttr.applicationId.equals(applicationId)) {
++    rmContext.getSystemCredentialsForApps().remove(applicationId);
++    Set<DelegationTokenToRenew> tokens = appTokens.get(applicationId);
++
++    if (tokens != null && !tokens.isEmpty()) {
++      synchronized (tokens) {
++        Iterator<DelegationTokenToRenew> it = tokens.iterator();
++        while (it.hasNext()) {
++          DelegationTokenToRenew dttr = it.next();
+-            LOG.debug("Removing delegation token for appId=" + applicationId + 
+-                "; token=" + dttr.token.getService());
++            LOG.debug("Removing delegation token for appId=" + applicationId
++                + "; token=" + dttr.token.getService());
+-          if(dttr.timerTask!=null)
++          if (dttr.timerTask != null)
+-  private static class DelegationTokenRenewerAppSubmitEvent extends
++  static class DelegationTokenRenewerAppSubmitEvent extends
++    private String user;
+-        Credentials credentails, boolean shouldCancelAtEnd) {
++        Credentials credentails, boolean shouldCancelAtEnd, String user) {
++      this.user = user;
++
++    public String getUser() {
++      return user;
++    }

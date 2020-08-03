@@ -1,0 +1,154 @@
+YARN-6840. Implement zookeeper based store for scheduler configuration updates. (Jonathan Hung via wangda)
+
+Change-Id: I9debea674fe8c7e4109d4ca136965a1ea4c48bcc
+
++import com.google.common.annotations.VisibleForTesting;
+-import org.apache.hadoop.security.AccessControlException;
+-import org.apache.hadoop.yarn.exceptions.YarnException;
+-import org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity.CSQueue;
+-import org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity.CapacityScheduler;
++  private Configuration oldConf;
++    case YarnConfiguration.ZK_CONFIGURATION_STORE:
++      this.confStore = new ZKConfigurationStore();
++      break;
+-    confStore.initialize(config, schedConf);
++    try {
++      confStore.initialize(config, schedConf, rmContext);
++    } catch (Exception e) {
++      throw new IOException(e);
++    }
++  @VisibleForTesting
++  public YarnConfigurationStore getConfStore() {
++    return confStore;
++  }
++
+-  public synchronized void mutateConfiguration(UserGroupInformation user,
+-      SchedConfUpdateInfo confUpdate) throws IOException, YarnException {
+-    if (!aclMutationPolicy.isMutationAllowed(user, confUpdate)) {
+-      throw new AccessControlException("User is not admin of all modified" +
+-          " queues.");
+-    }
+-    Configuration oldConf = new Configuration(schedConf);
++  public ConfigurationMutationACLPolicy getAclMutationPolicy() {
++    return aclMutationPolicy;
++  }
++
++  @Override
++  public void logAndApplyMutation(UserGroupInformation user,
++      SchedConfUpdateInfo confUpdate) throws Exception {
++    oldConf = new Configuration(schedConf);
+-    long id = confStore.logMutation(log);
++    confStore.logMutation(log);
+-    try {
+-      rmContext.getRMAdminService().refreshQueues();
+-    } catch (IOException | YarnException e) {
+-      schedConf = oldConf;
+-      confStore.confirmMutation(id, false);
+-      throw e;
+-    }
+-    confStore.confirmMutation(id, true);
+-  public void recoverConf() throws IOException {
+-    List<LogMutation> uncommittedLogs = confStore.getPendingMutations();
+-    Configuration oldConf = new Configuration(schedConf);
+-    for (LogMutation mutation : uncommittedLogs) {
+-      for (Map.Entry<String, String> kv : mutation.getUpdates().entrySet()) {
+-        if (kv.getValue() == null) {
+-          schedConf.unset(kv.getKey());
+-        } else {
+-          schedConf.set(kv.getKey(), kv.getValue());
+-        }
+-      }
+-      try {
+-        rmContext.getScheduler().reinitialize(schedConf, rmContext);
+-      } catch (IOException e) {
+-        schedConf = oldConf;
+-        confStore.confirmMutation(mutation.getId(), false);
+-        LOG.info("Configuration mutation " + mutation.getId()
+-            + " was rejected", e);
+-        continue;
+-      }
+-      confStore.confirmMutation(mutation.getId(), true);
+-      LOG.info("Configuration mutation " + mutation.getId()+ " was accepted");
++  public void confirmPendingMutation(boolean isValid) throws Exception {
++    confStore.confirmMutation(isValid);
++    if (!isValid) {
++      schedConf = oldConf;
++  @Override
++  public void reloadConfigurationFromStore() throws Exception {
++    schedConf = confStore.retrieve();
++  }
++
++  private List<String> getSiblingQueues(String queuePath, Configuration conf) {
++    String parentQueue = queuePath.substring(0, queuePath.lastIndexOf('.'));
++    String childQueuesKey = CapacitySchedulerConfiguration.PREFIX +
++        parentQueue + CapacitySchedulerConfiguration.DOT +
++        CapacitySchedulerConfiguration.QUEUES;
++    return new ArrayList<>(conf.getStringCollection(childQueuesKey));
++  }
++
+-    CapacityScheduler cs = (CapacityScheduler) rmContext.getScheduler();
+-        new CapacitySchedulerConfiguration(cs.getConfiguration(), false);
++        new CapacitySchedulerConfiguration(schedConf, false);
+-      CapacityScheduler cs = (CapacityScheduler) rmContext.getScheduler();
+-      CSQueue queue = cs.getQueue(queueName);
+-      if (queue == null ||
+-          !queue.getQueuePath().equals(queueToRemove)) {
+-        throw new IOException("Queue " + queueToRemove + " not found");
+-      } else if (queueToRemove.lastIndexOf('.') == -1) {
++      if (queueToRemove.lastIndexOf('.') == -1) {
+-      }
+-      String parentQueuePath = queueToRemove.substring(0, queueToRemove
+-          .lastIndexOf('.'));
+-      String[] siblingQueues = proposedConf.getQueues(parentQueuePath);
+-      List<String> newSiblingQueues = new ArrayList<>();
+-      for (String siblingQueue : siblingQueues) {
+-        if (!siblingQueue.equals(queueName)) {
+-          newSiblingQueues.add(siblingQueue);
+-        }
+-      }
+-      proposedConf.setQueues(parentQueuePath, newSiblingQueues
+-          .toArray(new String[0]));
+-      String queuesConfig = CapacitySchedulerConfiguration.PREFIX
+-          + parentQueuePath + CapacitySchedulerConfiguration.DOT
+-          + CapacitySchedulerConfiguration.QUEUES;
+-      if (newSiblingQueues.size() == 0) {
+-        confUpdate.put(queuesConfig, null);
+-        confUpdate.put(queuesConfig, Joiner.on(',').join(newSiblingQueues));
+-      }
+-      for (Map.Entry<String, String> confRemove : proposedConf.getValByRegex(
+-          ".*" + queueToRemove.replaceAll("\\.", "\\.") + "\\..*")
+-          .entrySet()) {
+-        proposedConf.unset(confRemove.getKey());
+-        confUpdate.put(confRemove.getKey(), null);
++        List<String> siblingQueues = getSiblingQueues(queueToRemove,
++            proposedConf);
++        if (!siblingQueues.contains(queueName)) {
++          throw new IOException("Queue " + queueToRemove + " not found");
++        }
++        siblingQueues.remove(queueName);
++        String parentQueuePath = queueToRemove.substring(0, queueToRemove
++            .lastIndexOf('.'));
++        proposedConf.setQueues(parentQueuePath, siblingQueues.toArray(
++            new String[0]));
++        String queuesConfig = CapacitySchedulerConfiguration.PREFIX
++            + parentQueuePath + CapacitySchedulerConfiguration.DOT
++            + CapacitySchedulerConfiguration.QUEUES;
++        if (siblingQueues.size() == 0) {
++          confUpdate.put(queuesConfig, null);
++        } else {
++          confUpdate.put(queuesConfig, Joiner.on(',').join(siblingQueues));
++        }
++        for (Map.Entry<String, String> confRemove : proposedConf.getValByRegex(
++            ".*" + queueToRemove.replaceAll("\\.", "\\.") + "\\..*")
++            .entrySet()) {
++          proposedConf.unset(confRemove.getKey());
++          confUpdate.put(confRemove.getKey(), null);
++        }
+-      CapacityScheduler cs = (CapacityScheduler) rmContext.getScheduler();
+-      if (cs.getQueue(queueName) != null) {
+-        throw new IOException("Can't add existing queue " + queuePath);
+-      } else if (queuePath.lastIndexOf('.') == -1) {
++      if (queuePath.lastIndexOf('.') == -1) {
++      } else if (getSiblingQueues(queuePath, proposedConf).contains(
++          queueName)) {
++        throw new IOException("Can't add existing queue " + queuePath);

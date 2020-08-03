@@ -1,0 +1,161 @@
+YARN-7939.  Added support to upgrade a component instance.
+            Contributed by Chandni Singh
+
+-/**
++/*
++import org.apache.hadoop.yarn.service.component.Component;
++import java.util.Map;
++import static org.apache.hadoop.yarn.service.utils.ServiceApiUtil.jsonSerDeser;
++
+- * Manages the state of the service.
++ * Manages the state of Service.
++  private final UpgradeComponentsFinder componentsFinder;
+-  private final UpgradeComponentsFinder componentsFinder;
++          .addTransition(State.STABLE, EnumSet.of(State.STABLE),
++              ServiceEventType.CHECK_STABLE, new CheckStableTransition())
++
+-              new StopUpgradeTransition())
++              new CheckStableTransition())
++
++          .addTransition(State.UPGRADING, EnumSet.of(State.STABLE,
++              State.UPGRADING), ServiceEventType.CHECK_STABLE,
++              new CheckStableTransition())
+-            "[SERVICE]: Invalid event {0} at {1}.", event.getType(),
++            "[SERVICE]: Invalid event {1} at {2}.", event.getType(),
+-        Service targetSpec = ServiceApiUtil.loadServiceUpgrade(
+-            serviceManager.fs, serviceManager.getName(), event.getVersion());
+-
+-        serviceManager.serviceSpec.setState(ServiceState.UPGRADING);
+-        List<org.apache.hadoop.yarn.service.api.records.Component>
+-            compsThatNeedUpgrade = serviceManager.componentsFinder.
+-            findTargetComponentSpecs(serviceManager.serviceSpec, targetSpec);
+-
+-        if (compsThatNeedUpgrade != null && !compsThatNeedUpgrade.isEmpty()) {
+-          compsThatNeedUpgrade.forEach(component -> {
+-            ComponentEvent needUpgradeEvent = new ComponentEvent(
+-                component.getName(), ComponentEventType.UPGRADE).
+-                setTargetSpec(component);
+-            serviceManager.dispatcher.getEventHandler().handle(
+-                needUpgradeEvent);
+-          });
++        if (!event.isAutoFinalize()) {
++          serviceManager.serviceSpec.setState(ServiceState.UPGRADING);
++        } else {
++          serviceManager.serviceSpec.setState(
++              ServiceState.UPGRADING_AUTO_FINALIZE);
+-  private static class StopUpgradeTransition implements
++  private static class CheckStableTransition implements
+-      //abort is not supported currently
+-      //trigger re-check of service state
+-      ServiceMaster.checkAndUpdateServiceState(serviceManager.scheduler,
+-          true);
+-      if (serviceManager.serviceSpec.getState().equals(ServiceState.STABLE)) {
+-        return serviceManager.finalizeUpgrade() ? State.STABLE :
+-            State.UPGRADING;
+-      } else {
+-        return State.UPGRADING;
++      //trigger check of service state
++      ServiceState currState = serviceManager.serviceSpec.getState();
++      if (currState.equals(ServiceState.STABLE)) {
++        return State.STABLE;
++      if (currState.equals(ServiceState.UPGRADING_AUTO_FINALIZE) ||
++          event.getType().equals(ServiceEventType.START)) {
++        ServiceState targetState = checkIfStable(serviceManager.serviceSpec);
++        if (targetState.equals(ServiceState.STABLE)) {
++          if (serviceManager.finalizeUpgrade()) {
++            LOG.info("Service def state changed from {} -> {}", currState,
++                serviceManager.serviceSpec.getState());
++            return State.STABLE;
++          }
++        }
++      }
++      return State.UPGRADING;
+-      Service upgradeSpec = ServiceApiUtil.loadServiceUpgrade(
++      // save the application id and state to
++      Service targetSpec = ServiceApiUtil.loadServiceUpgrade(
+-      ServiceApiUtil.writeAppDefinition(fs,
+-          ServiceApiUtil.getServiceJsonPath(fs, getName()), upgradeSpec);
++      targetSpec.setId(serviceSpec.getId());
++      targetSpec.setState(ServiceState.STABLE);
++      Map<String, Component> allComps = scheduler.getAllComponents();
++      targetSpec.getComponents().forEach(compSpec -> {
++        Component comp = allComps.get(compSpec.getName());
++        compSpec.setState(comp.getComponentSpec().getState());
++      });
++      jsonSerDeser.save(fs.getFileSystem(),
++          ServiceApiUtil.getServiceJsonPath(fs, getName()), targetSpec, true);
++      fs.deleteClusterUpgradeDir(getName(), upgradeVersion);
+-      LOG.error("Upgrade did not complete because unable to overwrite the" +
++      LOG.error("Upgrade did not complete because unable to re-write the" +
+-              "version {}", getName(), upgradeVersion);
++          "version {}", getName(), upgradeVersion);
++    serviceSpec.setState(ServiceState.STABLE);
++  private static ServiceState checkIfStable(Service service) {
++    // if desired == running
++    for (org.apache.hadoop.yarn.service.api.records.Component comp :
++        service.getComponents()) {
++      if (!comp.getState().equals(
++          org.apache.hadoop.yarn.service.api.records.ComponentState.STABLE)) {
++        return service.getState();
++      }
++    }
++    return ServiceState.STABLE;
++  }
++
++  /**
++   * Service state gets directly modified by ServiceMaster and Component.
++   * This is a problem for upgrade and flexing. For now, invoking
++   * ServiceMaster.checkAndUpdateServiceState here to make it easy to fix
++   * this in future.
++   */
++  public void checkAndUpdateServiceState(boolean isIncrement) {
++    writeLock.lock();
++    try {
++      if (!getState().equals(State.UPGRADING)) {
++        ServiceMaster.checkAndUpdateServiceState(this.scheduler,
++            isIncrement);
++      }
++    } finally {
++      writeLock.unlock();
++    }
++  }
++
++  void processUpgradeRequest(String upgradeVersion,
++      boolean autoFinalize) throws IOException {
++    Service targetSpec = ServiceApiUtil.loadServiceUpgrade(
++        context.fs, context.service.getName(), upgradeVersion);
++
++    List<org.apache.hadoop.yarn.service.api.records.Component>
++        compsThatNeedUpgrade = componentsFinder.
++        findTargetComponentSpecs(context.service, targetSpec);
++    ServiceEvent event = new ServiceEvent(ServiceEventType.UPGRADE)
++        .setVersion(upgradeVersion)
++        .setAutoFinalize(autoFinalize);
++    context.scheduler.getDispatcher().getEventHandler().handle(event);
++
++    if (compsThatNeedUpgrade != null && !compsThatNeedUpgrade.isEmpty()) {
++      if (autoFinalize) {
++        event.setAutoFinalize(true);
++      }
++      compsThatNeedUpgrade.forEach(component -> {
++        ComponentEvent needUpgradeEvent = new ComponentEvent(
++            component.getName(), ComponentEventType.UPGRADE)
++            .setTargetSpec(component)
++            .setUpgradeVersion(event.getVersion());
++        context.scheduler.getDispatcher().getEventHandler().handle(
++            needUpgradeEvent);
++      });
++    } else {
++      // nothing to upgrade if upgrade auto finalize is requested, trigger a
++      // state check.
++      if (autoFinalize) {
++        context.scheduler.getDispatcher().getEventHandler().handle(
++            new ServiceEvent(ServiceEventType.CHECK_STABLE));
++      }
++    }
++  }
++
+-
+-
+
+INS26 INS26 INS26 MOV23 INS40 INS40 INS40 INS31 INS31 MOV31 INS31 UPD42 INS83 INS83 INS43 INS42 INS44 INS8 INS29 INS83 INS39 INS42 INS44 INS8 INS39 INS42 INS44 INS44 INS43 MOV8 UPD66 INS32 MOV78 INS83 MOV43 INS42 MOV44 MOV44 INS8 INS21 INS42 MOV43 INS42 INS70 INS41 INS65 INS39 INS42 INS21 INS54 INS43 INS42 INS39 INS42 INS42 INS60 INS21 MOV32 INS42 INS54 INS60 INS25 INS25 MOV41 INS8 INS32 INS44 INS32 INS8 INS40 INS66 INS66 INS66 INS66 INS32 INS8 INS8 INS42 INS43 INS43 INS59 INS32 INS8 INS42 INS40 INS32 INS40 INS14 INS8 MOV12 INS43 INS59 INS32 INS8 INS27 INS8 MOV60 INS21 INS21 INS60 INS21 MOV21 INS21 INS42 INS42 INS40 INS43 INS42 INS42 INS42 INS25 INS42 INS42 INS25 INS21 INS42 INS42 INS42 INS32 INS32 INS42 INS42 INS25 INS25 INS32 INS42 UPD42 MOV42 INS42 INS40 INS40 INS43 INS25 MOV21 MOV41 INS42 INS42 MOV32 INS42 INS42 INS40 INS41 INS32 INS32 INS60 MOV25 INS32 INS32 INS74 INS59 INS32 INS32 INS40 INS38 INS8 INS38 INS8 INS32 UPD40 INS42 INS42 UPD40 INS32 INS42 INS42 INS32 INS42 INS42 INS8 INS42 INS8 MOV32 MOV42 INS40 INS32 INS40 INS14 UPD43 INS42 INS38 INS8 INS8 INS40 INS42 INS42 INS40 INS32 INS42 INS40 INS43 INS59 INS8 UPD42 INS42 INS42 INS32 INS42 INS42 INS40 INS43 INS43 INS43 INS42 INS32 INS32 INS42 INS86 UPD42 UPD42 INS32 UPD42 INS9 INS42 INS42 INS32 INS42 INS32 INS41 INS32 INS21 INS42 INS42 INS40 INS14 INS42 INS42 INS40 INS42 INS21 INS21 INS42 INS42 INS40 INS43 UPD42 INS32 MOV21 INS21 INS42 INS42 INS42 INS42 INS32 INS42 INS25 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS59 INS8 MOV42 INS42 INS42 INS32 INS42 INS40 INS32 INS32 INS42 INS40 INS32 INS43 INS40 INS32 INS32 INS42 INS42 INS42 INS32 INS42 UPD40 MOV40 MOV32 MOV8 INS42 INS60 INS21 UPD45 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS22 INS42 INS42 INS42 INS42 INS9 INS32 INS42 INS14 INS40 INS42 INS40 INS21 INS43 INS59 INS32 INS52 INS42 INS32 INS42 INS43 INS40 UPD45 INS32 INS40 INS42 INS42 INS32 INS42 INS42 INS32 INS32 INS40 INS42 INS42 INS42 INS42 INS45 INS42 INS32 INS42 INS42 INS32 INS32 INS42 MOV32 INS42 MOV32 INS32 INS40 INS42 INS42 INS42 INS42 INS42 UPD40 MOV40 INS42 DEL66 DEL66 DEL66 DEL66 DEL66 DEL66 DEL66 DEL66 DEL66 DEL66 DEL66 DEL66 DEL66 DEL65 DEL29 DEL40 DEL40 DEL16 DEL8 DEL42 DEL42 DEL9 DEL32 DEL21 DEL8 DEL42 DEL40 DEL83 DEL42 DEL54 DEL8

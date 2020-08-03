@@ -1,0 +1,217 @@
+YARN-661. Fixed NM to cleanup users' local directories correctly when starting up. Contributed by Omkar Vinit Joshi.
+
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/trunk@1503942 13f79535-47bb-0310-9956-ffa450edef68
+
++import static java.util.concurrent.TimeUnit.SECONDS;
++
++import java.util.Arrays;
++import java.util.HashSet;
++import java.util.Iterator;
++import java.util.List;
++import java.util.Set;
+-import static java.util.concurrent.TimeUnit.*;
++import java.util.concurrent.atomic.AtomicInteger;
+-import org.apache.hadoop.fs.Path;
++import org.apache.commons.logging.Log;
++import org.apache.commons.logging.LogFactory;
++import org.apache.hadoop.fs.Path;
+-import org.apache.commons.logging.Log;
+-import org.apache.commons.logging.LogFactory;
+-
++import com.google.common.annotations.VisibleForTesting;
+-  private final FileContext lfs = getLfs();
++  private static final FileContext lfs = getLfs();
++
+-      sched.schedule(new FileDeletion(user, subDir, baseDirs), debugDelay,
+-          TimeUnit.SECONDS);
++      if (baseDirs == null || baseDirs.length == 0) {
++        sched.schedule(new FileDeletionTask(this, user, subDir, null),
++          debugDelay, TimeUnit.SECONDS);
++      } else {
++        sched.schedule(
++          new FileDeletionTask(this, user, subDir, Arrays.asList(baseDirs)),
++          debugDelay, TimeUnit.SECONDS);
++      }
+-
++  
++  public void scheduleFileDeletionTask(FileDeletionTask fileDeletionTask) {
++    if (debugDelay != -1) {
++      sched.schedule(fileDeletionTask, debugDelay, TimeUnit.SECONDS);
++    }
++  }
++  
+-  private class FileDeletion implements Runnable {
+-    final String user;
+-    final Path subDir;
+-    final Path[] baseDirs;
+-    FileDeletion(String user, Path subDir, Path[] baseDirs) {
++  public static class FileDeletionTask implements Runnable {
++    private final String user;
++    private final Path subDir;
++    private final List<Path> baseDirs;
++    private final AtomicInteger numberOfPendingPredecessorTasks;
++    private final Set<FileDeletionTask> successorTaskSet;
++    private final DeletionService delService;
++    // By default all tasks will start as success=true; however if any of
++    // the dependent task fails then it will be marked as false in
++    // fileDeletionTaskFinished().
++    private boolean success;
++    
++    private FileDeletionTask(DeletionService delService, String user,
++        Path subDir, List<Path> baseDirs) {
++      this.delService = delService;
++      this.successorTaskSet = new HashSet<FileDeletionTask>();
++      this.numberOfPendingPredecessorTasks = new AtomicInteger(0);
++      success = true;
++    
++    /**
++     * increments and returns pending predecessor task count
++     */
++    public int incrementAndGetPendingPredecessorTasks() {
++      return numberOfPendingPredecessorTasks.incrementAndGet();
++    }
++    
++    /**
++     * decrements and returns pending predecessor task count
++     */
++    public int decrementAndGetPendingPredecessorTasks() {
++      return numberOfPendingPredecessorTasks.decrementAndGet();
++    }
++    
++    @VisibleForTesting
++    public String getUser() {
++      return this.user;
++    }
++    
++    @VisibleForTesting
++    public Path getSubDir() {
++      return this.subDir;
++    }
++    
++    @VisibleForTesting
++    public List<Path> getBaseDirs() {
++      return this.baseDirs;
++    }
++    
++    public synchronized void setSuccess(boolean success) {
++      this.success = success;
++    }
++    
++    public synchronized boolean getSucess() {
++      return this.success;
++    }
++    
++      if (LOG.isDebugEnabled()) {
++        LOG.debug(this);
++      }
++      boolean error = false;
+-        if (baseDirs == null || baseDirs.length == 0) {
++        if (baseDirs == null || baseDirs.size() == 0) {
++            error = true;
+-          return;
+-        }
+-        for (Path baseDir : baseDirs) {
+-          Path del = subDir == null? baseDir : new Path(baseDir, subDir);
+-          LOG.debug("NM deleting path : " + del);
+-          try {
+-            lfs.delete(del, true);
+-          } catch (IOException e) {
+-            LOG.warn("Failed to delete " + subDir);
++        } else {
++          for (Path baseDir : baseDirs) {
++            Path del = subDir == null? baseDir : new Path(baseDir, subDir);
++            LOG.debug("NM deleting path : " + del);
++            try {
++              lfs.delete(del, true);
++            } catch (IOException e) {
++              error = true;
++              LOG.warn("Failed to delete " + subDir);
++            }
+-          exec.deleteAsUser(user, subDir, baseDirs);
++          if (baseDirs == null || baseDirs.size() == 0) {
++            delService.exec.deleteAsUser(user, subDir, (Path[])null);
++          } else {
++            delService.exec.deleteAsUser(user, subDir,
++              baseDirs.toArray(new Path[0]));
++          }
++          error = true;
++          error = true;
++      if (error) {
++        setSuccess(!error);        
++      }
++      fileDeletionTaskFinished();
++    }
++
++    @Override
++    public String toString() {
++      StringBuffer sb = new StringBuffer("\nFileDeletionTask : ");
++      sb.append("  user : ").append(this.user);
++      sb.append("  subDir : ").append(
++        subDir == null ? "null" : subDir.toString());
++      sb.append("  baseDir : ");
++      if (baseDirs == null || baseDirs.size() == 0) {
++        sb.append("null");
++      } else {
++        for (Path baseDir : baseDirs) {
++          sb.append(baseDir.toString()).append(',');
++        }
++      }
++      return sb.toString();
++    }
++    
++    /**
++     * If there is a task dependency between say tasks 1,2,3 such that
++     * task2 and task3 can be started only after task1 then we should define
++     * task2 and task3 as successor tasks for task1.
++     * Note:- Task dependency should be defined prior to
++     * @param successorTask
++     */
++    public synchronized void addFileDeletionTaskDependency(
++        FileDeletionTask successorTask) {
++      if (successorTaskSet.add(successorTask)) {
++        successorTask.incrementAndGetPendingPredecessorTasks();
++      }
++    }
++    
++    /*
++     * This is called when
++     * 1) Current file deletion task ran and finished.
++     * 2) This can be even directly called by predecessor task if one of the
++     * dependent tasks of it has failed marking its success = false.  
++     */
++    private synchronized void fileDeletionTaskFinished() {
++      Iterator<FileDeletionTask> successorTaskI =
++          this.successorTaskSet.iterator();
++      while (successorTaskI.hasNext()) {
++        FileDeletionTask successorTask = successorTaskI.next();
++        if (!success) {
++          successorTask.setSuccess(success);
++        }
++        int count = successorTask.decrementAndGetPendingPredecessorTasks();
++        if (count == 0) {
++          if (successorTask.getSucess()) {
++            successorTask.delService.scheduleFileDeletionTask(successorTask);
++          } else {
++            successorTask.fileDeletionTaskFinished();
++          }
++        }
++      }
+-}
++  
++  /**
++   * Helper method to create file deletion task. To be used only if we need
++   * a way to define dependencies between deletion tasks.
++   * @param user user on whose behalf this task is suppose to run
++   * @param subDir sub directory as required in 
++   * {@link DeletionService#delete(String, Path, Path...)}
++   * @param baseDirs base directories as required in
++   * {@link DeletionService#delete(String, Path, Path...)}
++   */
++  public FileDeletionTask createFileDeletionTask(String user, Path subDir,
++      Path[] baseDirs) {
++    return new FileDeletionTask(this, user, subDir, Arrays.asList(baseDirs));
++  }
++}
+
+MOV26 MOV26 MOV26 MOV26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 UPD40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS31 INS31 INS83 INS8 INS83 INS39 INS42 INS44 INS8 INS83 INS83 INS42 INS23 INS23 INS23 INS23 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS29 INS83 INS43 INS42 INS44 INS44 MOV44 INS8 INS25 INS43 INS42 INS25 INS83 INS83 INS83 INS83 INS74 MOV59 INS83 INS83 INS43 INS59 INS83 INS83 INS74 INS59 INS83 INS43 INS59 INS83 INS39 INS59 INS83 UPD42 INS44 INS44 INS29 INS83 INS39 INS42 INS8 INS29 INS83 INS39 INS42 INS8 INS78 INS83 INS43 INS42 INS8 INS78 INS83 INS43 INS42 INS8 INS78 INS83 INS74 INS42 INS8 INS83 INS83 INS39 INS42 INS44 INS8 INS83 INS83 INS39 INS42 INS8 INS78 INS83 INS43 INS42 INS8 INS29 INS83 INS83 INS39 INS42 INS44 INS8 INS83 INS83 INS39 INS42 INS8 INS65 INS65 INS65 INS65 INS42 INS43 INS42 INS43 INS42 INS41 MOV27 INS8 INS42 INS27 INS8 INS43 INS43 INS42 INS42 INS43 INS43 INS42 INS42 INS42 INS42 INS43 INS42 INS74 INS42 INS21 INS21 INS21 INS21 INS65 INS41 INS65 INS41 INS42 INS42 INS41 INS42 INS42 INS41 INS42 INS43 INS43 INS41 INS39 INS42 INS21 INS41 INS25 INS60 INS25 INS21 INS42 INS42 INS60 INS21 INS21 INS21 INS25 INS41 INS65 INS65 INS43 INS42 INS25 INS60 INS61 INS66 INS66 INS42 INS66 INS42 INS66 INS65 INS42 INS66 INS65 INS42 INS42 INS14 MOV25 INS42 INS38 INS21 INS42 INS42 INS42 INS42 INS42 INS43 INS43 INS7 INS7 INS7 INS7 INS66 INS32 INS66 INS32 INS22 INS22 INS42 INS42 INS22 INS7 INS22 INS32 INS8 INS39 INS59 INS42 INS8 INS32 INS43 INS59 INS32 INS32 INS32 INS27 INS8 INS8 INS32 INS66 INS66 INS66 INS66 INS42 INS42 INS32 INS8 INS74 INS59 INS32 INS8 INS68 INS68 INS43 INS52 INS42 INS42 INS32 INS27 INS8 INS34 INS32 INS42 INS42 INS22 INS42 INS22 INS14 INS22 INS14 INS42 INS9 INS42 INS42 INS42 INS42 INS52 INS42 INS52 INS42 INS52 INS42 INS22 INS42 INS52 INS42 INS42 INS42 INS21 INS42 INS9 MOV12 INS21 INS42 INS42 INS42 INS14 INS32 INS42 INS22 INS32 INS42 INS16 INS42 INS42 INS45 INS27 INS27 INS21 INS70 INS42 INS42 INS42 INS42 INS42 INS21 INS43 INS43 INS42 INS32 INS42 INS42 INS60 INS25 INS60 INS25 INS42 INS42 INS69 INS69 INS69 INS42 INS42 INS69 INS69 INS69 INS42 INS42 INS42 INS42 INS27 INS27 INS21 INS42 INS42 INS42 INS42 INS40 INS52 INS42 INS52 INS42 INS74 INS52 INS42 INS43 INS34 INS52 INS42 INS32 INS8 INS8 INS32 INS43 INS45 INS42 INS42 INS45 INS52 INS42 INS42 INS42 INS45 INS27 INS45 INS32 INS42 INS33 INS32 INS34 INS32 INS44 INS42 INS8 INS32 INS42 INS42 INS22 INS42 INS43 INS59 INS38 INS8 INS39 INS59 INS27 INS8 INS43 INS43 INS43 INS43 INS43 INS43 INS42 INS33 MOV40 INS34 INS32 INS43 INS43 INS42 INS42 INS42 INS52 MOV54 MOV70 MOV21 INS25 MOV44 INS42 INS38 INS42 INS42 INS33 INS42 INS42 INS42 INS42 INS42 INS42 INS45 INS43 INS42 INS21 INS42 INS42 INS52 INS42 INS42 INS42 INS32 INS42 INS21 INS42 INS32 INS42 INS34 INS25 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS14 INS42 INS40 INS42 INS42 INS32 MOV8 INS27 INS8 INS8 INS21 MOV43 INS21 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS32 INS8 INS8 INS43 INS52 INS42 INS42 INS33 UPD43 INS52 INS32 INS42 INS42 INS54 INS27 INS27 INS21 MOV21 INS7 UPD42 MOV42 INS7 INS32 INS42 INS13 INS42 INS42 INS42 INS42 INS42 INS21 INS21 INS42 UPD42 INS42 INS42 INS42 INS21 MOV8 MOV12 INS42 INS33 INS32 INS34 INS32 INS42 INS9 INS42 INS9 INS42 INS42 INS32 INS32 INS32 INS7 INS44 INS42 INS42 INS40 INS42 INS42 INS42 INS11 INS40 INS32 INS42 INS42 INS40 INS42 INS42 INS42 INS42 INS42 INS9 INS43 INS42 INS21 MOV5 INS33 MOV42 INS42 INS3 INS42 INS7 INS5 INS34 INS42 INS9 INS43 INS85 INS42 DEL42 DEL8 DEL83 DEL42 DEL54 DEL41 DEL42 DEL8

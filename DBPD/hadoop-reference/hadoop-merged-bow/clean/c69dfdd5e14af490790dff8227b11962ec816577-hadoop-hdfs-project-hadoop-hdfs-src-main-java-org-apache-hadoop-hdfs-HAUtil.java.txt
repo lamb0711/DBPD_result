@@ -1,0 +1,156 @@
+HDFS-2958. Sweep for remaining proxy construction which doesn't go through failover path.
+
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/branches/HDFS-1623@1294811 13f79535-47bb-0310-9956-ffa450edef68
+
+-import java.lang.reflect.Constructor;
+-import org.apache.hadoop.hdfs.DFSClient.Conf;
+-import org.apache.hadoop.hdfs.protocol.ClientProtocol;
+-import org.apache.hadoop.hdfs.server.protocol.NamenodeProtocol;
+-import org.apache.hadoop.hdfs.server.protocol.NamenodeProtocols;
+-import org.apache.hadoop.io.retry.FailoverProxyProvider;
+-import org.apache.hadoop.io.retry.RetryPolicies;
+-import org.apache.hadoop.io.retry.RetryProxy;
+-  /** Creates the Failover proxy provider instance*/
+-  @SuppressWarnings("unchecked")
+-  private static <T> FailoverProxyProvider<T> createFailoverProxyProvider(
+-      Configuration conf, Class<FailoverProxyProvider<T>> failoverProxyProviderClass,
+-      Class<T> xface, URI nameNodeUri) throws IOException {
+-    Preconditions.checkArgument(
+-        xface.isAssignableFrom(NamenodeProtocols.class),
+-        "Interface %s is not a NameNode protocol", xface);
+-    try {
+-      Constructor<FailoverProxyProvider<T>> ctor = failoverProxyProviderClass
+-          .getConstructor(Configuration.class, URI.class, Class.class);
+-      FailoverProxyProvider<?> provider = ctor.newInstance(conf, nameNodeUri,
+-          xface);
+-      return (FailoverProxyProvider<T>) provider;
+-    } catch (Exception e) {
+-      String message = "Couldn't create proxy provider " + failoverProxyProviderClass;
+-      if (LOG.isDebugEnabled()) {
+-        LOG.debug(message, e);
+-      }
+-      if (e.getCause() instanceof IOException) {
+-        throw (IOException) e.getCause();
+-      } else {
+-        throw new IOException(message, e);
+-      }
+-    }
+-  }
+-
+-  /** Gets the configured Failover proxy provider's class */
+-  private static <T> Class<FailoverProxyProvider<T>> getFailoverProxyProviderClass(
+-      Configuration conf, URI nameNodeUri, Class<T> xface) throws IOException {
+-    if (nameNodeUri == null) {
+-      return null;
+-    }
+-    String host = nameNodeUri.getHost();
+-
+-    String configKey = DFS_CLIENT_FAILOVER_PROXY_PROVIDER_KEY_PREFIX + "."
+-        + host;
+-    try {
+-      @SuppressWarnings("unchecked")
+-      Class<FailoverProxyProvider<T>> ret = (Class<FailoverProxyProvider<T>>) conf
+-          .getClass(configKey, null, FailoverProxyProvider.class);
+-      if (ret != null) {
+-        // If we found a proxy provider, then this URI should be a logical NN.
+-        // Given that, it shouldn't have a non-default port number.
+-        int port = nameNodeUri.getPort();
+-        if (port > 0 && port != NameNode.DEFAULT_PORT) {
+-          throw new IOException("Port " + port + " specified in URI "
+-              + nameNodeUri + " but host '" + host
+-              + "' is a logical (HA) namenode"
+-              + " and does not use port information.");
+-        }
+-      }
+-      return ret;
+-    } catch (RuntimeException e) {
+-      if (e.getCause() instanceof ClassNotFoundException) {
+-        throw new IOException("Could not load failover proxy provider class "
+-            + conf.get(configKey) + " which is configured for authority "
+-            + nameNodeUri, e);
+-      } else {
+-        throw e;
+-      }
+-    }
+-  }
+-  
+-   * Creates the namenode proxy with the passed Protocol.
+-   * @param conf the configuration containing the required IPC
+-   * properties, client failover configurations, etc.
+-   * @param nameNodeUri the URI pointing either to a specific NameNode
+-   * or to a logical nameservice.
+-   * @param xface the IPC interface which should be created
+-   * @return an object containing both the proxy and the associated
+-   * delegation token service it corresponds to
+-   **/
+-  @SuppressWarnings("unchecked")
+-  public static <T> ProxyAndInfo<T> createProxy(
+-      Configuration conf, URI nameNodeUri,
+-      Class<T> xface) throws IOException {
+-    Class<FailoverProxyProvider<T>> failoverProxyProviderClass =
+-        HAUtil.getFailoverProxyProviderClass(conf, nameNodeUri, xface);
+-
+-    if (failoverProxyProviderClass == null) {
+-      // Non-HA case
+-      return createNonHAProxy(conf, nameNodeUri, xface);
+-    } else {
+-      // HA case
+-      FailoverProxyProvider<T> failoverProxyProvider = HAUtil
+-          .createFailoverProxyProvider(conf, failoverProxyProviderClass, xface,
+-              nameNodeUri);
+-      Conf config = new Conf(conf);
+-      T proxy = (T) RetryProxy.create(xface, failoverProxyProvider, RetryPolicies
+-          .failoverOnNetworkException(RetryPolicies.TRY_ONCE_THEN_FAIL,
+-              config.maxFailoverAttempts, config.failoverSleepBaseMillis,
+-              config.failoverSleepMaxMillis));
+-      
+-      Text dtService = buildTokenServiceForLogicalUri(nameNodeUri);
+-      return new ProxyAndInfo<T>(proxy, dtService);
+-    }
+-  }
+-  
+-  @SuppressWarnings("unchecked")
+-  private static <T> ProxyAndInfo<T> createNonHAProxy(
+-      Configuration conf, URI nameNodeUri, Class<T> xface) throws IOException {
+-    InetSocketAddress nnAddr = NameNode.getAddress(nameNodeUri);
+-    Text dtService = SecurityUtil.buildTokenService(nnAddr);
+-
+-    if (xface == ClientProtocol.class) {
+-      T proxy = (T)DFSUtil.createNamenode(nnAddr, conf);
+-      return new ProxyAndInfo<T>(proxy, dtService);
+-    } else if (xface == NamenodeProtocol.class) {
+-      T proxy = (T) DFSUtil.createNNProxyWithNamenodeProtocol(
+-          nnAddr, conf, UserGroupInformation.getCurrentUser());
+-      return new ProxyAndInfo<T>(proxy, dtService);
+-    } else {
+-      throw new AssertionError("Unsupported proxy type: " + xface);
+-    }
+-  }
+-    
+-  /**
+-  
+-  /**
+-   * Wrapper for a client proxy as well as its associated service ID.
+-   * This is simply used as a tuple-like return type for
+-   * {@link HAUtil#createProxy(Configuration, URI, Class)}.
+-   */
+-  public static class ProxyAndInfo<PROXYTYPE> {
+-    private final PROXYTYPE proxy;
+-    private final Text dtService;
+-    
+-    public ProxyAndInfo(PROXYTYPE proxy, Text dtService) {
+-      this.proxy = proxy;
+-      this.dtService = dtService;
+-    }
+-    
+-    public PROXYTYPE getProxy() {
+-      return proxy;
+-    }
+-    
+-    public Text getDelegationTokenService() {
+-      return dtService;
+-    }
+-  }
+
+DEL40 DEL26 DEL40 DEL26 DEL40 DEL26 DEL40 DEL26 DEL40 DEL26 DEL40 DEL26 DEL40 DEL26 DEL40 DEL26 DEL66 DEL65 DEL29 DEL42 DEL45 DEL79 DEL83 DEL83 DEL42 DEL73 DEL42 DEL43 DEL42 DEL43 DEL74 DEL42 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL43 DEL42 DEL43 DEL74 DEL74 DEL42 DEL44 DEL42 DEL43 DEL42 DEL43 DEL74 DEL42 DEL44 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL42 DEL42 DEL42 DEL42 DEL43 DEL57 DEL32 DEL45 DEL42 DEL32 DEL21 DEL42 DEL43 DEL42 DEL43 DEL42 DEL43 DEL74 DEL74 DEL42 DEL42 DEL42 DEL42 DEL43 DEL57 DEL42 DEL43 DEL57 DEL42 DEL43 DEL57 DEL32 DEL59 DEL60 DEL42 DEL43 DEL76 DEL74 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL43 DEL42 DEL43 DEL74 DEL42 DEL11 DEL41 DEL8 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL45 DEL42 DEL27 DEL59 DEL60 DEL42 DEL42 DEL32 DEL42 DEL42 DEL42 DEL42 DEL32 DEL21 DEL8 DEL25 DEL42 DEL42 DEL32 DEL42 DEL43 DEL62 DEL42 DEL43 DEL42 DEL42 DEL32 DEL11 DEL53 DEL8 DEL42 DEL43 DEL42 DEL42 DEL14 DEL53 DEL8 DEL25 DEL8 DEL12 DEL54 DEL8 DEL31 DEL66 DEL65 DEL29 DEL83 DEL83 DEL42 DEL73 DEL42 DEL43 DEL42 DEL43 DEL42 DEL43 DEL74 DEL74 DEL42 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL43 DEL74 DEL42 DEL44 DEL42 DEL43 DEL42 DEL33 DEL27 DEL33 DEL41 DEL8 DEL25 DEL42 DEL43 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL43 DEL42 DEL42 DEL45 DEL42 DEL27 DEL59 DEL60 DEL42 DEL45 DEL79 DEL42 DEL43 DEL42 DEL43 DEL42 DEL43 DEL74 DEL74 DEL42 DEL42 DEL43 DEL42 DEL43 DEL42 DEL43 DEL74 DEL74 DEL42 DEL42 DEL42 DEL33 DEL42 DEL43 DEL57 DEL32 DEL11 DEL59 DEL60 DEL42 DEL33 DEL27 DEL39 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL34 DEL27 DEL42 DEL40 DEL27 DEL27 DEL42 DEL43 DEL45 DEL42 DEL45 DEL42 DEL45 DEL42 DEL45 DEL45 DEL27 DEL14 DEL53 DEL8 DEL25 DEL8 DEL25 DEL42 DEL41 DEL8 DEL42 DEL43 DEL42 DEL44 DEL42 DEL42 DEL32 DEL42 DEL43 DEL62 DEL42 DEL43 DEL45 DEL42 DEL42 DEL42 DEL32 DEL45 DEL42 DEL27 DEL42 DEL14 DEL53 DEL8 DEL42 DEL53 DEL8 DEL25 DEL8 DEL12 DEL54 DEL8 DEL31 DEL66 DEL65 DEL42 DEL66 DEL66 DEL65 DEL42 DEL66 DEL66 DEL65 DEL42 DEL66 DEL65 DEL66 DEL66 DEL65 DEL29 DEL42 DEL45 DEL79 DEL83 DEL83 DEL42 DEL73 DEL42 DEL43 DEL42 DEL43 DEL74 DEL42 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL43 DEL74 DEL42 DEL44 DEL42 DEL43 DEL42 DEL43 DEL42 DEL43 DEL42 DEL43 DEL74 DEL74 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL33 DEL27 DEL42 DEL42 DEL42 DEL42 DEL32 DEL41 DEL8 DEL42 DEL43 DEL42 DEL43 DEL74 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL43 DEL42 DEL42 DEL43 DEL42 DEL14 DEL59 DEL60 DEL42 DEL43 DEL42 DEL42 DEL43 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL40 DEL40 DEL40 DEL40 DEL32 DEL32 DEL11 DEL59 DEL60 DEL42 DEL43 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL43 DEL42 DEL43 DEL74 DEL42 DEL42 DEL14 DEL41 DEL8 DEL25 DEL8 DEL31 DEL42 DEL45 DEL79 DEL83 DEL83 DEL42 DEL73 DEL42 DEL43 DEL42 DEL43 DEL74 DEL42 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL43 DEL74 DEL42 DEL44 DEL42 DEL43 DEL42 DEL43 DEL42 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL43 DEL42 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL42 DEL43 DEL57 DEL27 DEL42 DEL43 DEL42 DEL42 DEL43 DEL42 DEL42 DEL42 DEL42 DEL32 DEL11 DEL59 DEL60 DEL42 DEL43 DEL42 DEL43 DEL74 DEL42 DEL42 DEL14 DEL41 DEL8 DEL42 DEL42 DEL43 DEL57 DEL27 DEL42 DEL43 DEL42 DEL42 DEL43 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL32 DEL11 DEL59 DEL60 DEL42 DEL43 DEL42 DEL43 DEL74 DEL42 DEL42 DEL14 DEL41 DEL8 DEL42 DEL43 DEL45 DEL42 DEL27 DEL14 DEL53 DEL8 DEL25 DEL25 DEL8 DEL31 DEL66 DEL66 DEL42 DEL42 DEL42 DEL43 DEL69 DEL42 DEL43 DEL69 DEL42 DEL43 DEL69 DEL68 DEL65 DEL66 DEL65 DEL29 DEL83 DEL83 DEL42 DEL42 DEL73 DEL83 DEL83 DEL42 DEL43 DEL42 DEL59 DEL23 DEL83 DEL83 DEL42 DEL43 DEL42 DEL59 DEL23 DEL83 DEL42 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL44 DEL52 DEL42 DEL22 DEL42 DEL7 DEL21 DEL52 DEL42 DEL22 DEL42 DEL7 DEL21 DEL8 DEL31 DEL83 DEL42 DEL43 DEL42 DEL42 DEL41 DEL8 DEL31 DEL83 DEL42 DEL43 DEL42 DEL42 DEL41 DEL8 DEL31 DEL55

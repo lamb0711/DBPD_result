@@ -1,0 +1,178 @@
+HDFS-5589. Namenode loops caching and uncaching when data should be uncached. (awang via cmccabe)
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/trunk@1555996 13f79535-47bb-0310-9956-ffa450edef68
+
++import java.util.ArrayList;
++import java.util.TreeMap;
+-  private final Random random = new Random();
++  private static final Random random = new Random();
+-      // Reset the directive's statistics
+-      directive.resetStatistics();
+-    }  else if (cblock.getReplication() == 0) {
++    } else if (cblock.getReplication() == 0) {
++      // Need to set the replication to 0 so it doesn't flip back to cached
++      // when the mark flips on the next scan
++      cblock.setReplicationAndMark((short)0, mark);
+-  private void addNewPendingCached(int neededCached,
++  private void addNewPendingCached(final int neededCached,
+-    List<DatanodeDescriptor> possibilities = new LinkedList<DatanodeDescriptor>();
++    // Filter the list of replicas to only the valid targets
++    List<DatanodeDescriptor> possibilities =
++        new LinkedList<DatanodeDescriptor>();
++    int outOfCapacity = 0;
+-      if ((datanode != null) && 
+-          ((!pendingCached.contains(datanode)) &&
+-          ((corrupt == null) || (!corrupt.contains(datanode))))) {
+-        possibilities.add(datanode);
++      if (datanode == null) {
++        continue;
++      if (datanode.isDecommissioned() || datanode.isDecommissionInProgress()) {
++        continue;
++      }
++      if (corrupt != null && corrupt.contains(datanode)) {
++        continue;
++      }
++      if (pendingCached.contains(datanode) || cached.contains(datanode)) {
++        continue;
++      }
++      long pendingCapacity = datanode.getCacheRemaining();
++      // Subtract pending cached blocks from effective capacity
++      Iterator<CachedBlock> it = datanode.getPendingCached().iterator();
++      while (it.hasNext()) {
++        CachedBlock cBlock = it.next();
++        BlockInfo info =
++            blockManager.getStoredBlock(new Block(cBlock.getBlockId()));
++        if (info != null) {
++          pendingCapacity -= info.getNumBytes();
++        }
++      }
++      it = datanode.getPendingUncached().iterator();
++      // Add pending uncached blocks from effective capacity
++      while (it.hasNext()) {
++        CachedBlock cBlock = it.next();
++        BlockInfo info =
++            blockManager.getStoredBlock(new Block(cBlock.getBlockId()));
++        if (info != null) {
++          pendingCapacity += info.getNumBytes();
++        }
++      }
++      if (pendingCapacity < blockInfo.getNumBytes()) {
++        if (LOG.isTraceEnabled()) {
++          LOG.trace("Datanode " + datanode + " is not a valid possibility for"
++              + " block " + blockInfo.getBlockId() + " of size "
++              + blockInfo.getNumBytes() + " bytes, only has "
++              + datanode.getCacheRemaining() + " bytes of cache remaining.");
++        }
++        outOfCapacity++;
++        continue;
++      }
++      possibilities.add(datanode);
+-    while (neededCached > 0) {
+-      if (possibilities.isEmpty()) {
+-        LOG.warn("We need " + neededCached + " more replica(s) than " +
+-            "actually exist to provide a cache replication of " +
+-            cachedBlock.getReplication() + " for " + cachedBlock);
+-        return;
+-      }
+-      DatanodeDescriptor datanode =
+-          possibilities.remove(random.nextInt(possibilities.size()));
+-      if (LOG.isDebugEnabled()) {
+-        LOG.debug("AddNewPendingCached: datanode " + datanode + 
+-            " will now cache block " + cachedBlock);
+-      }
++    List<DatanodeDescriptor> chosen = chooseDatanodesForCaching(possibilities,
++        neededCached, blockManager.getDatanodeManager().getStaleInterval());
++    for (DatanodeDescriptor datanode : chosen) {
+-      neededCached--;
++    // We were unable to satisfy the requested replication factor
++    if (neededCached > chosen.size()) {
++      if (LOG.isDebugEnabled()) {
++        LOG.debug(
++            "Only have " +
++            (cachedBlock.getReplication() - neededCached + chosen.size()) +
++            " of " + cachedBlock.getReplication() + " cached replicas for " +
++            cachedBlock + " (" + outOfCapacity + " nodes have insufficient " +
++            "capacity).");
++      }
++    }
++  }
++
++  /**
++   * Chooses datanode locations for caching from a list of valid possibilities.
++   * Non-stale nodes are chosen before stale nodes.
++   * 
++   * @param possibilities List of candidate datanodes
++   * @param neededCached Number of replicas needed
++   * @param staleInterval Age of a stale datanode
++   * @return A list of chosen datanodes
++   */
++  private static List<DatanodeDescriptor> chooseDatanodesForCaching(
++      final List<DatanodeDescriptor> possibilities, final int neededCached,
++      final long staleInterval) {
++    // Make a copy that we can modify
++    List<DatanodeDescriptor> targets =
++        new ArrayList<DatanodeDescriptor>(possibilities);
++    // Selected targets
++    List<DatanodeDescriptor> chosen = new LinkedList<DatanodeDescriptor>();
++
++    // Filter out stale datanodes
++    List<DatanodeDescriptor> stale = new LinkedList<DatanodeDescriptor>();
++    Iterator<DatanodeDescriptor> it = targets.iterator();
++    while (it.hasNext()) {
++      DatanodeDescriptor d = it.next();
++      if (d.isStale(staleInterval)) {
++        it.remove();
++        stale.add(d);
++      }
++    }
++    // Select targets
++    while (chosen.size() < neededCached) {
++      // Try to use stale nodes if we're out of non-stale nodes, else we're done
++      if (targets.isEmpty()) {
++        if (!stale.isEmpty()) {
++          targets = stale;
++        } else {
++          break;
++        }
++      }
++      // Select a random target
++      DatanodeDescriptor target =
++          chooseRandomDatanodeByRemainingCapacity(targets);
++      chosen.add(target);
++      targets.remove(target);
++    }
++    return chosen;
++  }
++
++  /**
++   * Choose a single datanode from the provided list of possible
++   * targets, weighted by the percentage of free space remaining on the node.
++   * 
++   * @return The chosen datanode
++   */
++  private static DatanodeDescriptor chooseRandomDatanodeByRemainingCapacity(
++      final List<DatanodeDescriptor> targets) {
++    // Use a weighted probability to choose the target datanode
++    float total = 0;
++    for (DatanodeDescriptor d : targets) {
++      total += d.getCacheRemainingPercent();
++    }
++    // Give each datanode a portion of keyspace equal to its relative weight
++    // [0, w1) selects d1, [w1, w2) selects d2, etc.
++    TreeMap<Integer, DatanodeDescriptor> lottery =
++        new TreeMap<Integer, DatanodeDescriptor>();
++    int offset = 0;
++    for (DatanodeDescriptor d : targets) {
++      // Since we're using floats, be paranoid about negative values
++      int weight =
++          Math.max(1, (int)((d.getCacheRemainingPercent() / total) * 1000000));
++      offset += weight;
++      lottery.put(offset, d);
++    }
++    // Choose a number from [0, offset), which is the total amount of weight,
++    // to select the winner
++    DatanodeDescriptor winner =
++        lottery.higherEntry(random.nextInt(offset)).getValue();
++    return winner;
+
+INS26 INS26 INS40 INS40 INS31 INS31 INS83 INS29 INS83 INS83 INS74 INS42 INS44 INS44 INS44 INS8 INS29 INS83 INS83 INS43 INS42 INS44 INS8 INS83 INS60 INS24 MOV60 INS70 INS25 INS65 INS65 INS65 INS65 INS65 INS43 INS43 INS83 INS74 INS42 INS83 INS39 INS42 INS83 INS39 INS42 INS60 INS60 INS60 INS60 INS61 INS61 INS41 INS65 INS65 INS42 INS83 INS74 INS42 INS60 INS70 INS60 INS60 INS70 INS60 INS41 INS39 INS59 MOV58 MOV27 MOV37 INS8 INS74 INS44 INS42 INS8 INS27 INS8 INS66 INS66 INS42 INS66 INS42 INS66 INS42 INS66 INS66 INS42 INS42 INS43 INS43 INS74 INS59 INS74 INS59 INS74 INS59 INS74 INS59 INS32 INS8 INS27 INS8 INS42 INS66 INS66 INS66 INS43 INS43 INS39 INS59 INS44 INS42 INS8 INS74 INS59 INS39 INS59 INS44 INS42 INS8 INS43 INS59 INS42 INS42 INS34 MOV60 INS25 INS25 INS25 INS25 INS60 INS60 INS61 INS21 INS61 INS25 MOV21 INS43 INS43 UPD42 MOV43 INS42 MOV21 MOV60 MOV6 INS42 INS32 MOV25 INS42 INS42 INS43 INS43 INS42 INS14 INS43 INS43 INS42 INS14 INS43 INS43 INS42 INS14 INS43 INS43 INS42 INS32 INS42 INS42 INS60 INS25 INS32 INS42 INS25 INS60 INS21 INS21 INS42 INS42 INS42 INS34 INS43 INS42 INS21 INS43 INS43 INS43 INS42 INS14 INS42 INS34 INS43 INS42 INS60 INS21 INS21 INS42 INS42 INS32 INS27 INS8 INS27 INS8 UPD27 MOV27 INS8 INS27 INS8 INS39 INS59 INS74 INS59 INS32 INS8 INS7 INS32 INS8 INS27 INS8 INS42 INS42 INS42 UPD42 INS42 INS42 INS42 INS42 INS74 INS42 INS42 INS42 INS74 INS42 INS42 INS74 INS42 INS42 INS42 INS42 INS43 INS59 INS32 INS8 INS42 INS42 INS32 INS8 INS43 INS59 INS32 INS32 INS42 INS7 INS42 INS42 INS42 INS74 INS42 INS39 INS59 INS7 INS32 INS32 INS42 INS42 INS33 INS18 INS32 INS32 INS18 INS27 MOV32 INS18 MOV32 INS32 INS18 INS42 INS32 INS43 INS43 INS42 INS32 INS42 INS42 INS60 INS60 MOV25 INS42 INS32 INS42 INS42 INS60 INS60 INS25 INS42 INS32 MOV25 INS21 INS18 INS32 UPD42 MOV42 INS43 INS43 INS43 INS43 INS43 INS43 INS42 INS42 INS32 INS42 INS42 INS42 INS21 INS21 INS42 INS42 INS25 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS43 INS43 INS43 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS21 INS42 INS42 INS42 INS42 MOV42 MOV33 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS43 INS59 INS43 INS59 INS27 INS32 INS42 INS43 INS59 INS43 INS59 INS27 INS8 INS42 INS42 INS37 UPD42 MOV42 UPD42 MOV42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS32 INS38 INS8 INS8 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS34 INS11 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS32 UPD42 MOV42 MOV33 INS21 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS32 UPD42 MOV42 INS33 INS21 UPD42 UPD42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS21 INS10 INS39 INS36 INS42 INS42 INS11 INS42 INS42 INS42 INS42 INS42 INS14 INS7 INS42 INS42 INS42 INS42 INS14 INS7 UPD45 INS36 INS45 MOV32 UPD45 INS45 INS42 INS45 INS45 INS42 INS42 INS7 INS27 INS39 INS34 INS43 INS32 INS42 INS32 INS43 INS32 INS42 INS32 UPD42 INS27 INS42 INS42 INS36 INS34 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 UPD45 UPD42 INS45 UPD45 INS32 UPD45 INS32 UPD45 INS32 INS45 INS27 INS32 INS27 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS42 DEL42 DEL42 DEL32 DEL21 DEL27 DEL36 DEL38 DEL36 DEL27 DEL36 DEL38 DEL36 DEL36 DEL27 DEL36 DEL27 DEL42 DEL41 DEL42 DEL32 DEL42 DEL8 DEL24 DEL34 DEL27 DEL42 DEL37 DEL21 DEL8 DEL61

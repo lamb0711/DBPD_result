@@ -1,0 +1,151 @@
+HDFS-10896. Move lock logging logic from FSNamesystem into FSNamesystemLock. Contributed by Erik Krogen.
+
+-import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_NAMENODE_WRITE_LOCK_REPORTING_THRESHOLD_MS_KEY;
+-import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_NAMENODE_WRITE_LOCK_REPORTING_THRESHOLD_MS_DEFAULT;
+-import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_NAMENODE_READ_LOCK_REPORTING_THRESHOLD_MS_KEY;
+-import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_NAMENODE_READ_LOCK_REPORTING_THRESHOLD_MS_DEFAULT;
+-import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_LOCK_SUPPRESS_WARNING_INTERVAL_KEY;
+-import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_LOCK_SUPPRESS_WARNING_INTERVAL_DEFAULT;
+-import java.util.concurrent.atomic.AtomicInteger;
+-import java.util.concurrent.atomic.AtomicLong;
+-import org.apache.hadoop.util.Timer;
+-    boolean fair = conf.getBoolean("dfs.namenode.fslock.fair", true);
+-    LOG.info("fsLock is fair:" + fair);
+-    fsLock = new FSNamesystemLock(fair);
+-    cond = fsLock.writeLock().newCondition();
++    fsLock = new FSNamesystemLock(conf);
++    cond = fsLock.newWriteLockCondition();
+-    setTimer(new Timer());
+-      this.writeLockReportingThreshold = conf.getLong(
+-          DFS_NAMENODE_WRITE_LOCK_REPORTING_THRESHOLD_MS_KEY,
+-          DFS_NAMENODE_WRITE_LOCK_REPORTING_THRESHOLD_MS_DEFAULT);
+-      this.readLockReportingThreshold = conf.getLong(
+-          DFS_NAMENODE_READ_LOCK_REPORTING_THRESHOLD_MS_KEY,
+-          DFS_NAMENODE_READ_LOCK_REPORTING_THRESHOLD_MS_DEFAULT);
+-
+-      this.lockSuppressWarningInterval = conf.getTimeDuration(
+-          DFS_LOCK_SUPPRESS_WARNING_INTERVAL_KEY,
+-          DFS_LOCK_SUPPRESS_WARNING_INTERVAL_DEFAULT, TimeUnit.MILLISECONDS);
+-
+-  private final long lockSuppressWarningInterval;
+-  /** Threshold (ms) for long holding write lock report. */
+-  private final long writeLockReportingThreshold;
+-  private int numWriteLockWarningsSuppressed = 0;
+-  private long timeStampOfLastWriteLockReport = 0;
+-  private long longestWriteLockHeldInterval = 0;
+-  /** Last time stamp for write lock. Keep the longest one for multi-entrance.*/
+-  private long writeLockHeldTimeStamp;
+-  /** Threshold (ms) for long holding read lock report. */
+-  private long readLockReportingThreshold;
+-  private AtomicInteger numReadLockWarningsSuppressed = new AtomicInteger(0);
+-  private AtomicLong timeStampOfLastReadLockReport = new AtomicLong(0);
+-  private AtomicLong longestReadLockHeldInterval = new AtomicLong(0);
+-  private Timer timer;
+-  /**
+-   * Last time stamp for read lock. Keep the longest one for
+-   * multi-entrance. This is ThreadLocal since there could be
+-   * many read locks held simultaneously.
+-   */
+-  private static ThreadLocal<Long> readLockHeldTimeStamp =
+-      new ThreadLocal<Long>() {
+-        @Override
+-        public Long initialValue() {
+-          return Long.MAX_VALUE;
+-        }
+-      };
+-
+-    this.fsLock.readLock().lock();
+-    if (this.fsLock.getReadHoldCount() == 1) {
+-      readLockHeldTimeStamp.set(timer.monotonicNow());
+-    }
++    this.fsLock.readLock();
+-    final boolean needReport = this.fsLock.getReadHoldCount() == 1;
+-    final long readLockInterval = timer.monotonicNow() -
+-        readLockHeldTimeStamp.get();
+-    if (needReport) {
+-      readLockHeldTimeStamp.remove();
+-    }
+-
+-    this.fsLock.readLock().unlock();
+-
+-    if (needReport && readLockInterval >= this.readLockReportingThreshold) {
+-      long localLongestReadLock;
+-      do {
+-        localLongestReadLock = longestReadLockHeldInterval.get();
+-      } while (localLongestReadLock - readLockInterval < 0
+-          && !longestReadLockHeldInterval.compareAndSet(localLongestReadLock,
+-                                                        readLockInterval));
+-
+-      long localTimeStampOfLastReadLockReport;
+-      long now;
+-      do {
+-        now = timer.monotonicNow();
+-        localTimeStampOfLastReadLockReport = timeStampOfLastReadLockReport
+-            .get();
+-        if (now - localTimeStampOfLastReadLockReport <
+-            lockSuppressWarningInterval) {
+-          numReadLockWarningsSuppressed.incrementAndGet();
+-          return;
+-        }
+-      } while (!timeStampOfLastReadLockReport.compareAndSet(
+-          localTimeStampOfLastReadLockReport, now));
+-      int numSuppressedWarnings = numReadLockWarningsSuppressed.getAndSet(0);
+-      long longestLockHeldInterval = longestReadLockHeldInterval.getAndSet(0);
+-      LOG.info("FSNamesystem read lock held for " + readLockInterval +
+-          " ms via\n" + StringUtils.getStackTrace(Thread.currentThread()) +
+-          "\tNumber of suppressed read-lock reports: " +
+-          numSuppressedWarnings + "\n\tLongest read-lock held interval: " +
+-          longestLockHeldInterval);
+-    }
++    this.fsLock.readUnlock();
+-    this.fsLock.writeLock().lock();
+-    if (fsLock.getWriteHoldCount() == 1) {
+-      writeLockHeldTimeStamp = timer.monotonicNow();
+-    }
++    this.fsLock.writeLock();
+-    this.fsLock.writeLock().lockInterruptibly();
+-    if (fsLock.getWriteHoldCount() == 1) {
+-      writeLockHeldTimeStamp = timer.monotonicNow();
+-    }
++    this.fsLock.writeLockInterruptibly();
+-    final boolean needReport = fsLock.getWriteHoldCount() == 1 &&
+-        fsLock.isWriteLockedByCurrentThread();
+-    final long currentTime = timer.monotonicNow();
+-    final long writeLockInterval = currentTime - writeLockHeldTimeStamp;
+-
+-    boolean logReport = false;
+-    int numSuppressedWarnings = 0;
+-    long longestLockHeldInterval = 0;
+-    if (needReport && writeLockInterval >= this.writeLockReportingThreshold) {
+-      if (writeLockInterval > longestWriteLockHeldInterval) {
+-        longestWriteLockHeldInterval = writeLockInterval;
+-      }
+-      if (currentTime - timeStampOfLastWriteLockReport > this
+-          .lockSuppressWarningInterval) {
+-        logReport = true;
+-        numSuppressedWarnings = numWriteLockWarningsSuppressed;
+-        numWriteLockWarningsSuppressed = 0;
+-        longestLockHeldInterval = longestWriteLockHeldInterval;
+-        longestWriteLockHeldInterval = 0;
+-        timeStampOfLastWriteLockReport = currentTime;
+-      } else {
+-        numWriteLockWarningsSuppressed++;
+-      }
+-    }
+-
+-    this.fsLock.writeLock().unlock();
+-
+-    if (logReport) {
+-      LOG.info("FSNamesystem write lock held for " + writeLockInterval +
+-          " ms via\n" + StringUtils.getStackTrace(Thread.currentThread()) +
+-          "\tNumber of suppressed write-lock reports: " +
+-          numSuppressedWarnings + "\n\tLongest write-lock held interval: " +
+-              longestLockHeldInterval);
+-    }
++    this.fsLock.writeUnlock();
+-  @VisibleForTesting
+-  void setTimer(Timer newTimer) {
+-    this.timer = newTimer;
+-  }
+
+MOV78 INS8 MOV78 INS8 INS8 MOV78 INS8 MOV21 MOV21 MOV21 MOV21 MOV32 INS32 MOV32 MOV32 MOV32 MOV22 UPD42 MOV42 UPD42 UPD42 UPD42 MOV42 UPD42 DEL40 DEL26 DEL40 DEL26 DEL40 DEL26 DEL40 DEL26 DEL40 DEL26 DEL40 DEL26 DEL40 DEL26 DEL40 DEL26 DEL40 DEL26 DEL39 DEL42 DEL42 DEL42 DEL45 DEL9 DEL32 DEL59 DEL60 DEL42 DEL42 DEL45 DEL42 DEL27 DEL32 DEL21 DEL42 DEL32 DEL42 DEL42 DEL43 DEL14 DEL32 DEL21 DEL52 DEL42 DEL22 DEL42 DEL42 DEL42 DEL42 DEL32 DEL7 DEL21 DEL52 DEL42 DEL22 DEL42 DEL42 DEL42 DEL42 DEL32 DEL7 DEL21 DEL52 DEL42 DEL22 DEL42 DEL42 DEL42 DEL42 DEL40 DEL32 DEL7 DEL21 DEL83 DEL83 DEL39 DEL42 DEL59 DEL23 DEL66 DEL65 DEL29 DEL83 DEL83 DEL39 DEL42 DEL59 DEL23 DEL83 DEL39 DEL42 DEL34 DEL59 DEL23 DEL83 DEL39 DEL42 DEL34 DEL59 DEL23 DEL83 DEL39 DEL42 DEL34 DEL59 DEL23 DEL66 DEL65 DEL29 DEL83 DEL39 DEL42 DEL59 DEL23 DEL66 DEL65 DEL29 DEL83 DEL39 DEL42 DEL59 DEL23 DEL83 DEL42 DEL43 DEL42 DEL42 DEL43 DEL34 DEL14 DEL59 DEL23 DEL83 DEL42 DEL43 DEL42 DEL42 DEL43 DEL34 DEL14 DEL59 DEL23 DEL83 DEL42 DEL43 DEL42 DEL42 DEL43 DEL34 DEL14 DEL59 DEL23 DEL83 DEL42 DEL43 DEL42 DEL59 DEL23 DEL66 DEL66 DEL66 DEL65 DEL29 DEL83 DEL83 DEL42 DEL43 DEL42 DEL43 DEL74 DEL42 DEL42 DEL43 DEL42 DEL43 DEL74 DEL83 DEL42 DEL43 DEL42 DEL40 DEL41 DEL8 DEL31 DEL1 DEL14 DEL59 DEL23 DEL42 DEL32 DEL34 DEL27 DEL42 DEL42 DEL42 DEL42 DEL32 DEL32 DEL21 DEL8 DEL25 DEL8 DEL83 DEL39 DEL42 DEL34 DEL27 DEL59 DEL60 DEL83 DEL39 DEL42 DEL42 DEL42 DEL32 DEL42 DEL42 DEL32 DEL27 DEL59 DEL60 DEL42 DEL42 DEL42 DEL32 DEL21 DEL8 DEL25 DEL32 DEL42 DEL32 DEL42 DEL42 DEL52 DEL42 DEL22 DEL27 DEL27 DEL39 DEL42 DEL59 DEL60 DEL42 DEL42 DEL42 DEL32 DEL7 DEL21 DEL8 DEL42 DEL42 DEL27 DEL34 DEL27 DEL42 DEL42 DEL42 DEL42 DEL32 DEL38 DEL27 DEL19 DEL39 DEL42 DEL59 DEL60 DEL39 DEL42 DEL59 DEL60 DEL42 DEL42 DEL42 DEL32 DEL7 DEL21 DEL42 DEL42 DEL42 DEL32 DEL7 DEL21 DEL42 DEL42 DEL27 DEL42 DEL27 DEL42 DEL42 DEL32 DEL21 DEL41 DEL8 DEL25 DEL8 DEL42 DEL42 DEL42 DEL42 DEL32 DEL38 DEL19 DEL39 DEL42 DEL42 DEL42 DEL34 DEL32 DEL59 DEL60 DEL39 DEL42 DEL42 DEL42 DEL34 DEL32 DEL59 DEL60 DEL42 DEL42 DEL45 DEL42 DEL45 DEL42 DEL42 DEL42 DEL42 DEL32 DEL32 DEL45 DEL42 DEL45 DEL42 DEL27 DEL32 DEL21 DEL8 DEL25 DEL42 DEL32 DEL42 DEL42 DEL32 DEL34 DEL27 DEL42 DEL42 DEL42 DEL32 DEL7 DEL21 DEL8 DEL25 DEL8 DEL42 DEL42 DEL42 DEL32 DEL7 DEL52 DEL42 DEL22 DEL42 DEL32 DEL42 DEL32 DEL21 DEL42 DEL42 DEL32 DEL34 DEL27 DEL8 DEL25 DEL8 DEL42 DEL78 DEL42 DEL42 DEL7 DEL83 DEL39 DEL42 DEL42 DEL42 DEL32 DEL34 DEL27 DEL42 DEL42 DEL32 DEL27 DEL59 DEL60 DEL83 DEL39 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL83 DEL39 DEL42 DEL42 DEL42 DEL27 DEL59 DEL60 DEL39 DEL42 DEL9 DEL59 DEL60 DEL39 DEL42 DEL34 DEL59 DEL60 DEL39 DEL42 DEL34 DEL59 DEL60 DEL42 DEL42 DEL52 DEL42 DEL22 DEL27 DEL27 DEL42 DEL42 DEL27 DEL8 DEL25 DEL42 DEL42 DEL27 DEL52 DEL42 DEL22 DEL27 DEL42 DEL9 DEL7 DEL21 DEL42 DEL42 DEL7 DEL21 DEL42 DEL34 DEL7 DEL21 DEL42 DEL42 DEL7 DEL21 DEL42 DEL34 DEL7 DEL21 DEL42 DEL42 DEL7 DEL21 DEL8 DEL42 DEL37 DEL21 DEL8 DEL25 DEL8 DEL25 DEL52 DEL42 DEL22 DEL42 DEL32 DEL42 DEL32 DEL21 DEL42 DEL42 DEL42 DEL45 DEL42 DEL45 DEL42 DEL42 DEL42 DEL42 DEL32 DEL32 DEL45 DEL42 DEL45 DEL42 DEL27 DEL32 DEL21 DEL8 DEL25 DEL8 DEL42 DEL78 DEL39 DEL42 DEL42 DEL43 DEL42 DEL44 DEL52 DEL42 DEL22 DEL42 DEL7 DEL21 DEL8 DEL31

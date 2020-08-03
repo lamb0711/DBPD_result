@@ -1,0 +1,242 @@
+HDFS-7855. Separate class Packet from DFSOutputStream. Contributed by Li Bo.
+
+-import java.nio.BufferOverflowException;
+-import org.apache.hadoop.hdfs.security.token.block.InvalidBlockTokenException;
+-  private final LinkedList<Packet> dataQueue = new LinkedList<Packet>();
+-  private final LinkedList<Packet> ackQueue = new LinkedList<Packet>();
+-  private Packet currentPacket = null;
++  private final LinkedList<DFSPacket> dataQueue = new LinkedList<DFSPacket>();
++  private final LinkedList<DFSPacket> ackQueue = new LinkedList<DFSPacket>();
++  private DFSPacket currentPacket = null;
+-  private Packet createPacket(int packetSize, int chunksPerPkt, long offsetInBlock,
+-      long seqno) throws InterruptedIOException {
++  private DFSPacket createPacket(int packetSize, int chunksPerPkt, long offsetInBlock,
++      long seqno, boolean lastPacketInBlock) throws InterruptedIOException {
+-    return new Packet(buf, chunksPerPkt, offsetInBlock, seqno, getChecksumSize());
++    return new DFSPacket(buf, chunksPerPkt, offsetInBlock, seqno,
++                         getChecksumSize(), lastPacketInBlock);
+-  private Packet createHeartbeatPacket() throws InterruptedIOException {
++  private DFSPacket createHeartbeatPacket() throws InterruptedIOException {
+-    return new Packet(buf, 0, 0, Packet.HEART_BEAT_SEQNO, getChecksumSize());
++    return new DFSPacket(buf, 0, 0, DFSPacket.HEART_BEAT_SEQNO,
++                         getChecksumSize(), false);
+-  private static class Packet {
+-    private static final long HEART_BEAT_SEQNO = -1L;
+-    final long seqno; // sequencenumber of buffer in block
+-    final long offsetInBlock; // offset in block
+-    boolean syncBlock; // this packet forces the current block to disk
+-    int numChunks; // number of chunks currently in packet
+-    final int maxChunks; // max chunks in packet
+-    private byte[] buf;
+-    private boolean lastPacketInBlock; // is this the last packet in block?
+-
+-    /**
+-     * buf is pointed into like follows:
+-     *  (C is checksum data, D is payload data)
+-     *
+-     * [_________CCCCCCCCC________________DDDDDDDDDDDDDDDD___]
+-     *           ^        ^               ^               ^
+-     *           |        checksumPos     dataStart       dataPos
+-     *           checksumStart
+-     * 
+-     * Right before sending, we move the checksum data to immediately precede
+-     * the actual data, and then insert the header into the buffer immediately
+-     * preceding the checksum data, so we make sure to keep enough space in
+-     * front of the checksum data to support the largest conceivable header. 
+-     */
+-    int checksumStart;
+-    int checksumPos;
+-    final int dataStart;
+-    int dataPos;
+-
+-    /**
+-     * Create a new packet.
+-     * 
+-     * @param chunksPerPkt maximum number of chunks per packet.
+-     * @param offsetInBlock offset in bytes into the HDFS block.
+-     */
+-    private Packet(byte[] buf, int chunksPerPkt, long offsetInBlock, long seqno,
+-        int checksumSize) {
+-      this.lastPacketInBlock = false;
+-      this.numChunks = 0;
+-      this.offsetInBlock = offsetInBlock;
+-      this.seqno = seqno;
+-
+-      this.buf = buf;
+-
+-      checksumStart = PacketHeader.PKT_MAX_HEADER_LEN;
+-      checksumPos = checksumStart;
+-      dataStart = checksumStart + (chunksPerPkt * checksumSize);
+-      dataPos = dataStart;
+-      maxChunks = chunksPerPkt;
+-    }
+-
+-    synchronized void writeData(byte[] inarray, int off, int len)
+-        throws ClosedChannelException {
+-      checkBuffer();
+-      if (dataPos + len > buf.length) {
+-        throw new BufferOverflowException();
+-      }
+-      System.arraycopy(inarray, off, buf, dataPos, len);
+-      dataPos += len;
+-    }
+-
+-    synchronized void writeChecksum(byte[] inarray, int off, int len)
+-        throws ClosedChannelException {
+-      checkBuffer();
+-      if (len == 0) {
+-        return;
+-      }
+-      if (checksumPos + len > dataStart) {
+-        throw new BufferOverflowException();
+-      }
+-      System.arraycopy(inarray, off, buf, checksumPos, len);
+-      checksumPos += len;
+-    }
+-    
+-    /**
+-     * Write the full packet, including the header, to the given output stream.
+-     */
+-    synchronized void writeTo(DataOutputStream stm) throws IOException {
+-      checkBuffer();
+-
+-      final int dataLen = dataPos - dataStart;
+-      final int checksumLen = checksumPos - checksumStart;
+-      final int pktLen = HdfsConstants.BYTES_IN_INTEGER + dataLen + checksumLen;
+-
+-      PacketHeader header = new PacketHeader(
+-        pktLen, offsetInBlock, seqno, lastPacketInBlock, dataLen, syncBlock);
+-      
+-      if (checksumPos != dataStart) {
+-        // Move the checksum to cover the gap. This can happen for the last
+-        // packet or during an hflush/hsync call.
+-        System.arraycopy(buf, checksumStart, buf, 
+-                         dataStart - checksumLen , checksumLen); 
+-        checksumPos = dataStart;
+-        checksumStart = checksumPos - checksumLen;
+-      }
+-      
+-      final int headerStart = checksumStart - header.getSerializedSize();
+-      assert checksumStart + 1 >= header.getSerializedSize();
+-      assert checksumPos == dataStart;
+-      assert headerStart >= 0;
+-      assert headerStart + header.getSerializedSize() == checksumStart;
+-      
+-      // Copy the header data into the buffer immediately preceding the checksum
+-      // data.
+-      System.arraycopy(header.getBytes(), 0, buf, headerStart,
+-          header.getSerializedSize());
+-      
+-      // corrupt the data for testing.
+-      if (DFSClientFaultInjector.get().corruptPacket()) {
+-        buf[headerStart+header.getSerializedSize() + checksumLen + dataLen-1] ^= 0xff;
+-      }
+-
+-      // Write the now contiguous full packet to the output stream.
+-      stm.write(buf, headerStart, header.getSerializedSize() + checksumLen + dataLen);
+-
+-      // undo corruption.
+-      if (DFSClientFaultInjector.get().uncorruptPacket()) {
+-        buf[headerStart+header.getSerializedSize() + checksumLen + dataLen-1] ^= 0xff;
+-      }
+-    }
+-
+-    private synchronized void checkBuffer() throws ClosedChannelException {
+-      if (buf == null) {
+-        throw new ClosedChannelException();
+-      }
+-    }
+-
+-    private synchronized void releaseBuffer(ByteArrayManager bam) {
+-      bam.release(buf);
+-      buf = null;
+-    }
+-
+-    // get the packet's last byte's offset in the block
+-    synchronized long getLastByteOffsetBlock() {
+-      return offsetInBlock + dataPos - dataStart;
+-    }
+-
+-    /**
+-     * Check if this packet is a heart beat packet
+-     * @return true if the sequence number is HEART_BEAT_SEQNO
+-     */
+-    private boolean isHeartbeatPacket() {
+-      return seqno == HEART_BEAT_SEQNO;
+-    }
+-    
+-    @Override
+-    public String toString() {
+-      return "packet seqno: " + this.seqno +
+-      " offsetInBlock: " + this.offsetInBlock +
+-      " lastPacketInBlock: " + this.lastPacketInBlock +
+-      " lastByteOffsetInBlock: " + this.getLastByteOffsetBlock();
+-    }
+-  }
+-        Packet one;
++        DFSPacket one;
+-          if (one.lastPacketInBlock) {
++          if (one.isLastPacketInBlock()) {
+-          if (one.lastPacketInBlock) {
++          if (one.isLastPacketInBlock()) {
+-                && ack.getSeqno() != Packet.HEART_BEAT_SEQNO) {
++                && ack.getSeqno() != DFSPacket.HEART_BEAT_SEQNO) {
+-            if (seqno == Packet.HEART_BEAT_SEQNO) {  // a heartbeat ack
++            if (seqno == DFSPacket.HEART_BEAT_SEQNO) {  // a heartbeat ack
+-            Packet one;
++            DFSPacket one;
+-            if (one.seqno != seqno) {
++            if (one.getSeqno() != seqno) {
+-                                    one.seqno + " but received " + seqno);
++                                    one.getSeqno() + " but received " + seqno);
+-            isLastPacketInBlock = one.lastPacketInBlock;
++            isLastPacketInBlock = one.isLastPacketInBlock();
+-            Packet endOfBlockPacket = dataQueue.remove();  // remove the end of block packet
+-            assert endOfBlockPacket.lastPacketInBlock;
+-            assert lastAckedSeqno == endOfBlockPacket.seqno - 1;
+-            lastAckedSeqno = endOfBlockPacket.seqno;
++            DFSPacket endOfBlockPacket = dataQueue.remove();  // remove the end of block packet
++            assert endOfBlockPacket.isLastPacketInBlock();
++            assert lastAckedSeqno == endOfBlockPacket.getSeqno() - 1;
++            lastAckedSeqno = endOfBlockPacket.getSeqno();
+-      lastQueuedSeqno = currentPacket.seqno;
++      lastQueuedSeqno = currentPacket.getSeqno();
+-        DFSClient.LOG.debug("Queued packet " + currentPacket.seqno);
++        DFSClient.LOG.debug("Queued packet " + currentPacket.getSeqno());
+-          bytesCurBlock, currentSeqno++);
++          bytesCurBlock, currentSeqno++, false);
+-            currentPacket.seqno +
++            currentPacket.getSeqno() +
+-    currentPacket.numChunks++;
++    currentPacket.incNumChunks();
+-    if (currentPacket.numChunks == currentPacket.maxChunks ||
++    if (currentPacket.getNumChunks() == currentPacket.getMaxChunks() ||
+-            currentPacket.seqno +
++            currentPacket.getSeqno() +
+-        currentPacket = createPacket(0, 0, bytesCurBlock, currentSeqno++);
+-        currentPacket.lastPacketInBlock = true;
+-        currentPacket.syncBlock = shouldSyncBlock;
++        currentPacket = createPacket(0, 0, bytesCurBlock, currentSeqno++, true);
++        currentPacket.setSyncBlock(shouldSyncBlock);
+-                bytesCurBlock, currentSeqno++);
++                bytesCurBlock, currentSeqno++, false);
+-                bytesCurBlock, currentSeqno++);
++                bytesCurBlock, currentSeqno++, false);
+-          currentPacket.syncBlock = isSync;
++          currentPacket.setSyncBlock(isSync);
+-          currentPacket = createPacket(0, 0, bytesCurBlock, currentSeqno++);
+-          currentPacket.lastPacketInBlock = true;
+-          currentPacket.syncBlock = shouldSyncBlock || isSync;
++          currentPacket = createPacket(0, 0, bytesCurBlock, currentSeqno++, true);
++          currentPacket.setSyncBlock(shouldSyncBlock || isSync);
+-  private static void releaseBuffer(List<Packet> packets, ByteArrayManager bam) {
+-    for(Packet p : packets) {
++  private static void releaseBuffer(List<DFSPacket> packets, ByteArrayManager bam) {
++    for (DFSPacket p : packets) {
+-        currentPacket = createPacket(0, 0, bytesCurBlock, currentSeqno++);
+-        currentPacket.lastPacketInBlock = true;
+-        currentPacket.syncBlock = shouldSyncBlock;
++        currentPacket = createPacket(0, 0, bytesCurBlock, currentSeqno++, true);
++        currentPacket.setSyncBlock(shouldSyncBlock);
+
+UPD74 MOV74 UPD74 MOV74 UPD43 UPD43 INS44 UPD43 UPD43 UPD43 UPD42 UPD42 INS39 INS42 UPD42 UPD74 UPD42 UPD74 MOV74 UPD42 UPD74 MOV74 INS32 UPD43 UPD43 UPD43 UPD43 INS42 UPD43 UPD40 INS9 INS42 INS42 UPD42 UPD43 UPD42 UPD42 UPD42 UPD42 MOV32 INS32 INS32 MOV32 UPD42 UPD43 INS32 INS42 INS42 INS42 INS42 UPD42 INS42 INS42 MOV37 INS9 INS32 INS32 INS32 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 UPD43 INS32 INS32 INS32 MOV37 INS9 INS32 INS32 MOV37 INS9 UPD40 UPD42 INS32 INS32 UPD43 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 MOV27 UPD40 INS42 INS42 INS42 INS42 UPD42 INS42 INS42 INS32 MOV37 INS9 INS32 INS42 INS42 INS32 INS42 INS42 INS9 MOV37 INS9 INS42 INS42 DEL40 DEL26 DEL40 DEL26 DEL83 DEL83 DEL42 DEL83 DEL83 DEL83 DEL39 DEL42 DEL34 DEL38 DEL59 DEL23 DEL83 DEL39 DEL42 DEL59 DEL23 DEL83 DEL39 DEL42 DEL59 DEL23 DEL39 DEL42 DEL59 DEL23 DEL39 DEL42 DEL59 DEL23 DEL83 DEL39 DEL42 DEL59 DEL23 DEL83 DEL39 DEL85 DEL5 DEL42 DEL59 DEL23 DEL83 DEL39 DEL42 DEL59 DEL23 DEL66 DEL66 DEL66 DEL66 DEL66 DEL66 DEL66 DEL66 DEL66 DEL66 DEL65 DEL29 DEL39 DEL42 DEL59 DEL23 DEL39 DEL42 DEL59 DEL23 DEL83 DEL39 DEL42 DEL59 DEL23 DEL39 DEL42 DEL59 DEL23 DEL66 DEL65 DEL42 DEL66 DEL65 DEL42 DEL66 DEL65 DEL29 DEL83 DEL42 DEL39 DEL85 DEL5 DEL42 DEL44 DEL39 DEL42 DEL44 DEL39 DEL42 DEL44 DEL39 DEL42 DEL44 DEL39 DEL42 DEL44 DEL52 DEL42 DEL22 DEL9 DEL7 DEL21 DEL52 DEL42 DEL22 DEL34 DEL7 DEL21 DEL52 DEL42 DEL22 DEL42 DEL7 DEL21 DEL52 DEL42 DEL22 DEL42 DEL7 DEL21 DEL52 DEL42 DEL22 DEL42 DEL7 DEL21 DEL42 DEL40 DEL7 DEL21 DEL42 DEL42 DEL7 DEL21 DEL42 DEL42 DEL42 DEL42 DEL27 DEL36 DEL27 DEL7 DEL21 DEL42 DEL42 DEL7 DEL21 DEL42 DEL42 DEL7 DEL21 DEL8 DEL31 DEL83 DEL39 DEL42 DEL39 DEL85 DEL5 DEL42 DEL44 DEL39 DEL42 DEL44 DEL39 DEL42 DEL44 DEL42 DEL43 DEL42 DEL32 DEL21 DEL42 DEL42 DEL27 DEL40 DEL27 DEL42 DEL43 DEL14 DEL53 DEL8 DEL25 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL21 DEL42 DEL42 DEL7 DEL21 DEL8 DEL31 DEL83 DEL39 DEL42 DEL39 DEL85 DEL5 DEL42 DEL44 DEL39 DEL42 DEL44 DEL39 DEL42 DEL44 DEL42 DEL43 DEL42 DEL32 DEL21 DEL42 DEL34 DEL27 DEL41 DEL8 DEL25 DEL42 DEL42 DEL27 DEL42 DEL27 DEL42 DEL43 DEL14 DEL53 DEL8 DEL25 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL21 DEL42 DEL42 DEL7 DEL21 DEL8 DEL31 DEL66 DEL65 DEL29 DEL83 DEL39 DEL42 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL32 DEL21 DEL83 DEL39 DEL42 DEL42 DEL42 DEL27 DEL59 DEL60 DEL83 DEL39 DEL42 DEL42 DEL42 DEL27 DEL59 DEL60 DEL83 DEL39 DEL42 DEL40 DEL42 DEL42 DEL27 DEL59 DEL60 DEL42 DEL43 DEL42 DEL42 DEL43 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL14 DEL59 DEL60 DEL42 DEL42 DEL27 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL27 DEL42 DEL32 DEL21 DEL42 DEL42 DEL7 DEL21 DEL42 DEL42 DEL42 DEL27 DEL7 DEL21 DEL8 DEL25 DEL83 DEL39 DEL42 DEL42 DEL42 DEL42 DEL32 DEL27 DEL59 DEL60 DEL42 DEL34 DEL27 DEL42 DEL42 DEL32 DEL27 DEL6 DEL42 DEL42 DEL27 DEL6 DEL42 DEL34 DEL27 DEL6 DEL42 DEL42 DEL42 DEL32 DEL27 DEL42 DEL27 DEL6 DEL42 DEL42 DEL42 DEL42 DEL32 DEL34 DEL42 DEL42 DEL42 DEL42 DEL32 DEL32 DEL21 DEL42 DEL42 DEL32 DEL42 DEL32 DEL42 DEL42 DEL42 DEL42 DEL32 DEL42 DEL42 DEL27 DEL34 DEL27 DEL2 DEL34 DEL7 DEL21 DEL8 DEL25 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL42 DEL42 DEL27 DEL32 DEL21 DEL42 DEL42 DEL32 DEL42 DEL32 DEL42 DEL42 DEL42 DEL42 DEL32 DEL42 DEL42 DEL27 DEL34 DEL27 DEL2 DEL34 DEL7 DEL21 DEL8 DEL25 DEL8 DEL31 DEL83 DEL83 DEL39 DEL42 DEL42 DEL43 DEL42 DEL33 DEL27 DEL42 DEL43 DEL14 DEL53 DEL8 DEL25 DEL8 DEL31 DEL83 DEL83 DEL39 DEL42 DEL42 DEL43 DEL42 DEL44 DEL42 DEL42 DEL42 DEL32 DEL21 DEL42 DEL33 DEL7 DEL21 DEL8 DEL31 DEL83 DEL39 DEL42 DEL42 DEL42 DEL27 DEL42 DEL27 DEL41 DEL8 DEL31 DEL66 DEL65 DEL66 DEL65 DEL29 DEL83 DEL39 DEL42 DEL42 DEL42 DEL27 DEL41 DEL8 DEL31 DEL42 DEL78 DEL83 DEL42 DEL43 DEL42 DEL45 DEL52 DEL42 DEL22 DEL45 DEL52 DEL42 DEL22 DEL45 DEL52 DEL42 DEL22 DEL45 DEL52 DEL42 DEL32 DEL27 DEL41 DEL8 DEL31 DEL55 DEL40 DEL40 DEL40 DEL40 DEL40 DEL40 DEL40 DEL40 DEL40 DEL40 DEL40 DEL40 DEL37 DEL40 DEL40 DEL40 DEL40 DEL9 DEL7 DEL21 DEL40 DEL42 DEL7 DEL40 DEL42 DEL7 DEL40 DEL9 DEL7 DEL21 DEL40 DEL7 DEL40 DEL9 DEL7 DEL21 DEL40 DEL42 DEL7

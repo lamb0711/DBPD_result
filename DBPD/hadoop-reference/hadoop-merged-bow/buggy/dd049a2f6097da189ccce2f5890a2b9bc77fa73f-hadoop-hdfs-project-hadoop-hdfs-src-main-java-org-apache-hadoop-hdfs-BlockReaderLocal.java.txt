@@ -1,0 +1,231 @@
+HDFS-5950. The DFSClient and DataNode should use shared memory segments to communicate short-circuit information (cmccabe)
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/trunk@1573433 13f79535-47bb-0310-9956-ffa450edef68
+
+-import java.io.FileInputStream;
+-import java.util.concurrent.atomic.AtomicBoolean;
+-import org.apache.hadoop.hdfs.client.ShortCircuitCache;
+-import org.apache.hadoop.hdfs.protocol.DatanodeID;
+-import org.apache.hadoop.io.IOUtils;
+-    private DatanodeID datanodeID;
+-    private boolean mlocked;
+-    public Builder setDatanodeID(DatanodeID datanodeID) {
+-      this.datanodeID = datanodeID;
+-      return this;
+-    }
+-
+-    public Builder setMlocked(boolean mlocked) {
+-      this.mlocked = mlocked;
+-      return this;
+-    }
+-
+-   * If true, this block is mlocked on the DataNode.
+-   */
+-  private final AtomicBoolean mlocked;
+-
+-  /**
+-
+-  /**
+-   * DataNode which contained this block.
+-   */
+-  private final DatanodeID datanodeID;
+-  private ClientMmap clientMmap;
+-
+-    this.mlocked = new AtomicBoolean(builder.mlocked);
+-    this.datanodeID = builder.datanodeID;
+-  private boolean getCanSkipChecksum() {
+-    return (!verifyChecksum) || mlocked.get();
++  private boolean createNoChecksumContext() {
++    if (verifyChecksum) {
++      return replica.addNoChecksumAnchor();
++    } else {
++      return true;
++    }
+-  
++
++  private void releaseNoChecksumContext() {
++    if (verifyChecksum) {
++      replica.removeNoChecksumAnchor();
++    }
++  }
++
+-    boolean canSkipChecksum = getCanSkipChecksum();
+-    
+-    String traceString = null;
+-    if (LOG.isTraceEnabled()) {
+-      traceString = new StringBuilder().
+-          append("read(").
+-          append("buf.remaining=").append(buf.remaining()).
+-          append(", block=").append(block).
+-          append(", filename=").append(filename).
+-          append(", canSkipChecksum=").append(canSkipChecksum).
+-          append(")").toString();
+-      LOG.info(traceString + ": starting");
+-    }
+-    int nRead;
++    boolean canSkipChecksum = createNoChecksumContext();
+-      if (canSkipChecksum && zeroReadaheadRequested) {
+-        nRead = readWithoutBounceBuffer(buf);
+-      } else {
+-        nRead = readWithBounceBuffer(buf, canSkipChecksum);
+-      }
+-    } catch (IOException e) {
++      String traceString = null;
+-        LOG.info(traceString + ": I/O error", e);
++        traceString = new StringBuilder().
++            append("read(").
++            append("buf.remaining=").append(buf.remaining()).
++            append(", block=").append(block).
++            append(", filename=").append(filename).
++            append(", canSkipChecksum=").append(canSkipChecksum).
++            append(")").toString();
++        LOG.info(traceString + ": starting");
+-      throw e;
++      int nRead;
++      try {
++        if (canSkipChecksum && zeroReadaheadRequested) {
++          nRead = readWithoutBounceBuffer(buf);
++        } else {
++          nRead = readWithBounceBuffer(buf, canSkipChecksum);
++        }
++      } catch (IOException e) {
++        if (LOG.isTraceEnabled()) {
++          LOG.info(traceString + ": I/O error", e);
++        }
++        throw e;
++      }
++      if (LOG.isTraceEnabled()) {
++        LOG.info(traceString + ": returning " + nRead);
++      }
++      return nRead;
++    } finally {
++      if (canSkipChecksum) releaseNoChecksumContext();
+-    if (LOG.isTraceEnabled()) {
+-      LOG.info(traceString + ": returning " + nRead);
+-    }
+-    return nRead;
+-    boolean canSkipChecksum = getCanSkipChecksum();
+-    String traceString = null;
+-    if (LOG.isTraceEnabled()) {
+-      traceString = new StringBuilder().
+-          append("read(arr.length=").append(arr.length).
+-          append(", off=").append(off).
+-          append(", len=").append(len).
+-          append(", filename=").append(filename).
+-          append(", block=").append(block).
+-          append(", canSkipChecksum=").append(canSkipChecksum).
+-          append(")").toString();
+-      LOG.trace(traceString + ": starting");
+-    }
++    boolean canSkipChecksum = createNoChecksumContext();
+-      if (canSkipChecksum && zeroReadaheadRequested) {
+-        nRead = readWithoutBounceBuffer(arr, off, len);
+-      } else {
+-        nRead = readWithBounceBuffer(arr, off, len, canSkipChecksum);
+-      }
+-    } catch (IOException e) {
++      String traceString = null;
+-        LOG.trace(traceString + ": I/O error", e);
++        traceString = new StringBuilder().
++            append("read(arr.length=").append(arr.length).
++            append(", off=").append(off).
++            append(", len=").append(len).
++            append(", filename=").append(filename).
++            append(", block=").append(block).
++            append(", canSkipChecksum=").append(canSkipChecksum).
++            append(")").toString();
++        LOG.trace(traceString + ": starting");
+-      throw e;
+-    }
+-    if (LOG.isTraceEnabled()) {
+-      LOG.trace(traceString + ": returning " + nRead);
++      try {
++        if (canSkipChecksum && zeroReadaheadRequested) {
++          nRead = readWithoutBounceBuffer(arr, off, len);
++        } else {
++          nRead = readWithBounceBuffer(arr, off, len, canSkipChecksum);
++        }
++      } catch (IOException e) {
++        if (LOG.isTraceEnabled()) {
++          LOG.trace(traceString + ": I/O error", e);
++        }
++        throw e;
++      }
++      if (LOG.isTraceEnabled()) {
++        LOG.trace(traceString + ": returning " + nRead);
++      }
++    } finally {
++      if (canSkipChecksum) releaseNoChecksumContext();
++  /**
++   * Get or create a memory map for this replica.
++   * 
++   * There are two kinds of ClientMmap objects we could fetch here: one that 
++   * will always read pre-checksummed data, and one that may read data that
++   * hasn't been checksummed.
++   *
++   * If we fetch the former, "safe" kind of ClientMmap, we have to increment
++   * the anchor count on the shared memory slot.  This will tell the DataNode
++   * not to munlock the block until this ClientMmap is closed.
++   * If we fetch the latter, we don't bother with anchoring.
++   *
++   * @param opts     The options to use, such as SKIP_CHECKSUMS.
++   * 
++   * @return         null on failure; the ClientMmap otherwise.
++   */
+-    if ((!opts.contains(ReadOption.SKIP_CHECKSUMS)) &&
+-          verifyChecksum && (!mlocked.get())) {
+-      if (LOG.isTraceEnabled()) {
+-        LOG.trace("can't get an mmap for " + block + " of " + filename + 
+-            " since SKIP_CHECKSUMS was not given, " +
+-            "we aren't skipping checksums, and the block is not mlocked.");
++    boolean anchor = verifyChecksum &&
++        (opts.contains(ReadOption.SKIP_CHECKSUMS) == false);
++    if (anchor) {
++      if (!createNoChecksumContext()) {
++        if (LOG.isTraceEnabled()) {
++          LOG.trace("can't get an mmap for " + block + " of " + filename + 
++              " since SKIP_CHECKSUMS was not given, " +
++              "we aren't skipping checksums, and the block is not mlocked.");
++        }
++        return null;
+-      return null;
+-    return replica.getOrCreateClientMmap();
+-  }
+-
+-  /**
+-   * Set the mlocked state of the BlockReader.
+-   * This method does NOT need to be synchronized because mlocked is atomic.
+-   *
+-   * @param mlocked  the new mlocked state of the BlockReader.
+-   */
+-  public void setMlocked(boolean mlocked) {
+-    this.mlocked.set(mlocked);
++    ClientMmap clientMmap = null;
++    try {
++      clientMmap = replica.getOrCreateClientMmap(anchor);
++    } finally {
++      if ((clientMmap == null) && anchor) {
++        releaseNoChecksumContext();
++      }
++    }
++    return clientMmap;
++  
++  /**
++   * Make the replica anchorable.  Normally this can only be done by the
++   * DataNode.  This method is only for testing.
++   */
++  @VisibleForTesting
++  void forceAnchorable() {
++    replica.getSlot().makeAnchorable();
++  }
++
++  /**
++   * Make the replica unanchorable.  Normally this can only be done by the
++   * DataNode.  This method is only for testing.
++   */
++  @VisibleForTesting
++  void forceUnanchorable() {
++    replica.getSlot().makeUnanchorable();
++  }
+
+INS31 INS31 INS31 INS83 INS39 INS42 INS8 UPD39 UPD42 INS8 INS8 INS29 INS8 INS29 INS78 MOV39 UPD42 MOV42 INS8 INS29 INS78 INS39 INS42 MOV8 INS25 INS25 INS60 INS54 INS60 MOV60 INS54 MOV41 INS65 INS65 INS65 INS60 INS25 INS60 INS54 INS41 MOV65 INS42 INS21 INS65 INS42 INS42 INS8 INS8 INS42 INS8 INS39 INS59 MOV8 INS8 INS39 INS59 MOV8 INS8 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS42 INS66 INS66 INS39 INS59 INS42 MOV8 MOV43 INS59 INS8 INS8 INS42 UPD66 UPD66 INS32 INS66 INS66 INS41 INS41 INS21 INS42 INS32 INS25 INS42 INS32 INS25 INS42 MOV27 MOV36 INS42 INS33 INS21 INS25 INS32 INS42 INS32 UPD42 INS32 INS9 INS32 INS42 INS42 INS21 INS42 INS42 INS21 INS38 INS7 INS27 INS8 INS42 INS42 INS42 UPD42 MOV42 INS42 INS42 UPD42 MOV42 UPD42 MOV42 INS32 INS32 INS27 INS32 INS42 INS32 INS36 INS42 INS21 INS42 INS42 MOV32 INS9 INS42 INS42 INS42 INS42 INS27 INS32 INS42 INS33 INS42 DEL40 DEL26 DEL40 DEL26 DEL40 DEL26 DEL40 DEL26 DEL40 DEL26 DEL83 DEL42 DEL43 DEL42 DEL59 DEL23 DEL83 DEL39 DEL42 DEL59 DEL23 DEL83 DEL42 DEL43 DEL42 DEL42 DEL43 DEL42 DEL44 DEL52 DEL42 DEL22 DEL42 DEL7 DEL21 DEL52 DEL41 DEL8 DEL31 DEL83 DEL42 DEL43 DEL42 DEL39 DEL42 DEL44 DEL52 DEL42 DEL22 DEL42 DEL7 DEL21 DEL52 DEL41 DEL8 DEL31 DEL66 DEL65 DEL29 DEL83 DEL83 DEL42 DEL43 DEL42 DEL59 DEL23 DEL66 DEL65 DEL29 DEL83 DEL83 DEL42 DEL43 DEL42 DEL59 DEL23 DEL83 DEL42 DEL59 DEL23 DEL52 DEL42 DEL22 DEL42 DEL43 DEL40 DEL14 DEL7 DEL21 DEL52 DEL42 DEL22 DEL40 DEL7 DEL21 DEL42 DEL38 DEL36 DEL32 DEL27 DEL41 DEL39 DEL42 DEL42 DEL32 DEL59 DEL60 DEL39 DEL42 DEL42 DEL32 DEL59 DEL60 DEL38 DEL42 DEL42 DEL32 DEL38 DEL36 DEL42 DEL42 DEL32 DEL41 DEL42 DEL66 DEL65 DEL29 DEL83 DEL39 DEL42 DEL44 DEL31 DEL52 DEL42 DEL22

@@ -1,0 +1,277 @@
+JCR-2573 - Performance of AC Evaluation [work in progress]
+
+git-svn-id: https://svn.apache.org/repos/asf/jackrabbit/trunk@950440 13f79535-47bb-0310-9956-ffa450edef68
+
+-import java.security.Principal;
+-import java.util.ArrayList;
+-import java.util.Arrays;
+-import java.util.HashMap;
+-import java.util.HashSet;
+-import java.util.List;
+-import java.util.Map;
+-import java.util.Set;
++import org.apache.commons.collections.map.LRUMap;
++import org.apache.jackrabbit.api.security.principal.PrincipalManager;
++import org.apache.jackrabbit.core.NodeImpl;
++import org.apache.jackrabbit.core.SessionImpl;
++import org.apache.jackrabbit.core.id.ItemId;
++import org.apache.jackrabbit.core.security.SecurityConstants;
++import org.apache.jackrabbit.core.security.authorization.AbstractAccessControlProvider;
++import org.apache.jackrabbit.core.security.authorization.AbstractCompiledPermissions;
++import org.apache.jackrabbit.core.security.authorization.AccessControlConstants;
++import org.apache.jackrabbit.core.security.authorization.AccessControlEditor;
++import org.apache.jackrabbit.core.security.authorization.AccessControlEntryImpl;
++import org.apache.jackrabbit.core.security.authorization.AccessControlListener;
++import org.apache.jackrabbit.core.security.authorization.AccessControlModifications;
++import org.apache.jackrabbit.core.security.authorization.CompiledPermissions;
++import org.apache.jackrabbit.core.security.authorization.Permission;
++import org.apache.jackrabbit.core.security.authorization.PrivilegeRegistry;
++import org.apache.jackrabbit.spi.Path;
++import org.apache.jackrabbit.util.Text;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
+-import javax.jcr.Item;
+-import javax.jcr.observation.Event;
+-import javax.jcr.observation.EventIterator;
+-
+-import org.apache.jackrabbit.api.security.principal.PrincipalManager;
+-import org.apache.jackrabbit.core.ItemImpl;
+-import org.apache.jackrabbit.core.NodeImpl;
+-import org.apache.jackrabbit.core.SessionImpl;
+-import org.apache.jackrabbit.core.observation.SynchronousEventListener;
+-import org.apache.jackrabbit.core.security.SecurityConstants;
+-import org.apache.jackrabbit.core.security.authorization.AbstractAccessControlProvider;
+-import org.apache.jackrabbit.core.security.authorization.AbstractCompiledPermissions;
+-import org.apache.jackrabbit.core.security.authorization.AccessControlConstants;
+-import org.apache.jackrabbit.core.security.authorization.AccessControlEditor;
+-import org.apache.jackrabbit.core.security.authorization.CompiledPermissions;
+-import org.apache.jackrabbit.core.security.authorization.Permission;
+-import org.apache.jackrabbit.core.security.authorization.PrivilegeRegistry;
+-import org.apache.jackrabbit.spi.Path;
+-import org.apache.jackrabbit.spi.commons.name.PathFactoryImpl;
+-import org.apache.jackrabbit.util.Text;
+-import org.slf4j.Logger;
+-import org.slf4j.LoggerFactory;
++import java.security.Principal;
++import java.util.HashMap;
++import java.util.HashSet;
++import java.util.Iterator;
++import java.util.List;
++import java.util.Map;
++import java.util.Set;
++    private NodeImpl acRoot;    
+-    private NodeImpl acRoot;
+-
+-    //-------------------------------------------------< AccessControlUtils >---
+-    /**
+-     * @see org.apache.jackrabbit.core.security.authorization.AccessControlUtils#isAcItem(Path)
+-     */
+-    public boolean isAcItem(Path absPath) throws RepositoryException {
+-        Path.Element[] elems = absPath.getElements();
+-        for (Path.Element elem : elems) {
+-            if (N_POLICY.equals(elem.getName())) {
+-                return true;
+-            }
+-        }
+-        return false;
+-    }
+-
+-    /**
+-     * @see org.apache.jackrabbit.core.security.authorization.AccessControlUtils#isAcItem(ItemImpl)
+-     */
+-    public boolean isAcItem(ItemImpl item) throws RepositoryException {
+-        NodeImpl n = ((item.isNode()) ? (NodeImpl) item : (NodeImpl) item.getParent());
+-        return n.isNodeType(NT_REP_ACL) || n.isNodeType(NT_REP_ACE);
+-    }
++    private EntriesCache entriesCache;
++    private int readBits;
++        entriesCache = new EntriesCache(session, editor, acRoot.getPath());
++        readBits = PrivilegeRegistry.getBits(new Privilege[] {session.getAccessControlManager().privilegeFromName(Privilege.JCR_READ)});
++
++    
++    @Override
++    public void close() {
++        super.close();        
++        entriesCache.close();
++    }
+-           As tmp. solution some default policy is returned indicating.
++           As tmp. solution some default policy is returned instead.
+-            return new ACLProvider.CompiledPermissionImpl(principals);
++            return new CompiledPermissionImpl(principals);
+-            CompiledPermissions cp = new CompiledPermissionImpl(principals, false);
+-            return cp.grants(PathFactoryImpl.getInstance().getRootPath(), Permission.READ);
++            CompiledPermissionImpl cp = new CompiledPermissionImpl(principals, false);
++            return cp.canRead(((NodeImpl) session.getRootNode()).getPrimaryPath());
+-            implements SynchronousEventListener {
++            implements AccessControlListener {
++        private boolean canReadAll;
++
++        private final Map<ItemId, Boolean> readCache = new LRUMap(2000);
++        private final Object monitor = new Object();
++
+-            entries = reload();
++            reload();
+-            // TODO: describe
+-                int events = Event.PROPERTY_CHANGED | Event.PROPERTY_ADDED |
+-                        Event.PROPERTY_REMOVED | Event.NODE_ADDED | Event.NODE_REMOVED;
+-                String[] ntNames = new String[] {
+-                        session.getJCRName(NT_REP_ACE)
+-                };
+-                observationMgr.addEventListener(this, events, acRoot.getPath(), true, null, ntNames, false);
++                /*
++                 Make sure this AclPermission recalculates the permissions if
++                 any ACL concerning it is modified.
++                 */
++                 entriesCache.addListener(this);
++            }
++        }
++               
++        /**
++         * @throws RepositoryException if an error occurs
++         */
++        private void reload() throws RepositoryException {
++            // reload the paths
++            acPaths.clear();
++            for (Principal p : principals) {
++                acPaths.add(editor.getPathToAcNode(p));
++            }
++
++            // and retrieve the entries from the entry-collector.
++            entries = entriesCache.getEntries(principals);
++            
++            // in addition: trivial check if read access is deny somewhere
++            // as as shortcut in #canRead(Path)
++            canReadAll = canRead(session.getQPath("/"));            
++            if (canReadAll) {
++                for (AccessControlEntry entry : entries) {
++                    AccessControlEntryImpl ace = (AccessControlEntryImpl) entry;
++                    if (!ace.isAllow() && ((ace.getPrivilegeBits() & readBits) == readBits)) {
++                        // found an ace that defines read deny for a sub tree
++                        // -> canReadAll is false.
++                        canReadAll = false;
++                        break;
++                    }
++                }
+-            Result result;
+-            if (session.itemExists(jcrPath)) {
+-                Item item = session.getItem(jcrPath);
+-                result = getResult(item, item.getPath(), isAcItem);
+-            } else {
+-                result = getResult(null, jcrPath, isAcItem);
+-            }
+-            return result;
++            return buildResult(jcrPath, isAcItem);
+-         *
+-         * @param target Existing target item for which the permissions will be
+-         * evaluated or <code>null</code>.
++         * 
+-        private Result getResult(Item target,
+-                                 String targetPath,
+-                                 boolean isAcItem) throws RepositoryException {
++        private Result buildResult(String targetPath,
++                                   boolean isAcItem) throws RepositoryException {
+-                boolean matches = (target != null) ? entr.matches(target) : entr.matches(targetPath);
++                boolean matches = entr.matches(targetPath);
+-            try {
+-                observationMgr.removeEventListener(this);
+-            } catch (RepositoryException e) {
+-                log.debug("Unable to unregister listener: ", e.getMessage());
+-            }
++            entriesCache.removeListener(this);
+-        //--------------------------------------------------< EventListener >---
+-         * @see javax.jcr.observation.EventListener#onEvent(EventIterator)
++         * @see CompiledPermissions#canRead(Path, ItemId)
+-        public synchronized void onEvent(EventIterator events) {
++        public boolean canRead(Path path, ItemId itemId) throws RepositoryException {
++            boolean canRead;
++            if (path == null) {
++                // only itemId: try to avoid expensive resolution from itemID to path
++                synchronized (monitor) {
++                    if (readCache.containsKey(itemId)) {
++                        // id has been evaluated before -> shortcut
++                        canRead = readCache.get(itemId);
++                    } else {
++                        canRead = canRead(session.getHierarchyManager().getPath(itemId));
++                        readCache.put(itemId, canRead);
++                        return canRead;
++                    }
++                }
++            } else {
++                // path param present:
++                canRead = canRead(path);
++            }
++            return canRead;
++        }
++
++        private boolean canRead(Path path) throws RepositoryException {
++            // first try if reading non-ac-items was always granted -> no eval
++            // otherwise evaluate the permissions.
++            return (canReadAll && !isAcItem(path)) || grants(path, Permission.READ);
++        }
++
++        //------------------------------------------< AccessControlListener >---
++        /**
++         * @see AccessControlListener#acModified(org.apache.jackrabbit.core.security.authorization.AccessControlModifications)
++         */
++        public void acModified(AccessControlModifications modifications) {
+-                while (events.hasNext() && !reload) {
+-                    Event ev = events.nextEvent();
+-                    String path = ev.getPath();
+-                    // only invalidate cache if any of the events affects the
+-                    // nodes defining permissions for the principals.
+-                    switch (ev.getType()) {
+-                        case Event.NODE_ADDED:
+-                        case Event.NODE_REMOVED:
+-                        case Event.NODE_MOVED:
+-                            reload = acPaths.contains(Text.getRelativeParent(path, 2));
+-                            break;
+-                        case Event.PROPERTY_ADDED:
+-                        case Event.PROPERTY_CHANGED:
+-                        case Event.PROPERTY_REMOVED:
+-                            reload = acPaths.contains(Text.getRelativeParent(path, 3));
+-                            break;
+-
+-                        default:
+-                            // illegal event-type: should never occur. ignore
+-                            break;
+-                    }
++                Iterator keys = modifications.getNodeIdentifiers().iterator();
++                while (keys.hasNext() && !reload) {
++                    String path = keys.next().toString();
++                    reload = acPaths.contains(path);
+-                    // reload the acl
+-                    entries = reload();
++                    // reload the ac-path list and the list of aces
++                    reload();
+-
+-        /**
+-         *
+-         * @return the aces
+-         * @throws RepositoryException if an error occurs
+-         */
+-        private List<AccessControlEntry> reload() throws RepositoryException {
+-            // reload the paths
+-            acPaths.clear();
+-
+-            // acNodes must be ordered in the same order as the principals
+-            // in order to obtain proper acl-evaluation in case the given
+-            // principal-set is ordered.
+-            List<AccessControlEntry> allACEs = new ArrayList<AccessControlEntry>();
+-            // build acl-hierarchy assuming that principal-order determines the
+-            // acl-inheritance.
+-            for (Principal p : principals) {
+-                ACLTemplate acl = editor.getACL(p);
+-                if (acl == null || acl.isEmpty()) {
+-                    acPaths.add(editor.getPathToAcNode(p));
+-                } else {
+-                    // retrieve the ACEs from the node
+-                    AccessControlEntry[] aces = acl.getAccessControlEntries();
+-                    allACEs.addAll(Arrays.asList(aces));
+-                    acPaths.add(acl.getPath());
+-                }
+-            }
+-
+-            return allACEs;
+-        }
+
+MOV26 MOV26 MOV26 MOV26 MOV26 MOV26 MOV26 MOV26 MOV26 MOV26 MOV26 MOV26 MOV26 MOV26 MOV26 MOV26 MOV26 MOV26 MOV26 MOV26 MOV26 MOV26 MOV23 MOV31 UPD40 UPD40 UPD40 UPD40 UPD40 UPD40 INS23 INS23 MOV31 INS83 INS43 INS59 INS83 INS39 INS59 INS78 UPD39 UPD42 UPD43 INS23 INS23 INS23 INS31 INS31 INS31 INS31 UPD42 MOV42 UPD42 MOV42 INS42 INS21 INS21 INS42 INS21 INS21 UPD42 INS83 INS39 INS59 INS83 INS83 INS74 INS59 INS83 INS83 INS43 INS59 MOV29 UPD83 UPD42 MOV43 UPD42 MOV29 MOV78 INS83 INS39 INS42 INS8 MOV29 MOV83 UPD39 MOV39 UPD42 MOV42 MOV44 INS44 MOV43 INS8 MOV83 INS39 INS42 INS44 MOV43 INS8 INS29 INS83 INS39 INS42 INS44 INS8 INS7 INS7 INS48 INS32 INS42 INS43 INS43 INS43 INS42 INS14 INS42 INS42 INS14 MOV21 INS70 INS21 MOV21 INS25 INS41 INS21 MOV21 UPD43 UPD42 INS43 INS42 MOV60 INS25 INS41 INS43 INS42 INS41 INS65 INS43 INS42 INS54 INS42 INS14 INS42 INS32 INS42 UPD42 MOV42 UPD42 MOV42 INS42 INS42 INS42 INS43 INS34 INS43 MOV32 MOV44 INS42 MOV8 INS7 INS7 INS42 INS8 INS32 INS32 UPD42 INS42 INS39 INS27 INS8 INS8 INS42 UPD42 MOV42 INS27 INS68 UPD42 MOV42 INS8 MOV12 INS43 INS42 INS42 MOV32 INS42 INS42 INS3 UPD43 INS42 INS42 INS42 INS32 INS42 INS32 INS70 UPD42 MOV42 MOV42 MOV42 INS42 INS42 INS52 INS42 INS42 INS69 UPD42 INS42 INS33 INS51 INS21 INS36 INS32 INS42 INS42 INS69 MOV60 MOV60 INS61 MOV25 INS42 INS5 INS4 UPD42 UPD42 INS42 INS42 INS42 INS42 INS32 INS44 INS42 INS8 INS43 INS42 INS8 MOV7 INS27 INS42 INS42 INS40 INS43 UPD43 INS27 INS8 INS43 INS85 INS32 UPD43 INS36 UPD42 UPD42 UPD42 UPD42 MOV42 UPD42 MOV42 INS45 UPD43 MOV43 UPD42 MOV42 INS60 INS25 MOV32 INS42 INS25 UPD42 INS42 INS38 INS40 UPD42 UPD42 MOV32 MOV38 MOV60 INS21 INS42 INS32 INS42 INS40 INS42 INS11 UPD42 INS43 INS59 INS27 INS8 INS32 INS8 INS8 UPD42 MOV42 INS32 INS32 UPD42 UPD42 UPD42 MOV43 INS7 MOV32 INS42 INS42 MOV43 INS32 INS42 INS42 INS11 INS38 INS36 INS21 INS10 UPD42 MOV42 UPD42 MOV42 INS42 INS21 INS21 INS21 INS41 INS42 INS42 UPD42 MOV42 UPD42 MOV42 UPD42 INS42 INS32 UPD42 MOV42 UPD42 MOV42 INS43 INS42 INS32 INS27 INS7 INS7 MOV7 INS32 INS42 INS32 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 INS42 INS42 INS42 INS36 INS42 INS42 INS9 INS42 INS32 UPD42 INS42 INS42 INS42 INS42 UPD42 MOV42 INS42 INS27 UPD42 MOV42 UPD42 MOV42 INS42 UPD42 INS32 INS42 INS32 UPD42 INS42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 DEL40 DEL26 DEL40 DEL26 DEL83 DEL39 DEL42 DEL43 DEL42 DEL44 DEL40 DEL43 DEL85 DEL5 DEL42 DEL42 DEL32 DEL59 DEL60 DEL40 DEL43 DEL42 DEL44 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL32 DEL9 DEL41 DEL8 DEL25 DEL8 DEL70 DEL9 DEL41 DEL8 DEL31 DEL40 DEL42 DEL42 DEL43 DEL69 DEL68 DEL65 DEL29 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL42 DEL42 DEL32 DEL36 DEL42 DEL43 DEL42 DEL11 DEL42 DEL42 DEL32 DEL11 DEL16 DEL36 DEL59 DEL60 DEL42 DEL32 DEL42 DEL42 DEL42 DEL32 DEL27 DEL41 DEL40 DEL32 DEL40 DEL42 DEL7 DEL39 DEL42 DEL40 DEL40 DEL40 DEL40 DEL40 DEL27 DEL59 DEL60 DEL42 DEL43 DEL85 DEL5 DEL42 DEL42 DEL43 DEL85 DEL5 DEL42 DEL42 DEL42 DEL32 DEL4 DEL3 DEL59 DEL60 DEL42 DEL9 DEL33 DEL42 DEL9 DEL66 DEL65 DEL52 DEL32 DEL8 DEL44 DEL42 DEL42 DEL45 DEL32 DEL32 DEL21 DEL8 DEL12 DEL54 DEL42 DEL43 DEL42 DEL59 DEL60 DEL42 DEL42 DEL42 DEL32 DEL42 DEL43 DEL42 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL42 DEL32 DEL7 DEL21 DEL8 DEL42 DEL33 DEL32 DEL7 DEL21 DEL8 DEL25 DEL42 DEL41 DEL42 DEL66 DEL66 DEL65 DEL42 DEL43 DEL42 DEL44 DEL42 DEL33 DEL27 DEL36 DEL42 DEL42 DEL42 DEL32 DEL16 DEL40 DEL42 DEL42 DEL43 DEL42 DEL42 DEL32 DEL42 DEL34 DEL42 DEL42 DEL42 DEL34 DEL32 DEL42 DEL43 DEL85 DEL5 DEL42 DEL7 DEL40 DEL42 DEL42 DEL43 DEL69 DEL68 DEL65 DEL29 DEL83 DEL42 DEL42 DEL32 DEL27 DEL42 DEL32 DEL59 DEL60 DEL32 DEL40 DEL49 DEL40 DEL49 DEL40 DEL49 DEL21 DEL10 DEL40 DEL49 DEL40 DEL49 DEL40 DEL49 DEL21 DEL10 DEL49 DEL10 DEL50 DEL8 DEL61 DEL8 DEL54 DEL8 DEL31 DEL42 DEL43 DEL43 DEL74 DEL42 DEL42 DEL43 DEL42 DEL43 DEL74 DEL42 DEL42 DEL43 DEL43 DEL74 DEL14 DEL59 DEL60 DEL42 DEL42 DEL33 DEL27 DEL27 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL32 DEL21 DEL42 DEL32 DEL32 DEL21 DEL8 DEL25 DEL8 DEL70 DEL42 DEL41 DEL8 DEL31

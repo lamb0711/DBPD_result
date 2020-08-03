@@ -1,0 +1,125 @@
+HDDS-273. DeleteLog entries should be purged only after corresponding DNs commit the transaction. Contributed by Lokesh Jain.
+
++import org.apache.hadoop.hdds.protocol.DatanodeDetails;
++import org.apache.hadoop.hdds.protocol.proto
++    .StorageContainerDatanodeProtocolProtos.ContainerBlocksDeletionACKProto
++    .DeleteBlockTransactionResult;
++import org.apache.hadoop.hdds.scm.container.Mapping;
+-import org.apache.hadoop.utils.MetadataKeyFilters.MetadataKeyFilter;
++import org.eclipse.jetty.util.ConcurrentHashSet;
+-import java.util.ArrayList;
++import java.util.Collection;
++import java.util.Set;
++import java.util.concurrent.ConcurrentHashMap;
++import java.util.UUID;
++import java.util.stream.Collectors;
++  private final Mapping containerManager;
+-  private long lastReadTxID;
++  // Maps txId to set of DNs which are successful in committing the transaction
++  private Map<Long, Set<UUID>> transactionToDNsCommitMap;
+-  public DeletedBlockLogImpl(Configuration conf) throws IOException {
++  public DeletedBlockLogImpl(Configuration conf, Mapping containerManager)
++      throws IOException {
++    this.containerManager = containerManager;
+-    lastReadTxID = 0;
++
++    // transactionToDNsCommitMap is updated only when
++    // transaction is added to the log and when it is removed.
++
++    // maps transaction to dns which have committed it.
++    transactionToDNsCommitMap = new ConcurrentHashMap<>();
+-  public List<DeletedBlocksTransaction> getTransactions(
+-      int count) throws IOException {
+-    List<DeletedBlocksTransaction> result = new ArrayList<>();
+-    MetadataKeyFilter getNextTxID = (preKey, currentKey, nextKey)
+-        -> Longs.fromByteArray(currentKey) > lastReadTxID;
+-    MetadataKeyFilter avoidInvalidTxid = (preKey, currentKey, nextKey)
+-        -> !Arrays.equals(LATEST_TXID, currentKey);
+-    lock.lock();
+-    try {
+-      deletedStore.iterate(null, (key, value) -> {
+-        if (getNextTxID.filterKey(null, key, null) &&
+-            avoidInvalidTxid.filterKey(null, key, null)) {
+-          DeletedBlocksTransaction block = DeletedBlocksTransaction
+-              .parseFrom(value);
+-          if (block.getCount() > -1 && block.getCount() <= maxRetry) {
+-            result.add(block);
+-          }
+-        }
+-        return result.size() < count;
+-      });
+-      // Scan the metadata from the beginning.
+-      if (result.size() < count || result.size() < 1) {
+-        lastReadTxID = 0;
+-      } else {
+-        lastReadTxID = result.get(result.size() - 1).getTxID();
+-      }
+-    } finally {
+-      lock.unlock();
+-    }
+-    return result;
+-  }
+-
+-  @Override
+-   * @param txIDs - transaction IDs.
++   * @param transactionResults - transaction IDs.
++   * @param dnID - Id of Datanode which has acknowledged a delete block command.
+-  public void commitTransactions(List<Long> txIDs) throws IOException {
++  public void commitTransactions(
++      List<DeleteBlockTransactionResult> transactionResults, UUID dnID) {
+-      for (Long txID : txIDs) {
++      Set<UUID> dnsWithCommittedTxn;
++      for (DeleteBlockTransactionResult transactionResult : transactionResults) {
++        if (isTransactionFailed(transactionResult)) {
++          continue;
++        }
+-          deletedStore.delete(Longs.toByteArray(txID));
+-        } catch (IOException ex) {
+-          LOG.warn("Cannot commit txID " + txID, ex);
++          long txID = transactionResult.getTxID();
++          // set of dns which have successfully committed transaction txId.
++          dnsWithCommittedTxn = transactionToDNsCommitMap.get(txID);
++          Long containerId = transactionResult.getContainerID();
++          if (dnsWithCommittedTxn == null || containerId == null) {
++            LOG.warn("Transaction txId={} commit by dnId={} failed."
++                + " Corresponding entry not found.", txID, dnID);
++            return;
++          }
++
++          dnsWithCommittedTxn.add(dnID);
++          Collection<DatanodeDetails> containerDnsDetails =
++              containerManager.getContainerWithPipeline(containerId)
++                  .getPipeline().getDatanodes().values();
++          // The delete entry can be safely removed from the log if all the
++          // corresponding nodes commit the txn.
++          if (dnsWithCommittedTxn.size() >= containerDnsDetails.size()) {
++            List<UUID> containerDns = containerDnsDetails.stream()
++                .map(dnDetails -> dnDetails.getUuid())
++                .collect(Collectors.toList());
++            if (dnsWithCommittedTxn.containsAll(containerDns)) {
++              transactionToDNsCommitMap.remove(txID);
++              LOG.debug("Purging txId={} from block deletion log", txID);
++              deletedStore.delete(Longs.toByteArray(txID));
++            }
++          }
++        } catch (IOException e) {
++          LOG.warn("Could not commit delete block transaction: " +
++              transactionResult.getTxID(), e);
++  private boolean isTransactionFailed(DeleteBlockTransactionResult result) {
++    if (LOG.isDebugEnabled()) {
++      LOG.debug(
++          "Got block deletion ACK from datanode, TXIDs={}, " + "success={}",
++          result.getTxID(), result.getSuccess());
++    }
++    if (!result.getSuccess()) {
++      LOG.warn("Got failed ACK for TXID={}, prepare to resend the "
++          + "TX in next interval", result.getTxID());
++      return true;
++    }
++    return false;
++  }
++
+-            transactions.addTransaction(block);
++            Set<UUID> dnsWithTransactionCommitted = transactionToDNsCommitMap
++                .putIfAbsent(block.getTxID(), new ConcurrentHashSet<>());
++            transactions.addTransaction(block, dnsWithTransactionCommitted);

@@ -1,0 +1,401 @@
+YARN-7259. Add size-based rolling policy to LogAggregationIndexedFileController. (xgong via wangda)
+
+Change-Id: Ifaf82c0aee6b73b9b6ebf103aa72e131e3942f31
+
++import java.security.MessageDigest;
++import java.security.NoSuchAlgorithmException;
+-import java.util.UUID;
++import org.apache.hadoop.fs.RemoteIterator;
++import org.apache.hadoop.yarn.util.Clock;
++import org.apache.hadoop.yarn.util.SystemClock;
+-  private static final int UUID_LENGTH = 36;
++  private static final String LOG_ROLL_OVER_MAX_FILE_SIZE_GB =
++      "indexedFile.log.roll-over.max-file-size-gb";
+-  private String uuid = null;
++  private byte[] uuid = null;
++  private final int UUID_LENGTH = 32;
++  private long logRollOverMaxFileSize;
++  private Clock sysClock;
++    this.logRollOverMaxFileSize = getRollOverLogMaxSize(conf);
++    this.sysClock = getSystemClock();
++    final ApplicationId appId = context.getAppId();
+-    logAggregationTimeInThisCycle = System.currentTimeMillis();
++    logAggregationTimeInThisCycle = this.sysClock.getTime();
+-          boolean fileExist = fc.util().exists(remoteLogFile);
+-          if (fileExist && context.isLogAggregationInRolling()) {
+-            fsDataOStream = fc.create(remoteLogFile,
+-                EnumSet.of(CreateFlag.APPEND),
+-                new Options.CreateOpts[] {});
+-            if (uuid == null) {
+-              FSDataInputStream fsDataInputStream = null;
+-              try {
+-                fsDataInputStream = fc.open(remoteLogFile);
+-                byte[] b = new byte[UUID_LENGTH];
+-                int actual = fsDataInputStream.read(b);
+-                if (actual != UUID_LENGTH) {
+-                  // Get an error when parse the UUID from existed log file.
+-                  // Simply OverWrite the existed log file and re-create the
+-                  // UUID.
+-                  fsDataOStream = fc.create(remoteLogFile,
+-                      EnumSet.of(CreateFlag.OVERWRITE),
+-                          new Options.CreateOpts[] {});
+-                  uuid = UUID.randomUUID().toString();
+-                  fsDataOStream.write(uuid.getBytes(Charset.forName("UTF-8")));
+-                  fsDataOStream.flush();
+-                } else {
+-                  uuid = new String(b, Charset.forName("UTF-8"));
+-                }
+-              } finally {
+-                IOUtils.cleanupWithLogger(LOG, fsDataInputStream);
+-              }
+-            }
+-            // if the remote log file exists, but we do not have any
+-            // indexedLogsMeta. We need to re-load indexedLogsMeta from
+-            // the existing remote log file. If the re-load fails, we simply
+-            // re-create a new indexedLogsMeta object. And will re-load
+-            // the indexedLogsMeta from checksum file later.
+-            if (indexedLogsMeta == null) {
+-              try {
+-                indexedLogsMeta = loadIndexedLogsMeta(remoteLogFile);
+-              } catch (IOException ex) {
+-                // DO NOTHING
+-              }
+-            }
+-          } else {
+-            fsDataOStream = fc.create(remoteLogFile,
+-                EnumSet.of(CreateFlag.CREATE, CreateFlag.OVERWRITE),
+-                new Options.CreateOpts[] {});
+-            if (uuid == null) {
+-              uuid = UUID.randomUUID().toString();
+-            }
+-            byte[] b = uuid.getBytes(Charset.forName("UTF-8"));
+-            fsDataOStream.write(b);
+-            fsDataOStream.flush();
+-          }
+-          final long currentAggregatedLogFileLength = fc
+-              .getFileStatus(remoteLogFile).getLen();
+-          // only check the check-sum file when we are in append mode
++          Path aggregatedLogFile = null;
+-            // check whether the checksum file exists to figure out
+-            // whether the previous log aggregation process is successful
+-            // and the aggregated log file is corrupted or not.
+-            remoteLogCheckSumFile = new Path(remoteLogFile.getParent(),
+-                (remoteLogFile.getName() + CHECK_SUM_FILE_SUFFIX));
+-            boolean exist = fc.util().exists(remoteLogCheckSumFile);
+-            if (!exist) {
+-              FSDataOutputStream checksumFileOutputStream = null;
+-              try {
+-                checksumFileOutputStream = fc.create(remoteLogCheckSumFile,
+-                    EnumSet.of(CreateFlag.CREATE, CreateFlag.OVERWRITE),
+-                    new Options.CreateOpts[] {});
+-                checksumFileOutputStream.writeLong(
+-                    currentAggregatedLogFileLength);
+-              } finally {
+-                IOUtils.cleanupWithLogger(LOG, checksumFileOutputStream);
+-              }
+-            } else {
+-              FSDataInputStream checksumFileInputStream = null;
+-              try {
+-                checksumFileInputStream = fc.open(remoteLogCheckSumFile);
+-                long endIndex = checksumFileInputStream.readLong();
+-                IndexedLogsMeta recoveredLogsMeta = loadIndexedLogsMeta(
+-                    remoteLogFile, endIndex);
+-                if (recoveredLogsMeta == null) {
+-                  indexedLogsMeta.getLogMetas().clear();
+-                } else {
+-                  indexedLogsMeta = recoveredLogsMeta;
+-                }
+-              } finally {
+-                IOUtils.cleanupWithLogger(LOG, checksumFileInputStream);
+-              }
++            aggregatedLogFile = initializeWriterInRolling(
++                remoteLogFile, appId, nodeId);
++          } else {
++            aggregatedLogFile = remoteLogFile;
++            fsDataOStream = fc.create(remoteLogFile,
++                EnumSet.of(CreateFlag.CREATE, CreateFlag.OVERWRITE),
++                new Options.CreateOpts[] {});
++            if (uuid == null) {
++              uuid = createUUID(appId);
++            fsDataOStream.write(uuid);
++            fsDataOStream.flush();
++
++          long aggregatedLogFileLength = fc.getFileStatus(
++              aggregatedLogFile).getLen();
+-          if (fsDataOStream.getPos() >= (currentAggregatedLogFileLength
++          if (fsDataOStream.getPos() >= (aggregatedLogFileLength
+-            currentOffSet = currentAggregatedLogFileLength;
++            currentOffSet = aggregatedLogFileLength;
++  private Path initializeWriterInRolling(final Path remoteLogFile,
++      final ApplicationId appId, final String nodeId) throws Exception {
++    Path aggregatedLogFile = null;
++    // check uuid
++    // if we can not find uuid, we would load the uuid
++    // from previous aggregated log files, and at the same
++    // time, we would delete any aggregated log files which
++    // has invalid uuid.
++    if (uuid == null) {
++      uuid = loadUUIDFromLogFile(fc, remoteLogFile.getParent(),
++            appId, nodeId);
++    }
++    Path currentRemoteLogFile = getCurrentRemoteLogFile(
++        fc, remoteLogFile.getParent(), nodeId);
++    // check checksum file
++    boolean overwriteCheckSum = true;
++    remoteLogCheckSumFile = new Path(remoteLogFile.getParent(),
++        (remoteLogFile.getName() + CHECK_SUM_FILE_SUFFIX));
++    if(fc.util().exists(remoteLogCheckSumFile)) {
++      // if the checksum file exists, we should reset cached
++      // indexedLogsMeta.
++      indexedLogsMeta.getLogMetas().clear();
++      if (currentRemoteLogFile != null) {
++        FSDataInputStream checksumFileInputStream = null;
++        try {
++          checksumFileInputStream = fc.open(remoteLogCheckSumFile);
++          int nameLength = checksumFileInputStream.readInt();
++          byte[] b = new byte[nameLength];
++          int actualLength = checksumFileInputStream.read(b);
++          if (actualLength == nameLength) {
++            String recoveredLogFile = new String(
++                b, Charset.forName("UTF-8"));
++            if (recoveredLogFile.equals(
++                currentRemoteLogFile.getName())) {
++              overwriteCheckSum = false;
++              long endIndex = checksumFileInputStream.readLong();
++              IndexedLogsMeta recoveredLogsMeta = null;
++              try {
++                truncateFileWithRetries(fc, currentRemoteLogFile,
++                    endIndex);
++                recoveredLogsMeta = loadIndexedLogsMeta(
++                    currentRemoteLogFile);
++              } catch (Exception ex) {
++                recoveredLogsMeta = loadIndexedLogsMeta(
++                    currentRemoteLogFile, endIndex);
++              }
++              if (recoveredLogsMeta != null) {
++                indexedLogsMeta = recoveredLogsMeta;
++              }
++            }
++          }
++        } finally {
++          IOUtils.cleanupWithLogger(LOG, checksumFileInputStream);
++        }
++      }
++    }
++    // check whether we need roll over old logs
++    if (currentRemoteLogFile == null || isRollover(
++        fc, currentRemoteLogFile)) {
++      indexedLogsMeta.getLogMetas().clear();
++      overwriteCheckSum = true;
++      aggregatedLogFile = new Path(remoteLogFile.getParent(),
++          remoteLogFile.getName() + "_" + sysClock.getTime());
++      fsDataOStream = fc.create(aggregatedLogFile,
++          EnumSet.of(CreateFlag.CREATE, CreateFlag.OVERWRITE),
++          new Options.CreateOpts[] {});
++      // writes the uuid
++      fsDataOStream.write(uuid);
++      fsDataOStream.flush();
++    } else {
++      aggregatedLogFile = currentRemoteLogFile;
++      fsDataOStream = fc.create(currentRemoteLogFile,
++          EnumSet.of(CreateFlag.CREATE, CreateFlag.APPEND),
++          new Options.CreateOpts[] {});
++    }
++    // recreate checksum file if needed before aggregate the logs
++    if (overwriteCheckSum) {
++      final long currentAggregatedLogFileLength = fc
++          .getFileStatus(aggregatedLogFile).getLen();
++      FSDataOutputStream checksumFileOutputStream = null;
++      try {
++        checksumFileOutputStream = fc.create(remoteLogCheckSumFile,
++            EnumSet.of(CreateFlag.CREATE, CreateFlag.OVERWRITE),
++            new Options.CreateOpts[] {});
++        String fileName = aggregatedLogFile.getName();
++        checksumFileOutputStream.writeInt(fileName.length());
++        checksumFileOutputStream.write(fileName.getBytes(
++            Charset.forName("UTF-8")));
++        checksumFileOutputStream.writeLong(
++            currentAggregatedLogFileLength);
++        checksumFileOutputStream.flush();
++      } finally {
++        IOUtils.cleanupWithLogger(LOG, checksumFileOutputStream);
++      }
++    }
++    return aggregatedLogFile;
++  }
++
+-    byte[] separator = this.uuid.getBytes(Charset.forName("UTF-8"));
+-    this.fsDataOStream.write(separator);
++    this.fsDataOStream.write(uuid);
++  private void deleteFileWithRetries(final FileContext fileContext,
++      final Path deletePath) throws Exception {
++    new FSAction<Void>() {
++      @Override
++      public Void run() throws Exception {
++        if (fileContext.util().exists(deletePath)) {
++          fileContext.delete(deletePath, false);
++        }
++        return null;
++      }
++    }.runWithRetries();
++  }
++
++  private void truncateFileWithRetries(final FileContext fileContext,
++      final Path truncatePath, final long newLength) throws Exception {
++    new FSAction<Void>() {
++      @Override
++      public Void run() throws Exception {
++        fileContext.truncate(truncatePath, newLength);
++        return null;
++      }
++    }.runWithRetries();
++  }
++
+-    Map<String, FileStatus> checkSumFiles = filterFiles(
+-        nodeFiles, CHECK_SUM_FILE_SUFFIX);
++    Map<String, Long> checkSumFiles = parseCheckSumFiles(nodeFiles);
+-      FileStatus checkSum = getAllChecksumFiles(checkSumFiles,
+-          thisNodeFile.getPath().getName());
++      Long checkSumIndex = checkSumFiles.get(nodeName);
+-      if (checkSum != null) {
+-        endIndex = loadIndexedLogsCheckSum(checkSum.getPath());
++      if (checkSumIndex != null) {
++        endIndex = checkSumIndex.longValue();
+-    Map<String, FileStatus> checkSumFiles = filterFiles(
+-        nodeFiles, CHECK_SUM_FILE_SUFFIX);
++    Map<String, Long> checkSumFiles = parseCheckSumFiles(nodeFiles);
+-        FileStatus checkSum = getAllChecksumFiles(checkSumFiles,
++        Long checkSumIndex = checkSumFiles.get(
+-        if (checkSum != null) {
+-          endIndex = loadIndexedLogsCheckSum(checkSum.getPath());
++        if (checkSumIndex != null) {
++          endIndex = checkSumIndex.longValue();
+-  public Map<String, FileStatus> filterFiles(
+-      List<FileStatus> fileList, final String suffix) throws IOException {
+-    Map<String, FileStatus> checkSumFiles = new HashMap<>();
++  public Map<String, Long> parseCheckSumFiles(
++      List<FileStatus> fileList) throws IOException {
++    Map<String, Long> checkSumFiles = new HashMap<>();
+-                suffix);
++                CHECK_SUM_FILE_SUFFIX);
++    FileContext fc = null;
+-      checkSumFiles.put(file.getPath().getName(), file);
++      FSDataInputStream checksumFileInputStream = null;
++      try {
++        if (fc == null) {
++          fc = FileContext.getFileContext(file.getPath().toUri(), conf);
++        }
++        String nodeName = null;
++        long index = 0L;
++        checksumFileInputStream = fc.open(file.getPath());
++        int nameLength = checksumFileInputStream.readInt();
++        byte[] b = new byte[nameLength];
++        int actualLength = checksumFileInputStream.read(b);
++        if (actualLength == nameLength) {
++          nodeName = new String(b, Charset.forName("UTF-8"));
++          index = checksumFileInputStream.readLong();
++        } else {
++          continue;
++        }
++        if (nodeName != null && !nodeName.isEmpty()) {
++          checkSumFiles.put(nodeName, Long.valueOf(index));
++        }
++      } catch (IOException ex) {
++        continue;
++      } finally {
++        IOUtils.cleanupWithLogger(LOG, checksumFileInputStream);
++      }
+-  @Private
+-  public long loadIndexedLogsCheckSum(Path remoteLogCheckSumPath)
+-      throws IOException {
+-    FileContext fileContext =
+-        FileContext.getFileContext(remoteLogCheckSumPath.toUri(), conf);
+-    FSDataInputStream fsDataIStream = null;
+-    try {
+-      fsDataIStream = fileContext.open(remoteLogCheckSumPath);
+-      return fsDataIStream.readLong();
+-    } finally {
+-      IOUtils.cleanupWithLogger(LOG, fsDataIStream);
+-    }
+-  }
+-
++  @Private
++  @VisibleForTesting
++  public long getRollOverLogMaxSize(Configuration conf) {
++    return 1024L * 1024 * 1024 * conf.getInt(
++        LOG_ROLL_OVER_MAX_FILE_SIZE_GB, 10);
++  }
++
++
++  private Path getCurrentRemoteLogFile(final FileContext fc,
++      final Path parent, final String nodeId) throws IOException {
++    RemoteIterator<FileStatus> files = fc.listStatus(parent);
++    long maxTime = 0L;
++    Path returnPath = null;
++    while(files.hasNext()) {
++      FileStatus candidate = files.next();
++      String fileName = candidate.getPath().getName();
++      if (fileName.contains(LogAggregationUtils.getNodeString(nodeId))
++          && !fileName.endsWith(LogAggregationUtils.TMP_FILE_SUFFIX) &&
++          !fileName.endsWith(CHECK_SUM_FILE_SUFFIX)) {
++        if (candidate.getModificationTime() > maxTime) {
++          maxTime = candidate.getModificationTime();
++          returnPath = candidate.getPath();
++        }
++      }
++    }
++    return returnPath;
++  }
++
++  private byte[] loadUUIDFromLogFile(final FileContext fc,
++      final Path parent, final ApplicationId appId, final String nodeId)
++      throws Exception {
++    byte[] id = null;
++    RemoteIterator<FileStatus> files = fc.listStatus(parent);
++    FSDataInputStream fsDataInputStream = null;
++    byte[] uuid = createUUID(appId);
++    while(files.hasNext()) {
++      try {
++        Path checkPath = files.next().getPath();
++        if (checkPath.getName().contains(LogAggregationUtils
++            .getNodeString(nodeId)) && !checkPath.getName()
++                .endsWith(CHECK_SUM_FILE_SUFFIX)) {
++          fsDataInputStream = fc.open(checkPath);
++          byte[] b = new byte[uuid.length];
++          int actual = fsDataInputStream.read(b);
++          if (actual != uuid.length || Arrays.equals(b, uuid)) {
++            deleteFileWithRetries(fc, checkPath);
++          } else if (id == null){
++            id = uuid;
++          }
++        }
++      } finally {
++        IOUtils.cleanupWithLogger(LOG, fsDataInputStream);
++      }
++    }
++    return id == null ? uuid : id;
++  }
++
++  @Private
++  @VisibleForTesting
++  public boolean isRollover(final FileContext fc,
++      final Path candidate) throws IOException {
++    FileStatus fs = fc.getFileStatus(candidate);
++    return fs.getLen() >= this.logRollOverMaxFileSize;
++  }
++
++  @Private
++  @VisibleForTesting
++  public Clock getSystemClock() {
++    return SystemClock.getInstance();
++  }
++
++  private byte[] createUUID(ApplicationId appId) throws IOException {
++    try {
++      MessageDigest digest = MessageDigest.getInstance("SHA-256");
++      return digest.digest(appId.toString().getBytes(
++          Charset.forName("UTF-8")));
++    } catch (NoSuchAlgorithmException ex) {
++      throw new IOException(ex);
++    }
++  }

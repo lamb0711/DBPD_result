@@ -1,0 +1,196 @@
+HDFS-6474. Namenode needs to get the actual keys and iv from the KeyProvider. (wang)
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/branches/fs-encryption@1609833 13f79535-47bb-0310-9956-ffa450edef68
+
++import static org.apache.hadoop.crypto.key.KeyProvider.KeyVersion;
++import java.security.GeneralSecurityException;
++import org.apache.hadoop.crypto.key.KeyProviderCryptoExtension;
+-  private KeyProvider provider = null;
++  private KeyProviderCryptoExtension provider = null;
+-      provider = providers.get(0);
++      provider = KeyProviderCryptoExtension
++          .createKeyProviderCryptoExtension(providers.get(0));
+-   * @param src path of the file
++   * @param srcIIP path of the file
++   * Create a new FileEncryptionInfo for a path. Also chooses an
++   * appropriate CipherSuite to use from the list provided by the
++   * client.
++   *
++   * @param src Target path
++   * @param pathComponents Target path split up into path components
++   * @param cipherSuites List of CipherSuites provided by the client
++   * @return a new FileEncryptionInfo, or null if path is not within an
++   * encryption
++   * zone.
++   * @throws IOException
++   */
++  private FileEncryptionInfo newFileEncryptionInfo(String src,
++      byte[][] pathComponents, List<CipherSuite> cipherSuites)
++      throws IOException {
++    INodesInPath iip = null;
++    CipherSuite suite = null;
++    KeyVersion latestEZKeyVersion = null;
++    readLock();
++    try {
++      src = FSDirectory.resolvePath(src, pathComponents, dir);
++      iip = dir.getINodesInPath4Write(src);
++      // Nothing to do if the path is not within an EZ
++      if (!dir.isInAnEZ(iip)) {
++        return null;
++      }
++      suite = chooseCipherSuite(iip, cipherSuites);
++      if (suite != null) {
++        Preconditions.checkArgument(!suite.equals(CipherSuite.UNKNOWN),
++            "Chose an UNKNOWN CipherSuite!");
++      }
++      latestEZKeyVersion = dir.getLatestKeyVersion(iip);
++    } finally {
++      readUnlock();
++    }
++
++    // If the latest key version is null, need to fetch it and update
++    if (latestEZKeyVersion == null) {
++      latestEZKeyVersion = dir.updateLatestKeyVersion(iip);
++    }
++    Preconditions.checkState(latestEZKeyVersion != null);
++
++    // Generate the EDEK while not holding the lock
++    KeyProviderCryptoExtension.EncryptedKeyVersion edek = null;
++    try {
++      edek = provider.generateEncryptedKey(latestEZKeyVersion);
++    } catch (GeneralSecurityException e) {
++      throw new IOException(e);
++    }
++    Preconditions.checkNotNull(edek);
++
++    return new FileEncryptionInfo(suite, edek.getEncryptedKey().getMaterial(),
++        edek.getIv(), edek.getKeyVersionName());
++  }
++
++  /**
+-    writeLock();
++
++    /*
++     * We want to avoid holding any locks while creating a new
++     * FileEncryptionInfo, since this can be very slow. Since the path can
++     * flip flop between being in an encryption zone and not in the meantime,
++     * we need to recheck the preconditions and generate a new
++     * FileEncryptionInfo in some circumstances.
++     *
++     * A special RetryStartFileException is used to indicate that we should
++     * retry creation of a FileEncryptionInfo.
++     */
+-      checkOperation(OperationCategory.WRITE);
+-      checkNameNodeSafeMode("Cannot create file" + src);
+-      src = FSDirectory.resolvePath(src, pathComponents, dir);
+-      startFileInternal(pc, src, permissions, holder, clientMachine, create,
+-          overwrite, createParent, replication, blockSize, cipherSuites,
+-          logRetryCache);
+-      stat = dir.getFileInfo(src, false);
+-    } catch (StandbyException se) {
+-      skipSync = true;
+-      throw se;
++      boolean shouldContinue = true;
++      int iters = 0;
++      while (shouldContinue) {
++        skipSync = false;
++        if (iters >= 10) {
++          throw new IOException("Too many retries because of encryption zone " +
++              "operations, something might be broken!");
++        }
++        shouldContinue = false;
++        iters++;
++        // Optimistically generate a FileEncryptionInfo for this path.
++        FileEncryptionInfo feInfo =
++            newFileEncryptionInfo(src, pathComponents, cipherSuites);
++
++        // Try to create the file with this feInfo
++        writeLock();
++        try {
++          checkOperation(OperationCategory.WRITE);
++          checkNameNodeSafeMode("Cannot create file" + src);
++          src = FSDirectory.resolvePath(src, pathComponents, dir);
++          startFileInternal(pc, src, permissions, holder, clientMachine, create,
++              overwrite, createParent, replication, blockSize, feInfo,
++              logRetryCache);
++          stat = dir.getFileInfo(src, false);
++        } catch (StandbyException se) {
++          skipSync = true;
++          throw se;
++        } catch (RetryStartFileException e) {
++          shouldContinue = true;
++          if (LOG.isTraceEnabled()) {
++            LOG.trace("Preconditions failed, retrying creation of " +
++                    "FileEncryptionInfo", e);
++          }
++        } finally {
++          writeUnlock();
++        }
++      }
+-      writeUnlock();
+-    } 
++    }
+-      short replication, long blockSize, List<CipherSuite> cipherSuites,
++      short replication, long blockSize, FileEncryptionInfo feInfo,
+-      ParentNotDirectoryException, IOException {
++      ParentNotDirectoryException, RetryStartFileException, IOException {
+-    FileEncryptionInfo feInfo = null;
+-    CipherSuite suite = chooseCipherSuite(iip, cipherSuites);
+-    if (suite != null) {
+-      Preconditions.checkArgument(!suite.equals(CipherSuite.UNKNOWN), 
+-          "Chose an UNKNOWN CipherSuite!");
+-      // TODO: fill in actual key/iv in HDFS-6474
+-      // For now, populate with dummy data
+-      byte[] key = new byte[suite.getAlgorithmBlockSize()];
+-      for (int i = 0; i < key.length; i++) {
+-        key[i] = (byte)i;
++    if (!dir.isInAnEZ(iip)) {
++      // If the path is not in an EZ, we don't need an feInfo.
++      // Null it out in case one was already generated.
++      feInfo = null;
++    } else {
++      // The path is now within an EZ, but no feInfo. Retry.
++      if (feInfo == null) {
++        throw new RetryStartFileException();
+-      byte[] iv = new byte[suite.getAlgorithmBlockSize()];
+-      for (int i = 0; i < iv.length; i++) {
+-        iv[i] = (byte)(3+i*2);
++      // It's in an EZ and we have a provided feInfo. Make sure the
++      // keyVersion of the encryption key used matches one of the keyVersions of
++      // the key of the encryption zone.
++      if (!dir.isValidKeyVersion(iip, feInfo.getEzKeyVersionName())) {
++        throw new RetryStartFileException();
+-      feInfo = new FileEncryptionInfo(suite, key, iv);
++      KeyVersion keyVersion;
+-        keyId = createNewKey(src);
++        keyId = UUID.randomUUID().toString();
++        keyVersion = createNewKey(keyId, src);
+-        if (provider.getCurrentKey(keyId) == null) {
+-
++        keyVersion = provider.getCurrentKey(keyId);
++        if (keyVersion == null) {
+-      createEncryptionZoneInt(src, keyId, cacheEntry != null);
++      createEncryptionZoneInt(src, keyId, keyVersion, cacheEntry != null);
+-    final boolean logRetryCache) throws IOException {
++    final KeyVersion keyVersion, final boolean logRetryCache) throws
++      IOException {
+-      final XAttr keyIdXAttr = dir.createEncryptionZone(src, keyId);
++      final XAttr keyIdXAttr = dir.createEncryptionZone(src, keyId, keyVersion);
+-  private String createNewKey(String src)
++  /**
++   * Create a new key on the KeyProvider for an encryption zone.
++   *
++   * @param keyId id of the key
++   * @param src path of the encryption zone.
++   * @return KeyVersion of the created key
++   * @throws IOException
++   */
++  private KeyVersion createNewKey(String keyId, String src)
+-    final String keyId = UUID.randomUUID().toString();
++    Preconditions.checkNotNull(keyId);
++    Preconditions.checkNotNull(src);
++    KeyVersion version = null;
+-      provider.createKey(keyId, providerOptions);
++      version = provider.createKey(keyId, providerOptions);
+-    return keyId;
++    return version;

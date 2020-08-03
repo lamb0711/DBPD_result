@@ -1,0 +1,192 @@
+HADOOP-16916: ABFS: Delegation SAS generator for integration with Ranger
+
+Contributed by Thomas Marquardt.
+
+DETAILS:
+
+Previously we had a SASGenerator class which generated Service SAS, but we need to add DelegationSASGenerator.
+I separated SASGenerator into a base class and two subclasses ServiceSASGenerator and DelegationSASGenreator.  The
+code in ServiceSASGenerator is copied from SASGenerator but the DelegationSASGenrator code is new.  The
+DelegationSASGenerator code demonstrates how to use Delegation SAS with minimal permissions, as would be used
+by an authorization service such as Apache Ranger.  Adding this to the tests helps us lock in this behavior.
+
+Added a MockDelegationSASTokenProvider for testing User Delegation SAS.
+
+Fixed the ITestAzureBlobFileSystemCheckAccess tests to assume oauth client ID so that they are ignored when that
+is not configured.
+
+To improve performance, AbfsInputStream/AbfsOutputStream re-use SAS tokens until the expiry is within 120 seconds.
+After this a new SAS will be requested.  The default period of 120 seconds can be changed using the configuration
+setting "fs.azure.sas.token.renew.period.for.streams".
+
+The SASTokenProvider operation names were updated to correspond better with the ADLS Gen2 REST API, since these
+operations must be provided tokens with appropriate SAS parameters to succeed.
+
+Support for the version 2.0 AAD authentication endpoint was added to AzureADAuthenticator.
+
+The getFileStatus method was mistakenly calling the ADLS Gen2 Get Properties API which requires read permission
+while the getFileStatus call only requires execute permission.  ADLS Gen2 Get Status API is supposed to be used
+for this purpose, so the underlying AbfsClient.getPathStatus API was updated with a includeProperties
+parameter which is set to false for getFileStatus and true for getXAttr.
+
+Added SASTokenProvider support for delete recursive.
+
+Fixed bugs in AzureBlobFileSystem where public methods were not validating the Path by calling makeQualified.  This is
+necessary to avoid passing null paths and to convert relative paths into absolute paths.
+
+Canonicalized the path used for root path internally so that root path can be used with SAS tokens, which requires
+that the path in the URL and the path in the SAS token match.  Internally the code was using
+"//" instead of "/" for the root path, sometimes.  Also related to this, the AzureBlobFileSystemStore.getRelativePath
+API was updated so that we no longer remove and then add back a preceding forward / to paths.
+
+To run ITestAzureBlobFileSystemDelegationSAS tests follow the instructions in testing_azure.md under the heading
+"To run Delegation SAS test cases".  You also need to set "fs.azure.enable.check.access" to true.
+
+TEST RESULTS:
+
+namespace.enabled=true
+auth.type=SharedKey
+-------------------
+$mvn -T 1C -Dparallel-tests=abfs -Dscale -DtestsThreadCount=8 clean verify
+Tests run: 63, Failures: 0, Errors: 0, Skipped: 0
+Tests run: 432, Failures: 0, Errors: 0, Skipped: 41
+Tests run: 206, Failures: 0, Errors: 0, Skipped: 24
+
+namespace.enabled=false
+auth.type=SharedKey
+-------------------
+$mvn -T 1C -Dparallel-tests=abfs -Dscale -DtestsThreadCount=8 clean verify
+Tests run: 63, Failures: 0, Errors: 0, Skipped: 0
+Tests run: 432, Failures: 0, Errors: 0, Skipped: 244
+Tests run: 206, Failures: 0, Errors: 0, Skipped: 24
+
+namespace.enabled=true
+auth.type=SharedKey
+sas.token.provider.type=MockDelegationSASTokenProvider
+enable.check.access=true
+-------------------
+$mvn -T 1C -Dparallel-tests=abfs -Dscale -DtestsThreadCount=8 clean verify
+Tests run: 63, Failures: 0, Errors: 0, Skipped: 0
+Tests run: 432, Failures: 0, Errors: 0, Skipped: 33
+Tests run: 206, Failures: 0, Errors: 0, Skipped: 24
+
+namespace.enabled=true
+auth.type=OAuth
+-------------------
+$mvn -T 1C -Dparallel-tests=abfs -Dscale -DtestsThreadCount=8 clean verify
+Tests run: 63, Failures: 0, Errors: 0, Skipped: 0
+Tests run: 432, Failures: 0, Errors: 1, Skipped: 74
+Tests run: 206, Failures: 0, Errors: 0, Skipped: 140
+
++import java.nio.charset.StandardCharsets;
+-import java.time.Instant;
+-import org.apache.hadoop.fs.azurebfs.constants.AbfsHttpConstants;
+-import org.apache.hadoop.fs.azurebfs.services.AbfsUriQueryBuilder;
+-
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
+- * Test container SAS generator.
++ * Test SAS generator.
+-public class SASGenerator {
++public abstract class SASGenerator {
+-  private static final String HMAC_SHA256 = "HmacSHA256";
+-  private static final int TOKEN_START_PERIOD_IN_SECONDS = 5 * 60;
+-  private static final int TOKEN_EXPIRY_PERIOD_IN_SECONDS = 24 * 60 * 60;
+-  public static final DateTimeFormatter ISO_8601_UTC_DATE_FORMATTER =
++  public enum AuthenticationVersion {
++    Nov18("2018-11-09"),
++    Dec19("2019-12-12");
++
++    private final String ver;
++
++    AuthenticationVersion(String version) {
++      this.ver = version;
++    }
++
++    @Override
++    public String toString() {
++      return ver;
++    }
++  }
++
++  protected static final Logger LOG = LoggerFactory.getLogger(SASGenerator.class);
++  public static final int FIVE_MINUTES = 5 * 60;
++  public static final int ONE_DAY = 24 * 60 * 60;
++  public static final DateTimeFormatter ISO_8601_FORMATTER =
++
+-  public SASGenerator(byte[] key) {
++  // hide default constructor
++  private SASGenerator() {
++  }
++
++  /**
++   * Called by subclasses to initialize the cryptographic SHA-256 HMAC provider.
++   * @param key - a 256-bit secret key
++   */
++  protected SASGenerator(byte[] key) {
+-  public String getContainerSASWithFullControl(String accountName, String containerName) {
+-    String sp = "rcwdl";
+-    String sv = "2018-11-09";
+-    String sr = "c";
+-    String st = ISO_8601_UTC_DATE_FORMATTER.format(Instant.now().minusSeconds(TOKEN_START_PERIOD_IN_SECONDS));
+-    String se =
+-        ISO_8601_UTC_DATE_FORMATTER.format(Instant.now().plusSeconds(TOKEN_EXPIRY_PERIOD_IN_SECONDS));
+-
+-    String signature = computeSignatureForSAS(sp, st, se, sv, "c",
+-        accountName, containerName);
+-
+-    AbfsUriQueryBuilder qb = new AbfsUriQueryBuilder();
+-    qb.addQuery("sp", sp);
+-    qb.addQuery("st", st);
+-    qb.addQuery("se", se);
+-    qb.addQuery("sv", sv);
+-    qb.addQuery("sr", sr);
+-    qb.addQuery("sig", signature);
+-    return qb.toString().substring(1);
+-  }
+-
+-  private String computeSignatureForSAS(String sp, String st,
+-      String se, String sv, String sr, String accountName, String containerName) {
+-
+-    StringBuilder sb = new StringBuilder();
+-    sb.append(sp);
+-    sb.append("\n");
+-    sb.append(st);
+-    sb.append("\n");
+-    sb.append(se);
+-    sb.append("\n");
+-    // canonicalized resource
+-    sb.append("/blob/");
+-    sb.append(accountName);
+-    sb.append("/");
+-    sb.append(containerName);
+-    sb.append("\n");
+-    sb.append("\n"); // si
+-    sb.append("\n"); // sip
+-    sb.append("\n"); // spr
+-    sb.append(sv);
+-    sb.append("\n");
+-    sb.append(sr);
+-    sb.append("\n");
+-    sb.append("\n"); // - For optional : rscc - ResponseCacheControl
+-    sb.append("\n"); // - For optional : rscd - ResponseContentDisposition
+-    sb.append("\n"); // - For optional : rsce - ResponseContentEncoding
+-    sb.append("\n"); // - For optional : rscl - ResponseContentLanguage
+-    sb.append("\n"); // - For optional : rsct - ResponseContentType
+-
+-    String stringToSign = sb.toString();
+-    return computeHmac256(stringToSign);
+-  }
+-
+-      hmacSha256 = Mac.getInstance(HMAC_SHA256);
+-      hmacSha256.init(new SecretKeySpec(key, HMAC_SHA256));
++      hmacSha256 = Mac.getInstance("HmacSHA256");
++      hmacSha256.init(new SecretKeySpec(key, "HmacSHA256"));
+-  private String computeHmac256(final String stringToSign) {
++  protected String computeHmac256(final String stringToSign) {
+-      utf8Bytes = stringToSign.getBytes(AbfsHttpConstants.UTF_8);
++      utf8Bytes = stringToSign.getBytes(StandardCharsets.UTF_8.toString());
+-}
++}
+
+MOV26 MOV31 UPD40 UPD40 UPD40 INS83 INS42 INS71 INS23 INS83 INS42 INS72 INS72 INS23 INS31 INS31 INS83 INS83 INS83 INS43 INS59 UPD83 UPD83 INS42 INS29 UPD83 UPD83 UPD66 INS42 INS45 INS42 INS45 INS83 INS83 MOV43 INS59 INS42 MOV44 INS8 INS78 INS83 MOV43 INS42 INS8 UPD42 MOV42 UPD42 MOV42 MOV32 UPD42 UPD42 UPD42 INS65 INS65 UPD42 MOV42 UPD42 INS21 INS42 INS41 UPD42 UPD42 INS57 INS66 INS42 INS66 INS7 INS42 INS43 INS22 INS42 INS42 INS52 INS42 INS45 INS45 INS32 UPD40 MOV40 INS42 DEL42 DEL42 DEL42 DEL45 DEL42 DEL42 DEL42 DEL83 DEL83 DEL83 DEL42 DEL43 DEL42 DEL45 DEL59 DEL23 DEL83 DEL42 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL45 DEL59 DEL60 DEL42 DEL43 DEL42 DEL45 DEL59 DEL60 DEL42 DEL43 DEL45 DEL59 DEL60 DEL42 DEL43 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL42 DEL42 DEL32 DEL32 DEL59 DEL60 DEL42 DEL43 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL42 DEL42 DEL32 DEL32 DEL59 DEL60 DEL43 DEL59 DEL60 DEL42 DEL43 DEL42 DEL42 DEL43 DEL14 DEL59 DEL60 DEL42 DEL42 DEL45 DEL42 DEL32 DEL21 DEL42 DEL42 DEL45 DEL42 DEL32 DEL21 DEL42 DEL42 DEL45 DEL42 DEL32 DEL21 DEL42 DEL42 DEL45 DEL42 DEL32 DEL21 DEL42 DEL42 DEL45 DEL42 DEL32 DEL21 DEL42 DEL42 DEL45 DEL42 DEL32 DEL21 DEL42 DEL42 DEL32 DEL42 DEL34 DEL32 DEL41 DEL8 DEL31 DEL42 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL42 DEL43 DEL14 DEL59 DEL60 DEL42 DEL42 DEL42 DEL32 DEL21 DEL42 DEL42 DEL45 DEL32 DEL21 DEL42 DEL42 DEL42 DEL32 DEL21 DEL42 DEL42 DEL45 DEL32 DEL21 DEL42 DEL42 DEL42 DEL32 DEL21 DEL42 DEL42 DEL45 DEL32 DEL21 DEL42 DEL42 DEL45 DEL32 DEL21 DEL42 DEL42 DEL42 DEL32 DEL21 DEL42 DEL42 DEL45 DEL32 DEL21 DEL42 DEL42 DEL42 DEL32 DEL21 DEL42 DEL42 DEL45 DEL32 DEL21 DEL42 DEL42 DEL45 DEL32 DEL21 DEL42 DEL42 DEL45 DEL32 DEL21 DEL42 DEL42 DEL45 DEL32 DEL21 DEL42 DEL42 DEL42 DEL32 DEL21 DEL42 DEL42 DEL45 DEL32 DEL21 DEL42 DEL42 DEL42 DEL32 DEL21 DEL42 DEL42 DEL45 DEL32 DEL21 DEL42 DEL42 DEL45 DEL32 DEL21 DEL42 DEL42 DEL45 DEL32 DEL21 DEL42 DEL42 DEL45 DEL32 DEL21 DEL42 DEL42 DEL45 DEL32 DEL21 DEL42 DEL42 DEL45 DEL32 DEL21 DEL42 DEL43 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL42 DEL32 DEL41 DEL42 DEL42

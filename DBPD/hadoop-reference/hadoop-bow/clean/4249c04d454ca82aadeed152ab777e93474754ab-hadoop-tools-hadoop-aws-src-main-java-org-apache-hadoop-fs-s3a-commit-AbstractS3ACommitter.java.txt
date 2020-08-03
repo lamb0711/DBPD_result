@@ -1,0 +1,152 @@
+HADOOP-16798. S3A Committer thread pool shutdown problems. (#1963)
+
+
+
+Contributed by Steve Loughran.
+
+Fixes a condition which can cause job commit to fail if a task was
+aborted < 60s before the job commit commenced: the task abort
+will shut down the thread pool with a hard exit after 60s; the
+job commit POST requests would be scheduled through the same pool,
+so be interrupted and fail. At present the access is synchronized,
+but presumably the executor shutdown code is calling wait() and releasing
+locks.
+
+Task abort is triggered from the AM when task attempts succeed but
+there are still active speculative task attempts running. Thus it
+only surfaces when speculation is enabled and the final tasks are
+speculating, which, given they are the stragglers, is not unheard of.
+
+Note: this problem has never been seen in production; it has surfaced
+in the hadoop-aws tests on a heavily overloaded desktop
++import java.util.concurrent.Future;
+-          .executeWith(buildThreadPool(context))
++          .executeWith(buildSubmitter(context))
+-          .executeWith(buildThreadPool(context))
++          .executeWith(buildSubmitter(context))
+-          .executeWith(singleCommitThreadPool())
++          .executeWith(singleThreadSubmitter())
+-          .executeWith(singleCommitThreadPool())
++          .executeWith(singleThreadSubmitter())
+-          .executeWith(buildThreadPool(getJobContext()))
++          .executeWith(buildSubmitter(getJobContext()))
+-   * Returns an {@link ExecutorService} for parallel tasks. The number of
++   * Returns an {@link Tasks.Submitter} for parallel tasks. The number of
++   * this is used in Tasks as a cue
++   * to switch to single-threaded execution.
+-   * @return an {@link ExecutorService} or null for the number of threads
++   * @return a submitter or null
+-  protected final synchronized ExecutorService buildThreadPool(
++  protected Tasks.Submitter buildSubmitter(
++    if (getThreadCount(context) > 0) {
++      return new PoolSubmitter(context);
++    } else {
++      return null;
++    }
++  }
++  /**
++   * Returns an {@link ExecutorService} for parallel tasks. The number of
++   * threads in the thread-pool is set by fs.s3a.committer.threads.
++   * If num-threads is 0, this will raise an exception.
++   *
++   * @param context the JobContext for this commit
++   * @param numThreads threads
++   * @return an {@link ExecutorService} for the number of threads
++   */
++  private synchronized ExecutorService buildThreadPool(
++      JobContext context, int numThreads) {
++    Preconditions.checkArgument(numThreads > 0,
++        "Cannot create a thread pool with no threads");
+-      int numThreads = context.getConfiguration().getInt(
+-          FS_S3A_COMMITTER_THREADS,
+-          DEFAULT_COMMITTER_THREADS);
+-      if (numThreads > 0) {
+-        threadPool = HadoopExecutors.newFixedThreadPool(numThreads,
+-            new ThreadFactoryBuilder()
+-                .setDaemon(true)
+-                .setNameFormat(THREAD_PREFIX + context.getJobID() + "-%d")
+-                .build());
+-      } else {
+-        return null;
+-      }
++      threadPool = HadoopExecutors.newFixedThreadPool(numThreads,
++          new ThreadFactoryBuilder()
++              .setDaemon(true)
++              .setNameFormat(THREAD_PREFIX + context.getJobID() + "-%d")
++              .build());
++   * Get the thread count for this job's commit operations.
++   * @param context the JobContext for this commit
++   * @return a possibly zero thread count.
++   */
++  private int getThreadCount(final JobContext context) {
++    return context.getConfiguration().getInt(
++        FS_S3A_COMMITTER_THREADS,
++        DEFAULT_COMMITTER_THREADS);
++  }
++
++  /**
++   * Submit a runnable.
++   * This will demand-create the thread pool if needed.
++   * <p></p>
++   * This is synchronized to ensure the thread pool is always valid when
++   * work is synchronized. See HADOOP-16798.
++   * @param context the JobContext for this commit
++   * @param task task to execute
++   * @return the future of the submitted task.
++   */
++  private synchronized Future<?> submitRunnable(
++      final JobContext context,
++      final Runnable task) {
++    return buildThreadPool(context, getThreadCount(context)).submit(task);
++  }
++
++  /**
++   * The real task submitter, which hands off the work to
++   * the current thread pool.
++   */
++  private final class PoolSubmitter implements Tasks.Submitter {
++
++    private final JobContext context;
++
++    private final int numThreads;
++
++    private PoolSubmitter(final JobContext context) {
++      this.numThreads = getThreadCount(context);
++      Preconditions.checkArgument(numThreads > 0,
++          "Cannot create a thread pool with no threads");
++      this.context = context;
++    }
++
++    @Override
++    public Future<?> submit(final Runnable task) {
++      return submitRunnable(context, task);
++    }
++
++  }
++
++  /**
+-  protected synchronized void destroyThreadPool() {
+-    if (threadPool != null) {
+-      LOG.debug("Destroying thread pool");
+-      HadoopExecutors.shutdown(threadPool, LOG,
+-          THREAD_POOL_SHUTDOWN_DELAY_SECONDS, TimeUnit.SECONDS);
++  protected void destroyThreadPool() {
++    ExecutorService pool;
++    // reset the thread pool in a sync block, then shut it down
++    // afterwards. This allows for other threads to create a
++    // new thread pool on demand.
++    synchronized(this) {
++      pool = this.threadPool;
++    if (pool != null) {
++      LOG.debug("Destroying thread pool");
++      HadoopExecutors.shutdown(pool, LOG,
++          THREAD_POOL_SHUTDOWN_DELAY_SECONDS, TimeUnit.SECONDS);
++    }
+-   * Why not use the existing thread pool? Too much fear of deadlocking,
+-   * and tasks are being committed in parallel anyway.
+-  protected final synchronized ExecutorService singleCommitThreadPool() {
++  protected final synchronized Tasks.Submitter singleThreadSubmitter() {
+-            .executeWith(buildThreadPool(context))
++            .executeWith(buildSubmitter(context))
+-            .executeWith(buildThreadPool(context))
++            .executeWith(buildSubmitter(context))

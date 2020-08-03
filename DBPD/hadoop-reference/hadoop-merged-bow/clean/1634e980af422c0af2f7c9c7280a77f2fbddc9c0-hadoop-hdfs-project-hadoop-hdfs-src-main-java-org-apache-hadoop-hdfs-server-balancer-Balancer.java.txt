@@ -1,0 +1,249 @@
+HDFS-3495. Update Balancer to support new NetworkTopology with NodeGroup.  Contributed by Junping Du
+
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/trunk@1414874 13f79535-47bb-0310-9956-ffa450edef68
+
+- * <li>No block has been moved for 3 iterations. Exiting...
++ * <li>No block has been moved for 5 iterations. Exiting...
+-  private NetworkTopology cluster = new NetworkTopology();
++  private NetworkTopology cluster;
+-      // iterate all source's blocks until find a good one    
++      // iterate all source's blocks until find a good one
+-      // check if there is replica which is on the same rack with the target
++      final DatanodeInfo targetDN = target.getDatanode();
++      boolean find = false;
+-        if (cluster.isOnSameRack(loc.getDatanode(), target.getDatanode())) {
+-          if (loc.addPendingBlock(this)) {
+-            proxySource = loc;
++        // check if there is replica which is on the same rack with the target
++        if (cluster.isOnSameRack(loc.getDatanode(), targetDN) && addTo(loc)) {
++          find = true;
++          // if cluster is not nodegroup aware or the proxy is on the same 
++          // nodegroup with target, then we already find the nearest proxy
++          if (!cluster.isNodeGroupAware() 
++              || cluster.isOnSameNodeGroup(loc.getDatanode(), targetDN)) {
+-      }
+-      // find out a non-busy replica
+-      for (BalancerDatanode loc : block.getLocations()) {
+-        if (loc.addPendingBlock(this)) {
+-          proxySource = loc;
+-          return true;
++        
++        if (!find) {
++          // find out a non-busy replica out of rack of target
++          find = addTo(loc);
++      
++      return find;
++    }
++    
++    // add a BalancerDatanode as proxy source for specific block movement
++    private boolean addTo(BalancerDatanode bdn) {
++      if (bdn.addPendingBlock(this)) {
++        proxySource = bdn;
++        return true;
++      }
+-        if ( target.addPendingBlock(pendingBlock) ) { 
++        if (target.addPendingBlock(pendingBlock)) { 
+-    if (BlockPlacementPolicy.getInstance(conf, null, null).getClass() != 
+-        BlockPlacementPolicyDefault.class) {
+-      throw new UnsupportedActionException("Balancer without BlockPlacementPolicyDefault");
++    if (BlockPlacementPolicy.getInstance(conf, null, null) instanceof 
++        BlockPlacementPolicyDefault) {
++      throw new UnsupportedActionException(
++          "Balancer without BlockPlacementPolicyDefault");
++    cluster = NetworkTopology.getInstance(conf);
+-    // Match nodes on the same rack first
++    // First, match nodes on the same node group if cluster has nodegroup
++    // awareness
++    if (cluster.isNodeGroupAware()) {
++      chooseNodesOnSameNodeGroup();
++    }
++    
++    // Then, match nodes on the same rack
+-    // Then match nodes on different racks
++    // At last, match nodes on different racks
++  
++  /**
++   * Decide all <source, target> pairs where source and target are 
++   * on the same NodeGroup
++   */
++  private void chooseNodesOnSameNodeGroup() {
++
++    /* first step: match each overUtilized datanode (source) to
++     * one or more underUtilized datanodes within same NodeGroup(targets).
++     */
++    chooseOnSameNodeGroup(overUtilizedDatanodes, underUtilizedDatanodes);
++
++    /* match each remaining overutilized datanode (source) to below average 
++     * utilized datanodes within the same NodeGroup(targets).
++     * Note only overutilized datanodes that haven't had that max bytes to move
++     * satisfied in step 1 are selected
++     */
++    chooseOnSameNodeGroup(overUtilizedDatanodes, belowAvgUtilizedDatanodes);
++
++    /* match each remaining underutilized datanode to above average utilized 
++     * datanodes within the same NodeGroup.
++     * Note only underutilized datanodes that have not had that max bytes to
++     * move satisfied in step 1 are selected.
++     */
++    chooseOnSameNodeGroup(underUtilizedDatanodes, aboveAvgUtilizedDatanodes);
++  }
++  
++  /**
++   * Match two sets of nodes within the same NodeGroup, one should be source
++   * nodes (utilization > Avg), and the other should be destination nodes 
++   * (utilization < Avg).
++   * @param datanodes
++   * @param candidates
++   */
++  private <D extends BalancerDatanode, C extends BalancerDatanode> void 
++      chooseOnSameNodeGroup(Collection<D> datanodes, Collection<C> candidates) {
++    for (Iterator<D> i = datanodes.iterator(); i.hasNext();) {
++      final D datanode = i.next();
++      for(; chooseOnSameNodeGroup(datanode, candidates.iterator()); );
++      if (!datanode.isMoveQuotaFull()) {
++        i.remove();
++      }
++    }
++  }
++  
++  /**
++   * Match one datanode with a set of candidates nodes within the same NodeGroup.
++   */
++  private <T extends BalancerDatanode> boolean chooseOnSameNodeGroup(
++      BalancerDatanode dn, Iterator<T> candidates) {
++    final T chosen = chooseCandidateOnSameNodeGroup(dn, candidates);
++    if (chosen == null) {
++      return false;
++    }
++    if (dn instanceof Source) {
++      matchSourceWithTargetToMove((Source)dn, chosen);
++    } else {
++      matchSourceWithTargetToMove((Source)chosen, dn);
++    }
++    if (!chosen.isMoveQuotaFull()) {
++      candidates.remove();
++    }
++    return true;
++  }
++  
++  private void matchSourceWithTargetToMove(
++      Source source, BalancerDatanode target) {
++    long size = Math.min(source.availableSizeToMove(), target.availableSizeToMove());
++    NodeTask nodeTask = new NodeTask(target, size);
++    source.addNodeTask(nodeTask);
++    target.incScheduledSize(nodeTask.getSize());
++    sources.add(source);
++    targets.add(target);
++    LOG.info("Decided to move "+StringUtils.byteDesc(size)+" bytes from "
++        +source.datanode.getName() + " to " + target.datanode.getName());
++  }
++  
++  /** choose a datanode from <code>candidates</code> within the same NodeGroup 
++   * of <code>dn</code>.
++   */
++  private <T extends BalancerDatanode> T chooseCandidateOnSameNodeGroup(
++      BalancerDatanode dn, Iterator<T> candidates) {
++    if (dn.isMoveQuotaFull()) {
++      for(; candidates.hasNext(); ) {
++        final T c = candidates.next();
++        if (!c.isMoveQuotaFull()) {
++          candidates.remove();
++          continue;
++        }
++        if (cluster.isOnSameNodeGroup(dn.getDatanode(), c.getDatanode())) {
++          return c;
++        }
++      }
++    }
++    return null;
++  }
+-    chooseTargets(underUtilizedDatanodes.iterator(), onRack);
++    chooseTargets(underUtilizedDatanodes, onRack);
+-    chooseTargets(belowAvgUtilizedDatanodes.iterator(), onRack);
++    chooseTargets(belowAvgUtilizedDatanodes, onRack);
+-    /* match each remaining underutilized datanode to 
+-     * above average utilized datanodes.
++    /* match each remaining underutilized datanode (target) to 
++     * above average utilized datanodes (source).
+-    chooseSources(aboveAvgUtilizedDatanodes.iterator(), onRack);
++    chooseSources(aboveAvgUtilizedDatanodes, onRack);
+-  private void chooseTargets(  
+-      Iterator<BalancerDatanode> targetCandidates, boolean onRackTarget ) {
++  private void chooseTargets(
++      Collection<BalancerDatanode> targetCandidates, boolean onRackTarget ) {
+-      while (chooseTarget(source, targetCandidates, onRackTarget)) {
++      while (chooseTarget(source, targetCandidates.iterator(), onRackTarget)) {
+-      Iterator<Source> sourceCandidates, boolean onRackSource) {
++      Collection<Source> sourceCandidates, boolean onRackSource) {
+-      while (chooseSource(target, sourceCandidates, onRackSource)) {
++      while (chooseSource(target, sourceCandidates.iterator(), onRackSource)) {
+-      long size = Math.min(source.availableSizeToMove(),
+-          target.availableSizeToMove());
+-      NodeTask nodeTask = new NodeTask(target, size);
+-      source.addNodeTask(nodeTask);
+-      target.incScheduledSize(nodeTask.getSize());
+-      sources.add(source);
+-      targets.add(target);
++      matchSourceWithTargetToMove(source, target);
+-      LOG.info("Decided to move "+StringUtils.byteDesc(size)+" bytes from "
+-          +source.datanode + " to " + target.datanode);
+-  
++
+-      long size = Math.min(source.availableSizeToMove(),
+-          target.availableSizeToMove());
+-      NodeTask nodeTask = new NodeTask(target, size);
+-      source.addNodeTask(nodeTask);
+-      target.incScheduledSize(nodeTask.getSize());
+-      sources.add(source);
+-      targets.add(target);
++      matchSourceWithTargetToMove(source, target);
+-        sourceCandidates.remove();
+-      }
+-      LOG.info("Decided to move "+StringUtils.byteDesc(size)+" bytes from "
+-          +source.datanode + " to " + target.datanode);
++          sourceCandidates.remove();
++        }
++    if (cluster.isNodeGroupAware() && 
++        isOnSameNodeGroupWithReplicas(target, block, source)) {
++      return false;
++    }
+-  
++
++  /**
++   * Check if there are any replica (other than source) on the same node group
++   * with target. If true, then target is not a good candidate for placing 
++   * specific block replica as we don't want 2 replicas under the same nodegroup 
++   * after balance.
++   * @param target targetDataNode
++   * @param block dataBlock
++   * @param source sourceDataNode
++   * @return true if there are any replica (other than source) on the same node
++   * group with target
++   */
++  private boolean isOnSameNodeGroupWithReplicas(BalancerDatanode target,
++      BalancerBlock block, Source source) {
++    for (BalancerDatanode loc : block.locations) {
++      if (loc != source && 
++        cluster.isOnSameNodeGroup(loc.getDatanode(), target.getDatanode())) {
++          return true;
++        }
++      }
++    return false;
++  }
++
+-  private void resetData() {
+-    this.cluster = new NetworkTopology();
++  private void resetData(Configuration conf) {
++    this.cluster = NetworkTopology.getInstance(conf);
+-  private ReturnStatus run(int iteration, Formatter formatter) {
++  private ReturnStatus run(int iteration, Formatter formatter,
++      Configuration conf) {
+-      resetData();
++      resetData(conf);
+-          final ReturnStatus r = b.run(iteration, formatter);
++          final ReturnStatus r = b.run(iteration, formatter, conf);
+-            checkArgument(args.length >= 2, "args = " + Arrays.toString(args));           
++            checkArgument(args.length >= 2, "args = " + Arrays.toString(args));
+
+INS23 INS31 INS31 INS31 INS31 INS31 INS31 MOV83 MOV43 INS59 INS31 INS31 INS29 INS83 INS39 INS42 INS8 INS29 INS83 INS73 INS73 INS39 INS42 INS44 INS44 INS8 INS29 INS83 INS73 INS39 INS42 INS44 INS44 INS8 INS83 INS39 INS42 INS44 INS44 MOV8 INS29 INS83 INS73 INS43 INS42 INS44 INS44 INS8 INS29 INS83 INS39 INS42 INS44 INS44 INS44 INS8 INS44 INS44 UPD66 MOV42 MOV83 MOV39 MOV42 INS8 INS83 INS39 INS42 INS44 INS8 INS21 INS25 INS65 INS21 INS21 INS21 INS65 INS65 INS65 INS42 INS43 INS42 INS43 INS74 INS42 INS74 INS42 INS24 INS65 INS42 INS43 INS43 INS42 INS74 INS42 INS60 INS25 INS25 INS25 INS41 INS43 INS42 INS43 INS42 INS65 INS42 INS43 INS42 INS43 INS42 INS74 INS42 INS25 INS41 UPD74 UPD74 INS25 INS65 INS65 INS65 INS65 INS65 INS43 INS42 INS43 INS42 INS43 INS42 INS70 INS41 INS43 INS42 INS43 INS42 INS60 INS60 MOV70 INS41 INS43 INS42 MOV25 MOV41 INS62 INS7 INS32 INS8 INS66 INS66 INS32 INS32 INS32 INS66 INS66 INS66 INS42 INS42 UPD42 MOV42 INS42 INS43 INS43 INS43 INS43 INS58 INS32 INS8 INS66 INS42 INS42 INS43 INS43 INS83 INS43 INS59 INS27 INS8 INS62 INS8 INS8 INS38 INS8 INS9 INS42 INS42 INS66 INS66 INS42 INS42 INS43 INS43 INS32 INS8 INS33 UPD43 UPD43 INS8 INS27 INS8 INS66 INS66 INS66 INS66 INS42 INS66 INS42 INS66 INS42 INS66 INS66 INS66 INS42 INS42 INS42 MOV44 INS40 INS8 INS9 INS42 INS42 INS83 INS43 INS59 INS39 INS59 INS42 INS42 MOV32 MOV43 INS42 INS32 INS42 INS42 INS21 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS74 INS59 INS42 INS42 INS60 INS24 INS25 INS42 INS42 INS42 INS42 INS32 INS42 INS33 INS41 INS42 INS43 INS21 INS21 INS32 INS21 INS42 INS42 INS42 INS42 INS24 MOV42 MOV42 MOV42 UPD42 UPD42 MOV6 INS21 MOV25 MOV41 INS32 INS32 INS41 INS25 INS32 INS42 INS42 INS32 INS42 INS9 INS25 UPD42 INS42 INS42 INS42 INS32 INS43 INS43 INS42 INS32 INS83 INS43 INS59 INS32 INS20 INS38 INS8 INS42 INS42 INS42 INS9 INS42 INS32 INS32 INS42 INS42 INS32 INS32 INS32 INS32 INS8 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS9 INS27 INS8 INS42 INS42 INS42 INS42 INS42 INS27 INS38 INS8 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS32 INS32 INS21 INS42 INS11 INS42 INS42 INS11 INS42 INS42 INS42 INS40 INS42 INS40 INS42 INS42 INS42 INS60 INS25 INS25 INS32 INS32 INS42 INS42 INS42 UPD42 UPD42 INS27 INS32 INS41 INS42 INS32 INS32 INS21 INS42 INS21 UPD42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS43 INS42 INS43 INS42 INS83 INS43 INS59 INS38 INS8 INS32 INS8 MOV42 INS42 MOV42 INS42 INS42 INS42 INS42 INS42 INS32 MOV32 INS9 MOV42 MOV42 MOV32 INS42 INS42 INS42 INS7 INS27 INS7 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS32 INS21 INS18 INS42 INS42 INS32 INS32 INS41 INS42 INS42 INS42 INS9 INS38 INS32 INS42 INS32 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 MOV42 UPD42 MOV42 INS42 DEL43 DEL14 DEL59 DEL23 DEL32 DEL52 DEL32 DEL42 DEL42 DEL7 DEL21 DEL42 DEL42 DEL32 DEL8 DEL70 DEL8 DEL31 DEL42 DEL32 DEL57 DEL27 DEL40 DEL40 DEL42 DEL32 DEL42 DEL32 DEL42 DEL32 DEL39 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL42 DEL42 DEL32 DEL32 DEL59 DEL60 DEL42 DEL43 DEL42 DEL42 DEL43 DEL42 DEL42 DEL14 DEL59 DEL60 DEL42 DEL42 DEL42 DEL32 DEL21 DEL42 DEL42 DEL42 DEL42 DEL32 DEL32 DEL21 DEL42 DEL42 DEL42 DEL32 DEL21 DEL42 DEL42 DEL45 DEL42 DEL42 DEL42 DEL32 DEL45 DEL40 DEL45 DEL40 DEL27 DEL32 DEL21 DEL42 DEL43 DEL14

@@ -1,0 +1,192 @@
+HDFS-6716. Update usage of KeyProviderCryptoExtension APIs on NameNode. (wang)
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/branches/fs-encryption@1612438 13f79535-47bb-0310-9956-ffa450edef68
+
+-import java.util.HashSet;
+-import java.util.concurrent.Executors;
+-import java.util.concurrent.Future;
+-import java.util.concurrent.ScheduledExecutorService;
+-import java.util.concurrent.TimeUnit;
+-import com.google.common.annotations.VisibleForTesting;
+-import com.google.common.collect.Maps;
+-import com.google.common.collect.Sets;
+-import com.google.common.util.concurrent.ThreadFactoryBuilder;
+-import org.apache.hadoop.conf.Configuration;
+-import org.apache.hadoop.hdfs.DFSConfigKeys;
+-    private final String keyId;
++    private final String keyName;
+-    private final HashSet<KeyVersion> keyVersions;
+-    private KeyVersion latestVersion;
+-
+-    EncryptionZoneInt(long inodeId, String keyId) {
+-      this.keyId = keyId;
++    EncryptionZoneInt(long inodeId, String keyName) {
++      this.keyName = keyName;
+-      keyVersions = Sets.newHashSet();
+-      latestVersion = null;
+-    KeyVersion getLatestKeyVersion() {
+-      return latestVersion;
+-    }
+-
+-    void addKeyVersion(KeyVersion version) {
+-      Preconditions.checkNotNull(version);
+-      if (!keyVersions.contains(version)) {
+-        LOG.debug("Key {} has new key version {}", keyId, version);
+-        keyVersions.add(version);
+-      }
+-      // Always set the latestVersion to not get stuck on an old version in
+-      // racy situations. Should eventually converge thanks to the
+-      // monitor.
+-      latestVersion = version;
+-    }
+-
+-    String getKeyId() {
+-      return keyId;
++    String getKeyName() {
++      return keyName;
+-  private final ScheduledExecutorService monitor;
+-  public EncryptionZoneManager(FSDirectory dir, Configuration conf,
+-      KeyProvider provider) {
+-
++  public EncryptionZoneManager(FSDirectory dir, KeyProvider provider) {
+-
+-    monitor = Executors.newScheduledThreadPool(1,
+-        new ThreadFactoryBuilder()
+-            .setDaemon(true)
+-            .setNameFormat(EncryptionZoneMonitor.class.getSimpleName() + "-%d")
+-            .build());
+-    final int refreshMs = conf.getInt(
+-        DFSConfigKeys.DFS_NAMENODE_KEY_VERSION_REFRESH_INTERVAL_MS_KEY,
+-        DFSConfigKeys.DFS_NAMENODE_KEY_VERSION_REFRESH_INTERVAL_MS_DEFAULT
+-    );
+-    Preconditions.checkArgument(refreshMs >= 0, "%s cannot be negative",
+-        DFSConfigKeys.DFS_NAMENODE_KEY_VERSION_REFRESH_INTERVAL_MS_KEY);
+-    monitor.scheduleAtFixedRate(new EncryptionZoneMonitor(), 0, refreshMs,
+-        TimeUnit.MILLISECONDS);
+-  }
+-
+-  /**
+-   * Periodically wakes up to fetch the latest version of each encryption
+-   * zone key.
+-   */
+-  private class EncryptionZoneMonitor implements Runnable {
+-    @Override
+-    public void run() {
+-      LOG.debug("Monitor waking up to refresh encryption zone key versions");
+-      HashMap<Long, String> toFetch = Maps.newHashMap();
+-      HashMap<Long, KeyVersion> toUpdate =
+-          Maps.newHashMap();
+-      // Determine the keyIds to fetch
+-      readLock();
+-      try {
+-        for (EncryptionZoneInt ezi : encryptionZones.values()) {
+-          toFetch.put(ezi.getINodeId(), ezi.getKeyId());
+-        }
+-      } finally {
+-        readUnlock();
+-      }
+-      LOG.trace("Found {} keys to check", toFetch.size());
+-      // Fetch the key versions while not holding the lock
+-      for (Map.Entry<Long, String> entry : toFetch.entrySet()) {
+-        try {
+-          KeyVersion version = provider.getCurrentKey(entry.getValue());
+-          toUpdate.put(entry.getKey(), version);
+-        } catch (IOException e) {
+-          LOG.warn("Error while getting the current key for {} {}",
+-              entry.getValue(), e);
+-        }
+-      }
+-      LOG.trace("Fetched {} key versions from KeyProvider", toUpdate.size());
+-      // Update the key versions for each encryption zone
+-      writeLock();
+-      try {
+-        for (Map.Entry<Long, KeyVersion> entry : toUpdate.entrySet()) {
+-          EncryptionZoneInt ezi = encryptionZones.get(entry.getKey());
+-          // zone might have been removed in the intervening time
+-          if (ezi == null) {
+-            continue;
+-          }
+-          ezi.addKeyVersion(entry.getValue());
+-        }
+-      } finally {
+-        writeUnlock();
+-      }
+-    }
+-  }
+-
+-  /**
+-   * Forces the EncryptionZoneMonitor to run, waiting until completion.
+-   */
+-  @VisibleForTesting
+-  public void kickMonitor() throws Exception {
+-    Future future = monitor.submit(new EncryptionZoneMonitor());
+-    future.get();
+-  }
+-
+-  /**
+-   * Immediately fetches the latest KeyVersion for an encryption zone,
+-   * also updating the encryption zone.
+-   *
+-   * @param iip of the encryption zone
+-   * @return latest KeyVersion
+-   * @throws IOException on KeyProvider error
+-   */
+-  KeyVersion updateLatestKeyVersion(INodesInPath iip) throws IOException {
+-    EncryptionZoneInt ezi;
+-    readLock();
+-    try {
+-      ezi = getEncryptionZoneForPath(iip);
+-    } finally {
+-      readUnlock();
+-    }
+-    if (ezi == null) {
+-      throw new IOException("Cannot update KeyVersion since iip is not within" +
+-          " an encryption zone");
+-    }
+-
+-    // Do not hold the lock while doing KeyProvider operations
+-    KeyVersion version = provider.getCurrentKey(ezi.getKeyId());
+-
+-    writeLock();
+-    try {
+-      ezi.addKeyVersion(version);
+-      return version;
+-    } finally {
+-      writeUnlock();
+-    }
+-  KeyVersion getLatestKeyVersion(final INodesInPath iip) {
++  /**
++   * Get the key name for an encryption zone. Returns null if <tt>iip</tt> is
++   * not within an encryption zone.
++   * <p/>
++   * Called while holding the FSDirectory lock.
++   */
++  String getKeyName(final INodesInPath iip) {
+-      return ezi.getLatestKeyVersion();
+-    } finally {
+-      readUnlock();
+-    }
+-  }
+-
+-  /**
+-   * @return true if the provided <tt>keyVersionName</tt> is the name of a
+-   * valid KeyVersion for the encryption zone of <tt>iip</tt>,
+-   * and <tt>iip</tt> is within an encryption zone.
+-   */
+-  boolean isValidKeyVersion(final INodesInPath iip, String keyVersionName) {
+-    readLock();
+-    try {
+-      EncryptionZoneInt ezi = getEncryptionZoneForPath(iip);
+-      if (ezi == null) {
+-        return false;
+-      }
+-      for (KeyVersion ezVersion : ezi.keyVersions) {
+-        if (keyVersionName.equals(ezVersion.getVersionName())) {
+-          return true;
+-        }
+-      }
+-      return false;
++      return ezi.getKeyName();
+-      ezi.addKeyVersion(keyVersion);
+-        ret.add(new EncryptionZone(getFullPathName(ezi), ezi.getKeyId()));
++        ret.add(new EncryptionZone(getFullPathName(ezi), ezi.getKeyName()));

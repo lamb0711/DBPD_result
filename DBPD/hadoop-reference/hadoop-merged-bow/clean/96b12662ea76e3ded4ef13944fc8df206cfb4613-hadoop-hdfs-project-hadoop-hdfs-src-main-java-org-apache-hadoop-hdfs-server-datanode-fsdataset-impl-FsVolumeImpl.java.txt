@@ -1,0 +1,241 @@
+HDFS-10637. Modifications to remove the assumption that FsVolumes are backed by java.io.File. (Virajith Jalaparti via lei)
+
++import java.net.URI;
++import java.util.LinkedList;
++import org.apache.hadoop.hdfs.server.common.Storage.StorageDirectory;
++import org.apache.hadoop.hdfs.server.datanode.StorageLocation;
++import org.apache.hadoop.hdfs.server.datanode.DirectoryScanner.BlockDirFilter;
++import org.apache.hadoop.hdfs.server.datanode.DirectoryScanner.ReportCompiler;
++import org.apache.hadoop.hdfs.server.datanode.fsdataset.impl.RamDiskReplicaTracker.RamDiskReplica;
++
++  // Refers to the base StorageLocation used to construct this volume
++  // (i.e., does not include STORAGE_DIR_CURRENT in
++  // <location>/STORAGE_DIR_CURRENT/)
++  private final StorageLocation storageLocation;
++
+-  private final DF usage;           
++  private final DF usage;
+-  FsVolumeImpl(FsDatasetImpl dataset, String storageID, File currentDir,
+-      Configuration conf, StorageType storageType) throws IOException {
++  FsVolumeImpl(FsDatasetImpl dataset, String storageID, StorageDirectory sd,
++      Configuration conf) throws IOException {
++
++    if (sd.getStorageLocation() == null) {
++      throw new IOException("StorageLocation specified for storage directory " +
++          sd + " is null");
++    }
++    this.reservedForReplicas = new AtomicLong(0L);
++    this.storageLocation = sd.getStorageLocation();
++    this.currentDir = sd.getCurrentDir();
++    File parent = currentDir.getParentFile();
++    this.usage = new DF(parent, conf);
++    this.storageType = storageLocation.getStorageType();
+-    this.reservedForReplicas = new AtomicLong(0L);
+-    this.currentDir = currentDir;
+-    File parent = currentDir.getParentFile();
+-    this.usage = new DF(parent, conf);
+-    this.storageType = storageType;
++  @VisibleForTesting
+-  File getRbwDir(String bpid) throws IOException {
++  protected File getRbwDir(String bpid) throws IOException {
+-  File getLazyPersistDir(String bpid) throws IOException {
++  protected File getLazyPersistDir(String bpid) throws IOException {
+-  File getTmpDir(String bpid) throws IOException {
++  protected File getTmpDir(String bpid) throws IOException {
++  @VisibleForTesting
+-  public String getBasePath() {
+-    return currentDir.getParent();
++  public URI getBaseURI() {
++    return new File(currentDir.getParent()).toURI();
+-  
++
++  @Override
++  public DF getUsageStats(Configuration conf) {
++    if (currentDir != null) {
++      try {
++        return new DF(new File(currentDir.getParent()), conf);
++      } catch (IOException e) {
++        LOG.error("Unable to get disk statistics for volume " + this);
++      }
++    }
++    return null;
++  }
++
++  @Override
++  public StorageLocation getStorageLocation() {
++    return storageLocation;
++  }
++
+-  @Override
+-  public String getPath(String bpid) throws IOException {
+-    return getBlockPoolSlice(bpid).getDirectory().getAbsolutePath();
+-  }
+-
+-  @Override
++  @VisibleForTesting
+-    return currentDir.getAbsolutePath();
++    return currentDir != null ? currentDir.getParent() : "NULL";
++  @Override
++  public LinkedList<ScanInfo> compileReport(String bpid,
++      LinkedList<ScanInfo> report, ReportCompiler reportCompiler)
++      throws InterruptedException, IOException {
++    return compileReport(getFinalizedDir(bpid),
++        getFinalizedDir(bpid), report, reportCompiler);
++  }
++
++  private LinkedList<ScanInfo> compileReport(File bpFinalizedDir,
++      File dir, LinkedList<ScanInfo> report, ReportCompiler reportCompiler)
++        throws InterruptedException {
++
++    reportCompiler.throttle();
++
++    List <String> fileNames;
++    try {
++      fileNames = IOUtils.listDirectory(dir, BlockDirFilter.INSTANCE);
++    } catch (IOException ioe) {
++      LOG.warn("Exception occured while compiling report: ", ioe);
++      // Initiate a check on disk failure.
++      dataset.datanode.checkDiskErrorAsync();
++      // Ignore this directory and proceed.
++      return report;
++    }
++    Collections.sort(fileNames);
++
++    /*
++     * Assumption: In the sorted list of files block file appears immediately
++     * before block metadata file. This is true for the current naming
++     * convention for block file blk_<blockid> and meta file
++     * blk_<blockid>_<genstamp>.meta
++     */
++    for (int i = 0; i < fileNames.size(); i++) {
++      // Make sure this thread can make a timely exit. With a low throttle
++      // rate, completing a run can take a looooong time.
++      if (Thread.interrupted()) {
++        throw new InterruptedException();
++      }
++
++      File file = new File(dir, fileNames.get(i));
++      if (file.isDirectory()) {
++        compileReport(bpFinalizedDir, file, report, reportCompiler);
++        continue;
++      }
++      if (!Block.isBlockFilename(file)) {
++        if (isBlockMetaFile(Block.BLOCK_FILE_PREFIX, file.getName())) {
++          long blockId = Block.getBlockId(file.getName());
++          verifyFileLocation(file.getParentFile(), bpFinalizedDir,
++              blockId);
++          report.add(new ScanInfo(blockId, null, file, this));
++        }
++        continue;
++      }
++      File blockFile = file;
++      long blockId = Block.filename2id(file.getName());
++      File metaFile = null;
++
++      // Skip all the files that start with block name until
++      // getting to the metafile for the block
++      while (i + 1 < fileNames.size()) {
++        File blkMetaFile = new File(dir, fileNames.get(i + 1));
++        if (!(blkMetaFile.isFile()
++            && blkMetaFile.getName().startsWith(blockFile.getName()))) {
++          break;
++        }
++        i++;
++        if (isBlockMetaFile(blockFile.getName(), blkMetaFile.getName())) {
++          metaFile = blkMetaFile;
++          break;
++        }
++      }
++      verifyFileLocation(blockFile, bpFinalizedDir, blockId);
++      report.add(new ScanInfo(blockId, blockFile, metaFile, this));
++    }
++    return report;
++  }
++
++  /**
++   * Helper method to determine if a file name is consistent with a block.
++   * meta-data file
++   *
++   * @param blockId the block ID
++   * @param metaFile the file to check
++   * @return whether the file name is a block meta-data file name
++   */
++  private static boolean isBlockMetaFile(String blockId, String metaFile) {
++    return metaFile.startsWith(blockId)
++        && metaFile.endsWith(Block.METADATA_EXTENSION);
++  }
++
++  /**
++   * Verify whether the actual directory location of block file has the
++   * expected directory path computed using its block ID.
++   */
++  private void verifyFileLocation(File actualBlockFile,
++      File bpFinalizedDir, long blockId) {
++    File expectedBlockDir =
++        DatanodeUtil.idToBlockDir(bpFinalizedDir, blockId);
++    File actualBlockDir = actualBlockFile.getParentFile();
++    if (actualBlockDir.compareTo(expectedBlockDir) != 0) {
++      LOG.warn("Block: " + blockId +
++          " found in invalid directory.  Expected directory: " +
++          expectedBlockDir + ".  Actual directory: " + actualBlockDir);
++    }
++  }
++
++  public ReplicaInfo moveBlockToTmpLocation(ExtendedBlock block,
++      ReplicaInfo replicaInfo,
++      int smallBufferSize,
++      Configuration conf) throws IOException {
++
++    File[] blockFiles = FsDatasetImpl.copyBlockFiles(block.getBlockId(),
++        block.getGenerationStamp(), replicaInfo,
++        getTmpDir(block.getBlockPoolId()),
++        replicaInfo.isOnTransientStorage(), smallBufferSize, conf);
++
++    ReplicaInfo newReplicaInfo = new ReplicaBuilder(ReplicaState.TEMPORARY)
++        .setBlockId(replicaInfo.getBlockId())
++        .setGenerationStamp(replicaInfo.getGenerationStamp())
++        .setFsVolume(this)
++        .setDirectoryToUse(blockFiles[0].getParentFile())
++        .setBytesToReserve(0)
++        .build();
++    newReplicaInfo.setNumBytes(blockFiles[1].length());
++    return newReplicaInfo;
++  }
++
++  public File[] copyBlockToLazyPersistLocation(String bpId, long blockId,
++      long genStamp,
++      ReplicaInfo replicaInfo,
++      int smallBufferSize,
++      Configuration conf) throws IOException {
++
++    File lazyPersistDir  = getLazyPersistDir(bpId);
++    if (!lazyPersistDir.exists() && !lazyPersistDir.mkdirs()) {
++      FsDatasetImpl.LOG.warn("LazyWriter failed to create " + lazyPersistDir);
++      throw new IOException("LazyWriter fail to find or " +
++          "create lazy persist dir: " + lazyPersistDir.toString());
++    }
++
++    // No FsDatasetImpl lock for the file copy
++    File[] targetFiles = FsDatasetImpl.copyBlockFiles(
++        blockId, genStamp, replicaInfo, lazyPersistDir, true,
++        smallBufferSize, conf);
++    return targetFiles;
++  }
++
++  public void incrNumBlocks(String bpid) throws IOException {
++    getBlockPoolSlice(bpid).incrNumBlocks();
++  }
++
++  public void resolveDuplicateReplicas(String bpid, ReplicaInfo memBlockInfo,
++      ReplicaInfo diskBlockInfo, ReplicaMap volumeMap) throws IOException {
++    getBlockPoolSlice(bpid).resolveDuplicateReplicas(
++        memBlockInfo, diskBlockInfo, volumeMap);
++  }
++
++  public ReplicaInfo activateSavedReplica(String bpid,
++      ReplicaInfo replicaInfo, RamDiskReplica replicaState) throws IOException {
++    return getBlockPoolSlice(bpid).activateSavedReplica(replicaInfo,
++        replicaState);
++  }
+
+INS26 INS26 INS26 INS26 INS26 INS26 INS26 MOV31 MOV31 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS23 MOV44 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS83 INS83 INS43 INS59 MOV21 INS78 INS83 INS83 INS83 INS78 MOV78 INS43 UPD42 INS8 INS43 INS42 INS44 INS8 MOV78 INS83 INS43 INS42 INS8 INS78 MOV78 INS83 MOV43 INS42 MOV8 INS78 INS83 INS74 INS42 MOV44 INS44 INS44 INS43 INS43 INS8 INS83 INS74 INS42 INS44 INS44 INS44 INS44 INS43 INS8 INS29 INS83 INS83 INS39 INS42 INS44 INS44 INS8 INS29 INS83 INS39 INS42 INS44 INS44 INS44 INS8 INS83 INS43 INS42 INS44 INS44 INS44 INS44 INS43 INS8 INS83 INS5 INS42 INS44 INS44 INS44 INS44 INS44 INS44 INS43 INS8 INS83 INS39 INS42 INS44 INS43 MOV8 INS83 INS39 INS42 INS44 INS44 INS44 INS44 INS43 INS8 INS43 INS42 INS44 INS44 INS44 MOV43 INS42 INS42 UPD43 UPD42 INS25 INS21 INS42 INS42 INS42 INS41 INS42 INS43 INS42 INS25 INS41 INS42 INS41 INS42 INS42 INS43 INS43 INS74 INS42 INS43 INS42 INS42 INS42 INS41 INS43 INS43 INS43 INS42 INS43 INS42 INS74 INS42 INS43 INS42 INS42 INS21 INS60 INS54 INS21 INS24 INS41 INS65 INS65 INS65 INS65 MOV43 INS42 INS43 INS42 INS41 INS65 INS43 INS42 INS43 INS42 INS39 INS42 INS60 INS60 INS25 INS42 INS43 INS42 INS43 INS42 INS39 INS42 INS43 INS42 INS42 INS60 INS60 INS21 INS41 INS43 INS85 INS43 INS42 INS39 INS42 INS39 INS42 INS43 INS42 INS39 INS42 INS43 INS42 INS42 INS60 INS25 INS60 INS41 INS43 INS42 INS42 INS21 INS43 INS42 INS43 INS42 INS43 INS42 INS43 INS42 INS42 INS21 INS42 INS43 INS42 INS43 INS42 INS43 INS42 UPD42 INS27 INS8 INS7 INS32 INS42 INS27 INS8 INS33 INS42 INS16 INS42 INS42 INS43 INS43 INS42 INS32 INS42 INS42 INS42 INS42 INS43 INS43 INS42 INS32 INS74 INS59 INS8 INS12 INS32 INS58 INS27 INS37 INS8 INS42 INS66 INS66 INS42 INS66 INS42 INS66 INS66 INS42 INS27 INS66 INS66 INS42 INS42 INS43 INS59 INS43 INS59 INS27 INS8 INS42 INS42 INS42 INS5 INS59 INS43 INS59 INS32 INS42 INS42 INS42 INS42 INS42 INS43 INS59 INS27 INS8 INS5 INS59 INS42 INS42 MOV32 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS32 INS32 INS33 INS53 INS22 INS32 INS32 INS32 INS14 INS42 INS42 INS33 INS54 INS27 MOV32 INS45 INS42 INS42 INS42 INS32 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS43 MOV43 INS42 INS21 INS44 INS8 INS42 INS42 INS42 INS39 INS59 INS42 INS32 INS42 INS25 INS60 INS25 INS25 INS60 INS60 INS60 INS61 INS21 INS21 INS32 INS32 INS42 INS42 INS32 INS42 INS42 INS32 INS32 INS34 INS21 INS43 INS85 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS32 INS38 INS38 INS21 INS53 INS43 INS85 INS42 INS32 UPD42 INS32 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS14 INS52 INS42 INS42 INS42 INS42 INS42 INS42 INS42 MOV43 INS32 INS8 INS12 INS42 INS33 INS42 INS42 INS42 INS42 INS42 INS7 INS43 INS42 INS21 INS21 INS41 INS42 INS34 INS42 INS42 INS32 INS8 INS43 INS59 INS32 INS8 INS38 INS8 INS43 INS59 INS39 INS59 INS43 INS59 INS27 INS8 INS32 INS32 INS42 INS42 INS42 INS42 INS42 INS40 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS32 INS32 INS42 INS32 INS32 INS42 INS42 INS32 INS42 INS2 INS42 INS42 INS42 INS32 INS32 INS32 INS14 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS9 INS42 INS42 INS42 INS42 UPD42 MOV42 UPD42 MOV42 INS43 INS27 INS42 INS42 INS41 INS44 INS8 INS42 INS32 INS42 INS32 INS32 INS42 INS42 INS42 INS53 INS42 INS42 INS14 INS42 INS42 INS21 INS18 INS32 INS25 INS18 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS33 INS27 INS32 INS60 INS25 INS21 INS25 INS42 INS42 INS42 INS42 INS42 INS42 INS14 INS42 INS42 INS27 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS34 INS42 INS34 INS42 INS42 INS42 INS42 INS40 INS42 INS27 INS43 INS27 INS42 INS45 INS42 INS45 INS14 INS43 INS42 INS21 INS42 INS42 INS42 INS40 INS42 INS42 INS45 INS42 INS40 INS42 INS14 INS43 INS42 INS32 INS32 INS42 INS42 INS42 INS32 INS8 INS42 INS42 INS32 INS42 INS34 INS42 INS42 INS43 INS59 INS38 INS8 INS37 INS32 INS8 INS43 INS42 INS42 INS42 INS52 INS45 INS42 INS45 INS42 INS45 INS42 INS42 INS42 INS32 INS42 INS32 INS45 INS42 INS42 INS45 INS45 INS32 INS43 INS14 INS42 INS42 INS32 INS43 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS40 INS32 INS60 INS21 INS21 INS42 INS42 INS42 INS42 INS14 INS36 INS10 INS42 INS42 INS32 INS32 INS21 INS10 INS42 INS32 INS42 INS52 INS2 INS42 INS42 INS42 INS42 INS43 INS32 INS42 INS42 INS27 INS42 INS42 INS42 INS39 INS59 INS32 INS32 INS43 INS42 INS32 INS27 INS42 INS42 INS42 INS42 INS7 INS32 INS42 INS32 INS42 INS34 INS42 INS42 INS42 INS45 INS52 INS42 INS32 INS42 INS32 INS42 INS42 INS42 INS42 INS14 INS42 INS42 INS42 INS27 INS32 INS32 INS42 INS42 INS14 INS42 INS32 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS43 INS42 INS33 INS42 INS52 INS42 INS34 INS42 INS42 INS32 INS42 INS32 INS43 INS40 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 DEL42 DEL44 DEL42 DEL42 DEL42 DEL42 DEL32 DEL41 DEL42 DEL32

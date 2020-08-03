@@ -1,0 +1,235 @@
+HDFS-4791. Update and fix deletion of reference inode.  Contributed by Jing Zhao
+
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/branches/HDFS-2802@1479198 13f79535-47bb-0310-9956-ffa450edef68
+
+-import java.util.Iterator;
++import org.apache.hadoop.hdfs.server.namenode.snapshot.FileWithSnapshot;
++import org.apache.hadoop.hdfs.server.namenode.snapshot.INodeDirectoryWithSnapshot;
++  /**
++   * When destroying a reference node (WithName or DstReference), we call this
++   * method to identify the snapshot which is the latest snapshot before the
++   * reference node's creation. 
++   */
++  static Snapshot getPriorSnapshot(INodeReference ref) {
++    WithCount wc = (WithCount) ref.getReferredINode();
++    WithName wn = null;
++    if (ref instanceof DstReference) {
++      wn = wc.getLastWithName();
++    } else if (ref instanceof WithName) {
++      wn = wc.getPriorWithName((WithName) ref);
++    }
++    if (wn != null) {
++      INode referred = wc.getReferredINode();
++      if (referred instanceof FileWithSnapshot) {
++        return ((FileWithSnapshot) referred).getDiffs().getPrior(
++            wn.lastSnapshotId);
++      } else if (referred instanceof INodeDirectoryWithSnapshot) { 
++        return ((INodeDirectoryWithSnapshot) referred).getDiffs().getPrior(
++            wn.lastSnapshotId);
++      }
++    }
++    return null;
++  }
++  
+-  @Override
++  @Override // used by WithCount
+-  @Override
+-  public final void destroyAndCollectBlocks(
++  @Override // used by WithCount
++  public void destroyAndCollectBlocks(
++    /**
++     * Compare snapshot with IDs, where null indicates the current status thus
++     * is greater than any non-null snapshot.
++     */
++    public static final Comparator<WithName> WITHNAME_COMPARATOR
++        = new Comparator<WithName>() {
++      @Override
++      public int compare(WithName left, WithName right) {
++        return left.lastSnapshotId - right.lastSnapshotId;
++      }
++    };
++    
+-        withNameList.add((WithName) ref);
++        WithName refWithName = (WithName) ref;
++        int i = Collections.binarySearch(withNameList, refWithName,
++            WITHNAME_COMPARATOR);
++        Preconditions.checkState(i < 0);
++        withNameList.add(-i - 1, refWithName);
+-        Iterator<INodeReference.WithName> iter = withNameList.iterator();
+-        while (iter.hasNext()) {
+-          if (iter.next() == ref) {
+-            iter.remove();
+-            break;
+-          }
++        int i = Collections.binarySearch(withNameList, (WithName) ref,
++            WITHNAME_COMPARATOR);
++        if (i >= 0) {
++          withNameList.remove(i);
++    WithName getLastWithName() {
++      return withNameList.size() > 0 ? 
++          withNameList.get(withNameList.size() - 1) : null;
++    }
++    
++    WithName getPriorWithName(WithName post) {
++      int i = Collections.binarySearch(withNameList, post, WITHNAME_COMPARATOR);
++      if (i > 0) {
++        return withNameList.get(i - 1);
++      } else if (i == 0 || i == -1) {
++        return null;
++      } else {
++        return withNameList.get(-i - 2);
++      }
++    }
++    
+-        // sort withNameList based on the lastSnapshotId
+-        Collections.sort(withNameList, new Comparator<WithName>() {
+-          @Override
+-          public int compare(WithName w1, WithName w2) {
+-            return w1.lastSnapshotId - w2.lastSnapshotId;
+-          }
+-        });
+-        BlocksMapUpdateInfo collectedBlocks, List<INode> removedINodes)
+-        throws QuotaExceededException {
++        final BlocksMapUpdateInfo collectedBlocks,
++        final List<INode> removedINodes) throws QuotaExceededException {
++      // since WithName node resides in deleted list acting as a snapshot copy,
++      // the parameter snapshot must be non-null
++      Preconditions.checkArgument(snapshot != null);
++      // if prior is null, or if prior's id is <= dstSnapshotId, we will call
++      // destroyAndCollectBlocks method
++      Preconditions.checkArgument(prior != null);
++    
++    @Override
++    public void destroyAndCollectBlocks(BlocksMapUpdateInfo collectedBlocks,
++        final List<INode> removedINodes) {
++      if (removeReference(this) <= 0) {
++        getReferredINode().destroyAndCollectBlocks(collectedBlocks,
++            removedINodes);
++      } else {
++        Snapshot prior = getPriorSnapshot(this);
++        INode referred = getReferredINode().asReference().getReferredINode();
++        Snapshot snapshot = getSelfSnapshot();
++        
++        if (snapshot != null) {
++          Preconditions.checkState(prior == null || 
++              snapshot.getId() > prior.getId());
++          try {
++            Quota.Counts counts = referred.cleanSubtree(snapshot, prior,
++                collectedBlocks, removedINodes);
++            INodeReference ref = getReferredINode().getParentReference();
++            if (ref != null) {
++              ref.addSpaceConsumed(-counts.get(Quota.NAMESPACE),
++                  -counts.get(Quota.DISKSPACE), true, Snapshot.INVALID_ID);
++            }
++          } catch (QuotaExceededException e) {
++            LOG.error("should not exceed quota while snapshot deletion", e);
++          }
++        }
++      }
++    }
++    
++    private Snapshot getSelfSnapshot() {
++      INode referred = getReferredINode().asReference().getReferredINode();
++      Snapshot snapshot = null;
++      if (referred instanceof FileWithSnapshot) {
++        snapshot = ((FileWithSnapshot) referred).getDiffs().getPrior(
++            lastSnapshotId);
++      } else if (referred instanceof INodeDirectoryWithSnapshot) {
++        snapshot = ((INodeDirectoryWithSnapshot) referred).getDiffs().getPrior(
++            lastSnapshotId);
++      }
++      return snapshot;
++    }
+-      Quota.Counts counts = getReferredINode().cleanSubtree(snapshot, prior,
+-          collectedBlocks, removedINodes);
+-      if (snapshot != null) {
+-        // also need to update quota usage along the corresponding WithName node
+-        WithCount wc = (WithCount) getReferredINode();
+-        wc.addSpaceConsumedToRenameSrc(-counts.get(Quota.NAMESPACE),
+-            -counts.get(Quota.DISKSPACE), true, snapshot.getId());
++      if (snapshot == null && prior == null) {
++        Quota.Counts counts = Quota.Counts.newInstance();
++        this.computeQuotaUsage(counts, true);
++        destroyAndCollectBlocks(collectedBlocks, removedINodes);
++        return counts;
++      } else {
++        return getReferredINode().cleanSubtree(snapshot, prior,
++            collectedBlocks, removedINodes);
+-      return counts;
++    }
++    
++    /**
++     * {@inheritDoc}
++     * <br/>
++     * To destroy a DstReference node, we first remove its link with the 
++     * referred node. If the reference number of the referred node is <= 0, we 
++     * destroy the subtree of the referred node. Otherwise, we clean the 
++     * referred node's subtree and delete everything created after the last 
++     * rename operation, i.e., everything outside of the scope of the prior 
++     * WithName nodes.
++     */
++    @Override
++    public void destroyAndCollectBlocks(
++        BlocksMapUpdateInfo collectedBlocks, final List<INode> removedINodes) {
++      if (removeReference(this) <= 0) {
++        getReferredINode().destroyAndCollectBlocks(collectedBlocks,
++            removedINodes);
++      } else {
++        // we will clean everything, including files, directories, and 
++        // snapshots, that were created after this prior snapshot
++        Snapshot prior = getPriorSnapshot(this);
++        // prior must be non-null, otherwise we do not have any previous 
++        // WithName nodes, and the reference number will be 0.
++        Preconditions.checkState(prior != null);
++        // identify the snapshot created after prior
++        Snapshot snapshot = getSelfSnapshot(prior);
++        
++        INode referred = getReferredINode().asReference().getReferredINode();
++        if (referred instanceof FileWithSnapshot) {
++          // if referred is a file, it must be a FileWithSnapshot since we did
++          // recordModification before the rename
++          FileWithSnapshot sfile = (FileWithSnapshot) referred;
++          // make sure we mark the file as deleted
++          sfile.deleteCurrentFile();
++          if (snapshot != null) {
++            try {
++              referred.cleanSubtree(snapshot, prior, collectedBlocks,
++                  removedINodes);
++            } catch (QuotaExceededException e) {
++              LOG.error("should not exceed quota while snapshot deletion", e);
++            }
++          }
++        } else if (referred instanceof INodeDirectoryWithSnapshot) {
++          // similarly, if referred is a directory, it must be an
++          // INodeDirectoryWithSnapshot
++          INodeDirectoryWithSnapshot sdir = 
++              (INodeDirectoryWithSnapshot) referred;
++          try {
++            INodeDirectoryWithSnapshot.destroyDstSubtree(sdir, snapshot, prior,
++                collectedBlocks, removedINodes);
++          } catch (QuotaExceededException e) {
++            LOG.error("should not exceed quota while snapshot deletion", e);
++          }
++        }
++      }
++    }
++    
++    private Snapshot getSelfSnapshot(final Snapshot prior) {
++      WithCount wc = (WithCount) getReferredINode().asReference();
++      INode referred = wc.getReferredINode();
++      Snapshot lastSnapshot = null;
++      if (referred instanceof FileWithSnapshot) {
++        lastSnapshot = ((FileWithSnapshot) referred).getDiffs()
++            .getLastSnapshot(); 
++      } else if (referred instanceof INodeDirectoryWithSnapshot) {
++        lastSnapshot = ((INodeDirectoryWithSnapshot) referred)
++            .getLastSnapshot();
++      }
++      if (lastSnapshot != null && !lastSnapshot.equals(prior)) {
++        return lastSnapshot;
++      } else {
++        return null;
++      }
+
+MOV26 INS26 INS40 UPD40 INS31 INS29 INS83 INS43 INS42 INS44 INS8 INS23 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS65 INS42 INS43 INS42 INS60 INS60 INS25 INS25 INS41 INS29 INS83 INS83 INS83 INS74 INS59 MOV29 MOV83 MOV39 UPD42 MOV42 MOV44 INS8 MOV29 INS83 INS39 INS42 MOV44 INS8 MOV43 INS42 INS8 INS43 INS42 INS44 INS8 MOV43 MOV44 MOV44 INS44 MOV43 INS8 INS78 INS83 INS39 INS42 INS44 INS44 INS8 INS83 INS43 INS42 INS8 MOV78 MOV83 MOV43 INS42 MOV44 MOV44 MOV44 MOV44 MOV43 INS8 INS29 INS78 INS83 INS39 INS42 MOV44 INS44 INS8 INS83 INS43 INS42 INS44 INS8 INS66 INS66 INS66 INS42 INS43 INS59 INS43 INS59 INS62 INS8 MOV25 INS27 INS8 INS33 INS65 INS43 INS43 INS42 INS14 INS25 MOV25 INS41 INS42 INS43 INS42 INS60 INS25 INS40 INS83 INS43 INS42 INS83 INS42 INS21 INS21 MOV60 INS60 INS25 INS41 INS42 INS43 INS42 INS83 INS74 INS42 INS25 INS42 INS60 INS60 INS25 INS41 INS25 INS65 INS42 INS83 INS74 INS42 INS25 INS42 INS83 INS43 INS42 MOV60 INS60 INS60 INS25 INS25 INS42 INS42 INS11 INS42 INS42 INS33 INS42 INS43 INS21 INS62 INS42 INS33 INS60 INS25 INS66 INS66 INS42 INS42 MOV74 INS1 MOV62 INS8 MOV25 MOV62 INS8 MOV25 INS16 INS42 INS39 INS59 INS27 INS8 INS25 INS42 INS42 INS42 INS32 INS32 INS43 INS59 INS27 INS8 INS42 INS42 INS43 INS43 INS27 INS8 INS8 INS43 INS59 INS43 INS59 INS62 INS8 INS25 INS42 INS27 INS8 INS8 INS65 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS43 INS43 INS27 INS8 INS8 INS42 MOV43 INS43 INS59 INS43 INS59 INS62 INS8 INS25 INS27 INS8 INS8 INS43 INS32 INS42 INS7 INS42 INS43 INS43 INS59 INS62 INS8 INS25 INS31 INS60 INS60 INS21 INS21 INS60 INS25 INS27 INS32 INS33 INS42 INS32 INS42 INS34 INS41 INS27 INS8 INS8 INS42 INS42 INS27 INS42 INS42 INS27 INS42 INS42 INS32 INS42 INS33 INS21 INS42 INS42 INS32 INS34 INS21 INS60 INS60 INS60 INS25 INS42 INS42 INS32 INS42 INS42 INS33 INS42 INS43 INS21 INS62 INS8 INS27 INS27 INS60 INS21 INS21 MOV41 INS41 INS42 INS42 INS32 INS34 INS21 INS60 INS21 INS60 INS60 INS25 INS42 INS42 INS32 INS42 INS42 INS33 INS42 INS43 INS21 INS62 INS8 INS27 INS38 MOV41 INS41 INS42 INS42 INS42 INS42 INS32 INS42 INS7 INS42 INS42 INS32 INS42 INS43 INS41 INS62 INS8 MOV78 MOV83 UPD39 MOV39 UPD42 MOV42 INS44 INS44 MOV8 MOV43 INS59 INS39 MOV59 INS32 INS32 INS39 INS59 INS27 MOV8 INS32 INS34 INS42 INS42 INS27 INS42 INS42 INS42 INS42 INS42 INS32 INS27 INS27 INS41 INS41 INS42 INS33 INS42 INS33 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS32 INS42 INS52 INS32 INS43 INS59 INS43 INS59 INS43 INS59 MOV27 INS8 INS32 INS42 INS42 INS7 INS42 INS43 INS21 INS42 INS33 INS42 INS33 INS43 INS59 INS32 INS32 INS32 INS42 INS52 INS32 INS43 INS59 INS32 INS43 INS59 INS43 INS59 INS62 INS8 INS25 MOV43 INS32 MOV42 UPD42 MOV42 INS42 INS7 INS42 INS43 INS21 INS42 INS33 INS32 UPD42 INS33 INS42 INS42 INS42 MOV32 INS42 INS42 INS42 INS32 INS42 INS43 INS41 INS43 INS42 INS43 INS42 INS41 INS42 INS11 UPD42 INS42 INS42 INS27 INS42 INS42 INS27 UPD42 MOV42 INS42 INS32 INS42 INS34 INS42 INS42 INS32 INS34 INS42 INS42 INS27 INS42 INS34 INS42 INS38 INS33 INS32 INS42 INS42 INS42 INS42 INS38 INS38 INS9 INS40 INS32 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS32 INS21 INS54 INS32 INS42 INS42 INS32 INS42 INS7 MOV40 INS42 INS32 INS52 INS42 INS42 INS9 INS42 INS42 INS42 MOV32 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS42 MOV42 INS42 INS32 INS42 INS42 INS27 MOV42 INS42 INS32 INS42 INS42 INS32 INS42 INS43 INS60 INS21 INS25 INS62 INS8 INS32 INS42 INS42 INS32 INS42 INS7 UPD42 MOV42 UPD42 MOV42 INS42 UPD42 UPD42 INS32 INS42 INS40 INS42 INS32 INS42 INS42 INS27 INS43 INS42 INS42 INS42 UPD42 INS42 INS42 INS34 INS38 INS34 INS42 INS42 UPD42 MOV42 INS11 INS42 INS42 INS42 INS42 INS34 INS34 INS42 INS42 INS27 INS32 INS32 INS42 INS42 INS52 INS32 INS42 INS42 INS32 MOV8 INS12 INS42 INS32 INS42 INS42 INS42 INS32 INS40 INS42 INS42 INS42 INS52 INS42 INS33 INS42 INS42 INS32 INS42 INS42 INS43 INS59 INS32 INS27 INS8 INS42 INS43 INS60 INS54 INS42 INS32 UPD42 MOV42 INS42 INS32 INS36 INS42 INS32 INS42 INS40 INS40 INS40 INS42 INS42 INS43 INS42 UPD42 INS42 INS38 INS34 INS42 INS42 INS40 INS42 INS42 INS40 INS32 INS42 INS42 INS42 INS27 INS44 INS8 INS36 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS42 INS11 INS42 INS42 INS42 INS33 INS54 INS42 INS43 INS59 INS8 INS12 INS36 UPD42 MOV42 INS36 UPD42 MOV42 INS11 INS36 INS42 INS42 INS42 INS42 INS27 INS27 INS43 INS42 INS21 INS11 INS36 INS42 INS42 INS43 INS42 INS8 INS12 INS42 INS42 INS11 INS21 INS44 INS8 INS11 INS11 INS43 INS42 INS11 INS42 INS33 MOV32 INS32 INS42 INS32 INS43 INS42 INS11 INS42 INS21 INS44 INS8 INS43 INS42 INS32 INS43 INS42 INS21 INS43 INS42 INS43 INS42 INS42 INS43 INS42 INS42 INS42 INS42 INS42 UPD42 MOV42 INS42 INS42 INS45 INS42 INS42 INS43 INS42 INS32 INS43 INS42 INS21 INS42 UPD42 MOV42 UPD42 MOV42 INS42 MOV42 MOV42 MOV42 MOV42 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 MOV42 INS32 INS42 INS42 INS45 INS42 INS42 INS42 INS45 INS42 DEL83 DEL10 DEL42 DEL32 DEL42 DEL27 DEL31 DEL42 DEL43 DEL40 DEL43 DEL74 DEL60 DEL42 DEL32 DEL8 DEL61 DEL8 DEL25 DEL8 DEL31 DEL42 DEL42 DEL42 DEL83 DEL39 DEL42 DEL42 DEL44 DEL42 DEL44 DEL40 DEL40 DEL27 DEL41 DEL8 DEL31 DEL1 DEL14 DEL32 DEL21 DEL32 DEL42 DEL40 DEL32 DEL38 DEL42 DEL40 DEL32 DEL38 DEL9 DEL32 DEL21 DEL8 DEL25 DEL8 DEL31

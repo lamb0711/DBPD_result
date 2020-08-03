@@ -1,0 +1,136 @@
+HDDS-850. ReadStateMachineData hits OverlappingFileLockException in ContainerStateMachine. Contributed by Shashikant Banerjee.
+
++import com.google.common.cache.Cache;
++import com.google.common.cache.CacheBuilder;
++import org.apache.ratis.server.impl.RaftServerProxy;
++import java.util.Collection;
++import java.util.concurrent.Callable;
++import java.util.concurrent.TimeUnit;
++import java.util.concurrent.ExecutionException;
+-  private final ConcurrentHashMap<Long, CompletableFuture<Message>>
+-      createContainerFutureMap;
++  private final Cache<Long, ByteString> stateMachineDataCache;
+-      List<ExecutorService> executors) {
++      List<ExecutorService> executors, long expiryInterval) {
+-    this.createContainerFutureMap = new ConcurrentHashMap<>();
++    stateMachineDataCache = CacheBuilder.newBuilder()
++        .expireAfterAccess(expiryInterval, TimeUnit.MILLISECONDS)
++        // set the limit on no of cached entries equal to no of max threads
++        // executing writeStateMachineData
++        .maximumSize(chunkExecutor.getCorePoolSize()).build();
+-    } else if (proto.getCmdType() == Type.CreateContainer) {
+-      return TransactionContext.newBuilder()
+-          .setClientRequest(request)
+-          .setStateMachine(this)
+-          .setServerRole(RaftPeerRole.LEADER)
+-          .setStateMachineData(request.getMessage().getContent())
+-          .setLogData(request.getMessage().getContent())
+-          .build();
+-    long containerID = write.getBlockID().getContainerID();
+-    CompletableFuture<Message> future =
+-        createContainerFutureMap.get(containerID);
+-    CompletableFuture<Message> writeChunkFuture;
+-    if (future != null) {
+-      writeChunkFuture = future.thenApplyAsync(
+-          v -> runCommand(requestProto), chunkExecutor);
+-    } else {
+-      writeChunkFuture = CompletableFuture.supplyAsync(
+-          () -> runCommand(requestProto), chunkExecutor);
++    RaftServer server = ratisServer.getServer();
++    Preconditions.checkState(server instanceof RaftServerProxy);
++    try {
++      if (((RaftServerProxy) server).getImpl(gid).isLeader()) {
++        stateMachineDataCache.put(entryIndex, write.getData());
++      }
++    } catch (IOException ioe) {
++      return completeExceptionally(ioe);
++    CompletableFuture<Message> writeChunkFuture = CompletableFuture
++        .supplyAsync(() -> runCommand(requestProto), chunkExecutor);
+-  private CompletableFuture<Message> handleCreateContainer(
+-      ContainerCommandRequestProto requestProto) {
+-    long containerID = requestProto.getContainerID();
+-    createContainerFutureMap.
+-        computeIfAbsent(containerID, k -> new CompletableFuture<>());
+-    return CompletableFuture.completedFuture(() -> ByteString.EMPTY);
+-  }
+-
++
++      // For only writeChunk, there will be writeStateMachineData call.
++      // CreateContainer will happen as a part of writeChunk only.
+-      case CreateContainer:
+-        return handleCreateContainer(requestProto);
+-            .setChunkData(writeChunkRequestProto.getChunkData());
++            .setChunkData(writeChunkRequestProto.getChunkData())
++            // set readFromTempFile to true in case, the chunkFile does
++            // not exist as applyTransaction is not executed for this entry yet.
++            .setReadFromTmpFile(true);
++    ByteString data = responseProto.getData();
+-    Preconditions.checkNotNull(responseProto.getData());
++    Preconditions.checkNotNull(data);
++    return data;
++  }
++  /**
++   * Reads the Entry from the Cache or loads it back by reading from disk.
++   */
++  private ByteString getCachedStateMachineData(Long logIndex,
++      ContainerCommandRequestProto requestProto) throws ExecutionException {
++    try {
++      return reconstructWriteChunkRequest(
++          stateMachineDataCache.get(logIndex, new Callable<ByteString>() {
++            @Override
++            public ByteString call() throws Exception {
++              return readStateMachineData(requestProto);
++            }
++          }), requestProto);
++    } catch (ExecutionException e) {
++      throw e;
++    }
++  }
++
++  private ByteString reconstructWriteChunkRequest(ByteString data,
++      ContainerCommandRequestProto requestProto) {
++    WriteChunkRequestProto writeChunkRequestProto =
++        requestProto.getWriteChunk();
+-            .setData(responseProto.getData())
+-            .setStage(Stage.WRITE_DATA);
++            .setData(data).setStage(Stage.WRITE_DATA);
+-
+-
+-        return CompletableFuture.supplyAsync(() ->
+-                readStateMachineData(requestProto), chunkExecutor);
+-      } else if (requestProto.getCmdType() == Type.CreateContainer) {
+-        return CompletableFuture.completedFuture(requestProto.toByteString());
++        CompletableFuture<ByteString> future = new CompletableFuture<>();
++        return future.supplyAsync(() -> {
++          try {
++            return getCachedStateMachineData(entry.getIndex(), requestProto);
++          } catch (ExecutionException e) {
++            future.completeExceptionally(e);
++            return null;
++          }
++        }, chunkExecutor);
+-      // Mark the createContainerFuture complete so that writeStateMachineData
+-      // for WriteChunk gets unblocked
+-      if (cmdType == Type.CreateContainer) {
+-        long containerID = requestProto.getContainerID();
+-        future.thenApply(
+-            r -> {
+-              createContainerFutureMap.remove(containerID).complete(null);
+-              LOG.info("create Container Transaction completed for container " +
+-                  containerID + " log index " + index);
+-              return r;
+-            });
+-      }
+-
++  private void evictStateMachineCache() {
++    stateMachineDataCache.invalidateAll();
++    stateMachineDataCache.cleanUp();
++  }
++
++  public void notifyNotLeader(Collection<TransactionContext> pendingEntries)
++      throws IOException {
++    evictStateMachineCache();
++  }
++
++  @Override
++    evictStateMachineCache();

@@ -1,0 +1,188 @@
+HDDS-2026. Overlapping chunk region cannot be read concurrently
+
+Signed-off-by: Anu Engineer <aengineer@apache.org>
+
++import com.google.common.annotations.VisibleForTesting;
++import org.apache.ratis.util.function.CheckedSupplier;
+-import java.nio.channels.AsynchronousFileChannel;
++import java.nio.file.Path;
++import java.util.Set;
++import java.util.concurrent.ConcurrentHashMap;
++  private static final Set<Path> LOCKS = ConcurrentHashMap.newKeySet();
++
+-   * @param volumeIOStats
++   * @param volumeIOStats statistics collector
+-   * @throws StorageContainerException
+-    FileChannel file = null;
+-    FileLock lock = null;
++    Path path = chunkFile.toPath();
++    long startTime = Time.monotonicNow();
++    processFileExclusively(path, () -> {
++      FileChannel file = null;
++      try {
++        // skip SYNC and DSYNC to reduce contention on file.lock
++        file = FileChannel.open(path,
++            StandardOpenOption.CREATE,
++            StandardOpenOption.WRITE,
++            StandardOpenOption.SPARSE);
+-    try {
+-      long writeTimeStart = Time.monotonicNow();
+-
+-      // skip SYNC and DSYNC to reduce contention on file.lock
+-      file = FileChannel.open(chunkFile.toPath(),
+-              StandardOpenOption.CREATE,
+-              StandardOpenOption.WRITE,
+-              StandardOpenOption.SPARSE);
+-
+-      lock = file.lock();
+-      int size = file.write(data, chunkInfo.getOffset());
+-      // Increment volumeIO stats here.
+-      volumeIOStats.incWriteTime(Time.monotonicNow() - writeTimeStart);
+-      volumeIOStats.incWriteOpCount();
+-      volumeIOStats.incWriteBytes(size);
+-      if (size != bufferSize) {
+-        log.error("Invalid write size found. Size:{}  Expected: {} ", size,
+-            bufferSize);
+-        throw new StorageContainerException("Invalid write size found. " +
+-            "Size: " + size + " Expected: " + bufferSize, INVALID_WRITE_SIZE);
+-      }
+-    } catch (StorageContainerException ex) {
+-      throw ex;
+-    } catch(IOException e) {
+-      throw new StorageContainerException(e, IO_EXCEPTION);
+-
+-    } finally {
+-      if (lock != null) {
+-        try {
+-          lock.release();
+-        } catch (IOException e) {
+-          log.error("Unable to release lock ??, Fatal Error.");
+-          throw new StorageContainerException(e, CONTAINER_INTERNAL_ERROR);
+-
++        int size;
++        try (FileLock ignored = file.lock()) {
++          size = file.write(data, chunkInfo.getOffset());
+-      }
+-      if (file != null) {
+-        try {
+-          if (sync) {
+-            // ensure data and metadata is persisted. Outside the lock
+-            file.force(true);
+-          }
+-          file.close();
+-        } catch (IOException e) {
+-          throw new StorageContainerException("Error closing chunk file",
+-              e, CONTAINER_INTERNAL_ERROR);
++
++        // Increment volumeIO stats here.
++        volumeIOStats.incWriteTime(Time.monotonicNow() - startTime);
++        volumeIOStats.incWriteOpCount();
++        volumeIOStats.incWriteBytes(size);
++        if (size != bufferSize) {
++          log.error("Invalid write size found. Size:{}  Expected: {} ", size,
++              bufferSize);
++          throw new StorageContainerException("Invalid write size found. " +
++              "Size: " + size + " Expected: " + bufferSize, INVALID_WRITE_SIZE);
++      } catch (StorageContainerException ex) {
++        throw ex;
++      } catch (IOException e) {
++        throw new StorageContainerException(e, IO_EXCEPTION);
++      } finally {
++        closeFile(file, sync);
+-    }
++
++      return null;
++    });
++
+-   * @param volumeIOStats
++   * @param volumeIOStats statistics collector
+-   * @throws StorageContainerException
+-   * @throws ExecutionException
+-   * @throws InterruptedException
+-    AsynchronousFileChannel file = null;
+-    FileLock lock = null;
+-    try {
+-      long readStartTime = Time.monotonicNow();
+-      file =
+-          AsynchronousFileChannel.open(chunkFile.toPath(),
+-              StandardOpenOption.READ);
+-      lock = file.lock(data.getOffset(), data.getLen(), true).get();
++    long offset = data.getOffset();
++    long len = data.getLen();
++    ByteBuffer buf = ByteBuffer.allocate((int) len);
+-      ByteBuffer buf = ByteBuffer.allocate((int) data.getLen());
+-      file.read(buf, data.getOffset()).get();
++    Path path = chunkFile.toPath();
++    long startTime = Time.monotonicNow();
++    return processFileExclusively(path, () -> {
++      FileChannel file = null;
+-      // Increment volumeIO stats here.
+-      volumeIOStats.incReadTime(Time.monotonicNow() - readStartTime);
+-      volumeIOStats.incReadOpCount();
+-      volumeIOStats.incReadBytes(data.getLen());
++      try {
++        file = FileChannel.open(path, StandardOpenOption.READ);
+-      return buf;
+-    } catch (IOException e) {
+-      throw new StorageContainerException(e, IO_EXCEPTION);
+-    } finally {
+-      if (lock != null) {
+-        try {
+-          lock.release();
+-        } catch (IOException e) {
+-          log.error("I/O error is lock release.");
++        try (FileLock ignored = file.lock(offset, len, true)) {
++          file.read(buf, offset);
++        }
++
++        // Increment volumeIO stats here.
++        volumeIOStats.incReadTime(Time.monotonicNow() - startTime);
++        volumeIOStats.incReadOpCount();
++        volumeIOStats.incReadBytes(len);
++
++        return buf;
++      } catch (IOException e) {
++        throw new StorageContainerException(e, IO_EXCEPTION);
++      } finally {
++        if (file != null) {
++          IOUtils.closeStream(file);
+-      if (file != null) {
+-        IOUtils.closeStream(file);
+-      }
+-    }
++    });
++
++  @VisibleForTesting
++  static <T, E extends Exception> T processFileExclusively(
++      Path path, CheckedSupplier<T, E> op
++  ) throws E {
++    for (;;) {
++      if (LOCKS.add(path)) {
++        break;
++      }
++    }
++
++    try {
++      return op.get();
++    } finally {
++      LOCKS.remove(path);
++    }
++  }
++
++  private static void closeFile(FileChannel file, boolean sync)
++      throws StorageContainerException {
++    if (file != null) {
++      try {
++        if (sync) {
++          // ensure data and metadata is persisted
++          file.force(true);
++        }
++        file.close();
++      } catch (IOException e) {
++        throw new StorageContainerException("Error closing chunk file",
++            e, CONTAINER_INTERNAL_ERROR);
++      }
++    }
++  }
+
+MOV26 INS26 INS26 INS26 INS26 INS40 INS40 UPD40 INS40 INS40 INS23 INS31 INS31 INS83 INS83 INS83 INS74 INS59 INS78 INS83 INS73 INS73 INS43 INS42 INS44 INS44 INS43 INS8 INS83 INS83 INS39 INS42 INS44 INS44 MOV43 MOV8 INS43 INS43 INS42 INS32 MOV60 INS21 INS60 MOV60 INS60 MOV60 INS41 INS42 INS42 INS42 INS43 INS42 INS43 INS42 INS74 INS42 INS42 INS24 INS54 INS43 INS42 INS39 INS42 INS42 INS42 INS42 INS42 INS66 INS43 INS32 INS66 INS39 INS59 INS39 MOV43 INS59 UPD43 INS32 INS42 INS42 INS43 INS43 INS43 INS8 INS8 INS8 INS42 INS42 UPD42 MOV32 UPD42 INS42 INS42 INS86 INS42 MOV32 UPD42 MOV32 INS42 INS32 UPD42 UPD42 MOV32 UPD42 INS42 INS42 INS86 INS42 INS42 INS42 INS25 INS41 INS21 INS8 INS42 INS42 INS11 INS8 INS32 INS8 INS32 INS32 MOV60 MOV54 INS41 INS39 INS42 MOV60 MOV54 INS42 INS42 INS42 INS10 INS42 INS42 INS42 INS42 INS42 INS8 INS33 INS43 INS54 INS21 INS42 UPD42 INS54 INS58 INS8 INS32 INS58 INS8 MOV43 INS59 INS21 INS42 INS42 INS42 MOV43 INS59 MOV21 UPD42 MOV42 INS42 INS42 MOV32 INS7 UPD42 UPD42 INS42 INS42 INS32 INS32 UPD42 INS42 MOV32 MOV42 MOV42 UPD42 MOV42 UPD42 MOV42 MOV9 MOV42 MOV42 MOV42 UPD42 MOV42 DEL42 DEL65 DEL33 DEL42 DEL7 DEL21 DEL42 DEL65 DEL42 DEL65 DEL42 DEL65 DEL42 DEL42 DEL39 DEL11 DEL32 DEL33 DEL42 DEL32 DEL32 DEL42 DEL32 DEL42 DEL32 DEL32 DEL42 DEL32 DEL7 DEL21 DEL42 DEL32 DEL42 DEL33 DEL27 DEL42 DEL42 DEL32 DEL21 DEL8 DEL42 DEL43 DEL42 DEL44 DEL42 DEL42 DEL45 DEL32 DEL21 DEL8 DEL12 DEL54 DEL8 DEL25 DEL42 DEL33 DEL27 DEL42 DEL42 DEL32 DEL21 DEL8 DEL42 DEL43 DEL42 DEL44 DEL42 DEL42 DEL45 DEL32 DEL21 DEL42 DEL42 DEL14 DEL53 DEL8 DEL12 DEL54 DEL8 DEL25

@@ -1,0 +1,388 @@
+YARN-6405. Improve configuring services through REST API. Contributed by Jian He
+
++import com.google.common.cache.CacheBuilder;
++import com.google.common.cache.CacheLoader;
++import com.google.common.cache.LoadingCache;
++import org.apache.commons.io.IOUtils;
++import org.apache.hadoop.fs.FSDataInputStream;
++import org.apache.hadoop.fs.FileSystem;
++import org.apache.slider.api.resource.ConfigFile;
++import java.util.concurrent.TimeUnit;
+-
++  // priority_id -> RoleStatus
++  // component_name -> ProviderRole
++
++  // A cache for loading config files from remote such as hdfs
++  public LoadingCache<ConfigFile, Object> configFileCache = null;
++
+-
+-    log.debug("Building application state");
+-    appMetrics
+-        .tag("type", "Metrics type [component or service]", "service");
+-    appMetrics
+-        .tag("appId", "Application id for service", app.getId());
++    appMetrics.tag("type", "Metrics type [component or service]", "service");
++    appMetrics.tag("appId", "Application id for service", app.getId());
+-    //build the initial role list
+-    List<ProviderRole> roleList = new ArrayList<>(binding.roles);
+-    for (ProviderRole providerRole : roleList) {
+-      buildRole(providerRole);
+-    }
+-
++    //build the initial component list
+-      if (component.getUniqueComponentSupport()) {
+-        log.info("Skipping group " + name + ", as it's unique component");
+-        continue;
+-      }
+-      ProviderRole dynamicRole =
+-          createComponent(name, name, component, priority);
+-      buildRole(dynamicRole);
+-      roleList.add(dynamicRole);
++      createComponent(name, name, component, priority++);
++
+-    buildRoleRequirementsFromResources();
++//    buildRoleRequirementsFromResources();
+-
++    createConfigFileCache(binding.fs);
+-  //TODO WHY do we need to create the component for AM ?
++  private void createConfigFileCache(final FileSystem fileSystem) {
++    this.configFileCache =
++        CacheBuilder.newBuilder().expireAfterAccess(10, TimeUnit.MINUTES)
++            .build(new CacheLoader<ConfigFile, Object>() {
++              @Override public Object load(ConfigFile key) throws Exception {
++                switch (key.getType()) {
++                case HADOOP_XML:
++                  try (FSDataInputStream input = fileSystem
++                      .open(new Path(key.getSrcFile()))) {
++                    org.apache.hadoop.conf.Configuration confRead =
++                        new org.apache.hadoop.conf.Configuration(false);
++                    confRead.addResource(input);
++                    Map<String, String> map = new HashMap<>(confRead.size());
++                    for (Map.Entry<String, String> entry : confRead) {
++                      map.put(entry.getKey(), entry.getValue());
++                    }
++                    return map;
++                  }
++                case TEMPLATE:
++                  try (FSDataInputStream fileInput = fileSystem
++                      .open(new Path(key.getSrcFile()))) {
++                    return IOUtils.toString(fileInput);
++                  }
++                default:
++                  return null;
++                }
++              }
++            });
++  }
++
+-            placementTimeout, label, component);
+-
++            placementTimeout, label, component, this);
++    buildRole(newRole, component);
+-  public synchronized List<ProviderRole> updateComponents(Map<String, Long>
++  public synchronized void updateComponents(Map<String, Long>
+-        component.setNumberOfContainers(componentCounts.get(component
+-            .getName()));
++        long count = componentCounts.get(component.getName());
++        component.setNumberOfContainers(count);
++        ProviderRole role = roles.get(component.getName());
++        if (role != null && roleStatusMap.get(role.id) != null) {
++          setDesiredContainers(roleStatusMap.get(role.id), (int) count);
++        }
+-    //TODO update cluster description
+-    return buildRoleRequirementsFromResources();
+-  public synchronized List<ProviderRole> updateComponents(
++  public synchronized void updateComponents(
+-    return updateComponents(componentCounts);
++    updateComponents(componentCounts);
+-  private List<ProviderRole> buildRoleRequirementsFromResources()
+-      throws BadConfigException {
+-    List<ProviderRole> newRoles = new ArrayList<>(0);
+-
+-    // now update every role's desired count.
+-    // if there are no instance values, that role count goes to zero
+-    // Add all the existing roles
+-    // component name -> number of containers
+-    Map<String, Integer> groupCounts = new HashMap<>();
+-
+-    for (RoleStatus roleStatus : getRoleStatusMap().values()) {
+-      if (roleStatus.isExcludeFromFlexing()) {
+-        // skip inflexible roles, e.g AM itself
+-        continue;
+-      }
+-      long currentDesired = roleStatus.getDesired();
+-      String role = roleStatus.getName();
+-      String roleGroup = roleStatus.getGroup();
+-      Component component = roleStatus.getProviderRole().component;
+-      int desiredInstanceCount = component.getNumberOfContainers().intValue();
+-
+-      int newDesired = desiredInstanceCount;
+-      if (component.getUniqueComponentSupport()) {
+-        Integer groupCount = 0;
+-        if (groupCounts.containsKey(roleGroup)) {
+-          groupCount = groupCounts.get(roleGroup);
+-        }
+-
+-        newDesired = desiredInstanceCount - groupCount;
+-
+-        if (newDesired > 0) {
+-          newDesired = 1;
+-          groupCounts.put(roleGroup, groupCount + newDesired);
+-        } else {
+-          newDesired = 0;
+-        }
+-      }
+-
+-      if (newDesired == 0) {
+-        log.info("Role {} has 0 instances specified", role);
+-      }
+-      if (currentDesired != newDesired) {
+-        log.info("Role {} flexed from {} to {}", role, currentDesired,
+-            newDesired);
+-        setDesiredContainers(roleStatus, newDesired);
+-      }
+-    }
+-
+-    // now the dynamic ones. Iterate through the the cluster spec and
+-    // add any role status entries not in the role status
+-
+-    for (Component component : app.getComponents()) {
+-      String name = component.getName();
+-      if (roles.containsKey(name)) {
+-        continue;
+-      }
+-      if (component.getUniqueComponentSupport()) {
+-        // THIS NAME IS A GROUP
+-        int desiredInstanceCount = component.getNumberOfContainers().intValue();
+-        Integer groupCount = 0;
+-        if (groupCounts.containsKey(name)) {
+-          groupCount = groupCounts.get(name);
+-        }
+-        for (int i = groupCount + 1; i <= desiredInstanceCount; i++) {
+-          // this is a new instance of an existing group
+-          String newName = String.format("%s%d", name, i);
+-          if (roles.containsKey(newName)) {
+-            continue;
+-          }
+-          int newPriority = getNewPriority(i);
+-          log.info("Adding new role {}", newName);
+-          ProviderRole dynamicRole =
+-              createComponent(newName, name, component, newPriority);
+-          RoleStatus newRole = buildRole(dynamicRole);
+-          incDesiredContainers(newRole);
+-          log.info("New role {}", newRole);
+-          if (roleHistory != null) {
+-            roleHistory.addNewRole(newRole);
+-          }
+-          newRoles.add(dynamicRole);
+-        }
+-      } else {
+-        // this is a new value
+-        log.info("Adding new role {}, num containers {}", name,
+-            component.getNumberOfContainers());
+-        ProviderRole dynamicRole =
+-            createComponent(name, name, component, getNewPriority(1));
+-        RoleStatus newRole = buildRole(dynamicRole);
+-        incDesiredContainers(newRole,
+-            component.getNumberOfContainers().intValue());
+-        log.info("New role {}", newRole);
+-        if (roleHistory != null) {
+-          roleHistory.addNewRole(newRole);
+-        }
+-        newRoles.add(dynamicRole);
+-      }
+-    }
+-    // and fill in all those roles with their requirements
+-    buildRoleResourceRequirements();
+-
+-    return newRoles;
+-  }
++//  private List<ProviderRole> buildRoleRequirementsFromResources()
++//      throws BadConfigException {
++//
++//    List<ProviderRole> newRoles = new ArrayList<>(0);
++//
++//    // now update every role's desired count.
++//    // if there are no instance values, that role count goes to zero
++//    // Add all the existing roles
++//    // component name -> number of containers
++//    Map<String, Integer> groupCounts = new HashMap<>();
++//
++//    for (RoleStatus roleStatus : getRoleStatusMap().values()) {
++//      if (roleStatus.isExcludeFromFlexing()) {
++//        // skip inflexible roles, e.g AM itself
++//        continue;
++//      }
++//      long currentDesired = roleStatus.getDesired();
++//      String role = roleStatus.getName();
++//      String roleGroup = roleStatus.getGroup();
++//      Component component = roleStatus.getProviderRole().component;
++//      int desiredInstanceCount = component.getNumberOfContainers().intValue();
++//
++//      int newDesired = desiredInstanceCount;
++//      if (component.getUniqueComponentSupport()) {
++//        Integer groupCount = 0;
++//        if (groupCounts.containsKey(roleGroup)) {
++//          groupCount = groupCounts.get(roleGroup);
++//        }
++//
++//        newDesired = desiredInstanceCount - groupCount;
++//
++//        if (newDesired > 0) {
++//          newDesired = 1;
++//          groupCounts.put(roleGroup, groupCount + newDesired);
++//        } else {
++//          newDesired = 0;
++//        }
++//      }
++//
++//      if (newDesired == 0) {
++//        log.info("Role {} has 0 instances specified", role);
++//      }
++//      if (currentDesired != newDesired) {
++//        log.info("Role {} flexed from {} to {}", role, currentDesired,
++//            newDesired);
++//        setDesiredContainers(roleStatus, newDesired);
++//      }
++//    }
++//
++//    log.info("Counts per component: " + groupCounts);
++//    // now the dynamic ones. Iterate through the the cluster spec and
++//    // add any role status entries not in the role status
++//
++//    List<RoleStatus> list = new ArrayList<>(getRoleStatusMap().values());
++//    for (RoleStatus roleStatus : list) {
++//      String name = roleStatus.getName();
++//      Component component = roleStatus.getProviderRole().component;
++//      if (roles.containsKey(name)) {
++//        continue;
++//      }
++//      if (component.getUniqueComponentSupport()) {
++//        // THIS NAME IS A GROUP
++//        int desiredInstanceCount = component.getNumberOfContainers().intValue();
++//        Integer groupCount = 0;
++//        if (groupCounts.containsKey(name)) {
++//          groupCount = groupCounts.get(name);
++//        }
++//        log.info("Component " + component.getName() + ", current count = "
++//            + groupCount + ", desired count = " + desiredInstanceCount);
++//        for (int i = groupCount + 1; i <= desiredInstanceCount; i++) {
++//          int priority = roleStatus.getPriority();
++//          // this is a new instance of an existing group
++//          String newName = String.format("%s%d", name, i);
++//          int newPriority = getNewPriority(priority + i - 1);
++//          log.info("Adding new role {}", newName);
++//          ProviderRole dynamicRole =
++//              createComponent(newName, name, component, newPriority);
++//          RoleStatus newRole = buildRole(dynamicRole);
++//          incDesiredContainers(newRole);
++//          log.info("New role {}", newRole);
++//          if (roleHistory != null) {
++//            roleHistory.addNewRole(newRole);
++//          }
++//          newRoles.add(dynamicRole);
++//        }
++//      } else {
++//        // this is a new value
++//        log.info("Adding new role {}", name);
++//        ProviderRole dynamicRole =
++//            createComponent(name, name, component, roleStatus.getPriority());
++//        RoleStatus newRole = buildRole(dynamicRole);
++//        incDesiredContainers(roleStatus,
++//            component.getNumberOfContainers().intValue());
++//        log.info("New role {}", newRole);
++//        if (roleHistory != null) {
++//          roleHistory.addNewRole(newRole);
++//        }
++//        newRoles.add(dynamicRole);
++//      }
++//    }
++//    // and fill in all those roles with their requirements
++//    buildRoleResourceRequirements();
++//
++//    return newRoles;
++//  }
+-  public RoleStatus buildRole(ProviderRole providerRole) throws BadConfigException {
++  public RoleStatus buildRole(ProviderRole providerRole, Component component)
++      throws BadConfigException {
+-      throw new BadConfigException("Duplicate Provider Key: %s and %s",
+-                                   providerRole,
+-                                   roleStatusMap.get(priority)
+-                                       .getProviderRole());
++      throw new BadConfigException("Duplicate component priority Key: %s and %s",
++          providerRole, roleStatusMap.get(priority));
++    roleStatus.setResourceRequirements(buildResourceRequirements(roleStatus));
++    long prev = roleStatus.getDesired();
++    setDesiredContainers(roleStatus, component.getNumberOfContainers().intValue());
++    log.info("Set desired containers for component " + component.getName() +
++        " from " + prev + " to " + roleStatus.getDesired());
+-   * Build up the requirements of every resource
+-   */
+-  private void buildRoleResourceRequirements() {
+-    for (RoleStatus role : roleStatusMap.values()) {
+-      role.setResourceRequirements(buildResourceRequirements(role));
+-      log.info("Setting resource requirements for {} to {}", role.getName(),
+-          role.getResourceRequirements());
+-    }
+-  }
+-  /**
+-   * Enum all nodes by role. 
++   * Enum all nodes by role.
+-   * Build a map of role->nodename->node-info
++   * Build a map of Component_name -> ContainerId -> ClusterNode
+-   * Update internal state, such as the role request count. 
++   * Update internal state, such as the role request count.
++    int delta = n - role.getComponentMetrics().containersDesired.value();
+-    appMetrics.containersDesired.set(n);
+-  }
+-
+-  private void incDesiredContainers(RoleStatus role) {
+-    role.getComponentMetrics().containersDesired.incr();
+-    appMetrics.containersDesired.incr();
+-  }
+-
+-  private void incDesiredContainers(RoleStatus role, int n) {
+-    role.getComponentMetrics().containersDesired.incr(n);
+-    appMetrics.containersDesired.incr(n);
++    appMetrics.containersDesired.incr(delta);
+-   * {@link ResourceKeys#YARN_RESOURCE_NORMALIZATION_ENABLED} is set to false).
++   * {@link org.apache.slider.api.ResourceKeys#YARN_RESOURCE_NORMALIZATION_ENABLED}
++   * is set to false).
+-    if (component == null) {
+-      // this is for AM container
+-      // TODO why do we need to create the component for AM ?
+-      return Resource.newInstance(1, 512);
+-    }
+-        log.info("Failed container in role[{}] : {}", roleId, rolename);
++        log.info("Failed container in role[{}] : {}", roleId,
++            roleInstance.getCompInstanceName());
++          roleStatus.getProviderRole().failedInstanceName
++              .offer(roleInstance.compInstanceName);
+-   * actions if the number of desired role instances doesn't equal 
++   * actions if the number of desired role instances doesn't equal
+-    log.info("review one role " + role.getName());
+-    log.info("Reviewing {} : ", role);
+-    log.debug("Expected {}, Requested/Running {}, Delta: {}", expected,
+-        role.getActualAndRequested(), delta);
++    log.info("Reviewing " + role.getName() + ": " + role.getComponentMetrics());
+-          operations.add(new ContainerReleaseOperation(possible.getId()));
++          role.getProviderRole().failedInstanceName
++              .offer(possible.compInstanceName);
++          operations.add(new ContainerReleaseOperation(possible.getContainerId()));
+-        operations.add(new ContainerReleaseOperation(role.getId()));
++        operations.add(new ContainerReleaseOperation(role.getContainerId()));
+-   * Get diagnostics info about containers
+-   */
+-  public String getContainerDiagnosticInfo() {
+-    StringBuilder builder = new StringBuilder();
+-    for (RoleStatus roleStatus : getRoleStatusMap().values()) {
+-      builder.append(roleStatus).append('\n');
+-    }
+-    return builder.toString();
+-  }
+-
+-  /**
++    //TODO recover the component instance name from zk registry ?
+-    instance.group = role.getGroup();
+
+INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS23 INS31 INS83 INS74 INS59 INS83 INS39 INS42 INS44 INS8 INS39 INS39 MOV29 MOV44 MOV21 UPD43 MOV43 INS43 UPD43 MOV43 UPD42 MOV42 INS33 MOV21 INS83 INS43 INS42 INS21 INS21 INS21 INS21 MOV60 MOV21 INS21 INS60 UPD42 UPD42 MOV42 UPD42 UPD42 MOV42 INS7 INS32 MOV32 INS32 INS32 UPD66 UPD66 UPD66 INS39 INS59 UPD66 UPD66 INS21 UPD42 INS40 INS22 INS32 INS42 INS42 INS42 INS42 INS42 INS32 UPD42 UPD42 UPD42 INS42 INS42 INS27 INS42 INS27 UPD42 UPD42 INS32 INS52 INS42 INS32 INS42 INS14 INS52 INS42 INS42 INS45 INS32 INS45 INS42 INS45 INS32 INS42 INS32 INS40 UPD45 INS45 INS32 MOV42 MOV42 MOV42 MOV42 INS37 INS32 INS42 INS34 INS40 INS74 INS1 INS60 INS60 INS25 UPD45 MOV32 INS42 INS42 INS42 INS42 MOV22 INS42 INS42 INS42 INS42 UPD42 MOV42 INS42 INS43 INS43 INS43 INS31 INS39 INS59 MOV43 INS59 INS27 INS8 UPD42 MOV42 UPD42 MOV42 INS42 INS78 INS83 INS43 INS42 INS44 INS43 INS8 INS42 MOV32 INS42 INS42 INS42 INS32 INS27 INS27 INS21 INS42 UPD42 MOV42 INS43 INS42 UPD42 MOV42 INS50 INS42 INS42 INS32 INS42 INS33 INS32 INS33 INS32 INS32 INS21 INS21 MOV43 UPD42 MOV42 INS32 INS49 INS54 INS49 INS54 INS49 INS41 INS42 INS42 INS42 INS42 INS40 INS42 INS32 INS11 UPD42 MOV42 INS42 INS32 INS32 UPD42 UPD42 MOV42 UPD42 MOV42 INS42 INS58 INS8 INS42 INS58 INS8 INS33 INS42 INS42 INS40 INS39 INS42 MOV22 INS42 INS40 INS22 INS42 INS40 INS43 INS59 MOV60 MOV21 MOV60 MOV70 INS41 INS43 INS59 INS41 UPD42 INS32 INS42 MOV43 UPD42 MOV42 UPD42 MOV42 MOV32 UPD43 UPD74 INS42 INS42 UPD42 MOV42 INS42 INS32 INS32 INS42 INS42 UPD42 UPD42 UPD42 INS14 INS40 UPD42 INS14 UPD42 UPD42 UPD42 MOV43 UPD42 INS74 UPD42 INS42 UPD42 MOV42 INS14 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 INS43 INS32 INS43 INS9 INS32 INS43 MOV43 MOV43 INS43 INS32 INS42 UPD42 MOV42 UPD42 MOV42 INS40 INS42 INS42 INS40 UPD42 UPD42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 UPD42 UPD42 UPD42 UPD42 DEL42 DEL42 DEL45 DEL32 DEL21 DEL42 DEL43 DEL42 DEL43 DEL74 DEL42 DEL42 DEL43 DEL74 DEL40 DEL14 DEL59 DEL60 DEL42 DEL43 DEL42 DEL44 DEL42 DEL8 DEL70 DEL42 DEL42 DEL32 DEL42 DEL42 DEL45 DEL42 DEL45 DEL27 DEL32 DEL21 DEL18 DEL8 DEL25 DEL42 DEL43 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL42 DEL32 DEL21 DEL42 DEL42 DEL42 DEL32 DEL21 DEL42 DEL32 DEL21 DEL42 DEL42 DEL34 DEL32 DEL42 DEL42 DEL42 DEL32 DEL42 DEL43 DEL42 DEL42 DEL32 DEL42 DEL42 DEL42 DEL42 DEL32 DEL32 DEL21 DEL45 DEL42 DEL43 DEL42 DEL43 DEL74 DEL42 DEL32 DEL41 DEL42 DEL43 DEL42 DEL43 DEL74 DEL41 DEL83 DEL42 DEL43 DEL74 DEL42 DEL43 DEL42 DEL43 DEL74 DEL42 DEL42 DEL43 DEL74 DEL34 DEL14 DEL59 DEL60 DEL42 DEL43 DEL42 DEL44 DEL42 DEL32 DEL42 DEL32 DEL42 DEL42 DEL32 DEL18 DEL8 DEL25 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL43 DEL59 DEL60 DEL39 DEL42 DEL42 DEL42 DEL32 DEL42 DEL32 DEL59 DEL60 DEL39 DEL42 DEL42 DEL59 DEL60 DEL42 DEL42 DEL32 DEL43 DEL42 DEL34 DEL59 DEL60 DEL42 DEL42 DEL42 DEL32 DEL42 DEL42 DEL42 DEL42 DEL32 DEL7 DEL21 DEL8 DEL25 DEL42 DEL42 DEL42 DEL27 DEL7 DEL21 DEL42 DEL34 DEL27 DEL42 DEL34 DEL7 DEL21 DEL42 DEL42 DEL42 DEL42 DEL27 DEL32 DEL21 DEL8 DEL42 DEL34 DEL7 DEL21 DEL8 DEL25 DEL8 DEL25 DEL42 DEL34 DEL27 DEL42 DEL42 DEL45 DEL42 DEL32 DEL21 DEL8 DEL25 DEL42 DEL42 DEL27 DEL42 DEL42 DEL45 DEL42 DEL42 DEL42 DEL32 DEL21 DEL42 DEL42 DEL42 DEL32 DEL21 DEL8 DEL25 DEL8 DEL70 DEL42 DEL42 DEL32 DEL43 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL42 DEL42 DEL32 DEL18 DEL8 DEL25 DEL42 DEL42 DEL32 DEL39 DEL42 DEL42 DEL42 DEL32 DEL42 DEL32 DEL59 DEL60 DEL43 DEL42 DEL34 DEL59 DEL60 DEL42 DEL42 DEL42 DEL32 DEL42 DEL42 DEL42 DEL42 DEL32 DEL7 DEL21 DEL8 DEL25 DEL39 DEL42 DEL42 DEL34 DEL27 DEL59 DEL58 DEL42 DEL42 DEL27 DEL42 DEL37 DEL43 DEL42 DEL42 DEL42 DEL45 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL42 DEL42 DEL32 DEL18 DEL8 DEL25 DEL39 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL42 DEL45 DEL42 DEL32 DEL21 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL43 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL42 DEL32 DEL21 DEL42 DEL42 DEL45 DEL42 DEL32 DEL21 DEL42 DEL33 DEL27 DEL42 DEL32 DEL21 DEL8 DEL25 DEL42 DEL42 DEL42 DEL32 DEL21 DEL8 DEL24 DEL8 DEL42 DEL42 DEL45 DEL42 DEL42 DEL42 DEL32 DEL32 DEL21 DEL43 DEL59 DEL60 DEL42 DEL42 DEL45 DEL42 DEL32 DEL21 DEL42 DEL33 DEL27 DEL42 DEL42 DEL42 DEL32 DEL21 DEL8 DEL25 DEL8 DEL25 DEL8 DEL70 DEL42 DEL32 DEL21 DEL42 DEL41 DEL8 DEL31 DEL42 DEL32 DEL66 DEL65 DEL29 DEL83 DEL39 DEL42 DEL8 DEL31 DEL83 DEL39 DEL42 DEL42 DEL43 DEL42 DEL44 DEL42 DEL32 DEL21 DEL40 DEL42 DEL32 DEL21 DEL8 DEL31 DEL83 DEL39 DEL42 DEL43 DEL42 DEL44 DEL39 DEL42 DEL44 DEL42 DEL42 DEL32 DEL42 DEL22 DEL42 DEL32 DEL21 DEL40 DEL42 DEL42 DEL32 DEL21 DEL8 DEL31 DEL42 DEL42 DEL33 DEL27 DEL42 DEL42 DEL34 DEL34 DEL32 DEL41 DEL8 DEL25 DEL42 DEL42 DEL45 DEL42 DEL32 DEL21 DEL42 DEL42 DEL45 DEL42 DEL42 DEL42 DEL32 DEL42 DEL32 DEL21 DEL66 DEL65 DEL29 DEL83 DEL42 DEL43 DEL42 DEL42 DEL43 DEL14 DEL59 DEL60 DEL42 DEL43 DEL42 DEL44 DEL32 DEL32 DEL32 DEL42 DEL13 DEL32 DEL21 DEL8 DEL70 DEL42 DEL42 DEL32 DEL41 DEL8 DEL31 DEL40 DEL42 DEL42 DEL32 DEL7 DEL21

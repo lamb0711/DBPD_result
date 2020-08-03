@@ -1,0 +1,155 @@
+YARN-4412. Create ClusterMonitor to compute ordered list of preferred NMs for OPPORTUNITIC containers. (asuresh)
+
++import org.apache.commons.logging.Log;
++import org.apache.commons.logging.LogFactory;
++import org.apache.hadoop.yarn.api.records.NodeId;
++import org.apache.hadoop.yarn.event.EventHandler;
++
+-import org.apache.hadoop.yarn.server.resourcemanager.security
+-    .AMRMTokenSecretManager;
++import org.apache.hadoop.yarn.server.resourcemanager.scheduler.distributed
++    .TopKNodeSelector;
++import org.apache.hadoop.yarn.server.resourcemanager.scheduler.event.NodeAddedSchedulerEvent;
++import org.apache.hadoop.yarn.server.resourcemanager.scheduler.event.NodeRemovedSchedulerEvent;
++import org.apache.hadoop.yarn.server.resourcemanager.scheduler.event.NodeResourceUpdateSchedulerEvent;
++import org.apache.hadoop.yarn.server.resourcemanager.scheduler.event.NodeUpdateSchedulerEvent;
++import org.apache.hadoop.yarn.server.resourcemanager.scheduler.event.SchedulerEvent;
++import org.apache.hadoop.yarn.server.resourcemanager.security.AMRMTokenSecretManager;
++import java.util.HashSet;
++import java.util.Set;
++import java.util.concurrent.ConcurrentHashMap;
++/**
++ * The DistributedSchedulingService is started instead of the
++ * ApplicationMasterService if DistributedScheduling is enabled for the YARN
++ * cluster.
++ * It extends the functionality of the ApplicationMasterService by servicing
++ * clients (AMs and AMRMProxy request interceptors) that understand the
++ * DistributedSchedulingProtocol.
++ */
+-    implements DistributedSchedulerProtocol {
++    implements DistributedSchedulerProtocol, EventHandler<SchedulerEvent> {
++
++  private static final Log LOG =
++      LogFactory.getLog(DistributedSchedulingService.class);
++
++  private final TopKNodeSelector clusterMonitor;
++
++  private final ConcurrentHashMap<String, Set<NodeId>> rackToNode =
++      new ConcurrentHashMap<>();
++  private final ConcurrentHashMap<String, Set<NodeId>> hostToNode =
++      new ConcurrentHashMap<>();
++    int k = rmContext.getYarnConfiguration().getInt(
++        YarnConfiguration.DIST_SCHEDULING_TOP_K,
++        YarnConfiguration.DIST_SCHEDULING_TOP_K_DEFAULT);
++    long topKComputationInterval = rmContext.getYarnConfiguration().getLong(
++        YarnConfiguration.DIST_SCHEDULING_TOP_K_COMPUTE_INT_MS,
++        YarnConfiguration.DIST_SCHEDULING_TOP_K_COMPUTE_INT_MS_DEFAULT);
++    TopKNodeSelector.TopKComparator comparator =
++        TopKNodeSelector.TopKComparator.valueOf(
++            rmContext.getYarnConfiguration().get(
++                YarnConfiguration.DIST_SCHEDULING_TOP_K_COMPARATOR,
++                YarnConfiguration.DIST_SCHEDULING_TOP_K_COMPARATOR_DEFAULT));
++    TopKNodeSelector topKSelector =
++        new TopKNodeSelector(k, topKComputationInterval, comparator);
++    this.clusterMonitor = topKSelector;
+-    // To support application running no NMs that DO NOT support
+-    // Dist Scheduling...
++    // To support application running on NMs that DO NOT support
++    // Dist Scheduling... The server multiplexes both the
++    // ApplicationMasterProtocol as well as the DistributedSchedulingProtocol
+-    // TODO: The actual computation of the list will happen in YARN-4412
+-    // TODO: Till then, send the complete list
+-        new ArrayList<>(this.rmContext.getRMNodes().keySet()));
++        new ArrayList<>(this.clusterMonitor.selectNodes()));
+-        new ArrayList<>(this.rmContext.getRMNodes().keySet()));
++        new ArrayList<>(this.clusterMonitor.selectNodes()));
++
++  private void addToMapping(ConcurrentHashMap<String, Set<NodeId>> mapping,
++      String rackName, NodeId nodeId) {
++    if (rackName != null) {
++      mapping.putIfAbsent(rackName, new HashSet<NodeId>());
++      Set<NodeId> nodeIds = mapping.get(rackName);
++      synchronized (nodeIds) {
++        nodeIds.add(nodeId);
++      }
++    }
++  }
++
++  private void removeFromMapping(ConcurrentHashMap<String, Set<NodeId>> mapping,
++      String rackName, NodeId nodeId) {
++    if (rackName != null) {
++      Set<NodeId> nodeIds = mapping.get(rackName);
++      synchronized (nodeIds) {
++        nodeIds.remove(nodeId);
++      }
++    }
++  }
++
++  @Override
++  public void handle(SchedulerEvent event) {
++    switch (event.getType()) {
++      case NODE_ADDED:
++        if (!(event instanceof NodeAddedSchedulerEvent)) {
++          throw new RuntimeException("Unexpected event type: " + event);
++        }
++        NodeAddedSchedulerEvent nodeAddedEvent = (NodeAddedSchedulerEvent)event;
++        clusterMonitor.addNode(nodeAddedEvent.getContainerReports(),
++            nodeAddedEvent.getAddedRMNode());
++        addToMapping(rackToNode, nodeAddedEvent.getAddedRMNode().getRackName(),
++            nodeAddedEvent.getAddedRMNode().getNodeID());
++        addToMapping(hostToNode, nodeAddedEvent.getAddedRMNode().getHostName(),
++            nodeAddedEvent.getAddedRMNode().getNodeID());
++        break;
++      case NODE_REMOVED:
++        if (!(event instanceof NodeRemovedSchedulerEvent)) {
++          throw new RuntimeException("Unexpected event type: " + event);
++        }
++        NodeRemovedSchedulerEvent nodeRemovedEvent =
++            (NodeRemovedSchedulerEvent)event;
++        clusterMonitor.removeNode(nodeRemovedEvent.getRemovedRMNode());
++        removeFromMapping(rackToNode,
++            nodeRemovedEvent.getRemovedRMNode().getRackName(),
++            nodeRemovedEvent.getRemovedRMNode().getNodeID());
++        removeFromMapping(hostToNode,
++            nodeRemovedEvent.getRemovedRMNode().getHostName(),
++            nodeRemovedEvent.getRemovedRMNode().getNodeID());
++        break;
++      case NODE_UPDATE:
++        if (!(event instanceof NodeUpdateSchedulerEvent)) {
++          throw new RuntimeException("Unexpected event type: " + event);
++        }
++        NodeUpdateSchedulerEvent nodeUpdatedEvent = (NodeUpdateSchedulerEvent)event;
++        clusterMonitor.nodeUpdate(nodeUpdatedEvent.getRMNode());
++        break;
++      case NODE_RESOURCE_UPDATE:
++        if (!(event instanceof NodeResourceUpdateSchedulerEvent)) {
++          throw new RuntimeException("Unexpected event type: " + event);
++        }
++        NodeResourceUpdateSchedulerEvent nodeResourceUpdatedEvent =
++            (NodeResourceUpdateSchedulerEvent)event;
++        clusterMonitor.updateNodeResource(nodeResourceUpdatedEvent.getRMNode(),
++            nodeResourceUpdatedEvent.getResourceOption());
++        break;
++
++      // <-- IGNORED EVENTS : START -->
++      case APP_ADDED:
++        break;
++      case APP_REMOVED:
++        break;
++      case APP_ATTEMPT_ADDED:
++        break;
++      case APP_ATTEMPT_REMOVED:
++        break;
++      case CONTAINER_EXPIRED:
++        break;
++      case NODE_LABELS_UPDATE:
++        break;
++      // <-- IGNORED EVENTS : END -->
++      default:
++        LOG.error("Unknown event arrived at DistributedSchedulingService: "
++            + event.toString());
++    }
++  }
++
+
+INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS29 INS74 INS23 INS23 INS23 INS23 INS31 INS31 INS31 INS65 INS43 INS43 INS83 INS83 INS83 INS43 INS59 INS83 INS83 INS43 INS59 INS83 INS83 INS74 INS59 INS83 INS83 INS74 INS59 INS83 INS39 INS42 INS44 INS44 INS44 INS8 INS83 INS39 INS42 INS44 INS44 INS44 INS8 INS78 INS83 INS39 INS42 INS44 INS8 INS66 INS66 INS66 INS66 INS66 INS66 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS43 INS43 INS74 INS42 INS14 INS43 INS43 INS74 INS42 INS14 INS60 INS60 INS60 INS60 INS21 INS74 INS42 INS43 INS42 INS43 INS42 INS25 INS74 INS42 INS43 INS42 INS43 INS42 INS25 INS42 INS43 INS42 INS50 INS42 INS42 INS57 INS42 INS42 INS43 INS43 INS74 INS42 INS42 INS43 INS43 INS74 INS39 INS59 INS39 INS59 INS43 INS59 INS43 INS59 INS7 INS43 INS43 INS74 INS42 INS42 INS27 INS8 INS43 INS43 INS74 INS42 INS42 INS27 INS8 INS42 INS32 INS49 INS25 INS60 INS21 INS21 INS21 INS10 INS49 INS25 INS60 INS21 INS21 INS21 INS10 INS49 INS25 INS60 INS21 INS10 INS49 INS25 INS60 INS21 INS10 INS49 INS10 INS49 INS10 INS49 INS10 INS49 INS10 INS49 INS10 INS49 INS10 INS49 INS21 INS43 INS42 INS42 INS43 INS42 INS42 INS43 INS42 INS32 INS42 INS32 INS40 INS42 INS32 INS42 INS42 INS14 INS22 INS42 INS42 INS42 INS43 INS43 INS42 INS33 INS21 INS60 INS51 INS42 INS42 INS43 INS43 INS42 INS33 INS60 INS51 INS42 INS42 INS42 INS38 INS8 INS43 INS59 INS32 INS32 INS32 INS42 INS38 INS8 INS43 INS59 INS32 INS32 INS32 INS42 INS38 INS8 INS43 INS59 INS32 INS42 INS38 INS8 INS43 INS59 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS32 INS42 INS40 INS40 INS32 INS42 INS40 INS40 INS40 INS42 INS32 INS43 INS42 INS42 INS42 INS52 INS42 MOV74 INS32 MOV74 INS32 INS42 INS42 INS32 INS74 INS59 INS42 INS8 INS42 INS42 INS74 INS59 INS42 INS8 INS36 INS53 INS42 INS42 INS11 INS42 INS42 INS32 INS32 INS42 INS42 INS32 INS32 INS42 INS42 INS32 INS32 INS36 INS53 INS42 INS42 INS11 INS42 INS42 INS32 INS42 INS42 INS32 INS32 INS42 INS42 INS32 INS32 INS36 INS53 INS42 INS42 INS11 INS42 INS42 INS32 INS36 INS53 INS42 INS42 INS11 INS42 INS42 INS32 INS32 INS42 INS42 INS27 INS42 INS42 INS42 INS42 INS32 INS42 INS40 INS40 INS42 MOV22 UPD42 MOV42 MOV22 UPD42 MOV42 INS42 INS42 INS42 INS14 INS43 INS43 INS42 INS32 INS21 INS43 INS43 INS42 INS32 INS21 INS62 INS14 INS43 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS32 INS42 INS32 INS42 INS32 INS42 INS62 INS14 INS43 INS42 INS42 INS42 INS32 INS42 INS32 INS42 INS32 INS42 INS32 INS42 INS62 INS14 INS43 INS42 INS42 INS42 INS62 INS14 INS43 INS42 INS42 INS42 INS42 INS42 INS45 INS32 INS42 INS42 UPD42 UPD42 INS74 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS43 INS43 INS27 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS43 INS43 INS27 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS43 INS43 INS27 INS42 INS42 INS43 INS43 INS27 INS42 INS42 INS42 INS43 INS43 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS45 INS42 INS42 INS42 INS45 INS42 INS42 INS42 INS45 INS42 INS42 INS42 INS45 INS42 INS42 INS42 DEL32 DEL42 DEL32 DEL32 DEL42 DEL32

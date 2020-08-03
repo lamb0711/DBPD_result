@@ -1,0 +1,150 @@
+HDFS-12069. Ozone: Create a general abstraction for metadata store. Contributed by Weiwei Yang.
+
+-import com.google.protobuf.InvalidProtocolBufferException;
++import org.apache.commons.lang3.tuple.ImmutablePair;
+-import org.apache.hadoop.utils.LevelDBKeyFilters.KeyPrefixFilter;
+-import org.apache.hadoop.utils.LevelDBKeyFilters.LevelDBKeyFilter;
+-import org.apache.hadoop.utils.LevelDBStore;
+-import org.iq80.leveldb.DBIterator;
+-import org.iq80.leveldb.Options;
+-import org.iq80.leveldb.WriteBatch;
++import org.apache.hadoop.utils.BatchOperation;
++import org.apache.hadoop.utils.MetadataKeyFilters.KeyPrefixFilter;
++import org.apache.hadoop.utils.MetadataKeyFilters.MetadataKeyFilter;
++import org.apache.hadoop.utils.MetadataStore;
++import org.apache.hadoop.utils.MetadataStoreBuilder;
+-public class MetadataManagerImpl implements  MetadataManager {
++public class MetadataManagerImpl implements MetadataManager {
+-  private final LevelDBStore store;
++  private final MetadataStore store;
+-    Options options = new Options();
+-    options.cacheSize(cacheSize * OzoneConsts.MB);
+-    this.store = new LevelDBStore(ksmDBFile, options);
++    this.store = MetadataStoreBuilder.newBuilder()
++        .setConf(conf)
++        .setDbFile(ksmDBFile)
++        .setCacheSize(cacheSize * OzoneConsts.MB)
++        .build();
+-  public void deleteKey(byte[] key) {
++  public void deleteKey(byte[] key) throws IOException {
+-  public byte[] get(byte[] key) {
++  public byte[] get(byte[] key) throws IOException {
+-  public void put(byte[] key, byte[] value) {
++  public void put(byte[] key, byte[] value) throws IOException {
+-  public void delete(byte[] key) {
++  public void delete(byte[] key) throws IOException {
+-  /**
+-   * Performs a batch Put and Delete from Metadata DB.
+-   * Can be used to do multiple puts and deletes atomically.
+-   * @param putList - list of key and value pairs to put to Metadata DB.
+-   * @param delList - list of keys to delete from Metadata DB.
+-   */
+-  public void batchPutDelete(List<Map.Entry<byte[], byte[]>> putList,
+-                             List<byte[]> delList)
+-      throws IOException {
+-    WriteBatch batch = store.createWriteBatch();
+-    putList.forEach(entry -> batch.put(entry.getKey(), entry.getValue()));
+-    delList.forEach(entry -> batch.delete(entry));
+-    try {
+-      store.commitWriteBatch(batch);
+-    } finally {
+-      store.closeWriteBatch(batch);
+-    }
+-  }
+-
+-  /**
+-   * Performs a batch Put to Metadata DB.
+-   * Can be used to do multiple puts atomically.
+-   * @param list - list of Map.Entry
+-   */
+-  @Override
+-  public void batchPut(List<Map.Entry<byte[], byte[]>> list)
+-      throws IOException {
+-    WriteBatch batch = store.createWriteBatch();
+-    list.forEach(entry -> batch.put(entry.getKey(), entry.getValue()));
+-    try {
+-      store.commitWriteBatch(batch);
+-    } finally {
+-      store.closeWriteBatch(batch);
+-    }
++  public void writeBatch(BatchOperation batch) throws IOException {
++    this.store.writeBatch(batch);
+-    try (DBIterator iterator = store.getIterator()) {
+-      String dbVolumeRootName = OzoneConsts.KSM_VOLUME_PREFIX + volume
+-          + OzoneConsts.KSM_BUCKET_PREFIX;
+-      byte[] dbVolumeRootKey = DFSUtil.string2Bytes(dbVolumeRootName);
+-      // Seek to the root of the volume and look for the next key
+-      iterator.seek(dbVolumeRootKey);
+-      if (iterator.hasNext()) {
+-        String firstBucketKey = DFSUtil.bytes2String(iterator.next().getKey());
+-        // if the key starts with /<volume name>/
+-        // then there is at least one bucket
+-        return !firstBucketKey.startsWith(dbVolumeRootName);
+-      } else {
+-        return true;
+-      }
++    String dbVolumeRootName = OzoneConsts.KSM_VOLUME_PREFIX + volume;
++    byte[] dbVolumeRootKey = DFSUtil.string2Bytes(dbVolumeRootName);
++    // Seek to the root of the volume and look for the next key
++    ImmutablePair<byte[], byte[]> volumeRoot =
++        store.peekAround(1, dbVolumeRootKey);
++    if (volumeRoot != null) {
++      String firstBucketKey = DFSUtil.bytes2String(volumeRoot.getKey());
++      return !firstBucketKey.startsWith(dbVolumeRootName
++          + OzoneConsts.KSM_BUCKET_PREFIX);
++    return true;
+-    try (DBIterator iterator = store.getIterator()) {
+-      String keyRootName = OzoneConsts.KSM_VOLUME_PREFIX + volume
+-          + OzoneConsts.KSM_BUCKET_PREFIX + bucket
+-          + OzoneConsts.KSM_KEY_PREFIX;
+-      byte[] keyRoot = DFSUtil.string2Bytes(keyRootName);
+-      iterator.seek(keyRoot);
+-      if(iterator.hasNext()) {
+-        return !DFSUtil.bytes2String(iterator.next().getKey())
+-            .startsWith(keyRootName);
+-      }
+-      return true;
++    String keyRootName = OzoneConsts.KSM_VOLUME_PREFIX + volume
++        + OzoneConsts.KSM_BUCKET_PREFIX + bucket;
++    byte[] keyRoot = DFSUtil.string2Bytes(keyRootName);
++    ImmutablePair<byte[], byte[]> firstKey = store.peekAround(1, keyRoot);
++    if (firstKey != null) {
++      return !DFSUtil.bytes2String(firstKey.getKey())
++          .startsWith(keyRootName + OzoneConsts.KSM_KEY_PREFIX);
++    return true;
+-    LevelDBKeyFilter filter =
+-        new KeyPrefixFilter(getBucketKeyPrefix(volumeName, bucketPrefix));
++
++    // A bucket must start with /volume/bucket_prefix
++    // and exclude keys /volume/bucket_xxx/key_xxx
++    MetadataKeyFilter filter = (preKey, currentKey, nextKey) -> {
++      if (currentKey != null) {
++        String bucketNamePrefix = getBucketKeyPrefix(volumeName, bucketPrefix);
++        String bucket = DFSUtil.bytes2String(currentKey);
++        return bucket.startsWith(bucketNamePrefix) &&
++            !bucket.replaceFirst(bucketNamePrefix, "")
++                .contains(OzoneConsts.KSM_KEY_PREFIX);
++      }
++      return false;
++    };
+-    LevelDBKeyFilter filter =
++    MetadataKeyFilter filter =
+-    byte[] volumesInBytes = store.get(userNameKey);
+-    if (volumesInBytes == null) {
+-      // No volume found for this user, return an empty list
+-      return VolumeList.newBuilder().build();
+-    }
+-
++      byte[] volumesInBytes = store.get(userNameKey);
++      if (volumesInBytes == null) {
++        // No volume found for this user, return an empty list
++        return VolumeList.newBuilder().build();
++      }
+-    } catch (InvalidProtocolBufferException e) {
++    } catch (IOException e) {
+-          + "metadata might be corrupted",
+-          e, ResultCodes.FAILED_METADATA_ERROR);
++          + "metadata might be corrupted", e,
++          ResultCodes.FAILED_METADATA_ERROR);
+
+UPD40 UPD40 UPD40 UPD40 UPD40 UPD40 UPD43 INS43 INS43 MOV43 INS43 MOV78 UPD42 INS8 INS8 UPD42 INS21 INS42 INS42 INS42 INS43 UPD42 MOV21 INS60 MOV60 INS60 MOV25 MOV41 MOV60 MOV60 INS60 MOV25 MOV41 INS60 INS7 UPD42 MOV42 INS43 MOV59 UPD74 MOV74 INS59 INS27 MOV43 UPD74 MOV74 INS59 INS27 INS43 INS59 UPD43 MOV22 INS32 INS22 UPD42 UPD42 MOV42 UPD43 MOV5 INS42 INS32 INS42 INS33 UPD43 INS42 INS32 INS42 INS33 INS42 INS42 INS86 UPD42 MOV60 MOV25 INS32 INS42 INS52 INS42 UPD42 UPD42 MOV42 UPD42 MOV42 INS34 MOV42 INS43 INS42 UPD42 MOV42 UPD42 MOV42 INS34 MOV42 INS59 INS59 INS59 INS8 UPD43 INS32 INS42 MOV27 INS42 INS42 INS42 INS42 INS25 INS41 UPD42 INS32 UPD42 MOV42 INS42 INS27 INS27 INS27 INS8 INS9 INS32 INS42 UPD42 MOV42 UPD42 MOV42 INS42 INS40 INS42 INS40 INS42 INS33 MOV60 INS60 INS41 INS42 INS42 UPD42 MOV42 MOV43 MOV43 INS59 INS27 INS42 MOV32 INS42 INS32 INS32 INS38 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS32 INS42 INS40 INS42 INS42 INS42 INS45 DEL40 DEL26 DEL42 DEL43 DEL42 DEL42 DEL43 DEL14 DEL59 DEL60 DEL32 DEL21 DEL42 DEL43 DEL42 DEL42 DEL14 DEL7 DEL21 DEL66 DEL66 DEL65 DEL42 DEL66 DEL65 DEL42 DEL66 DEL65 DEL29 DEL83 DEL39 DEL42 DEL42 DEL43 DEL40 DEL43 DEL39 DEL85 DEL5 DEL74 DEL74 DEL42 DEL44 DEL42 DEL44 DEL42 DEL43 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL42 DEL42 DEL59 DEL42 DEL42 DEL42 DEL42 DEL32 DEL42 DEL42 DEL32 DEL32 DEL86 DEL32 DEL21 DEL42 DEL42 DEL42 DEL59 DEL42 DEL42 DEL42 DEL32 DEL86 DEL32 DEL21 DEL42 DEL42 DEL42 DEL32 DEL21 DEL8 DEL42 DEL42 DEL42 DEL32 DEL21 DEL8 DEL54 DEL8 DEL31 DEL66 DEL66 DEL65 DEL42 DEL66 DEL65 DEL29 DEL42 DEL78 DEL43 DEL74 DEL42 DEL42 DEL43 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL42 DEL42 DEL59 DEL42 DEL42 DEL42 DEL42 DEL32 DEL42 DEL42 DEL32 DEL32 DEL86 DEL32 DEL21 DEL42 DEL42 DEL42 DEL32 DEL21 DEL8 DEL8 DEL54 DEL8 DEL40 DEL42 DEL42 DEL32 DEL42 DEL32 DEL42 DEL8 DEL43 DEL42 DEL42 DEL42 DEL32 DEL59 DEL58 DEL60 DEL32 DEL21 DEL8 DEL54 DEL40 DEL40 DEL42 DEL42 DEL32 DEL42 DEL32 DEL42 DEL42 DEL43 DEL42 DEL42 DEL42 DEL32 DEL59 DEL58 DEL32 DEL21 DEL8 DEL54 DEL8 DEL42 DEL43 DEL42 DEL42 DEL43 DEL14

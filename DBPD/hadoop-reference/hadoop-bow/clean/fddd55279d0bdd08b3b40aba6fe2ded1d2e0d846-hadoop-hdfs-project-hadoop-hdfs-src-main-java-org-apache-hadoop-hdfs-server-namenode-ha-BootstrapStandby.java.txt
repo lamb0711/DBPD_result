@@ -1,0 +1,143 @@
+HDFS-8127. NameNode Failover during HA upgrade can cause DataNode to finalize upgrade. Contributed by Jing Zhao.
+
++import java.util.HashMap;
++import java.util.Iterator;
++import java.util.Map;
++import org.apache.hadoop.hdfs.server.common.InconsistentFSStateException;
++import org.apache.hadoop.hdfs.server.common.Storage.StorageDirectory;
++import org.apache.hadoop.hdfs.server.common.Storage.StorageState;
++import org.apache.hadoop.hdfs.server.namenode.NNUpgradeUtil;
+-
++    boolean isUpgradeFinalized;
++      isUpgradeFinalized = proxy.isUpgradeFinalized();
+-    
++        "       isUpgradeFinalized: " + isUpgradeFinalized + "\n" +
+-
+-    long imageTxId = proxy.getMostRecentCheckpointTxId();
+-    long curTxId = proxy.getTransactionID();
+-    
+-    // Check with the user before blowing away data.
+-    if (!Storage.confirmFormat(storage.dirIterable(null),
+-            force, interactive)) {
+-      storage.close();
++
++    if (!isUpgradeFinalized) {
++      // the remote NameNode is in upgrade state, this NameNode should also
++      // create the previous directory. First prepare the upgrade and rename
++      // the current dir to previous.tmp.
++      LOG.info("The active NameNode is in Upgrade. " +
++          "Prepare the upgrade for the standby NameNode as well.");
++      if (!doPreUpgrade(storage, nsInfo)) {
++        return ERR_CODE_ALREADY_FORMATTED;
++      }
++    } else if (!format(storage, nsInfo)) { // prompt the user to format storage
+-    
+-    // Format the storage (writes VERSION file)
+-    storage.format(nsInfo);
+-    // Load the newly formatted image, using all of the directories (including shared
+-    // edits)
++    // download the fsimage from active namenode
++    int download = downloadImage(storage, proxy);
++    if (download != 0) {
++      return download;
++    }
++
++    // finish the upgrade: rename previous.tmp to previous
++    if (!isUpgradeFinalized) {
++      doUpgrade(storage);
++    }
++    return 0;
++  }
++
++  /**
++   * Iterate over all the storage directories, checking if it should be
++   * formatted. Format the storage if necessary and allowed by the user.
++   * @return True if formatting is processed
++   */
++  private boolean format(NNStorage storage, NamespaceInfo nsInfo)
++      throws IOException {
++    // Check with the user before blowing away data.
++    if (!Storage.confirmFormat(storage.dirIterable(null), force, interactive)) {
++      storage.close();
++      return false;
++    } else {
++      // Format the storage (writes VERSION file)
++      storage.format(nsInfo);
++      return true;
++    }
++  }
++
++  /**
++   * This is called when using bootstrapStandby for HA upgrade. The SBN should
++   * also create previous directory so that later when it starts, it understands
++   * that the cluster is in the upgrade state. This function renames the old
++   * current directory to previous.tmp.
++   */
++  private boolean doPreUpgrade(NNStorage storage, NamespaceInfo nsInfo)
++      throws IOException {
++    boolean isFormatted = false;
++    Map<StorageDirectory, StorageState> dataDirStates =
++        new HashMap<>();
++    try {
++      isFormatted = FSImage.recoverStorageDirs(StartupOption.UPGRADE, storage,
++          dataDirStates);
++      if (dataDirStates.values().contains(StorageState.NOT_FORMATTED)) {
++        // recoverStorageDirs returns true if there is a formatted directory
++        isFormatted = false;
++        System.err.println("The original storage directory is not formatted.");
++      }
++    } catch (InconsistentFSStateException e) {
++      // if the storage is in a bad state,
++      LOG.warn("The storage directory is in an inconsistent state", e);
++    } finally {
++      storage.unlockAll();
++    }
++
++    // if there is InconsistentFSStateException or the storage is not formatted,
++    // format the storage. Although this format is done through the new
++    // software, since in HA setup the SBN is rolled back through
++    // "-bootstrapStandby", we should still be fine.
++    if (!isFormatted && !format(storage, nsInfo)) {
++      return false;
++    }
++
++    // make sure there is no previous directory
++    FSImage.checkUpgrade(storage);
++    // Do preUpgrade for each directory
++    for (Iterator<StorageDirectory> it = storage.dirIterator(false);
++         it.hasNext();) {
++      StorageDirectory sd = it.next();
++      try {
++        NNUpgradeUtil.renameCurToTmp(sd);
++      } catch (IOException e) {
++        LOG.error("Failed to move aside pre-upgrade storage " +
++            "in image directory " + sd.getRoot(), e);
++        throw e;
++      }
++    }
++    storage.setStorageInfo(nsInfo);
++    storage.setBlockPoolID(nsInfo.getBlockPoolID());
++    return true;
++  }
++
++  private void doUpgrade(NNStorage storage) throws IOException {
++    for (Iterator<StorageDirectory> it = storage.dirIterator(false);
++         it.hasNext();) {
++      StorageDirectory sd = it.next();
++      NNUpgradeUtil.doUpgrade(sd, storage);
++    }
++  }
++
++  private int downloadImage(NNStorage storage, NamenodeProtocol proxy)
++      throws IOException {
++    // Load the newly formatted image, using all of the directories
++    // (including shared edits)
++    final long imageTxId = proxy.getMostRecentCheckpointTxId();
++    final long curTxId = proxy.getTransactionID();
+-        "Expected edit log to be open for read";
++          "Expected edit log to be open for read";
+-      if (!skipSharedEditsCheck && !checkLogsAvailableForRead(image, imageTxId, curTxId)) {
++      if (!skipSharedEditsCheck &&
++          !checkLogsAvailableForRead(image, imageTxId, curTxId)) {
+-        otherHttpAddr, imageTxId, storage, true);
++          otherHttpAddr, imageTxId, storage, true);

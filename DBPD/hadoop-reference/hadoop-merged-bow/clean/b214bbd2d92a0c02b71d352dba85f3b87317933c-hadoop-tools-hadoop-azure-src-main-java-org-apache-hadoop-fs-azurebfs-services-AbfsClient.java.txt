@@ -1,0 +1,197 @@
+HADOOP-16916: ABFS: Delegation SAS generator for integration with Ranger
+
+Contributed by Thomas Marquardt.
+
+DETAILS:
+
+Previously we had a SASGenerator class which generated Service SAS, but we need to add DelegationSASGenerator.
+I separated SASGenerator into a base class and two subclasses ServiceSASGenerator and DelegationSASGenreator.  The
+code in ServiceSASGenerator is copied from SASGenerator but the DelegationSASGenrator code is new.  The
+DelegationSASGenerator code demonstrates how to use Delegation SAS with minimal permissions, as would be used
+by an authorization service such as Apache Ranger.  Adding this to the tests helps us lock in this behavior.
+
+Added a MockDelegationSASTokenProvider for testing User Delegation SAS.
+
+Fixed the ITestAzureBlobFileSystemCheckAccess tests to assume oauth client ID so that they are ignored when that
+is not configured.
+
+To improve performance, AbfsInputStream/AbfsOutputStream re-use SAS tokens until the expiry is within 120 seconds.
+After this a new SAS will be requested.  The default period of 120 seconds can be changed using the configuration
+setting "fs.azure.sas.token.renew.period.for.streams".
+
+The SASTokenProvider operation names were updated to correspond better with the ADLS Gen2 REST API, since these
+operations must be provided tokens with appropriate SAS parameters to succeed.
+
+Support for the version 2.0 AAD authentication endpoint was added to AzureADAuthenticator.
+
+The getFileStatus method was mistakenly calling the ADLS Gen2 Get Properties API which requires read permission
+while the getFileStatus call only requires execute permission.  ADLS Gen2 Get Status API is supposed to be used
+for this purpose, so the underlying AbfsClient.getPathStatus API was updated with a includeProperties
+parameter which is set to false for getFileStatus and true for getXAttr.
+
+Added SASTokenProvider support for delete recursive.
+
+Fixed bugs in AzureBlobFileSystem where public methods were not validating the Path by calling makeQualified.  This is
+necessary to avoid passing null paths and to convert relative paths into absolute paths.
+
+Canonicalized the path used for root path internally so that root path can be used with SAS tokens, which requires
+that the path in the URL and the path in the SAS token match.  Internally the code was using
+"//" instead of "/" for the root path, sometimes.  Also related to this, the AzureBlobFileSystemStore.getRelativePath
+API was updated so that we no longer remove and then add back a preceding forward / to paths.
+
+To run ITestAzureBlobFileSystemDelegationSAS tests follow the instructions in testing_azure.md under the heading
+"To run Delegation SAS test cases".  You also need to set "fs.azure.enable.check.access" to true.
+
+TEST RESULTS:
+
+namespace.enabled=true
+auth.type=SharedKey
+-------------------
+$mvn -T 1C -Dparallel-tests=abfs -Dscale -DtestsThreadCount=8 clean verify
+Tests run: 63, Failures: 0, Errors: 0, Skipped: 0
+Tests run: 432, Failures: 0, Errors: 0, Skipped: 41
+Tests run: 206, Failures: 0, Errors: 0, Skipped: 24
+
+namespace.enabled=false
+auth.type=SharedKey
+-------------------
+$mvn -T 1C -Dparallel-tests=abfs -Dscale -DtestsThreadCount=8 clean verify
+Tests run: 63, Failures: 0, Errors: 0, Skipped: 0
+Tests run: 432, Failures: 0, Errors: 0, Skipped: 244
+Tests run: 206, Failures: 0, Errors: 0, Skipped: 24
+
+namespace.enabled=true
+auth.type=SharedKey
+sas.token.provider.type=MockDelegationSASTokenProvider
+enable.check.access=true
+-------------------
+$mvn -T 1C -Dparallel-tests=abfs -Dscale -DtestsThreadCount=8 clean verify
+Tests run: 63, Failures: 0, Errors: 0, Skipped: 0
+Tests run: 432, Failures: 0, Errors: 0, Skipped: 33
+Tests run: 206, Failures: 0, Errors: 0, Skipped: 24
+
+namespace.enabled=true
+auth.type=OAuth
+-------------------
+$mvn -T 1C -Dparallel-tests=abfs -Dscale -DtestsThreadCount=8 clean verify
+Tests run: 63, Failures: 0, Errors: 0, Skipped: 0
+Tests run: 432, Failures: 0, Errors: 1, Skipped: 74
+Tests run: 206, Failures: 0, Errors: 0, Skipped: 140
+
++import com.google.common.base.Strings;
+-    abfsUriQueryBuilder.addQuery(QUERY_PARAM_DIRECTORY, relativePath == null ? AbfsHttpConstants.EMPTY_STRING
+-        : relativePath);
++    abfsUriQueryBuilder.addQuery(QUERY_PARAM_DIRECTORY, getDirectoryQueryParameter(relativePath));
+-    appendSASTokenToQuery(relativePath, SASTokenProvider.LISTSTATUS_OPERATION, abfsUriQueryBuilder);
++    appendSASTokenToQuery(relativePath, SASTokenProvider.LIST_OPERATION, abfsUriQueryBuilder);
+-        ? SASTokenProvider.CREATEFILE_OPERATION
+-        : SASTokenProvider.MKDIR_OPERATION;
++        ? SASTokenProvider.CREATE_FILE_OPERATION
++        : SASTokenProvider.CREATE_DIRECTORY_OPERATION;
+-                                  final int length) throws AzureBlobFileSystemException {
++                                  final int length, final String cachedSasToken) throws AzureBlobFileSystemException {
+-    appendSASTokenToQuery(path, SASTokenProvider.APPEND_OPERATION, abfsUriQueryBuilder);
++    // AbfsInputStream/AbfsOutputStream reuse SAS tokens for better performance
++    String sasTokenForReuse = appendSASTokenToQuery(path, SASTokenProvider.WRITE_OPERATION,
++        abfsUriQueryBuilder, cachedSasToken);
+-            requestHeaders, buffer, offset, length);
++            requestHeaders, buffer, offset, length, sasTokenForReuse);
+-  public AbfsRestOperation flush(final String path, final long position, boolean retainUncommittedData, boolean isClose)
++  public AbfsRestOperation flush(final String path, final long position, boolean retainUncommittedData,
++                                 boolean isClose, final String cachedSasToken)
+-    appendSASTokenToQuery(path, SASTokenProvider.APPEND_OPERATION, abfsUriQueryBuilder);
++    // AbfsInputStream/AbfsOutputStream reuse SAS tokens for better performance
++    String sasTokenForReuse = appendSASTokenToQuery(path, SASTokenProvider.WRITE_OPERATION,
++        abfsUriQueryBuilder, cachedSasToken);
+-            requestHeaders);
++            requestHeaders, sasTokenForReuse);
++    appendSASTokenToQuery(path, SASTokenProvider.SET_PROPERTIES_OPERATION, abfsUriQueryBuilder);
+-  public AbfsRestOperation getPathStatus(final String path) throws AzureBlobFileSystemException {
++  public AbfsRestOperation getPathStatus(final String path, final boolean includeProperties) throws AzureBlobFileSystemException {
++    String operation = SASTokenProvider.GET_PROPERTIES_OPERATION;
++    if (!includeProperties) {
++      // The default action (operation) is implicitly to get properties and this action requires read permission
++      // because it reads user defined properties.  If the action is getStatus or getAclStatus, then
++      // only traversal (execute) permission is required.
++      abfsUriQueryBuilder.addQuery(HttpQueryParams.QUERY_PARAM_ACTION, AbfsHttpConstants.GET_STATUS);
++      operation = SASTokenProvider.GET_STATUS_OPERATION;
++    }
+-    appendSASTokenToQuery(path, SASTokenProvider.GETFILESTATUS_OPERATION, abfsUriQueryBuilder);
++    appendSASTokenToQuery(path, operation, abfsUriQueryBuilder);
+-                                final int bufferLength, final String eTag) throws AzureBlobFileSystemException {
++                                final int bufferLength, final String eTag, String cachedSasToken) throws AzureBlobFileSystemException {
+-    appendSASTokenToQuery(path, SASTokenProvider.READ_OPERATION, abfsUriQueryBuilder);
++    // AbfsInputStream/AbfsOutputStream reuse SAS tokens for better performance
++    String sasTokenForReuse = appendSASTokenToQuery(path, SASTokenProvider.READ_OPERATION,
++        abfsUriQueryBuilder, cachedSasToken);
+-            bufferLength);
++            bufferLength, sasTokenForReuse);
+-    appendSASTokenToQuery(path, SASTokenProvider.DELETE_OPERATION, abfsUriQueryBuilder);
++    String operation = recursive ? SASTokenProvider.DELETE_RECURSIVE_OPERATION : SASTokenProvider.DELETE_OPERATION;
++    appendSASTokenToQuery(path, operation, abfsUriQueryBuilder);
+-    appendSASTokenToQuery(path, SASTokenProvider.SETOWNER_OPERATION, abfsUriQueryBuilder);
++    appendSASTokenToQuery(path, SASTokenProvider.SET_OWNER_OPERATION, abfsUriQueryBuilder);
+-    appendSASTokenToQuery(path, SASTokenProvider.SETPERMISSION_OPERATION, abfsUriQueryBuilder);
++    appendSASTokenToQuery(path, SASTokenProvider.SET_PERMISSION_OPERATION, abfsUriQueryBuilder);
+-    appendSASTokenToQuery(path, SASTokenProvider.SETACL_OPERATION, abfsUriQueryBuilder);
++    appendSASTokenToQuery(path, SASTokenProvider.SET_ACL_OPERATION, abfsUriQueryBuilder);
+-    appendSASTokenToQuery(path, SASTokenProvider.GETACL_OPERATION, abfsUriQueryBuilder);
++    appendSASTokenToQuery(path, SASTokenProvider.GET_ACL_OPERATION, abfsUriQueryBuilder);
++    appendSASTokenToQuery(path, SASTokenProvider.CHECK_ACCESS_OPERATION, abfsUriQueryBuilder);
++   * Get the directory query parameter used by the List Paths REST API and used
++   * as the path in the continuation token.  If the input path is null or the
++   * root path "/", empty string is returned. If the input path begins with '/',
++   * the return value is the substring beginning at offset 1.  Otherwise, the
++   * input path is returned.
++   * @param path the path to be listed.
++   * @return the value of the directory query parameter
++   */
++  public static String getDirectoryQueryParameter(final String path) {
++    String directory = path;
++    if (Strings.isNullOrEmpty(directory)) {
++      directory = AbfsHttpConstants.EMPTY_STRING;
++    } else if (directory.charAt(0) == '/') {
++      directory = directory.substring(1);
++    }
++    return directory;
++  }
++
++  /**
++   * @return sasToken - returned for optional re-use.
+-  private void appendSASTokenToQuery(String path, String operation, AbfsUriQueryBuilder queryBuilder) throws SASTokenProviderException {
++  private String appendSASTokenToQuery(String path, String operation, AbfsUriQueryBuilder queryBuilder) throws SASTokenProviderException {
++    return appendSASTokenToQuery(path, operation, queryBuilder, null);
++  }
++
++  /**
++   * If configured for SAS AuthType, appends SAS token to queryBuilder
++   * @param path
++   * @param operation
++   * @param queryBuilder
++   * @param cachedSasToken - previously acquired SAS token to be reused.
++   * @return sasToken - returned for optional re-use.
++   * @throws SASTokenProviderException
++   */
++  private String appendSASTokenToQuery(String path,
++                                       String operation,
++                                       AbfsUriQueryBuilder queryBuilder,
++                                       String cachedSasToken)
++      throws SASTokenProviderException {
++    String sasToken = null;
+-        String sasToken = sasTokenProvider.getSASToken(this.accountName,
+-            this.filesystem, path, operation);
+-        if ((sasToken == null) || sasToken.isEmpty()) {
+-          throw new UnsupportedOperationException("SASToken received is empty or null");
++        if (cachedSasToken == null) {
++          sasToken = sasTokenProvider.getSASToken(this.accountName,
++              this.filesystem, path, operation);
++          if ((sasToken == null) || sasToken.isEmpty()) {
++            throw new UnsupportedOperationException("SASToken received is empty or null");
++          }
++        } else {
++          sasToken = cachedSasToken;
++          LOG.trace("Using cached SAS token.");
+-
++    return sasToken;
+
+INS26 INS40 INS31 INS31 INS44 INS44 INS44 INS44 INS29 INS83 INS83 INS43 INS42 INS44 INS8 MOV29 INS83 INS43 INS42 INS44 INS44 INS44 INS43 INS8 INS29 MOV43 INS44 INS83 INS43 INS42 INS60 INS83 INS43 INS42 INS60 INS21 INS83 INS39 INS42 INS60 INS25 INS43 INS42 INS60 INS60 INS21 INS65 INS65 INS65 INS42 INS83 INS43 INS42 INS60 INS25 INS41 INS65 INS42 INS43 INS42 INS43 INS42 INS43 INS42 INS42 INS41 INS65 INS65 INS65 INS65 INS65 INS65 INS65 INS43 INS42 INS60 INS41 INS42 INS43 INS59 INS42 INS43 INS59 INS32 INS43 INS59 INS38 INS8 INS42 INS43 INS59 INS43 INS59 INS32 INS66 INS66 INS66 INS66 INS66 INS42 INS66 INS66 INS42 INS43 INS59 INS32 INS8 INS25 INS42 INS66 INS42 INS42 INS42 INS32 INS66 INS42 INS42 INS42 INS42 INS66 INS66 INS42 INS42 INS43 INS59 INS42 INS32 UPD40 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS40 INS42 INS42 INS42 INS40 INS42 INS21 INS21 INS42 INS42 INS42 INS32 INS42 INS42 INS16 INS42 UPD40 UPD40 UPD40 UPD40 INS42 INS42 INS40 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS21 INS27 INS8 INS42 INS42 INS42 INS42 INS33 INS42 INS42 INS33 INS42 INS42 UPD40 UPD40 MOV42 MOV42 UPD40 MOV40 MOV42 INS42 INS42 MOV42 MOV42 UPD40 MOV40 MOV42 INS42 INS42 INS32 INS7 MOV42 MOV42 MOV40 MOV42 INS42 INS42 INS42 INS40 INS40 INS7 INS32 INS13 INS21 INS42 INS42 INS40 INS40 INS42 INS40 INS42 INS40 INS42 INS42 INS34 INS7 INS25 INS42 INS32 INS27 INS8 INS8 INS42 INS42 INS34 INS42 INS33 INS21 MOV25 INS21 INS21 INS7 INS7 INS32 INS42 MOV32 INS42 INS42 INS42 INS42 INS45 DEL42 DEL33 DEL27 DEL40 DEL42 DEL16 DEL32 DEL21 DEL32 DEL21 DEL40 DEL32 DEL21 DEL40 DEL39 DEL42 DEL59 DEL60

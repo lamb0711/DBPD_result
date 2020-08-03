@@ -1,0 +1,117 @@
+HDFS-6934. Move checksum computation off the hot path when writing to RAM disk. Contributed by Chris Nauroth.
+
+-  private boolean needsChecksumTranslation;
++  private final boolean needsChecksumTranslation;
+-  private int bytesPerChecksum;
+-  private int checksumSize;
++  private final int bytesPerChecksum;
++  private final int checksumSize;
+-  private Checksum partialCrc = null;
+-    int len = header.getDataLen();
++    final int len = header.getDataLen();
+-    long firstByteInBlock = offsetInBlock;
++    final long firstByteInBlock = offsetInBlock;
+-      int checksumLen = ((len + bytesPerChecksum - 1)/bytesPerChecksum)*
+-                                                            checksumSize;
++      final int checksumLen = diskChecksum.getChecksumSize(len);
++      final int checksumReceivedLen = checksumBuf.capacity();
+-      if ( checksumBuf.capacity() != checksumLen) {
+-        throw new IOException("Length of checksums in packet " +
+-            checksumBuf.capacity() + " does not match calculated checksum " +
+-            "length " + checksumLen);
++      if (checksumReceivedLen > 0 && checksumReceivedLen != checksumLen) {
++        throw new IOException("Invalid checksum length: received length is "
++            + checksumReceivedLen + " but expected length is " + checksumLen);
+-      if (shouldVerifyChecksum()) {
++      if (checksumReceivedLen > 0 && shouldVerifyChecksum()) {
++
++      if (checksumReceivedLen == 0 && !streams.isTransientStorage()) {
++        // checksum is missing, need to calculate it
++        checksumBuf = ByteBuffer.allocate(checksumLen);
++        diskChecksum.calculateChunkedSums(dataBuf, checksumBuf);
++      }
+-      byte[] lastChunkChecksum;
+-      
++      final boolean shouldNotWriteChecksum = checksumReceivedLen == 0
++          && streams.isTransientStorage();
+-          if (firstByteInBlock % bytesPerChecksum != 0) {
+-            LOG.info("Packet starts at " + firstByteInBlock +
+-                     " for " + block +
+-                     " which is not a multiple of bytesPerChecksum " +
+-                     bytesPerChecksum);
++          Checksum partialCrc = null;
++          if (!shouldNotWriteChecksum && firstByteInBlock % bytesPerChecksum != 0) {
++            if (LOG.isDebugEnabled()) {
++              LOG.debug("receivePacket for " + block 
++                  + ": bytesPerChecksum=" + bytesPerChecksum                  
++                  + " does not divide firstByteInBlock=" + firstByteInBlock);
++            }
+-            computePartialChunkCrc(onDiskLen, offsetInChecksum, bytesPerChecksum);
++            partialCrc = computePartialChunkCrc(onDiskLen, offsetInChecksum);
+-          // If this is a partial chunk, then verify that this is the only
+-          // chunk in the packet. Calculate new crc for this chunk.
+-          if (partialCrc != null) {
++          final byte[] lastCrc;
++          if (shouldNotWriteChecksum) {
++            lastCrc = null;
++          } else if (partialCrc != null) {
++            // If this is a partial chunk, then verify that this is the only
++            // chunk in the packet. Calculate new crc for this chunk.
+-              throw new IOException("Got wrong length during writeBlock(" + 
+-                                    block + ") from " + inAddr + " " +
+-                                    "A packet can have only one partial chunk."+
+-                                    " len = " + len + 
+-                                    " bytesPerChecksum " + bytesPerChecksum);
++              throw new IOException("Unexpected packet data length for "
++                  +  block + " from " + inAddr + ": a partial chunk must be "
++                  + " sent in an individual packet (data length = " + len
++                  +  " > bytesPerChecksum = " + bytesPerChecksum + ")");
+-            lastChunkChecksum = Arrays.copyOfRange(
+-              buf, buf.length - checksumSize, buf.length
+-            );
++            lastCrc = copyLastChunkChecksum(buf, checksumSize, buf.length);
+-            lastChunkChecksum = Arrays.copyOfRange(
+-                checksumBuf.array(),
+-                checksumBuf.arrayOffset() + checksumBuf.position() + checksumLen - checksumSize,
+-                checksumBuf.arrayOffset() + checksumBuf.position() + checksumLen);
+-            checksumOut.write(checksumBuf.array(),
+-                checksumBuf.arrayOffset() + checksumBuf.position(),
+-                checksumLen);
++            // write checksum
++            final int offset = checksumBuf.arrayOffset() +
++                checksumBuf.position();
++            final int end = offset + checksumLen;
++            lastCrc = copyLastChunkChecksum(checksumBuf.array(), checksumSize,
++                end);
++            checksumOut.write(checksumBuf.array(), offset, checksumLen);
++
+-          replicaInfo.setLastChecksumAndDataLen(
+-            offsetInBlock, lastChunkChecksum
+-          );
++          replicaInfo.setLastChecksumAndDataLen(offsetInBlock, lastCrc);
++  private static byte[] copyLastChunkChecksum(byte[] array, int size, int end) {
++    return Arrays.copyOfRange(array, end - size, end);
++  }
++
+-  private void computePartialChunkCrc(long blkoff, long ckoff, 
+-                                      int bytesPerChecksum) throws IOException {
++  private Checksum computePartialChunkCrc(long blkoff, long ckoff)
++      throws IOException {
+-    int checksumSize = diskChecksum.getChecksumSize();
+-    LOG.info("computePartialChunkCrc sizePartialChunk " + 
+-              sizePartialChunk + " " + block +
+-              " block offset " + blkoff +
+-              " metafile offset " + ckoff);
++    if (LOG.isDebugEnabled()) {
++      LOG.debug("computePartialChunkCrc for " + block
++          + ": sizePartialChunk=" + sizePartialChunk
++          + ", block offset=" + blkoff
++          + ", metafile offset=" + ckoff);
++    }
+-    partialCrc = DataChecksum.newDataChecksum(
++    final Checksum partialCrc = DataChecksum.newDataChecksum(
+-    LOG.info("Read in partial CRC chunk from disk for " + block);
++    if (LOG.isDebugEnabled()) {
++      LOG.debug("Read in partial CRC chunk from disk for " + block);
++    }
++    return partialCrc;

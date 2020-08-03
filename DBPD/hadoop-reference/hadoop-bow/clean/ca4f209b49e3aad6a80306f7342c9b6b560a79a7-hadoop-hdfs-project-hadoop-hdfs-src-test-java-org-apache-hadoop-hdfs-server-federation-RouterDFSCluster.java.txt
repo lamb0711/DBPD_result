@@ -1,0 +1,555 @@
+HDFS-11546. Federation Router RPC server. Contributed by Jason Kace and Inigo Goiri.
+
+(cherry picked from commit 8a9cdebebf26841a0f1e99fb08135f4597f2eba2)
+
++import static org.apache.hadoop.fs.CommonConfigurationKeysPublic.FS_DEFAULT_NAME_KEY;
++import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_HA_NAMENODES_KEY_PREFIX;
++import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_HA_NAMENODE_ID_KEY;
++import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_NAMENODE_HTTP_ADDRESS_KEY;
++import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_NAMENODE_RPC_ADDRESS_KEY;
++import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_NAMENODE_RPC_BIND_HOST_KEY;
++import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_NAMESERVICES;
++import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_NAMESERVICE_ID;
++import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_ROUTER_DEFAULT_NAMESERVICE;
++import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_ROUTER_HANDLER_COUNT_KEY;
++import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_ROUTER_RPC_ADDRESS_KEY;
++import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_ROUTER_RPC_BIND_HOST_KEY;
++import static org.apache.hadoop.hdfs.DFSConfigKeys.FEDERATION_FILE_RESOLVER_CLIENT_CLASS;
++import static org.apache.hadoop.hdfs.DFSConfigKeys.FEDERATION_NAMENODE_RESOLVER_CLIENT_CLASS;
++import static org.apache.hadoop.hdfs.server.federation.FederationTestUtils.NAMENODES;
++import static org.apache.hadoop.hdfs.server.federation.FederationTestUtils.addDirectory;
++import static org.apache.hadoop.hdfs.server.federation.FederationTestUtils.waitNamenodeRegistered;
+-import static org.junit.Assert.assertFalse;
++import static org.junit.Assert.fail;
++import java.net.InetSocketAddress;
++import java.util.Map.Entry;
+-import org.apache.commons.logging.Log;
+-import org.apache.commons.logging.LogFactory;
++import org.apache.hadoop.fs.FileSystem;
+-import org.apache.hadoop.hdfs.DFSConfigKeys;
++import org.apache.hadoop.hdfs.server.federation.resolver.FileSubclusterResolver;
++import org.apache.hadoop.hdfs.server.namenode.FSImage;
++import org.apache.hadoop.hdfs.server.protocol.NamespaceInfo;
++import org.apache.hadoop.net.NetUtils;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
+- * Test utility to mimic a federated HDFS cluster with a router.
++ * Test utility to mimic a federated HDFS cluster with multiple routers.
++
++  private static final Logger LOG =
++      LoggerFactory.getLogger(RouterDFSCluster.class);
++
++  public static final String TEST_STRING = "teststring";
++  public static final String TEST_DIR = "testdir";
++  public static final String TEST_FILE = "testfile";
++
++
++  /** Nameservices in the federated cluster. */
++  private List<String> nameservices;
++  /** Namenodes in the federated cluster. */
++  private List<NamenodeContext> namenodes;
++  /** Routers in the federated cluster. */
++  private List<RouterContext> routers;
++  /** If the Namenodes are in high availability.*/
++  private boolean highAvailability;
++
++  /** Mini cluster. */
++  private MiniDFSCluster cluster;
++
++  /** Router configuration overrides. */
++  private Configuration routerOverrides;
++  /** Namenode configuration overrides. */
++  private Configuration namenodeOverrides;
++
++
+-    public RouterContext(Configuration conf, String ns, String nn)
++    public RouterContext(Configuration conf, String nsId, String nnId)
+-      this.namenodeId = nn;
+-      this.nameserviceId = ns;
+-      router = new Router();
+-      router.init(conf);
++      this.nameserviceId = nsId;
++      this.namenodeId = nnId;
++
++      this.router = new Router();
++      this.router.init(conf);
++      // Store the bound points for the router interfaces
++      InetSocketAddress rpcAddress = router.getRpcServerAddress();
++      if (rpcAddress != null) {
++        this.rpcPort = rpcAddress.getPort();
++        this.fileSystemUri =
++            URI.create("hdfs://" + NetUtils.getHostPortString(rpcAddress));
++        // Override the default FS to point to the router RPC
++        DistributedFileSystem.setDefaultUri(conf, fileSystemUri);
++        try {
++          this.fileContext = FileContext.getFileContext(conf);
++        } catch (UnsupportedFileSystemException e) {
++          this.fileContext = null;
++        }
++      }
+-    public DistributedFileSystem getFileSystem() throws IOException {
+-      DistributedFileSystem fs =
+-          (DistributedFileSystem) DistributedFileSystem.get(conf);
+-      return fs;
++    public FileSystem getFileSystem() throws IOException {
++      return DistributedFileSystem.get(conf);
+-      LOG.info("Connecting to router at " + fileSystemUri);
++      LOG.info("Connecting to router at {}", fileSystemUri);
+-
+-        LOG.info("Connecting to router at " + fileSystemUri);
++        LOG.info("Connecting to router at {}", fileSystemUri);
+-   * Namenode context.
++   * Namenode context in the federated cluster.
++    private Configuration conf;
+-    private Configuration conf;
+-    public NamenodeContext(Configuration conf, String ns, String nn,
+-        int index) {
++    public NamenodeContext(
++        Configuration conf, String nsId, String nnId, int index) {
+-      this.namenodeId = nn;
+-      this.nameserviceId = ns;
++      this.nameserviceId = nsId;
++      this.namenodeId = nnId;
+-    public void setNamenode(NameNode n) throws URISyntaxException {
+-      namenode = n;
++    public void setNamenode(NameNode nn) throws URISyntaxException {
++      this.namenode = nn;
+-      // Store the bound ports and override the default FS with the local NN's
+-      // RPC
+-      rpcPort = n.getNameNodeAddress().getPort();
+-      servicePort = n.getServiceRpcAddress().getPort();
+-      lifelinePort = n.getServiceRpcAddress().getPort();
+-      httpPort = n.getHttpAddress().getPort();
+-      fileSystemUri = new URI("hdfs://" + namenode.getHostAndPort());
+-      DistributedFileSystem.setDefaultUri(conf, fileSystemUri);
++      // Store the bound ports and override the default FS with the local NN RPC
++      this.rpcPort = nn.getNameNodeAddress().getPort();
++      this.servicePort = nn.getServiceRpcAddress().getPort();
++      this.lifelinePort = nn.getServiceRpcAddress().getPort();
++      this.httpPort = nn.getHttpAddress().getPort();
++      this.fileSystemUri = new URI("hdfs://" + namenode.getHostAndPort());
++      DistributedFileSystem.setDefaultUri(this.conf, this.fileSystemUri);
+-        this.fileContext = FileContext.getFileContext(conf);
++        this.fileContext = FileContext.getFileContext(this.conf);
+-    public DistributedFileSystem getFileSystem() throws IOException {
+-      DistributedFileSystem fs =
+-          (DistributedFileSystem) DistributedFileSystem.get(conf);
+-      return fs;
++    public FileSystem getFileSystem() throws IOException {
++      return DistributedFileSystem.get(conf);
+-      LOG.info("Connecting to namenode at " + fileSystemUri);
++      LOG.info("Connecting to namenode at {}", fileSystemUri);
+-        LOG.info("Connecting to namenode at " + fileSystemUri);
++        LOG.info("Connecting to namenode at {}", fileSystemUri);
+-  public static final String NAMENODE1 = "nn0";
+-  public static final String NAMENODE2 = "nn1";
+-  public static final String NAMENODE3 = "nn2";
+-  public static final String TEST_STRING = "teststring";
+-  public static final String TEST_DIR = "testdir";
+-  public static final String TEST_FILE = "testfile";
+-
+-  private List<String> nameservices;
+-  private List<RouterContext> routers;
+-  private List<NamenodeContext> namenodes;
+-  private static final Log LOG = LogFactory.getLog(RouterDFSCluster.class);
+-  private MiniDFSCluster cluster;
+-  private boolean highAvailability;
+-
+-  protected static final int DEFAULT_HEARTBEAT_INTERVAL = 5;
+-  protected static final int DEFAULT_CACHE_INTERVAL_SEC = 5;
+-  private Configuration routerOverrides;
+-  private Configuration namenodeOverrides;
+-
+-  private static final String NAMENODES = NAMENODE1 + "," + NAMENODE2;
+-
+-  public RouterDFSCluster(boolean ha, int numNameservices) {
+-    this(ha, numNameservices, 2);
+-  }
+-
++  public RouterDFSCluster(boolean ha, int numNameservices) {
++    this(ha, numNameservices, 2);
++  }
++
++  /**
++   * Add configuration settings to override default Router settings.
++   *
++   * @param conf Router configuration overrides.
++   */
++  /**
++   * Add configuration settings to override default Namenode settings.
++   *
++   * @param conf Namenode configuration overrides.
++   */
+-  public Configuration generateNamenodeConfiguration(
+-      String defaultNameserviceId) {
+-    Configuration c = new HdfsConfiguration();
++  /**
++   * Generate the configuration for a client.
++   *
++   * @param nsId Nameservice identifier.
++   * @return New namenode configuration.
++   */
++  public Configuration generateNamenodeConfiguration(String nsId) {
++    Configuration conf = new HdfsConfiguration();
+-    c.set(DFSConfigKeys.DFS_NAMESERVICES, getNameservicesKey());
+-    c.set("fs.defaultFS", "hdfs://" + defaultNameserviceId);
++    conf.set(DFS_NAMESERVICES, getNameservicesKey());
++    conf.set(FS_DEFAULT_NAME_KEY, "hdfs://" + nsId);
+-        c.set(DFSConfigKeys.DFS_HA_NAMENODES_KEY_PREFIX + "." + ns, NAMENODES);
++        conf.set(
++            DFS_HA_NAMENODES_KEY_PREFIX + "." + ns,
++            NAMENODES[0] + "," + NAMENODES[1]);
+-        c.set(DFSConfigKeys.DFS_NAMENODE_RPC_ADDRESS_KEY + "." + suffix,
++        conf.set(DFS_NAMENODE_RPC_ADDRESS_KEY + "." + suffix,
+-        c.set(DFSConfigKeys.DFS_NAMENODE_HTTP_ADDRESS_KEY + "." + suffix,
++        conf.set(DFS_NAMENODE_HTTP_ADDRESS_KEY + "." + suffix,
+-        c.set(DFSConfigKeys.DFS_NAMENODE_RPC_BIND_HOST_KEY + "." + suffix,
++        conf.set(DFS_NAMENODE_RPC_BIND_HOST_KEY + "." + suffix,
+-    if (namenodeOverrides != null) {
+-      c.addResource(namenodeOverrides);
++    if (this.namenodeOverrides != null) {
++      conf.addResource(this.namenodeOverrides);
+-    return c;
+-  }
+-
+-  public Configuration generateClientConfiguration() {
+-    Configuration conf = new HdfsConfiguration();
+-    conf.addResource(generateNamenodeConfiguration(getNameservices().get(0)));
+-  public Configuration generateRouterConfiguration(String localNameserviceId,
+-      String localNamenodeId) throws IOException {
+-    Configuration conf = new HdfsConfiguration();
+-    conf.addResource(generateNamenodeConfiguration(localNameserviceId));
++  /**
++   * Generate the configuration for a client.
++   *
++   * @return New configuration for a client.
++   */
++  public Configuration generateClientConfiguration() {
++    Configuration conf = new HdfsConfiguration(false);
++    String ns0 = getNameservices().get(0);
++    conf.addResource(generateNamenodeConfiguration(ns0));
++    return conf;
++  }
++
++  /**
++   * Generate the configuration for a Router.
++   *
++   * @param nsId Nameservice identifier.
++   * @param nnId Namenode identifier.
++   * @return New configuration for a Router.
++   */
++  public Configuration generateRouterConfiguration(String nsId, String nnId) {
++
++    Configuration conf = new HdfsConfiguration(false);
++    conf.addResource(generateNamenodeConfiguration(nsId));
++
++    conf.setInt(DFS_ROUTER_HANDLER_COUNT_KEY, 10);
++    conf.set(DFS_ROUTER_RPC_ADDRESS_KEY, "127.0.0.1:0");
++    conf.set(DFS_ROUTER_RPC_BIND_HOST_KEY, "0.0.0.0");
++
++    conf.set(DFS_ROUTER_DEFAULT_NAMESERVICE, nameservices.get(0));
+-    conf.set(DFSConfigKeys.FEDERATION_NAMENODE_RESOLVER_CLIENT_CLASS,
+-        MockResolver.class.getCanonicalName());
+-    conf.set(DFSConfigKeys.FEDERATION_FILE_RESOLVER_CLIENT_CLASS,
+-        MockResolver.class.getCanonicalName());
++    conf.setClass(FEDERATION_NAMENODE_RESOLVER_CLIENT_CLASS,
++        MockResolver.class, ActiveNamenodeResolver.class);
++    conf.setClass(FEDERATION_FILE_RESOLVER_CLIENT_CLASS,
++        MockResolver.class, FileSubclusterResolver.class);
+-    conf.set(DFSConfigKeys.DFS_NAMESERVICE_ID, localNameserviceId);
+-
+-    if (localNamenodeId != null) {
+-      conf.set(DFSConfigKeys.DFS_HA_NAMENODE_ID_KEY, localNamenodeId);
++    conf.set(DFS_NAMESERVICE_ID, nsId);
++    if (nnId != null) {
++      conf.set(DFS_HA_NAMENODE_ID_KEY, nnId);
+-    StringBuilder routerBuilder = new StringBuilder();
+-    for (String ns : nameservices) {
+-      for (NamenodeContext context : getNamenodes(ns)) {
+-        String suffix = context.getConfSuffix();
+-
+-        if (routerBuilder.length() != 0) {
+-          routerBuilder.append(",");
+-        }
+-        routerBuilder.append(suffix);
++    // Add custom overrides if available
++    if (this.routerOverrides != null) {
++      for (Entry<String, String> entry : this.routerOverrides) {
++        String confKey = entry.getKey();
++        String confValue = entry.getValue();
++        conf.set(confKey, confValue);
+-
+-    nameservices = new ArrayList<String>();
+-    for (int i = 0; i < numNameservices; i++) {
+-      nameservices.add("ns" + i);
+-    }
+-    namenodes = new ArrayList<NamenodeContext>();
+-    int index = 0;
+-    for (String ns : nameservices) {
++    this.nameservices = new ArrayList<>();
++    this.namenodes = new ArrayList<>();
++
++    NamenodeContext context = null;
++    int nnIndex = 0;
++    for (int i=0; i<numNameservices; i++) {
++      String ns = "ns" + i;
++      this.nameservices.add("ns" + i);
++
+-      if (highAvailability) {
+-        NamenodeContext context =
+-            new NamenodeContext(nnConf, ns, NAMENODE1, index);
+-        namenodes.add(context);
+-        index++;
+-
+-        if (numNamenodes > 1) {
+-          context = new NamenodeContext(nnConf, ns, NAMENODE2, index + 1);
+-          namenodes.add(context);
+-          index++;
+-        }
+-
+-        if (numNamenodes > 2) {
+-          context = new NamenodeContext(nnConf, ns, NAMENODE3, index + 1);
+-          namenodes.add(context);
+-          index++;
+-        }
+-
++      if (!highAvailability) {
++        context = new NamenodeContext(nnConf, ns, null, nnIndex++);
++        this.namenodes.add(context);
+-        NamenodeContext context = new NamenodeContext(nnConf, ns, null, index);
+-        namenodes.add(context);
+-        index++;
++        for (int j=0; j<numNamenodes; j++) {
++          context = new NamenodeContext(nnConf, ns, NAMENODES[j], nnIndex++);
++          this.namenodes.add(context);
++        }
+-    StringBuilder ns = new StringBuilder();
+-    for (int i = 0; i < nameservices.size(); i++) {
+-      if (i > 0) {
+-        ns.append(",");
++    StringBuilder sb = new StringBuilder();
++    for (String nsId : this.nameservices) {
++      if (sb.length() > 0) {
++        sb.append(",");
+-      ns.append(nameservices.get(i));
++      sb.append(nsId);
+-    return ns.toString();
++    return sb.toString();
+-    return nameservices.get(r.nextInt(nameservices.size()));
++    int randIndex = r.nextInt(nameservices.size());
++    return nameservices.get(randIndex);
+-    ArrayList<NamenodeContext> nns = new ArrayList<NamenodeContext>();
++    List<NamenodeContext> nns = new ArrayList<>();
+-    return namenodes.get(rand.nextInt(namenodes.size()));
++    int i = rand.nextInt(this.namenodes.size());
++    return this.namenodes.get(i);
+-    return namenodes;
++    return this.namenodes;
+-  public NamenodeContext getNamenode(String nameservice,
+-      String namenode) {
+-    for (NamenodeContext c : namenodes) {
++  public NamenodeContext getNamenode(String nameservice, String namenode) {
++    for (NamenodeContext c : this.namenodes) {
+-        if (namenode == null || c.namenodeId == null || namenode.isEmpty()
+-            || c.namenodeId.isEmpty()) {
++        if (namenode == null || namenode.isEmpty() ||
++            c.namenodeId == null || c.namenodeId.isEmpty()) {
+-    ArrayList<RouterContext> nns = new ArrayList<RouterContext>();
++    List<RouterContext> nns = new ArrayList<>();
+-  public RouterContext getRouterContext(String nameservice,
+-      String namenode) {
++  public RouterContext getRouterContext(String nsId, String nnId) {
+-      if (namenode == null) {
++      if (nnId == null) {
+-      if (c.namenodeId.equals(namenode)
+-          && c.nameserviceId.equals(nameservice)) {
++      if (c.namenodeId.equals(nnId) &&
++          c.nameserviceId.equals(nsId)) {
+-  public RouterContext buildRouter(String nameservice, String namenode)
++  public RouterContext buildRouter(String nsId, String nnId)
+-    Configuration config = generateRouterConfiguration(nameservice, namenode);
+-    RouterContext rc = new RouterContext(config, nameservice, namenode);
++    Configuration config = generateRouterConfiguration(nsId, nnId);
++    RouterContext rc = new RouterContext(config, nsId, nnId);
+-
+-          for(int i = 0; i < namenodes.size()/nameservices.size(); i++) {
++          for (int i=0; i<namenodes.size()/nameservices.size(); i++) {
+-      Configuration nnConf = generateNamenodeConfiguration(nameservices.get(0));
++      String ns0 = nameservices.get(0);
++      Configuration nnConf = generateNamenodeConfiguration(ns0);
+-      cluster = new MiniDFSCluster.Builder(nnConf).nnTopology(topology).build();
++      cluster = new MiniDFSCluster.Builder(nnConf)
++          .numDataNodes(nameservices.size()*2)
++          .nnTopology(topology)
++          .build();
+-      LOG.error("Cannot start Router DFS cluster: " + e.getMessage(), e);
+-      cluster.shutdown();
++      LOG.error("Cannot start Router DFS cluster: {}", e.getMessage(), e);
++      if (cluster != null) {
++        cluster.shutdown();
++      }
+-    // Create routers
+-    routers = new ArrayList<RouterContext>();
+-    for (String ns : nameservices) {
++    // Create one router per nameservice
++    this.routers = new ArrayList<>();
++    for (String ns : this.nameservices) {
+-        routers.add(buildRouter(ns, context.namenodeId));
++        RouterContext router = buildRouter(ns, context.namenodeId);
++        this.routers.add(router);
+-    for (RouterContext router : routers) {
++    for (RouterContext router : this.routers) {
++
+-    for (RouterContext router : routers) {
++    for (RouterContext router : this.routers) {
+-    assertFalse(
+-        "Timeout waiting for " + router.router.toString() + " to activate.",
+-        true);
++    fail("Timeout waiting for " + router.router + " to activate");
+-
+-    for (RouterContext r : routers) {
++    for (RouterContext r : this.routers) {
+-      for (NamenodeContext nn : namenodes) {
++      for (NamenodeContext nn : this.namenodes) {
+-        NamenodeStatusReport report = new NamenodeStatusReport(nn.nameserviceId,
+-            nn.namenodeId, nn.getRpcAddress(), nn.getServiceAddress(),
++        NamenodeStatusReport report = new NamenodeStatusReport(
++            nn.nameserviceId, nn.namenodeId,
++            nn.getRpcAddress(), nn.getServiceAddress(),
+-        report.setNamespaceInfo(nn.namenode.getNamesystem().getFSImage()
+-            .getStorage().getNamespaceInfo());
++        FSImage fsImage = nn.namenode.getNamesystem().getFSImage();
++        NamespaceInfo nsInfo = fsImage.getStorage().getNamespaceInfo();
++        report.setNamespaceInfo(nsInfo);
+-    for (RouterContext r : routers) {
+-      for (NamenodeContext nn : namenodes) {
+-        FederationTestUtils.waitNamenodeRegistered(
+-            r.router.getNamenodeResolver(), nn.nameserviceId, nn.namenodeId,
+-            null);
++    for (RouterContext r : this.routers) {
++      Router router = r.router;
++      for (NamenodeContext nn : this.namenodes) {
++        ActiveNamenodeResolver nnResolver = router.getNamenodeResolver();
++        waitNamenodeRegistered(
++            nnResolver, nn.nameserviceId, nn.namenodeId, null);
+-      FederationNamenodeServiceState state, String nameservice, String namenode)
++      FederationNamenodeServiceState state, String nsId, String nnId)
+-    LOG.info("Waiting for NN - " + nameservice + ":" + namenode
+-        + " to transition to state - " + state);
+-    FederationTestUtils.waitNamenodeRegistered(
+-        router.router.getNamenodeResolver(), nameservice, namenode, state);
+-  }
+-
+-  public String getFederatedPathForNameservice(String ns) {
+-    return "/" + ns;
+-  }
+-
+-  public String getNamenodePathForNameservice(String ns) {
+-    return "/target-" + ns;
++    LOG.info("Waiting for NN {} {} to transition to {}", nsId, nnId, state);
++    ActiveNamenodeResolver nnResolver = router.router.getNamenodeResolver();
++    waitNamenodeRegistered(nnResolver, nsId, nnId, state);
+-   * @return example:
++   * Get the federated path for a nameservice.
++   * @param nsId Nameservice identifier.
++   * @return Path in the Router.
++   */
++  public String getFederatedPathForNS(String nsId) {
++    return "/" + nsId;
++  }
++
++  /**
++   * Get the namenode path for a nameservice.
++   * @param nsId Nameservice identifier.
++   * @return Path in the Namenode.
++   */
++  public String getNamenodePathForNS(String nsId) {
++    return "/target-" + nsId;
++  }
++
++  /**
++   * Get the federated test directory for a nameservice.
++   * @param nsId Nameservice identifier.
++   * @return Example:
+-  public String getFederatedTestDirectoryForNameservice(String ns) {
+-    return getFederatedPathForNameservice(ns) + "/" + TEST_DIR;
++  public String getFederatedTestDirectoryForNS(String nsId) {
++    return getFederatedPathForNS(nsId) + "/" + TEST_DIR;
++   * Get the namenode test directory for a nameservice.
++   * @param nsId Nameservice identifier.
+-  public String getNamenodeTestDirectoryForNameservice(String ns) {
+-    return getNamenodePathForNameservice(ns) + "/" + TEST_DIR;
++  public String getNamenodeTestDirectoryForNS(String nsId) {
++    return getNamenodePathForNS(nsId) + "/" + TEST_DIR;
++   * Get the federated test file for a nameservice.
++   * @param nsId Nameservice identifier.
+-  public String getFederatedTestFileForNameservice(String ns) {
+-    return getFederatedPathForNameservice(ns) + "/" + TEST_FILE;
++  public String getFederatedTestFileForNS(String nsId) {
++    return getFederatedPathForNS(nsId) + "/" + TEST_FILE;
++   * Get the namenode test file for a nameservice.
++   * @param nsId Nameservice identifier.
+-  public String getNamenodeTestFileForNameservice(String ns) {
+-    return getNamenodePathForNameservice(ns) + "/" + TEST_FILE;
++  public String getNamenodeTestFileForNS(String nsId) {
++    return getNamenodePathForNS(nsId) + "/" + TEST_FILE;
++  /**
++   * Stop the federated HDFS cluster.
++   */
+-    cluster.shutdown();
++    if (cluster != null) {
++      cluster.shutdown();
++    }
++  /**
++   * Stop a router.
++   * @param router Router context.
++   */
+-
+-          LOG.error("Unable to shutdown router - " + router.rpcPort);
++          LOG.error("Cannot shutdown router {}", router.rpcPort);
+-        throw new IOException("Unable to create test directory for ns - " + ns);
++        throw new IOException("Cannot create test directory for ns " + ns);
+-    return FederationTestUtils.addDirectory(nn.getFileSystem(),
+-        getNamenodeTestDirectoryForNameservice(nn.nameserviceId));
++    FileSystem fs = nn.getFileSystem();
++    String testDir = getNamenodeTestDirectoryForNS(nn.nameserviceId);
++    return addDirectory(fs, testDir);
+-      FileStatus[] status = context.getFileSystem().listStatus(new Path("/"));
+-      for(int i = 0; i <status.length; i++) {
++      FileSystem fs = context.getFileSystem();
++      FileStatus[] status = fs.listStatus(new Path("/"));
++      for (int i = 0; i <status.length; i++) {
+-        context.getFileSystem().delete(p, true);
++        fs.delete(p, true);
+-      status = context.getFileSystem().listStatus(new Path("/"));
++      status = fs.listStatus(new Path("/"));
+-      for (String ns : nameservices) {
++      for (String nsId : nameservices) {
+-        resolver.addLocation(getFederatedPathForNameservice(ns), ns,
+-            getNamenodePathForNameservice(ns));
++        String routerPath = getFederatedPathForNS(nsId);
++        String nnPath = getNamenodePathForNS(nsId);
++        resolver.addLocation(routerPath, nsId, nnPath);
+-      // Root path goes to both NS1
+-      resolver.addLocation("/", nameservices.get(0), "/");
++      // Root path points to both first nameservice
++      String ns0 = nameservices.get(0);
++      resolver.addLocation("/", ns0, "/");
++    }
++  }
++
++  public MiniDFSCluster getCluster() {
++    return cluster;
++  }
++
++  /**
++   * Wait until the federated cluster is up and ready.
++   * @throws IOException If we cannot wait for the cluster to be up.
++   */
++  public void waitClusterUp() throws IOException {
++    cluster.waitClusterUp();
++    registerNamenodes();
++    try {
++      waitNamenodeRegistration();
++    } catch (Exception e) {
++      throw new IOException("Cannot wait for the namenodes", e);

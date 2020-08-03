@@ -1,0 +1,148 @@
+HDFS-12979. [SBN read] StandbyNode should upload FsImage to ObserverNode after checkpointing. Contributed by Chen Liang.
+
++import com.google.common.collect.Lists;
++import java.util.HashMap;
++import java.util.Map;
+-import java.util.concurrent.atomic.AtomicInteger;
+-  private long lastUploadTime;
+-  private boolean isPrimaryCheckPointer = true;
++
++  // A map from NN url to the most recent image upload time.
++  private final HashMap<String, CheckpointReceiverEntry> checkpointReceivers;
+-
++    this.checkpointReceivers = new HashMap<>();
++    for (URL address : activeNNAddresses) {
++      this.checkpointReceivers.put(address.toString(),
++          new CheckpointReceiverEntry());
++    }
++  }
++
++  private static final class CheckpointReceiverEntry {
++    private long lastUploadTime;
++    private boolean isPrimary;
++
++    CheckpointReceiverEntry() {
++      this.lastUploadTime = 0L;
++      this.isPrimary = true;
++    }
++
++    void setLastUploadTime(long lastUploadTime) {
++      this.lastUploadTime = lastUploadTime;
++    }
++
++    void setIsPrimary(boolean isPrimaryFor) {
++      this.isPrimary = isPrimaryFor;
++    }
++
++    long getLastUploadTime() {
++      return lastUploadTime;
++    }
++
++    boolean isPrimary() {
++      return isPrimary;
++    }
+-  private void doCheckpoint(boolean sendCheckpoint) throws InterruptedException, IOException {
++  private void doCheckpoint() throws InterruptedException, IOException {
+-    //early exit if we shouldn't actually send the checkpoint to the ANN
+-    if(!sendCheckpoint){
+-      return;
+-    }
+-
+-    List<Future<TransferFsImage.TransferResult>> uploads =
+-        new ArrayList<Future<TransferFsImage.TransferResult>>();
++    HashMap<String, Future<TransferFsImage.TransferResult>> uploads =
++        new HashMap<>();
+-      Future<TransferFsImage.TransferResult> upload =
+-          executor.submit(new Callable<TransferFsImage.TransferResult>() {
+-            @Override
+-            public TransferFsImage.TransferResult call()
+-                throws IOException, InterruptedException {
+-              CheckpointFaultInjector.getInstance().duringUploadInProgess();
+-              return TransferFsImage.uploadImageFromStorage(activeNNAddress, conf, namesystem
+-                  .getFSImage().getStorage(), imageType, txid, canceler);
+-            }
+-          });
+-      uploads.add(upload);
++      // Upload image if at least 1 of 2 following conditions met:
++      // 1. has been quiet for long enough, try to contact the node.
++      // 2. this standby IS the primary checkpointer of target NN.
++      String addressString = activeNNAddress.toString();
++      assert checkpointReceivers.containsKey(addressString);
++      CheckpointReceiverEntry receiverEntry =
++          checkpointReceivers.get(addressString);
++      long secsSinceLastUpload =
++          TimeUnit.MILLISECONDS.toSeconds(
++              monotonicNow() - receiverEntry.getLastUploadTime());
++      boolean shouldUpload = receiverEntry.isPrimary() ||
++          secsSinceLastUpload >= checkpointConf.getQuietPeriod();
++      if (shouldUpload) {
++        Future<TransferFsImage.TransferResult> upload =
++            executor.submit(new Callable<TransferFsImage.TransferResult>() {
++              @Override
++              public TransferFsImage.TransferResult call()
++                  throws IOException, InterruptedException {
++                CheckpointFaultInjector.getInstance().duringUploadInProgess();
++                return TransferFsImage.uploadImageFromStorage(activeNNAddress,
++                    conf, namesystem.getFSImage().getStorage(), imageType, txid,
++                    canceler);
++              }
++            });
++        uploads.put(addressString, upload);
++      }
+-    IOException ioe= null;
+-    int i = 0;
+-    boolean success = false;
+-    for (; i < uploads.size(); i++) {
+-      Future<TransferFsImage.TransferResult> upload = uploads.get(i);
++    List<IOException> ioes = Lists.newArrayList();
++    for (Map.Entry<String, Future<TransferFsImage.TransferResult>> entry :
++        uploads.entrySet()) {
++      String url = entry.getKey();
++      Future<TransferFsImage.TransferResult> upload = entry.getValue();
+-        // TODO should there be some smarts here about retries nodes that are not the active NN?
++        // TODO should there be some smarts here about retries nodes that
++        //  are not the active NN?
++        CheckpointReceiverEntry receiverEntry = checkpointReceivers.get(url);
+-          success = true;
+-          //avoid getting the rest of the results - we don't care since we had a successful upload
+-          break;
++          receiverEntry.setLastUploadTime(monotonicNow());
++          receiverEntry.setIsPrimary(true);
++        } else {
++          receiverEntry.setIsPrimary(false);
+-
+-        ioe = new IOException("Exception during image upload", e);
+-        break;
++        // Even if exception happens, still proceeds to next NN url.
++        // so that fail to upload to previous NN does not cause the
++        // remaining NN not getting the fsImage.
++        ioes.add(new IOException("Exception during image upload", e));
+-    if (ie == null && ioe == null) {
+-      //Update only when response from remote about success or
+-      lastUploadTime = monotonicNow();
+-      // we are primary if we successfully updated the ANN
+-      this.isPrimaryCheckPointer = success;
+-    }
+-    if (ie != null || ioe != null) {
++    if (ie != null) {
+-      for (; i < uploads.size(); i++) {
+-        Future<TransferFsImage.TransferResult> upload = uploads.get(i);
++      for (Map.Entry<String, Future<TransferFsImage.TransferResult>> entry :
++          uploads.entrySet()) {
++        Future<TransferFsImage.TransferResult> upload = entry.getValue();
+-      if (ie != null) {
+-        throw ie;
+-      } else if (ioe != null) {
+-        throw ioe;
+-      }
++      throw ie;
++    }
++
++    if (!ioes.isEmpty()) {
++      throw MultipleIOException.createIOException(ioes);
+-      lastUploadTime = monotonicNow();
+-            final long secsSinceLastUpload = (now - lastUploadTime) / 1000;
+-            boolean sendRequest = isPrimaryCheckPointer
+-                || secsSinceLastUpload >= checkpointConf.getQuietPeriod();
+-            doCheckpoint(sendRequest);
++            doCheckpoint();

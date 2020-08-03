@@ -1,0 +1,211 @@
+HDFS-4126. Add reading/writing snapshot information to FSImage. Contributed by Jing Zhao.
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/branches/HDFS-2802@1437256 13f79535-47bb-0310-9956-ffa450edef68
+
++import java.io.DataOutput;
++import java.io.IOException;
++import java.util.Map;
++import org.apache.hadoop.hdfs.DFSUtil;
++import org.apache.hadoop.hdfs.server.namenode.FSImageSerialization;
+-import com.google.common.annotations.VisibleForTesting;
+-  static class Diff {
++  public static class Diff {
++    INode searchCreated(final byte[] name) {
++      int cIndex = search(created, name);
++      return cIndex < 0 ? null : created.get(cIndex);
++    }
++    
++    INode searchDeleted(final byte[] name) {
++      int dIndex = search(deleted, name);
++      return dIndex < 0 ? null : deleted.get(dIndex);
++    }
++    
+-    Triple<Integer, INode, Integer> delete(final INode inode) {
++    Triple<Integer, INode, Integer> delete(final INode inode,
++        boolean updateCircularList) {
++        if (updateCircularList && previous instanceof FileWithSnapshot) {
++          // also we should remove previous from the circular list
++          ((FileWithSnapshot) previous).removeSelf();
++        }
+-    Triple<Integer, INode, Integer> modify(final INode oldinode, final INode newinode) {
++    Triple<Integer, INode, Integer> modify(final INode oldinode,
++        final INode newinode, boolean updateCircularList) {
++        if (updateCircularList && newinode instanceof FileWithSnapshot) {
++          // also should remove oldinode from the circular list
++          FileWithSnapshot newNodeWithLink = (FileWithSnapshot) newinode;
++          FileWithSnapshot oldNodeWithLink = (FileWithSnapshot) oldinode;
++          newNodeWithLink.setNext(oldNodeWithLink.getNext());
++          oldNodeWithLink.setNext(null);
++        }
++        
++     * @param updateCircularList Whether to update the circular linked list 
++     *                           while combining the diffs.                             
+-    void combinePostDiff(Diff postDiff, Processor deletedINodeProcesser) {
++    void combinePostDiff(Diff postDiff, Processor deletedINodeProcesser,
++        boolean updateCircularList) {
+-          Triple<Integer, INode, Integer> triple = delete(d);
++          Triple<Integer, INode, Integer> triple = delete(d, 
++              updateCircularList);
+-          final Triple<Integer, INode, Integer> triple = modify(d, c);
++          final Triple<Integer, INode, Integer> triple = modify(d, c,
++              updateCircularList);
++    
++    /** Serialize {@link #created} */
++    private void writeCreated(DataOutput out) throws IOException {
++      if (created != null) {
++        out.writeInt(created.size());
++        for (INode node : created) {
++          // For INode in created list, we only need to record its local name 
++          byte[] name = node.getLocalNameBytes();
++          out.writeShort(name.length);
++          out.write(name);
++        }
++      } else {
++        out.writeInt(0);
++      }     
++    }
++    
++    /** Serialize {@link #deleted} */
++    private void writeDeleted(DataOutput out) throws IOException {
++      if (deleted != null) {
++        out.writeInt(deleted.size());
++        for (INode node : deleted) {
++          if (node.isDirectory()) {
++            FSImageSerialization.writeINodeDirectory((INodeDirectory) node, out);
++          } else { // INodeFile
++            // we write the block information only for INodeFile node when the
++            // node is only stored in the deleted list or the node is not a
++            // snapshot copy
++            int createdIndex = search(created, node);
++            if (createdIndex < 0) {
++              FSImageSerialization.writeINodeFile((INodeFile) node, out, true);
++            } else {
++              INodeFile cNode = (INodeFile) created.get(createdIndex);
++              INodeFile dNode = (INodeFile) node;
++              // A corner case here: after deleting a Snapshot, when combining
++              // SnapshotDiff, we may put two inodes sharing the same name but
++              // with totally different blocks in the created and deleted list of
++              // the same SnapshotDiff.
++              if (cNode.getBlocks() == dNode.getBlocks()) {
++                FSImageSerialization.writeINodeFile(dNode, out, false);
++              } else {
++                FSImageSerialization.writeINodeFile(dNode, out, true);
++              }
++            }
++          }
++        }
++      } else {
++        out.writeInt(0);
++      }
++    }
++    
++    /** Serialize to out */
++    private void write(DataOutput out) throws IOException {
++      writeCreated(out);
++      writeDeleted(out);    
++    }
++    
++    /** @return The list of INodeDirectory contained in the deleted list */
++    private List<INodeDirectory> getDirsInDeleted() {
++      List<INodeDirectory> dirList = new ArrayList<INodeDirectory>();
++      if (deleted != null) {
++        for (INode node : deleted) {
++          if (node.isDirectory()) {
++            dirList.add((INodeDirectory) node);
++          }
++        }
++      }
++      return dirList;
++    }
+-  class SnapshotDiff implements Comparable<Snapshot> {
++  public class SnapshotDiff implements Comparable<Snapshot> {
+-    private final Diff diff = new Diff();
++    private final Diff diff;
++      this.diff = new Diff();
++    }
++
++    /** Constructor used by FSImage loading */
++    SnapshotDiff(Snapshot snapshot,
++        int childrenSize, INodeDirectory snapshotINode,
++        SnapshotDiff posteriorDiff, List<INode> createdList,
++        List<INode> deletedList) {
++      this.snapshot = snapshot;
++      this.childrenSize = childrenSize;
++      this.snapshotINode = snapshotINode;
++      this.posteriorDiff = posteriorDiff;
++      this.diff = new Diff();
++      diff.created = createdList;
++      diff.deleted = deletedList;
++    }
++    
++    public Diff getDiff() {
++      return diff;
+-              combined.combinePostDiff(d.diff, null);
++              combined.combinePostDiff(d.diff, null, false);
++    
++    /** Serialize fields to out */
++    void write(DataOutput out) throws IOException {
++      out.writeInt(childrenSize);
++      // No need to write all fields of Snapshot here, since the snapshot must
++      // have been recorded before when writing the FSImage. We only need to
++      // record the full path of its root.
++      byte[] fullPath = DFSUtil.string2Bytes(snapshot.getRoot()
++          .getFullPathName());
++      out.writeShort(fullPath.length);
++      out.write(fullPath);
++      // write snapshotINode
++      if (isSnapshotRoot()) {
++        out.writeBoolean(true);
++      } else {
++        out.writeBoolean(false);
++        if (snapshotINode != null) {
++          out.writeBoolean(true);
++          FSImageSerialization.writeINodeDirectory(snapshotINode, out);
++        } else {
++          out.writeBoolean(false);
++        }
++      }
++      // Write diff. Node need to write poseriorDiff, since diffs is a list.
++      diff.write(out);
++    }
++    
++    private List<INodeDirectory> getSnapshotDirectory() {
++      return diff.getDirsInDeleted();
++    }
+-        });
++        }, true);
+-
++  
++  /** Insert a SnapshotDiff to the head of diffs */
++  public void insertDiff(SnapshotDiff diff) {
++    diffs.add(0, diff);
++  }
++  
+-
++  
+-  @VisibleForTesting
+-    diff.diff.modify(p.right, p.left);
++    diff.diff.modify(p.right, p.left, true);
+-      undoInfo = diff.delete(child);
++      undoInfo = diff.delete(child, true);
++  
++  /**
++   * Get all the INodeDirectory stored in the deletes lists.
++   * 
++   * @param snapshotDirMap
++   *          A HashMap storing all the INodeDirectory stored in the deleted
++   *          lists, with their associated full Snapshot.
++   * @return The number of INodeDirectory returned.
++   */
++  public int getSnapshotDirectory(
++      Map<Snapshot, List<INodeDirectory>> snapshotDirMap) {
++    int dirNum = 0;
++    for (SnapshotDiff sdiff : diffs) {
++      List<INodeDirectory> list = sdiff.getSnapshotDirectory();
++      if (list.size() > 0) {
++        snapshotDirMap.put(sdiff.snapshot, list);
++        dirNum += list.size();
++      }
++    }
++    return dirNum;
++  }

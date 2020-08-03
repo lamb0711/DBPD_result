@@ -1,0 +1,180 @@
+HDFS-10884: [SPS]: Add block movement tracker to track the completion of block movement future tasks at DN. Contributed by Rakesh R
+
+-import java.util.concurrent.ExecutionException;
++import com.google.common.annotations.VisibleForTesting;
++
+-  private final CompletionService<Void> moverExecutorCompletionService;
+-  private final List<Future<Void>> moverTaskFutures;
++  private final CompletionService<BlockMovementResult> moverCompletionService;
++  private final BlocksMovementsCompletionHandler handler;
++  private final BlockStorageMovementTracker movementTracker;
++  private Daemon movementTrackerThread;
+-    moverExecutorCompletionService = new ExecutorCompletionService<>(
+-        moveExecutor);
+-    moverTaskFutures = new ArrayList<>();
++    moverCompletionService = new ExecutorCompletionService<>(moveExecutor);
++    handler = new BlocksMovementsCompletionHandler();
++    movementTracker = new BlockStorageMovementTracker(moverCompletionService,
++        handler);
++    movementTrackerThread = new Daemon(movementTracker);
++    movementTrackerThread.setName("BlockStorageMovementTracker");
++    movementTrackerThread.start();
+-   * TODO: Presently this function is a blocking call, this has to be refined by
+-   * moving the tracking logic to another tracker thread. HDFS-10884 jira
+-   * addresses the same.
+-   *
+-    Future<Void> moveCallable = null;
+-            blkMovingInfo.getBlock(), blockPoolID,
++            trackID, blockPoolID, blkMovingInfo.getBlock(),
++            blkMovingInfo.getSourceStorageTypes()[i],
+-        moveCallable = moverExecutorCompletionService.submit(blockMovingTask);
+-        moverTaskFutures.add(moveCallable);
+-      }
+-    }
+-
+-    for (int i = 0; i < moverTaskFutures.size(); i++) {
+-      try {
+-        moveCallable = moverExecutorCompletionService.take();
+-        moveCallable.get();
+-      } catch (InterruptedException | ExecutionException e) {
+-        // TODO: Failure retries and report back the error to NameNode.
+-        LOG.error("Exception while moving block replica to target storage type",
+-            e);
++        Future<BlockMovementResult> moveCallable = moverCompletionService
++            .submit(blockMovingTask);
++        movementTracker.addBlock(trackID, moveCallable);
+-   * given target.
++   * given target and wait for the response.
+-  private class BlockMovingTask implements Callable<Void> {
++  private class BlockMovingTask implements Callable<BlockMovementResult> {
++    private final long trackID;
++    private final String blockPoolID;
++    private final StorageType srcStorageType;
+-    private String blockPoolID;
+-    BlockMovingTask(Block block, String blockPoolID, DatanodeInfo source,
+-        DatanodeInfo target, StorageType targetStorageType) {
+-      this.block = block;
++    BlockMovingTask(long trackID, String blockPoolID, Block block,
++        DatanodeInfo source, DatanodeInfo target,
++        StorageType srcStorageType, StorageType targetStorageType) {
++      this.trackID = trackID;
++      this.block = block;
++      this.srcStorageType = srcStorageType;
+-    public Void call() {
+-      moveBlock();
+-      return null;
++    public BlockMovementResult call() {
++      BlockMovementStatus status = moveBlock();
++      return new BlockMovementResult(trackID, block.getBlockId(), target,
++          status);
+-    private void moveBlock() {
+-      LOG.info("Start moving block {}", block);
+-
+-      LOG.debug("Start moving block:{} from src:{} to destin:{} to satisfy "
+-          + "storageType:{}", block, source, target, targetStorageType);
++    private BlockMovementStatus moveBlock() {
++      LOG.info("Start moving block:{} from src:{} to destin:{} to satisfy "
++              + "storageType, sourceStoragetype:{} and destinStoragetype:{}",
++          block, source, target, srcStorageType, targetStorageType);
++        ExtendedBlock extendedBlock = new ExtendedBlock(blockPoolID, block);
+-        ExtendedBlock extendedBlock = new ExtendedBlock(blockPoolID, block);
++        return BlockMovementStatus.DN_BLK_STORAGE_MOVEMENT_SUCCESS;
++        return BlockMovementStatus.DN_BLK_STORAGE_MOVEMENT_FAILURE;
++
++  /**
++   * Block movement status code.
++   */
++  enum BlockMovementStatus {
++    /** Success. */
++    DN_BLK_STORAGE_MOVEMENT_SUCCESS(0),
++    /**
++     * Failure due to generation time stamp mismatches or network errors
++     * or no available space.
++     */
++    DN_BLK_STORAGE_MOVEMENT_FAILURE(-1);
++
++    // TODO: need to support different type of failures. Failure due to network
++    // errors, block pinned, no space available etc.
++
++    private final int code;
++
++    private BlockMovementStatus(int code) {
++      this.code = code;
++    }
++
++    /**
++     * @return the status code.
++     */
++    int getStatusCode() {
++      return code;
++    }
++  }
++
++  /**
++   * This class represents result from a block movement task. This will have the
++   * information of the task which was successful or failed due to errors.
++   */
++  static class BlockMovementResult {
++    private final long trackId;
++    private final long blockId;
++    private final DatanodeInfo target;
++    private final BlockMovementStatus status;
++
++    public BlockMovementResult(long trackId, long blockId,
++        DatanodeInfo target, BlockMovementStatus status) {
++      this.trackId = trackId;
++      this.blockId = blockId;
++      this.target = target;
++      this.status = status;
++    }
++
++    long getTrackId() {
++      return trackId;
++    }
++
++    long getBlockId() {
++      return blockId;
++    }
++
++    BlockMovementStatus getStatus() {
++      return status;
++    }
++
++    @Override
++    public String toString() {
++      return new StringBuilder().append("Block movement result(\n  ")
++          .append("track id: ").append(trackId).append(" block id: ")
++          .append(blockId).append(" target node: ").append(target)
++          .append(" movement status: ").append(status).append(")").toString();
++    }
++  }
++
++  /**
++   * Blocks movements completion handler, which is used to collect details of
++   * the completed list of block movements and notify the namenode about the
++   * success or failures.
++   */
++  static class BlocksMovementsCompletionHandler {
++    private final List<BlockMovementResult> completedBlocks = new ArrayList<>();
++
++    /**
++     * Collect all the block movement results and notify namenode.
++     *
++     * @param results
++     *          result of all the block movements per trackId
++     */
++    void handle(List<BlockMovementResult> results) {
++      completedBlocks.addAll(results);
++      // TODO: notify namenode about the success/failures.
++    }
++
++    @VisibleForTesting
++    List<BlockMovementResult> getCompletedBlocks() {
++      return completedBlocks;
++    }
++  }
++
++  @VisibleForTesting
++  BlocksMovementsCompletionHandler getBlocksMovementsCompletionHandler() {
++    return handler;
++  }

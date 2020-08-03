@@ -1,0 +1,164 @@
+HDFS-4417. Fix case where local reads get disabled incorrectly. Contributed by Colin Patrick McCabe.
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/branches/HDFS-347@1437616 13f79535-47bb-0310-9956-ffa450edef68
+
+-import org.apache.hadoop.fs.ChecksumException;
++import org.apache.hadoop.fs.ChecksumException;
+-import org.apache.hadoop.hdfs.FileInputStreamCache;
++
++import com.google.common.annotations.VisibleForTesting;
++  @VisibleForTesting
++  static boolean tcpReadsDisabledForTesting = false;
+-
+-
+-  private Peer newPeer(InetSocketAddress addr) throws IOException {
++  private Peer newTcpPeer(InetSocketAddress addr) throws IOException {
+-    DomainSocket domSock = null;
+-
+-      domSock = dfsClient.getDomainSocketFactory().create(addr, this);
+-      if (domSock != null) {
+-        // Create a UNIX Domain peer.
+-        peer = new DomainPeer(domSock);
+-      } else {
+-        // Create a conventional TCP-based Peer.
+-        sock = dfsClient.socketFactory.createSocket();
+-        NetUtils.connect(sock, addr,
+-          dfsClient.getRandomLocalInterfaceAddr(),
+-          dfsClient.getConf().socketTimeout);
+-        peer = TcpPeerServer.peerFromSocketAndKey(sock, 
+-            dfsClient.getDataEncryptionKey());
+-      }
++      sock = dfsClient.socketFactory.createSocket();
++      NetUtils.connect(sock, addr,
++        dfsClient.getRandomLocalInterfaceAddr(),
++        dfsClient.getConf().socketTimeout);
++      peer = TcpPeerServer.peerFromSocketAndKey(sock, 
++          dfsClient.getDataEncryptionKey());
+-        IOUtils.closeQuietly(domSock);
++   * Throwing an IOException from this method is basically equivalent to 
++   * declaring the DataNode bad, so we try to connect a lot of different ways
++   * before doing that.
+-    
+-    IOException err = null;
+-
+-    // We retry several times here.
+-    // On the first nCachedConnRetry times, we try to fetch a socket from
+-    // the socketCache and use it.  This may fail, since the old socket may
+-    // have been closed by the peer.
+-    // After that, we try to create a new socket using newPeer().
+-    // This may create either a TCP socket or a UNIX domain socket, depending
+-    // on the configuration and whether the peer is remote.
+-    // If we try to create a UNIX domain socket and fail, we will not try that 
+-    // again.  Instead, we'll try to create a TCP socket.  Only after we've 
+-    // failed to create a TCP-based BlockReader will we throw an IOException
+-    // from this function.  Throwing an IOException from here is basically
+-    // equivalent to declaring the DataNode bad.
+-    boolean triedNonDomainSocketReader = false;
+-    for (int retries = 0;
+-          retries < nCachedConnRetry || (!triedNonDomainSocketReader);
+-          ++retries) {
+-      Peer peer = null;
+-      if (retries < nCachedConnRetry) {
+-        peer = peerCache.get(chosenNode);
+-      }
+-      if (peer == null) {
+-        peer = newPeer(dnAddr);
+-        if (peer.getDomainSocket() == null) {
+-          triedNonDomainSocketReader = true;
+-        }
+-      }
+-      boolean success = false;
++    // Look for cached domain peers.
++    int cacheTries = 0;
++    DomainSocketFactory dsFactory = dfsClient.getDomainSocketFactory();
++    BlockReader reader = null;
++    for (; cacheTries < nCachedConnRetry; ++cacheTries) {
++      Peer peer = peerCache.get(chosenNode, true);
++      if (peer == null) break;
+-        boolean allowShortCircuitLocalReads =
+-          (peer.getDomainSocket() != null) &&
+-          dfsClient.getConf().shortCircuitLocalReads && 
+-          (!shortCircuitForbidden());
+-        // Here we will try to send either an OP_READ_BLOCK request or an 
+-        // OP_REQUEST_SHORT_CIRCUIT_FDS, depending on what kind of block reader 
+-        // we're trying to create.
+-        BlockReader blockReader = BlockReaderFactory.newBlockReader(
++        boolean allowShortCircuitLocalReads = dfsClient.getConf().
++            shortCircuitLocalReads && (!shortCircuitForbidden());
++        reader = BlockReaderFactory.newBlockReader(
+-            dfsClient.getDomainSocketFactory(), allowShortCircuitLocalReads);
+-        success = true;
+-        return blockReader;
+-       } catch (IOException ex) {
+-         // Our socket is no good.
+-        DFSClient.LOG.debug("Error making BlockReader. " +
++            dsFactory, allowShortCircuitLocalReads);
++        return reader;
++      } catch (IOException ex) {
++        DFSClient.LOG.debug("Error making BlockReader with DomainSocket. " +
+-        if (peer.getDomainSocket() != null) {
+-          // If the Peer that we got the error from was a DomainPeer,
+-          // mark the socket path as bad, so that newDataSocket will not try 
+-          // to re-open this socket for a while.
+-          dfsClient.getDomainSocketFactory().
+-              disableDomainSocketPath(peer.getDomainSocket().getPath());
+-        }
+-        err = ex;
+-        if (!success) {
++        if (reader == null) {
+-    throw err;
++    // Try to create a DomainPeer.
++    DomainSocket domSock = dsFactory.create(dnAddr, this);
++    if (domSock != null) {
++      Peer peer = new DomainPeer(domSock);
++      try {
++        boolean allowShortCircuitLocalReads = dfsClient.getConf().
++            shortCircuitLocalReads && (!shortCircuitForbidden());
++        reader = BlockReaderFactory.newBlockReader(
++            dfsClient.conf, file, block, blockToken, startOffset,
++            len, verifyChecksum, clientName, peer, chosenNode, 
++            dsFactory, allowShortCircuitLocalReads);
++        return reader;
++      } catch (IOException e) {
++        DFSClient.LOG.warn("failed to connect to " + domSock, e);
++      } finally {
++        if (reader == null) {
++         // If the Peer that we got the error from was a DomainPeer,
++         // mark the socket path as bad, so that newDataSocket will not try 
++         // to re-open this socket for a while.
++         dsFactory.disableDomainSocketPath(domSock.getPath());
++         IOUtils.closeQuietly(peer);
++        }
++      }
++    }
++
++    // Look for cached peers.
++    for (; cacheTries < nCachedConnRetry; ++cacheTries) {
++      Peer peer = peerCache.get(chosenNode, false);
++      if (peer == null) break;
++      try {
++        reader = BlockReaderFactory.newBlockReader(
++            dfsClient.conf, file, block, blockToken, startOffset,
++            len, verifyChecksum, clientName, peer, chosenNode, 
++            dsFactory, false);
++        return reader;
++      } catch (IOException ex) {
++        DFSClient.LOG.debug("Error making BlockReader. Closing stale " +
++          peer, ex);
++      } finally {
++        if (reader == null) {
++          IOUtils.closeQuietly(peer);
++        }
++      }
++    }
++    if (tcpReadsDisabledForTesting) {
++      throw new IOException("TCP reads are disabled.");
++    }
++    // Try to create a new remote peer.
++    Peer peer = newTcpPeer(dnAddr);
++    return BlockReaderFactory.newBlockReader(
++        dfsClient.conf, file, block, blockToken, startOffset,
++        len, verifyChecksum, clientName, peer, chosenNode, 
++        dsFactory, false);
+
+MOV26 UPD40 INS23 INS78 INS83 INS39 INS59 UPD42 MOV8 MOV60 INS42 INS42 INS9 MOV60 MOV60 MOV60 INS54 INS60 INS24 MOV60 INS25 INS24 INS25 INS60 INS41 MOV8 INS8 INS66 INS66 INS66 INS39 INS43 MOV43 INS59 INS27 MOV38 INS8 MOV43 MOV27 INS8 INS27 INS38 INS8 INS42 INS8 INS43 INS59 INS32 MOV21 MOV41 INS25 UPD42 INS34 INS42 UPD42 MOV32 UPD42 MOV42 INS33 UPD42 MOV42 MOV42 UPD42 MOV60 INS25 INS54 UPD42 INS32 INS60 INS54 INS42 INS42 INS42 INS60 INS25 INS54 MOV53 INS42 INS42 INS32 INS42 INS42 INS40 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS9 MOV38 INS8 MOV27 INS10 INS8 INS12 INS8 INS42 INS42 INS42 INS52 INS43 INS59 MOV8 INS12 INS8 INS43 INS59 INS27 INS10 INS8 INS12 MOV8 INS14 INS42 INS42 MOV21 MOV21 INS32 INS60 MOV21 INS41 MOV44 INS8 MOV25 INS42 INS42 MOV14 INS21 INS44 INS8 MOV25 INS42 INS42 INS32 INS42 INS33 MOV21 INS41 INS44 INS8 INS43 INS45 INS42 INS42 INS42 INS9 INS39 INS59 INS42 INS21 INS7 UPD42 MOV43 INS42 MOV21 UPD27 INS42 INS42 INS42 INS9 INS42 INS43 INS42 INS21 INS27 INS42 UPD42 MOV42 INS42 INS27 UPD42 INS32 INS42 INS42 INS32 INS42 INS21 INS42 INS32 INS42 INS32 INS42 INS33 INS22 INS36 INS42 INS42 INS40 UPD42 INS42 INS42 UPD42 INS42 INS42 INS42 INS42 INS42 INS42 INS40 INS42 INS27 UPD42 MOV42 INS32 MOV42 MOV42 MOV40 MOV42 MOV42 MOV42 MOV42 MOV42 MOV42 MOV42 MOV42 MOV42 UPD42 MOV42 MOV42 UPD42 UPD42 INS32 INS42 INS42 INS40 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS9 INS40 INS42 INS27 INS42 INS32 INS42 INS38 INS45 INS45 INS42 INS42 INS42 INS42 UPD45 UPD42 UPD42 MOV42 INS42 INS42 INS42 INS45 INS42 INS42 INS42 INS32 UPD42 MOV42 INS42 DEL42 DEL52 DEL32 DEL7 DEL42 DEL7 DEL21 DEL8 DEL25 DEL42 DEL33 DEL59 DEL60 DEL42 DEL42 DEL42 DEL32 DEL21 DEL8 DEL25 DEL8 DEL54 DEL8 DEL33 DEL39 DEL9 DEL33 DEL42 DEL42 DEL32 DEL42 DEL9 DEL7 DEL39 DEL9 DEL42 DEL42 DEL32 DEL33 DEL27 DEL36 DEL42 DEL42 DEL32 DEL32 DEL59 DEL60 DEL42 DEL9 DEL7 DEL21 DEL45 DEL42 DEL42 DEL32 DEL42 DEL32 DEL42 DEL32 DEL42 DEL42 DEL42 DEL38 DEL42 DEL39 DEL34 DEL59 DEL58 DEL27 DEL42 DEL38 DEL36 DEL27 DEL42 DEL42 DEL27 DEL8 DEL25 DEL42 DEL42 DEL32 DEL7 DEL21 DEL8 DEL25 DEL8 DEL12 DEL54 DEL8 DEL24

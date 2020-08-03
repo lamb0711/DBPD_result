@@ -1,0 +1,160 @@
+HDFS-7672. Handle write failure for stripping blocks and refactor the existing code in DFSStripedOutputStream and StripedDataStreamer.
+
+-import java.util.List;
++import static org.apache.hadoop.hdfs.protocol.HdfsConstants.BLOCK_STRIPED_CELL_SIZE;
++import static org.apache.hadoop.hdfs.protocol.HdfsConstants.NUM_DATA_BLOCKS;
++import static org.apache.hadoop.hdfs.protocol.HdfsConstants.NUM_PARITY_BLOCKS;
++import java.io.IOException;
++import java.util.concurrent.atomic.AtomicReference;
++
++import org.apache.hadoop.hdfs.DFSStripedOutputStream.Coordinator;
+-import java.io.IOException;
+-import java.util.concurrent.BlockingQueue;
+-import java.util.concurrent.TimeUnit;
+-import java.util.concurrent.atomic.AtomicReference;
+-
+-import static org.apache.hadoop.hdfs.protocol.HdfsConstants.BLOCK_STRIPED_CELL_SIZE;
+-import static org.apache.hadoop.hdfs.protocol.HdfsConstants.NUM_DATA_BLOCKS;
+-import static org.apache.hadoop.hdfs.protocol.HdfsConstants.NUM_PARITY_BLOCKS;
+-
+-  private final short index;
+-  private final List<BlockingQueue<LocatedBlock>> stripedBlocks;
+-  private boolean hasCommittedBlock = false;
++  private final Coordinator coordinator;
++  private final int index;
++  private volatile boolean isFailed;
+-  StripedDataStreamer(HdfsFileStatus stat, ExtendedBlock block,
++  StripedDataStreamer(HdfsFileStatus stat,
+-                      ByteArrayManager byteArrayManage, short index,
+-                      List<BlockingQueue<LocatedBlock>> stripedBlocks,
+-                      String[] favoredNodes) {
+-    super(stat, block, dfsClient, src, progress, checksum, cachingStrategy,
++                      ByteArrayManager byteArrayManage, String[] favoredNodes,
++                      short index, Coordinator coordinator) {
++    super(stat, null, dfsClient, src, progress, checksum, cachingStrategy,
+-    this.stripedBlocks = stripedBlocks;
++    this.coordinator = coordinator;
+-  /**
+-   * Construct a data streamer for appending to the last partial block
+-   * @param lastBlock last block of the file to be appended
+-   * @param stat status of the file to be appended
+-   * @throws IOException if error occurs
+-   */
+-  StripedDataStreamer(LocatedBlock lastBlock, HdfsFileStatus stat,
+-                      DFSClient dfsClient, String src,
+-                      Progressable progress, DataChecksum checksum,
+-                      AtomicReference<CachingStrategy> cachingStrategy,
+-                      ByteArrayManager byteArrayManage, short index,
+-                      List<BlockingQueue<LocatedBlock>> stripedBlocks)
+-      throws IOException {
+-    super(lastBlock, stat, dfsClient, src, progress, checksum, cachingStrategy,
+-        byteArrayManage);
+-    this.index = index;
+-    this.stripedBlocks = stripedBlocks;
++  int getIndex() {
++    return index;
++  }
++
++  void setIsFailed(boolean isFailed) {
++    this.isFailed = isFailed;
++  }
++
++  boolean isFailed() {
++    return isFailed;
+-    if (!isLeadingStreamer() && !isParityStreamer()) {
+-      // before retrieving a new block, transfer the finished block to
+-      // leading streamer
+-      LocatedBlock finishedBlock = new LocatedBlock(
+-          new ExtendedBlock(block.getBlockPoolId(), block.getBlockId(),
+-              block.getNumBytes(), block.getGenerationStamp()), null);
+-      try {
+-        boolean offSuccess = stripedBlocks.get(0).offer(finishedBlock, 30,
+-            TimeUnit.SECONDS);
+-      } catch (InterruptedException ie) {
+-        // TODO: Handle InterruptedException (HDFS-7786)
+-      }
++    if (!isParityStreamer()) {
++      coordinator.putEndBlock(index, block);
+-    LocatedBlock lb = null;
+-      if (hasCommittedBlock) {
+-        /**
+-         * when committing a block group, leading streamer has to adjust
+-         * {@link block} to include the size of block group
+-         */
+-        for (int i = 1; i < NUM_DATA_BLOCKS; i++) {
+-          try {
+-            LocatedBlock finishedLocatedBlock = stripedBlocks.get(0).poll(30,
+-                TimeUnit.SECONDS);
+-            if (finishedLocatedBlock == null) {
+-              throw new IOException("Fail to get finished LocatedBlock " +
+-                  "from streamer, i=" + i);
+-            }
+-            ExtendedBlock finishedBlock = finishedLocatedBlock.getBlock();
+-            long bytes = finishedBlock == null ? 0 : finishedBlock.getNumBytes();
+-            if (block != null) {
+-              block.setNumBytes(block.getNumBytes() + bytes);
+-            }
+-          } catch (InterruptedException ie) {
+-            DFSClient.LOG.info("InterruptedException received when putting" +
+-                " a block to stripeBlocks, ie = " + ie);
+-          }
++      if (coordinator.shouldLocateFollowingBlock()) {
++        // set numByte for the previous block group
++        long bytes = 0;
++        for (int i = 0; i < NUM_DATA_BLOCKS; i++) {
++          final ExtendedBlock b = coordinator.getEndBlock(i);
++          bytes += b == null ? 0 : b.getNumBytes();
++        block.setNumBytes(bytes);
+-      lb = super.locateFollowingBlock(excludedNodes);
+-      hasCommittedBlock = true;
+-      assert lb instanceof LocatedStripedBlock;
+-      DFSClient.LOG.debug("Leading streamer obtained bg " + lb);
+-      LocatedBlock[] blocks = StripedBlockUtil.parseStripedBlockGroup(
+-          (LocatedStripedBlock) lb, BLOCK_STRIPED_CELL_SIZE, NUM_DATA_BLOCKS,
+-          NUM_PARITY_BLOCKS);
++      final LocatedStripedBlock lsb
++          = (LocatedStripedBlock)super.locateFollowingBlock(excludedNodes);
++      if (LOG.isDebugEnabled()) {
++        LOG.debug("Obtained block group " + lsb);
++      }
++      LocatedBlock[] blocks = StripedBlockUtil.parseStripedBlockGroup(lsb,
++          BLOCK_STRIPED_CELL_SIZE, NUM_DATA_BLOCKS, NUM_PARITY_BLOCKS);
++
+-      lb = blocks[0];
+-      for (int i = 1; i < blocks.length; i++) {
+-        try {
+-          boolean offSuccess = stripedBlocks.get(i).offer(blocks[i],
+-              90, TimeUnit.SECONDS);
+-          if(!offSuccess){
+-            String msg = "Fail to put block to stripeBlocks. i = " + i;
+-            DFSClient.LOG.info(msg);
+-            throw new IOException(msg);
+-          } else {
+-            DFSClient.LOG.info("Allocate a new block to a streamer. i = " + i
+-                + ", block: " + blocks[i]);
+-          }
+-        } catch (InterruptedException ie) {
+-          DFSClient.LOG.info("InterruptedException received when putting" +
+-              " a block to stripeBlocks, ie = " + ie);
+-        }
+-      }
+-    } else {
+-      try {
+-        // wait 90 seconds to get a block from the queue
+-        lb = stripedBlocks.get(index).poll(90, TimeUnit.SECONDS);
+-      } catch (InterruptedException ie) {
+-        DFSClient.LOG.info("InterruptedException received when retrieving " +
+-            "a block from stripeBlocks, ie = " + ie);
++      for (int i = 0; i < blocks.length; i++) {
++        coordinator.putStripedBlock(i, blocks[i]);
+-    return lb;
++
++    return coordinator.getStripedBlock(index);
++  }
++
++  @Override
++  public String toString() {
++    return "#" + index + ": isFailed? " + Boolean.toString(isFailed).charAt(0)
++        + ", " + super.toString();
+
+MOV26 MOV26 MOV26 MOV26 MOV26 UPD40 MOV44 MOV44 INS31 INS31 INS31 INS31 INS31 INS43 INS59 INS39 MOV59 INS83 INS39 INS42 INS8 INS39 INS42 MOV44 INS8 INS39 INS42 INS8 MOV78 MOV83 MOV43 MOV42 MOV44 MOV43 INS8 INS78 INS83 MOV43 INS42 INS8 INS42 INS42 UPD42 UPD43 UPD42 INS41 UPD39 UPD42 MOV21 INS41 INS25 INS41 INS42 INS41 UPD42 INS33 INS42 INS42 MOV38 MOV32 INS8 INS32 INS27 UPD42 UPD42 INS21 INS25 INS60 INS25 MOV60 MOV6 INS24 UPD42 MOV42 INS42 UPD42 MOV42 UPD45 MOV45 INS42 UPD45 MOV45 INS32 UPD45 MOV45 INS48 UPD42 UPD42 INS32 INS32 INS8 INS83 MOV43 INS59 INS32 INS8 MOV58 MOV27 MOV37 INS8 MOV32 UPD42 MOV42 UPD34 MOV34 INS42 INS42 INS42 UPD42 MOV42 MOV42 INS42 INS42 INS60 INS24 MOV21 INS42 MOV11 UPD42 MOV42 INS42 MOV21 INS21 UPD42 UPD42 UPD42 INS39 MOV59 MOV58 MOV27 MOV37 INS8 MOV48 INS42 UPD34 INS32 UPD42 INS34 MOV60 INS21 INS42 INS42 UPD42 MOV42 UPD42 MOV42 MOV42 MOV2 UPD34 INS83 MOV43 INS7 UPD45 UPD42 UPD42 INS42 INS16 UPD42 MOV42 UPD42 MOV42 UPD42 MOV27 MOV34 MOV32 UPD42 UPD42 DEL40 DEL26 DEL40 DEL26 DEL39 DEL42 DEL43 DEL42 DEL43 DEL42 DEL43 DEL74 DEL74 DEL42 DEL59 DEL9 DEL42 DEL43 DEL42 DEL43 DEL42 DEL43 DEL74 DEL74 DEL42 DEL44 DEL42 DEL66 DEL65 DEL42 DEL66 DEL65 DEL42 DEL66 DEL65 DEL42 DEL66 DEL65 DEL29 DEL42 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL43 DEL74 DEL42 DEL44 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL43 DEL42 DEL43 DEL74 DEL74 DEL42 DEL44 DEL42 DEL43 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL46 DEL52 DEL42 DEL22 DEL42 DEL7 DEL21 DEL8 DEL31 DEL42 DEL32 DEL38 DEL27 DEL42 DEL43 DEL42 DEL42 DEL43 DEL42 DEL32 DEL42 DEL32 DEL42 DEL42 DEL32 DEL42 DEL42 DEL32 DEL14 DEL33 DEL14 DEL59 DEL60 DEL39 DEL42 DEL42 DEL42 DEL34 DEL32 DEL42 DEL42 DEL34 DEL40 DEL32 DEL59 DEL60 DEL8 DEL42 DEL43 DEL42 DEL44 DEL8 DEL12 DEL54 DEL33 DEL42 DEL43 DEL34 DEL32 DEL34 DEL40 DEL42 DEL42 DEL32 DEL42 DEL27 DEL42 DEL40 DEL42 DEL43 DEL60 DEL42 DEL42 DEL33 DEL27 DEL42 DEL43 DEL45 DEL45 DEL42 DEL27 DEL14 DEL53 DEL8 DEL25 DEL42 DEL43 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL39 DEL42 DEL16 DEL59 DEL60 DEL42 DEL33 DEL27 DEL8 DEL25 DEL8 DEL42 DEL43 DEL42 DEL44 DEL40 DEL45 DEL45 DEL42 DEL27 DEL32 DEL21 DEL8 DEL12 DEL54 DEL8 DEL24 DEL8 DEL25 DEL42 DEL7 DEL21 DEL42 DEL9 DEL7 DEL21 DEL42 DEL62 DEL6 DEL42 DEL42 DEL34 DEL2 DEL7 DEL21 DEL39 DEL42 DEL32 DEL42 DEL42 DEL2 DEL34 DEL40 DEL32 DEL59 DEL60 DEL42 DEL38 DEL42 DEL45 DEL42 DEL27 DEL59 DEL60 DEL40 DEL42 DEL32 DEL21 DEL42 DEL43 DEL42 DEL14 DEL53 DEL8 DEL40 DEL42 DEL45 DEL42 DEL27 DEL32 DEL21 DEL8 DEL25 DEL8 DEL42 DEL43 DEL42 DEL44 DEL40 DEL42 DEL45 DEL42 DEL27 DEL32 DEL21 DEL8 DEL12 DEL54 DEL8 DEL24 DEL8 DEL42 DEL40 DEL32 DEL7 DEL21 DEL8 DEL42 DEL43 DEL42 DEL44 DEL40 DEL42 DEL45 DEL42 DEL27 DEL32 DEL21 DEL8 DEL12 DEL54 DEL8 DEL25 DEL42 DEL41 DEL8 DEL31

@@ -1,0 +1,297 @@
+HADOOP-9955. RPC idle connection closing is extremely inefficient (daryn)
+
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/trunk@1542111 13f79535-47bb-0310-9956-ffa450edef68
+
+-import java.util.Random;
++import java.util.Timer;
++import java.util.TimerTask;
++import java.util.concurrent.atomic.AtomicInteger;
+-  private int maxIdleTime;                        // the maximum idle time after 
+-                                                  // which a client may be disconnected
+-  private int thresholdIdleConnections;           // the number of idle connections
+-                                                  // after which we will start
+-                                                  // cleaning up idle 
+-                                                  // connections
+-  int maxConnectionsToNuke;                       // the max number of 
+-                                                  // connections to nuke
+-                                                  //during a cleanup
+-  
+-  private List<Connection> connectionList = 
+-    Collections.synchronizedList(new LinkedList<Connection>());
+-  //maintain a list
+-  //of client connections
++  // maintains the set of client connections and handles idle timeouts
++  private ConnectionManager connectionManager;
+-  private int numConnections = 0;
+-  List<Connection> getConnections() {
+-    return connectionList;
++  Connection[] getConnections() {
++    return connectionManager.toArray();
+-    private Random rand = new Random();
+-    private long lastCleanupRunTime = 0; //the last time when a cleanup connec-
+-                                         //-tion (for idle connections) ran
+-    private long cleanupInterval = 10000; //the minimum interval between 
+-                                          //two cleanup runs
+-    /** cleanup connections from connectionList. Choose a random range
+-     * to scan and also have a limit on the number of the connections
+-     * that will be cleanedup per run. The criteria for cleanup is the time
+-     * for which the connection was idle. If 'force' is true then all 
+-     * connections will be looked at for the cleanup.
+-     */
+-    private void cleanupConnections(boolean force) {
+-      if (force || numConnections > thresholdIdleConnections) {
+-        long currentTime = Time.now();
+-        if (!force && (currentTime - lastCleanupRunTime) < cleanupInterval) {
+-          return;
+-        }
+-        int start = 0;
+-        int end = numConnections - 1;
+-        if (!force) {
+-          start = rand.nextInt() % numConnections;
+-          end = rand.nextInt() % numConnections;
+-          int temp;
+-          if (end < start) {
+-            temp = start;
+-            start = end;
+-            end = temp;
+-          }
+-        }
+-        int i = start;
+-        int numNuked = 0;
+-        while (i <= end) {
+-          Connection c;
+-          synchronized (connectionList) {
+-            try {
+-              c = connectionList.get(i);
+-            } catch (Exception e) {return;}
+-          }
+-          if (c.timedOut(currentTime)) {
+-            if (LOG.isDebugEnabled())
+-              LOG.debug(getName() + ": disconnecting client " + c.getHostAddress());
+-            closeConnection(c);
+-            numNuked++;
+-            end--;
+-            c = null;
+-            if (!force && numNuked == maxConnectionsToNuke) break;
+-          }
+-          else i++;
+-        }
+-        lastCleanupRunTime = Time.now();
+-      }
+-    }
++      connectionManager.startIdleScan();
+-          cleanupConnections(true);
++          connectionManager.closeIdle(true);
+-        cleanupConnections(false);
+-        // clean up all connections
+-        while (!connectionList.isEmpty()) {
+-          closeConnection(connectionList.remove(0));
+-        }
++        // close all connections
++        connectionManager.stopIdleScan();
++        connectionManager.closeAll();
+-          if (LOG.isDebugEnabled())
+-            LOG.debug(getName() + ": disconnecting client " + c.getHostAddress());
+-    void doAccept(SelectionKey key) throws IOException,  OutOfMemoryError {
+-      Connection c = null;
++    void doAccept(SelectionKey key) throws InterruptedException, IOException,  OutOfMemoryError {
+-        try {
+-          c = new Connection(channel, Time.now());
+-          synchronized (connectionList) {
+-            connectionList.add(numConnections, c);
+-            numConnections++;
+-          }
+-          reader.addConnection(c);
+-          if (LOG.isDebugEnabled())
+-            LOG.debug("Server connection from " + c.toString() +
+-                "; # active connections: " + numConnections +
+-                "; # queued calls: " + callQueue.size());          
+-        } catch (InterruptedException ie) {
+-          if (running) {
+-            LOG.info(
+-                getName() + ": disconnecting client " + c.getHostAddress() +
+-                " due to unexpected interrupt");
+-          }
+-          closeConnection(c);
+-        }
++        Connection c = connectionManager.register(channel);
++        key.attach(c);  // so closeCurrentConnection can get the object
++        reader.addConnection(c);
+-        if (LOG.isDebugEnabled())
+-          LOG.debug(getName() + ": disconnecting client " + 
+-                    c + ". Number of active connections: "+
+-                    numConnections);
+-    private boolean timedOut(long currentTime) {
+-      if (isIdle() && currentTime -  lastContact > maxIdleTime)
+-        return true;
+-      return false;
+-    }
+-    
+-    this.maxIdleTime = 2 * conf.getInt(
+-        CommonConfigurationKeysPublic.IPC_CLIENT_CONNECTION_MAXIDLETIME_KEY,
+-        CommonConfigurationKeysPublic.IPC_CLIENT_CONNECTION_MAXIDLETIME_DEFAULT);
+-    this.maxConnectionsToNuke = conf.getInt(
+-        CommonConfigurationKeysPublic.IPC_CLIENT_KILL_MAX_KEY,
+-        CommonConfigurationKeysPublic.IPC_CLIENT_KILL_MAX_DEFAULT);
+-    this.thresholdIdleConnections = conf.getInt(
+-        CommonConfigurationKeysPublic.IPC_CLIENT_IDLETHRESHOLD_KEY,
+-        CommonConfigurationKeysPublic.IPC_CLIENT_IDLETHRESHOLD_DEFAULT);
++    connectionManager = new ConnectionManager();
+-    synchronized (connectionList) {
+-      if (connectionList.remove(connection))
+-        numConnections--;
+-    }
+-    connection.close();
++    connectionManager.close(connection);
+-    return numConnections;
++    return connectionManager.size();
++  
++  private class ConnectionManager {
++    final private AtomicInteger count = new AtomicInteger();    
++    final private Set<Connection> connections;
++
++    final private Timer idleScanTimer;
++    final private int idleScanThreshold;
++    final private int idleScanInterval;
++    final private int maxIdleTime;
++    final private int maxIdleToClose;
++    
++    ConnectionManager() {
++      this.idleScanTimer = new Timer(
++          "IPC Server idle connection scanner for port " + getPort(), true);
++      this.idleScanThreshold = conf.getInt(
++          CommonConfigurationKeysPublic.IPC_CLIENT_IDLETHRESHOLD_KEY,
++          CommonConfigurationKeysPublic.IPC_CLIENT_IDLETHRESHOLD_DEFAULT);
++      this.idleScanInterval = conf.getInt(
++          CommonConfigurationKeys.IPC_CLIENT_CONNECTION_IDLESCANINTERVAL_KEY,
++          CommonConfigurationKeys.IPC_CLIENT_CONNECTION_IDLESCANINTERVAL_DEFAULT);
++      this.maxIdleTime = 2 * conf.getInt(
++          CommonConfigurationKeysPublic.IPC_CLIENT_CONNECTION_MAXIDLETIME_KEY,
++          CommonConfigurationKeysPublic.IPC_CLIENT_CONNECTION_MAXIDLETIME_DEFAULT);
++      this.maxIdleToClose = conf.getInt(
++          CommonConfigurationKeysPublic.IPC_CLIENT_KILL_MAX_KEY,
++          CommonConfigurationKeysPublic.IPC_CLIENT_KILL_MAX_DEFAULT);
++      // create a set with concurrency -and- a thread-safe iterator, add 2
++      // for listener and idle closer threads
++      this.connections = Collections.newSetFromMap(
++          new ConcurrentHashMap<Connection,Boolean>(
++              maxQueueSize, 0.75f, readThreads+2));
++    }
++
++    private boolean add(Connection connection) {
++      boolean added = connections.add(connection);
++      if (added) {
++        count.getAndIncrement();
++      }
++      return added;
++    }
++    
++    private boolean remove(Connection connection) {
++      boolean removed = connections.remove(connection);
++      if (removed) {
++        count.getAndDecrement();
++      }
++      return removed;
++    }
++    
++    int size() {
++      return count.get();
++    }
++
++    Connection[] toArray() {
++      return connections.toArray(new Connection[0]);
++    }
++
++    Connection register(SocketChannel channel) {
++      Connection connection = new Connection(channel, Time.now());
++      add(connection);
++      if (LOG.isDebugEnabled()) {
++        LOG.debug("Server connection from " + connection +
++            "; # active connections: " + size() +
++            "; # queued calls: " + callQueue.size());
++      }      
++      return connection;
++    }
++    
++    boolean close(Connection connection) {
++      boolean exists = remove(connection);
++      if (exists) {
++        if (LOG.isDebugEnabled()) {
++          LOG.debug(Thread.currentThread().getName() +
++              ": disconnecting client " + connection +
++              ". Number of active connections: "+ size());
++        }
++        // only close if actually removed to avoid double-closing due
++        // to possible races
++        connection.close();
++      }
++      return exists;
++    }
++    
++    // synch'ed to avoid explicit invocation upon OOM from colliding with
++    // timer task firing
++    synchronized void closeIdle(boolean scanAll) {
++      long minLastContact = Time.now() - maxIdleTime;
++      // concurrent iterator might miss new connections added
++      // during the iteration, but that's ok because they won't
++      // be idle yet anyway and will be caught on next scan
++      int closed = 0;
++      for (Connection connection : connections) {
++        // stop if connections dropped below threshold unless scanning all
++        if (!scanAll && size() < idleScanThreshold) {
++          break;
++        }
++        // stop if not scanning all and max connections are closed
++        if (connection.isIdle() &&
++            connection.getLastContact() < minLastContact &&
++            close(connection) &&
++            !scanAll && (++closed == maxIdleToClose)) {
++          break;
++        }
++      }
++    }
++    
++    void closeAll() {
++      // use a copy of the connections to be absolutely sure the concurrent
++      // iterator doesn't miss a connection
++      for (Connection connection : toArray()) {
++        close(connection);
++      }
++    }
++    
++    void startIdleScan() {
++      scheduleIdleScanTask();
++    }
++    
++    void stopIdleScan() {
++      idleScanTimer.cancel();
++    }
++    
++    private void scheduleIdleScanTask() {
++      if (!running) {
++        return;
++      }
++      TimerTask idleScanTask = new TimerTask(){
++        @Override
++        public void run() {
++          if (!running) {
++            return;
++          }
++          if (LOG.isDebugEnabled()) {
++            LOG.debug(Thread.currentThread().getName()+": task running");
++          }
++          try {
++            closeIdle(false);
++          } finally {
++            // explicitly reschedule so next execution occurs relative
++            // to the end of this scan, not the beginning
++            scheduleIdleScanTask();
++          }
++        }
++      };
++      idleScanTimer.schedule(idleScanTask, idleScanInterval);
++    }
++  }
+
+MOV26 INS26 INS26 UPD40 INS40 INS40 INS23 INS31 INS31 INS31 INS55 MOV83 INS43 INS59 MOV78 INS5 INS42 INS8 INS83 INS39 INS42 INS44 INS8 MOV29 INS83 INS39 INS42 INS8 INS83 INS42 INS23 INS23 INS23 MOV23 MOV23 INS23 INS23 INS31 INS31 INS31 INS31 INS31 MOV31 INS31 MOV31 INS31 INS31 INS31 INS31 INS42 INS42 MOV43 INS85 INS41 MOV43 INS21 INS43 INS42 INS21 INS41 INS83 INS83 INS43 INS59 INS83 INS83 UPD74 MOV74 INS59 INS83 INS83 INS43 INS59 INS83 INS83 INS83 INS83 MOV83 INS39 MOV59 INS83 INS83 INS39 INS59 INS42 INS8 INS83 INS39 INS42 INS44 INS8 INS83 INS39 INS42 INS44 INS8 INS39 INS42 INS8 INS5 INS42 INS8 MOV43 INS42 INS44 INS39 INS42 MOV44 INS8 UPD83 UPD42 INS44 INS39 INS42 INS8 INS39 INS42 INS8 INS39 INS42 INS8 INS83 INS39 INS42 INS8 INS32 INS21 MOV25 INS7 INS42 INS32 INS32 INS42 INS42 INS14 UPD43 INS42 INS42 INS42 UPD42 UPD42 INS42 INS21 MOV21 INS21 MOV21 MOV21 INS21 INS43 INS42 INS60 INS25 INS41 INS43 INS42 INS60 INS25 INS41 INS41 INS43 INS85 INS41 INS43 INS42 INS60 INS21 INS25 INS60 INS25 INS41 INS39 INS42 INS60 INS60 INS70 INS70 INS21 INS21 INS25 INS60 INS21 INS42 INS42 INS32 INS8 MOV27 MOV8 MOV8 INS42 INS14 INS42 INS42 INS42 INS42 INS42 INS43 UPD42 INS7 INS7 INS7 INS42 INS39 INS59 INS42 INS8 INS42 INS42 INS39 INS59 INS42 INS8 INS42 INS32 INS42 INS32 INS42 INS43 INS59 INS32 MOV32 INS8 UPD42 INS39 INS59 INS42 INS8 INS42 INS39 INS59 INS39 INS59 INS44 INS42 INS8 INS44 INS32 INS8 INS32 INS32 INS38 MOV8 INS43 INS59 INS32 INS42 INS42 INS21 MOV21 MOV21 MOV21 MOV21 MOV60 INS60 INS21 MOV21 INS43 INS42 INS22 INS14 INS22 INS32 INS22 INS32 INS42 INS32 INS21 INS42 INS32 INS21 INS42 INS42 INS42 INS42 INS3 INS42 INS42 MOV14 INS42 INS42 INS21 INS42 INS32 INS25 MOV21 INS42 INS27 INS42 INS34 INS43 INS42 INS25 MOV25 INS43 INS42 INS42 INS21 INS42 INS42 INS42 INS42 INS42 INS42 INS14 INS42 INS42 INS42 INS42 INS32 INS32 INS8 MOV43 INS59 MOV32 INS42 INS52 INS42 INS43 INS27 INS9 UPD42 INS52 INS42 INS42 INS42 INS40 INS40 UPD42 INS52 INS42 MOV42 UPD42 MOV42 MOV14 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS32 INS5 INS34 INS32 INS42 INS42 MOV32 INS8 MOV32 INS42 INS42 INS27 INS8 INS27 INS8 INS42 INS32 INS43 INS1 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 MOV21 MOV21 INS42 INS32 UPD42 UPD42 MOV42 UPD42 MOV42 INS45 INS32 UPD74 INS42 INS34 INS27 INS42 INS42 INS42 INS42 INS43 INS85 INS42 INS42 INS27 INS21 INS38 INS27 INS10 INS27 INS36 INS10 INS42 INS42 INS42 INS31 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 INS42 UPD43 INS43 INS42 INS34 INS42 INS45 INS42 INS45 INS32 INS45 MOV32 INS32 INS42 INS32 INS42 INS27 INS38 INS27 INS78 MOV83 UPD39 MOV39 INS42 INS8 UPD42 INS42 INS42 INS42 INS42 INS27 INS42 INS27 INS32 INS42 INS38 INS42 INS42 INS25 INS25 INS54 UPD42 INS42 INS32 INS45 INS42 INS45 INS32 INS32 INS27 INS42 INS42 INS42 INS38 MOV8 MOV32 INS8 INS8 INS8 INS32 INS42 INS42 UPD42 MOV42 UPD42 MOV42 INS32 INS42 INS42 INS21 INS21 INS21 INS42 INS42 MOV42 INS42 INS32 INS32 INS32 INS42 INS42 INS27 INS42 INS9 INS42 INS32 INS45 INS32 INS42 INS42 INS42 DEL39 DEL23 DEL43 DEL74 DEL42 DEL32 DEL59 DEL23 DEL83 DEL39 DEL42 DEL34 DEL59 DEL23 DEL83 DEL42 DEL43 DEL42 DEL42 DEL43 DEL14 DEL59 DEL23 DEL83 DEL39 DEL42 DEL34 DEL59 DEL23 DEL83 DEL39 DEL42 DEL34 DEL59 DEL23 DEL66 DEL66 DEL66 DEL66 DEL66 DEL65 DEL29 DEL83 DEL39 DEL42 DEL39 DEL42 DEL44 DEL42 DEL42 DEL42 DEL27 DEL27 DEL39 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL38 DEL42 DEL42 DEL27 DEL36 DEL42 DEL27 DEL27 DEL25 DEL39 DEL42 DEL34 DEL59 DEL60 DEL39 DEL42 DEL42 DEL34 DEL27 DEL59 DEL60 DEL42 DEL38 DEL42 DEL42 DEL42 DEL32 DEL42 DEL27 DEL7 DEL21 DEL42 DEL42 DEL42 DEL32 DEL42 DEL27 DEL7 DEL21 DEL39 DEL42 DEL59 DEL60 DEL42 DEL42 DEL27 DEL42 DEL42 DEL7 DEL21 DEL42 DEL42 DEL7 DEL21 DEL42 DEL42 DEL7 DEL21 DEL8 DEL25 DEL8 DEL25 DEL39 DEL42 DEL42 DEL59 DEL60 DEL39 DEL42 DEL34 DEL59 DEL60 DEL42 DEL42 DEL27 DEL42 DEL59 DEL60 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL7 DEL21 DEL8 DEL42 DEL43 DEL42 DEL44 DEL12 DEL54 DEL8 DEL51 DEL42 DEL42 DEL42 DEL32 DEL42 DEL42 DEL32 DEL42 DEL42 DEL42 DEL32 DEL45 DEL42 DEL42 DEL32 DEL27 DEL32 DEL21 DEL25 DEL42 DEL37 DEL21 DEL42 DEL37 DEL21 DEL42 DEL33 DEL7 DEL21 DEL42 DEL38 DEL42 DEL42 DEL27 DEL27 DEL10 DEL25 DEL8 DEL42 DEL37 DEL21 DEL25 DEL8 DEL61 DEL42 DEL7 DEL21 DEL8 DEL25 DEL8 DEL31 DEL42 DEL9 DEL32 DEL21 DEL42 DEL34 DEL32 DEL32 DEL32 DEL38 DEL8 DEL61 DEL42 DEL33 DEL59 DEL60 DEL45 DEL42 DEL32 DEL45 DEL42 DEL45 DEL27 DEL42 DEL7 DEL21 DEL42 DEL42 DEL32 DEL21 DEL42 DEL37 DEL21 DEL8 DEL51 DEL21 DEL25 DEL8 DEL42 DEL44 DEL42 DEL42 DEL42 DEL42 DEL32 DEL45 DEL42 DEL42 DEL32 DEL45 DEL27 DEL32 DEL21 DEL8 DEL25 DEL42 DEL42 DEL32 DEL21 DEL8 DEL12 DEL54 DEL8 DEL42 DEL42 DEL42 DEL32 DEL45 DEL42 DEL42 DEL32 DEL27 DEL32 DEL21 DEL25 DEL42 DEL42 DEL42 DEL32 DEL45 DEL42 DEL45 DEL42 DEL27 DEL32 DEL21 DEL42 DEL42 DEL32 DEL21 DEL8 DEL25 DEL83 DEL39 DEL42 DEL39 DEL42 DEL44 DEL42 DEL32 DEL42 DEL42 DEL27 DEL42 DEL27 DEL27 DEL9 DEL41 DEL25 DEL9 DEL41 DEL8 DEL31 DEL42 DEL42 DEL41 DEL8 DEL31 DEL42 DEL32 DEL42 DEL37 DEL21 DEL42 DEL8 DEL51

@@ -1,0 +1,115 @@
+HDFS-7035. Make adding a new data directory to the DataNode an atomic operation and improve error handling (Lei Xu via Colin P. McCabe)
+
+-import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_DATA_TRANSFER_PROTECTION_DEFAULT;
+-import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_DATA_TRANSFER_PROTECTION_KEY;
+-import static org.apache.hadoop.hdfs.DFSConfigKeys.IGNORE_SECURE_PORTS_FOR_TESTING_DEFAULT;
+-import static org.apache.hadoop.hdfs.DFSConfigKeys.IGNORE_SECURE_PORTS_FOR_TESTING_KEY;
++import java.util.concurrent.Callable;
++import java.util.concurrent.ExecutorService;
++import java.util.concurrent.Executors;
++import java.util.concurrent.Future;
+-import org.apache.hadoop.tracing.TraceAdminPB;
++    /** The storage locations of the newly added volumes. */
++    /** The storage locations of the volumes that are removed. */
++    /** The unchanged locations that existed in the old configuration. */
++    List<StorageLocation> unchangedLocations = Lists.newArrayList();
++   * @param newVolumes a comma separated string that specifies the data volumes.
+-  ChangedVolumes parseChangedVolumes() throws IOException {
+-    List<StorageLocation> locations = getStorageLocations(getConf());
++  ChangedVolumes parseChangedVolumes(String newVolumes) throws IOException {
++    Configuration conf = new Configuration();
++    conf.set(DFS_DATANODE_DATA_DIR_KEY, newVolumes);
++    List<StorageLocation> locations = getStorageLocations(conf);
+-        if (sl.next().getFile().getCanonicalPath().equals(
++        StorageLocation location = sl.next();
++        if (location.getFile().getCanonicalPath().equals(
++          results.unchangedLocations.add(location);
+-   * @throws Exception
++   * @throws IOException on error. If an IOException is thrown, some new volumes
++   * may have been successfully added and removed.
+-  private synchronized void refreshVolumes(String newVolumes) throws Exception {
++  private synchronized void refreshVolumes(String newVolumes) throws IOException {
+-    List<StorageLocation> locations = getStorageLocations(conf);
+-    final int numOldDataDirs = dataDirs.size();
+-    dataDirs = locations;
+-    ChangedVolumes changedVolumes = parseChangedVolumes();
+-
++    int numOldDataDirs = dataDirs.size();
++    ChangedVolumes changedVolumes = parseChangedVolumes(newVolumes);
++    List<String> effectiveVolumes = Lists.newArrayList();
++    for (StorageLocation sl : changedVolumes.unchangedLocations) {
++      effectiveVolumes.add(sl.toString());
++    }
++
++        final List<NamespaceInfo> nsInfos = Lists.newArrayList();
+-          NamespaceInfo nsInfo = bpos.getNamespaceInfo();
+-          LOG.info("Loading volumes for namesapce: " + nsInfo.getNamespaceID());
+-          storage.addStorageLocations(
+-              this, nsInfo, changedVolumes.newLocations, StartupOption.HOTSWAP);
++          nsInfos.add(bpos.getNamespaceInfo());
+-        List<String> bpids = Lists.newArrayList();
+-        for (BPOfferService bpos : blockPoolManager.getAllNamenodeThreads()) {
+-          bpids.add(bpos.getBlockPoolId());
+-        }
+-        List<StorageLocation> succeedVolumes =
+-            data.addVolumes(changedVolumes.newLocations, bpids);
+-
+-        if (succeedVolumes.size() < changedVolumes.newLocations.size()) {
+-          List<StorageLocation> failedVolumes = Lists.newArrayList();
+-          // Clean all failed volumes.
+-          for (StorageLocation location : changedVolumes.newLocations) {
+-            if (!succeedVolumes.contains(location)) {
+-              errorMessageBuilder.append("FAILED TO ADD:");
+-              failedVolumes.add(location);
+-            } else {
+-              errorMessageBuilder.append("ADDED:");
++        ExecutorService service = Executors.newFixedThreadPool(
++            changedVolumes.newLocations.size());
++        List<Future<IOException>> exceptions = Lists.newArrayList();
++        for (final StorageLocation location : changedVolumes.newLocations) {
++          exceptions.add(service.submit(new Callable<IOException>() {
++            @Override
++            public IOException call() {
++              try {
++                data.addVolume(location, nsInfos);
++              } catch (IOException e) {
++                return e;
++              }
++              return null;
+-            errorMessageBuilder.append(location);
+-            errorMessageBuilder.append("\n");
++          }));
++        }
++
++        for (int i = 0; i < changedVolumes.newLocations.size(); i++) {
++          StorageLocation volume = changedVolumes.newLocations.get(i);
++          Future<IOException> ioExceptionFuture = exceptions.get(i);
++          try {
++            IOException ioe = ioExceptionFuture.get();
++            if (ioe != null) {
++              errorMessageBuilder.append(String.format("FAILED TO ADD: %s: %s\n",
++                  volume.toString(), ioe.getMessage()));
++            } else {
++              effectiveVolumes.add(volume.toString());
++            }
++            LOG.info("Storage directory is loaded: " + volume.toString());
++          } catch (Exception e) {
++            errorMessageBuilder.append(String.format("FAILED to ADD: %s: %s\n",
++                volume.toString(), e.getMessage()));
+-          storage.removeVolumes(failedVolumes);
+-          data.removeVolumes(failedVolumes);
+-        storage.removeVolumes(changedVolumes.deactivateLocations);
++        try {
++          storage.removeVolumes(changedVolumes.deactivateLocations);
++        } catch (IOException e) {
++          errorMessageBuilder.append(e.getMessage());
++        }
+-    } catch (IOException e) {
+-      LOG.warn("There is IOException when refresh volumes! ", e);
+-      throw e;
++    } finally {
++      conf.set(DFS_DATANODE_DATA_DIR_KEY,
++          Joiner.on(",").join(effectiveVolumes));
++      dataDirs = getStorageLocations(conf);
+-        storage.recoverTransitionRead(this, bpid, nsInfo, dataDirs, startOpt);
++        storage.recoverTransitionRead(this, nsInfo, dataDirs, startOpt);

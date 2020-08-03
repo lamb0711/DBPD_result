@@ -1,0 +1,411 @@
+HADOOP-14556. S3A to support Delegation Tokens.
+
+Contributed by Steve Loughran and Daryn Sharp.
+
++import java.util.Optional;
++import org.apache.hadoop.fs.s3a.auth.RoleModel;
++import org.apache.hadoop.fs.s3a.auth.delegation.AWSPolicyProvider;
++import org.apache.hadoop.fs.s3a.auth.delegation.EncryptionSecretOperations;
++import org.apache.hadoop.fs.s3a.auth.delegation.EncryptionSecrets;
++import org.apache.hadoop.fs.s3a.auth.delegation.S3ADelegationTokens;
++import org.apache.hadoop.fs.s3a.auth.delegation.AbstractS3ATokenIdentifier;
++import org.apache.hadoop.security.token.Token;
+-import static org.apache.commons.lang3.StringUtils.isNotBlank;
++import static org.apache.hadoop.fs.s3a.auth.RolePolicies.STATEMENT_ALLOW_SSE_KMS_RW;
++import static org.apache.hadoop.fs.s3a.auth.RolePolicies.allowS3Operations;
++import static org.apache.hadoop.fs.s3a.auth.delegation.S3ADelegationTokens.TokenIssuingPolicy.NoTokensAvailable;
++import static org.apache.hadoop.fs.s3a.auth.delegation.S3ADelegationTokens.hasDelegationTokenBinding;
++import static org.apache.hadoop.io.IOUtils.cleanupWithLogger;
+-public class S3AFileSystem extends FileSystem implements StreamCapabilities {
++public class S3AFileSystem extends FileSystem implements StreamCapabilities,
++    AWSPolicyProvider {
+-  private S3AEncryptionMethods serverSideEncryptionAlgorithm;
++
++  /**
++   * This must never be null; until initialized it just declares that there
++   * is no encryption.
++   */
++  private EncryptionSecrets encryptionSecrets = new EncryptionSecrets();
++  /** Delegation token integration; non-empty when DT support is enabled. */
++  private Optional<S3ADelegationTokens> delegationTokens = Optional.empty();
++
++  /** Principal who created the FS; recorded during initialization. */
++  private UserGroupInformation owner;
++
+-    setUri(name);
++    // patch the Hadoop security providers
+-    super.initialize(name, conf);
++    // look for delegation token support early.
++    boolean delegationTokensEnabled = hasDelegationTokenBinding(conf);
++    if (delegationTokensEnabled) {
++      LOG.debug("Using delegation tokens");
++    }
++    // set the URI, this will do any fixup of the URI to remove secrets,
++    // canonicalize.
++    setUri(name, delegationTokensEnabled);
++    super.initialize(uri, conf);
+-      instrumentation = new S3AInstrumentation(name);
++
++      // look for encryption data
++      // DT Bindings may override this
++      setEncryptionSecrets(new EncryptionSecrets(
++          getEncryptionAlgorithm(bucket, conf),
++          getServerSideEncryptionKey(bucket, getConf())));
++
++      invoker = new Invoker(new S3ARetryPolicy(getConf()), onRetry);
++      instrumentation = new S3AInstrumentation(uri);
+-      username = UserGroupInformation.getCurrentUser().getShortUserName();
++      owner = UserGroupInformation.getCurrentUser();
++      username = owner.getShortUserName();
+-
+-      Class<? extends S3ClientFactory> s3ClientFactoryClass = conf.getClass(
+-          S3_CLIENT_FACTORY_IMPL, DEFAULT_S3_CLIENT_FACTORY_IMPL,
+-          S3ClientFactory.class);
+-
+-      credentials = createAWSCredentialProviderSet(name, conf);
+-      s3 = ReflectionUtils.newInstance(s3ClientFactoryClass, conf)
+-          .createS3Client(name, bucket, credentials);
+-      invoker = new Invoker(new S3ARetryPolicy(getConf()), onRetry);
++      // creates the AWS client, including overriding auth chain if
++      // the FS came with a DT
++      // this may do some patching of the configuration (e.g. setting
++      // the encryption algorithms)
++      bindAWSClient(name, delegationTokensEnabled);
++
+-      serverSideEncryptionAlgorithm = getEncryptionAlgorithm(bucket, conf);
++  /**
++   * Set up the client bindings.
++   * If delegation tokens are enabled, the FS first looks for a DT
++   * ahead of any other bindings;.
++   * If there is a DT it uses that to do the auth
++   * and switches to the DT authenticator automatically (and exclusively)
++   * @param name URI of the FS
++   * @param dtEnabled are delegation tokens enabled?
++   * @throws IOException failure.
++   */
++  private void bindAWSClient(URI name, boolean dtEnabled) throws IOException {
++    Configuration conf = getConf();
++    credentials = null;
++    String uaSuffix = "";
++
++    if (dtEnabled) {
++      // Delegation support.
++      // Create and start the DT integration.
++      // Then look for an existing DT for this bucket, switch to authenticating
++      // with it if so.
++
++      LOG.debug("Using delegation tokens");
++      S3ADelegationTokens tokens = new S3ADelegationTokens();
++      this.delegationTokens = Optional.of(tokens);
++      tokens.bindToFileSystem(getCanonicalUri(), this);
++      tokens.init(conf);
++      tokens.start();
++      // switch to the DT provider and bypass all other configured
++      // providers.
++      if (tokens.isBoundToDT()) {
++        // A DT was retrieved.
++        LOG.debug("Using existing delegation token");
++        // and use the encryption settings from that client, whatever they were
++      } else {
++        LOG.debug("No delegation token for this instance");
++      }
++      // Get new credential chain
++      credentials = tokens.getCredentialProviders();
++      // and any encryption secrets which came from a DT
++      tokens.getEncryptionSecrets()
++          .ifPresent(this::setEncryptionSecrets);
++      // and update the UA field with any diagnostics provided by
++      // the DT binding.
++      uaSuffix = tokens.getUserAgentField();
++    } else {
++      // DT support is disabled, so create the normal credential chain
++      credentials = createAWSCredentialProviderSet(name, conf);
++    }
++    LOG.debug("Using credential provider {}", credentials);
++    Class<? extends S3ClientFactory> s3ClientFactoryClass = conf.getClass(
++        S3_CLIENT_FACTORY_IMPL, DEFAULT_S3_CLIENT_FACTORY_IMPL,
++        S3ClientFactory.class);
++
++    s3 = ReflectionUtils.newInstance(s3ClientFactoryClass, conf)
++        .createS3Client(getUri(), bucket, credentials, uaSuffix);
++  }
++
++  /**
++   * Set the encryption secrets for requests.
++   * @param secrets secrets
++   */
++  protected void setEncryptionSecrets(final EncryptionSecrets secrets) {
++    this.encryptionSecrets = secrets;
++  }
++
++  /**
++   * Get the encryption secrets.
++   * This potentially sensitive information and must be treated with care.
++   * @return the current encryption secrets.
++   */
++  public EncryptionSecrets getEncryptionSecrets() {
++    return encryptionSecrets;
++  }
++
+-   * Set the URI field through {@link S3xLoginHelper}.
++   * Set the URI field through {@link S3xLoginHelper} and
++   * optionally {@link #canonicalizeUri(URI)}
+-   * @param uri filesystem URI.
++   * @param fsUri filesystem URI.
++   * @param canonicalize true if the URI should be canonicalized.
+-  protected void setUri(URI uri) {
+-    this.uri = S3xLoginHelper.buildFSURI(uri);
++  protected void setUri(URI fsUri, boolean canonicalize) {
++    URI u = S3xLoginHelper.buildFSURI(fsUri);
++    this.uri = canonicalize ? u : canonicalizeUri(u);
++  /**
++   * Get the canonical URI.
++   * @return the canonical URI of this FS.
++   */
++  public URI getCanonicalUri() {
++    return uri;
++  }
++
++  @VisibleForTesting
+-    return Constants.S3A_DEFAULT_PORT;
++    return 0;
+-    return serverSideEncryptionAlgorithm;
++    return encryptionSecrets.getEncryptionMethod();
++  /**
++   * Override the base canonicalization logic and relay to
++   * {@link S3xLoginHelper#canonicalizeUri(URI, int)}.
++   * This allows for the option of changing this logic for better DT handling.
++   * @param rawUri raw URI.
++   * @return the canonical URI to use in delegation tokens and file context.
++   */
+-                serverSideEncryptionAlgorithm,
+-                getServerSideEncryptionKey(bucket, getConf())),
++                getServerSideEncryptionAlgorithm(),
++                encryptionSecrets.getEncryptionKey()),
+-  @Retries.RetryRaw
++  @Retries.RetryTranslated
+-    return getObjectMetadata(pathToKey(path));
++    return once("getObjectMetadata", path.toString(),
++        () ->
++          // this always does a full HEAD to the object
++          getObjectMetadata(pathToKey(path)));
++  }
++
++  /**
++   * Get all the headers of the object of a path, if the object exists.
++   * @param path path to probe
++   * @return an immutable map of object headers.
++   * @throws IOException failure of the query
++   */
++  @Retries.RetryTranslated
++  public Map<String, Object> getObjectHeaders(Path path) throws IOException {
++    LOG.debug("getObjectHeaders({})", path);
++    checkNotClosed();
++    incrementReadOperations();
++    return getObjectMetadata(path).getRawMetadata();
+-    if(S3AEncryptionMethods.SSE_C.equals(serverSideEncryptionAlgorithm) &&
+-        isNotBlank(getServerSideEncryptionKey(bucket, getConf()))){
+-      request.setSSECustomerKey(generateSSECustomerKey());
+-    }
++    generateSSECustomerKey().ifPresent(request::setSSECustomerKey);
++   * Get the owner of this FS: who created it?
++   * @return the owner of the FS.
++   */
++  public UserGroupInformation getOwner() {
++    return owner;
++  }
++
++  /**
++      cleanupWithLogger(LOG, delegationTokens.orElse(null));
+-   * Override getCanonicalServiceName because we don't support token in S3A.
++   * Get the delegation token support for this filesystem;
++   * not null iff delegation support is enabled.
++   * @return the token support, or an empty option.
++   */
++  @VisibleForTesting
++  public Optional<S3ADelegationTokens> getDelegationTokens() {
++    return delegationTokens;
++  }
++
++  /**
++   * Return a service name iff delegation tokens are enabled and the
++   * token binding is issuing delegation tokens.
++   * @return the canonical service name or null
+-    // Does not support Token
+-    return null;
++    // this could all be done in map statements, but it'd be harder to
++    // understand and maintain.
++    // Essentially: no DTs, no canonical service name.
++    if (!delegationTokens.isPresent()) {
++      return null;
++    }
++    // DTs present: ask the binding if it is willing to
++    // serve tokens (or fail noisily).
++    S3ADelegationTokens dt = delegationTokens.get();
++    return dt.getTokenIssuingPolicy() != NoTokensAvailable
++        ? dt.getCanonicalServiceName()
++        : null;
++  }
++
++  /**
++   * Get a delegation token if the FS is set up for them.
++   * If the user already has a token, it is returned,
++   * <i>even if it has expired</i>.
++   * @param renewer the account name that is allowed to renew the token.
++   * @return the delegation token or null
++   * @throws IOException IO failure
++   */
++  @Override
++  public Token<AbstractS3ATokenIdentifier> getDelegationToken(String renewer)
++      throws IOException {
++    entryPoint(Statistic.INVOCATION_GET_DELEGATION_TOKEN);
++    LOG.debug("Delegation token requested");
++    if (delegationTokens.isPresent()) {
++      return delegationTokens.get().getBoundOrNewDT(encryptionSecrets);
++    } else {
++      // Delegation token support is not set up
++      LOG.debug("Token support is not enabled");
++      return null;
++    }
++  }
++
++  /**
++   * Build the AWS policy for restricted access to the resources needed
++   * by this bucket.
++   * The policy generated includes S3 access, S3Guard access
++   * if needed, and KMS operations.
++   * @param access access level desired.
++   * @return a policy for use in roles
++   */
++  @Override
++  public List<RoleModel.Statement> listAWSPolicyRules(
++      final Set<AccessLevel> access) {
++    if (access.isEmpty()) {
++      return Collections.emptyList();
++    }
++    List<RoleModel.Statement> statements = new ArrayList<>(
++        allowS3Operations(bucket,
++            access.contains(AccessLevel.WRITE)
++                || access.contains(AccessLevel.ADMIN)));
++
++    // no attempt is made to qualify KMS access; there's no
++    // way to predict read keys, and not worried about granting
++    // too much encryption access.
++    statements.add(STATEMENT_ALLOW_SSE_KMS_RW);
++
++    // add any metastore policies
++    if (metadataStore instanceof AWSPolicyProvider) {
++      statements.addAll(
++          ((AWSPolicyProvider) metadataStore).listAWSPolicyRules(access));
++    }
++    return statements;
++  /**
++   * Set the optional parameters when initiating the request (encryption,
++   * headers, storage, etc).
++   * @param request request to patch.
++   */
+-      InitiateMultipartUploadRequest req) {
+-    switch (serverSideEncryptionAlgorithm) {
+-    case SSE_KMS:
+-      req.setSSEAwsKeyManagementParams(generateSSEAwsKeyParams());
+-      break;
+-    case SSE_C:
+-      if (isNotBlank(getServerSideEncryptionKey(bucket, getConf()))) {
+-        //at the moment, only supports copy using the same key
+-        req.setSSECustomerKey(generateSSECustomerKey());
+-      }
+-      break;
+-    default:
+-    }
++      InitiateMultipartUploadRequest request) {
++    generateSSEAwsKeyParams().ifPresent(request::setSSEAwsKeyManagementParams);
++    generateSSECustomerKey().ifPresent(request::setSSECustomerKey);
+-    switch (serverSideEncryptionAlgorithm) {
+-    case SSE_C:
+-      if (isNotBlank(getServerSideEncryptionKey(bucket, getConf()))) {
+-        request.setSSECustomerKey(generateSSECustomerKey());
+-      }
+-      break;
+-    default:
+-    }
++    generateSSECustomerKey().ifPresent(request::setSSECustomerKey);
+-    switch (serverSideEncryptionAlgorithm) {
++    switch (getServerSideEncryptionAlgorithm()) {
+-      copyObjectRequest.setSSEAwsKeyManagementParams(
+-          generateSSEAwsKeyParams()
+-      );
++      generateSSEAwsKeyParams().ifPresent(
++          copyObjectRequest::setSSEAwsKeyManagementParams);
+-      if (isNotBlank(getServerSideEncryptionKey(bucket, getConf()))) {
+-        //at the moment, only supports copy using the same key
+-        SSECustomerKey customerKey = generateSSECustomerKey();
++      generateSSECustomerKey().ifPresent(customerKey -> {
+-      }
++      });
+-    switch (serverSideEncryptionAlgorithm) {
+-    case SSE_KMS:
+-      request.setSSEAwsKeyManagementParams(generateSSEAwsKeyParams());
+-      break;
+-    case SSE_C:
+-      if (isNotBlank(getServerSideEncryptionKey(bucket, getConf()))) {
+-        request.setSSECustomerKey(generateSSECustomerKey());
+-      }
+-      break;
+-    default:
+-    }
++    generateSSEAwsKeyParams().ifPresent(request::setSSEAwsKeyManagementParams);
++    generateSSECustomerKey().ifPresent(request::setSSECustomerKey);
+-    if (S3AEncryptionMethods.SSE_S3.equals(serverSideEncryptionAlgorithm)) {
+-      metadata.setSSEAlgorithm(serverSideEncryptionAlgorithm.getMethod());
++    final S3AEncryptionMethods algorithm
++        = getServerSideEncryptionAlgorithm();
++    if (S3AEncryptionMethods.SSE_S3.equals(algorithm)) {
++      metadata.setSSEAlgorithm(algorithm.getMethod());
+-   * Create the AWS SDK structure used to configure SSE, based on the
+-   * configuration.
+-   * @return an instance of the class, which main contain the encryption key
++   * Create the AWS SDK structure used to configure SSE,
++   * if the encryption secrets contain the information/settings for this.
++   * @return an optional set of KMS Key settings
+-  @Retries.OnceExceptionsSwallowed
+-  private SSEAwsKeyManagementParams generateSSEAwsKeyParams() {
+-    //Use specified key, otherwise default to default master aws/s3 key by AWS
+-    SSEAwsKeyManagementParams sseAwsKeyManagementParams =
+-        new SSEAwsKeyManagementParams();
+-    String encryptionKey = getServerSideEncryptionKey(bucket, getConf());
+-    if (isNotBlank(encryptionKey)) {
+-      sseAwsKeyManagementParams = new SSEAwsKeyManagementParams(encryptionKey);
+-    }
+-    return sseAwsKeyManagementParams;
++  private Optional<SSEAwsKeyManagementParams> generateSSEAwsKeyParams() {
++    return EncryptionSecretOperations.createSSEAwsKeyManagementParams(
++        encryptionSecrets);
+-   * Create the SSE-C structure for the AWS SDK.
++   * Create the SSE-C structure for the AWS SDK, if the encryption secrets
++   * contain the information/settings for this.
+-   * @return the customer key.
++   * @return an optional customer key.
+-  @Retries.OnceExceptionsSwallowed
+-  private SSECustomerKey generateSSECustomerKey() {
+-    SSECustomerKey customerKey = new SSECustomerKey(
+-        getServerSideEncryptionKey(bucket, getConf()));
+-    return customerKey;
++  private Optional<SSECustomerKey> generateSSECustomerKey() {
++    return EncryptionSecretOperations.createSSECustomerKey(
++        encryptionSecrets);
+-    if (serverSideEncryptionAlgorithm != null) {
++    if (getServerSideEncryptionAlgorithm() != null) {
+-          .append(serverSideEncryptionAlgorithm)
++          .append(getServerSideEncryptionAlgorithm())
++    sb.append(", delegation tokens=")
++        .append(delegationTokens.map(Objects::toString).orElse("disabled"));
+-      return once("getFileChecksum", path.toString(),
+-          () -> {
+-            // this always does a full HEAD to the object
+-            ObjectMetadata headers = getObjectMetadata(path);
+-            String eTag = headers.getETag();
+-            return eTag != null ? new EtagChecksum(eTag) : null;
+-          });
++      ObjectMetadata headers = getObjectMetadata(path);
++      String eTag = headers.getETag();
++      return eTag != null ? new EtagChecksum(eTag) : null;

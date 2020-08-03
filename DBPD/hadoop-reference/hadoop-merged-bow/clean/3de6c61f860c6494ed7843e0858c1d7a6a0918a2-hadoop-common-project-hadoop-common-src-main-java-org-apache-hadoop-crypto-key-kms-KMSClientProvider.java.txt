@@ -1,0 +1,165 @@
+Merge r1609845 through r1612431 from trunk.
+
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/branches/HDFS-6584@1612432 13f79535-47bb-0310-9956-ffa450edef68
+
++import org.apache.hadoop.crypto.key.KeyProviderCryptoExtension.EncryptedKeyVersion;
++import org.apache.hadoop.fs.CommonConfigurationKeysPublic;
++
++import java.net.SocketTimeoutException;
++import java.util.LinkedList;
++import java.util.Queue;
++import java.util.concurrent.ExecutionException;
++
++import org.apache.hadoop.crypto.key.KeyProviderCryptoExtension;
++import org.apache.hadoop.crypto.key.KeyProviderCryptoExtension.CryptoExtension;
++
++import com.google.common.base.Preconditions;
+-public class KMSClientProvider extends KeyProvider {
++public class KMSClientProvider extends KeyProvider implements CryptoExtension {
++  private final ValueQueue<EncryptedKeyVersion> encKeyVersionQueue;
++
++  private class EncryptedQueueRefiller implements
++    ValueQueue.QueueRefiller<EncryptedKeyVersion> {
++
++    @Override
++    public void fillQueueForKey(String keyName,
++        Queue<EncryptedKeyVersion> keyQueue, int numEKVs) throws IOException {
++      checkNotNull(keyName, "keyName");
++      Map<String, String> params = new HashMap<String, String>();
++      params.put(KMSRESTConstants.EEK_OP, KMSRESTConstants.EEK_GENERATE);
++      params.put(KMSRESTConstants.EEK_NUM_KEYS, "" + numEKVs);
++      URL url = createURL(KMSRESTConstants.KEY_RESOURCE, keyName,
++          KMSRESTConstants.EEK_SUB_RESOURCE, params);
++      HttpURLConnection conn = createConnection(url, HTTP_GET);
++      conn.setRequestProperty(CONTENT_TYPE, APPLICATION_JSON_MIME);
++      List response = call(conn, null,
++          HttpURLConnection.HTTP_OK, List.class);
++      List<EncryptedKeyVersion> ekvs =
++          parseJSONEncKeyVersion(keyName, response);
++      keyQueue.addAll(ekvs);
++    }
++  }
++
++  public static class KMSEncryptedKeyVersion extends EncryptedKeyVersion {
++    public KMSEncryptedKeyVersion(String keyName, String keyVersionName,
++        byte[] iv, String encryptedVersionName, byte[] keyMaterial) {
++      super(keyName, keyVersionName, iv, new KMSKeyVersion(null, 
++          encryptedVersionName, keyMaterial));
++    }
++  }
++
++  @SuppressWarnings("rawtypes")
++  private static List<EncryptedKeyVersion>
++      parseJSONEncKeyVersion(String keyName, List valueList) {
++    List<EncryptedKeyVersion> ekvs = new LinkedList<EncryptedKeyVersion>();
++    if (!valueList.isEmpty()) {
++      for (Object values : valueList) {
++        Map valueMap = (Map) values;
++
++        String versionName = checkNotNull(
++                (String) valueMap.get(KMSRESTConstants.VERSION_NAME_FIELD),
++                KMSRESTConstants.VERSION_NAME_FIELD);
++
++        byte[] iv = Base64.decodeBase64(checkNotNull(
++                (String) valueMap.get(KMSRESTConstants.IV_FIELD),
++                KMSRESTConstants.IV_FIELD));
++
++        Map encValueMap = checkNotNull((Map)
++                valueMap.get(KMSRESTConstants.ENCRYPTED_KEY_VERSION_FIELD),
++                KMSRESTConstants.ENCRYPTED_KEY_VERSION_FIELD);
++
++        String encVersionName = checkNotNull((String)
++                encValueMap.get(KMSRESTConstants.VERSION_NAME_FIELD),
++                KMSRESTConstants.VERSION_NAME_FIELD);
++
++        byte[] encKeyMaterial = Base64.decodeBase64(checkNotNull((String)
++                encValueMap.get(KMSRESTConstants.MATERIAL_FIELD),
++                KMSRESTConstants.MATERIAL_FIELD));
++
++        ekvs.add(new KMSEncryptedKeyVersion(keyName, versionName, iv,
++            encVersionName, encKeyMaterial));
++      }
++    }
++    return ekvs;
++  }
++
++    encKeyVersionQueue =
++        new ValueQueue<KeyProviderCryptoExtension.EncryptedKeyVersion>(
++            conf.getInt(
++                CommonConfigurationKeysPublic.KMS_CLIENT_ENC_KEY_CACHE_SIZE,
++                CommonConfigurationKeysPublic.
++                    KMS_CLIENT_ENC_KEY_CACHE_SIZE_DEFAULT),
++            conf.getFloat(
++                CommonConfigurationKeysPublic.
++                    KMS_CLIENT_ENC_KEY_CACHE_LOW_WATERMARK,
++                CommonConfigurationKeysPublic.
++                    KMS_CLIENT_ENC_KEY_CACHE_LOW_WATERMARK_DEFAULT),
++            conf.getInt(
++                CommonConfigurationKeysPublic.
++                    KMS_CLIENT_ENC_KEY_CACHE_EXPIRY_MS,
++                CommonConfigurationKeysPublic.
++                    KMS_CLIENT_ENC_KEY_CACHE_EXPIRY_DEFAULT),
++            conf.getInt(
++                CommonConfigurationKeysPublic.
++                    KMS_CLIENT_ENC_KEY_CACHE_NUM_REFILL_THREADS,
++                CommonConfigurationKeysPublic.
++                    KMS_CLIENT_ENC_KEY_CACHE_NUM_REFILL_THREADS_DEFAULT),
++            new EncryptedQueueRefiller());
++  public EncryptedKeyVersion generateEncryptedKey(
++      String encryptionKeyName) throws IOException, GeneralSecurityException {
++    try {
++      return encKeyVersionQueue.getNext(encryptionKeyName);
++    } catch (ExecutionException e) {
++      if (e.getCause() instanceof SocketTimeoutException) {
++        throw (SocketTimeoutException)e.getCause();
++      }
++      throw new IOException(e);
++    }
++  }
++
++  @SuppressWarnings("rawtypes")
++  @Override
++  public KeyVersion decryptEncryptedKey(
++      EncryptedKeyVersion encryptedKeyVersion) throws IOException,
++                                                      GeneralSecurityException {
++    checkNotNull(encryptedKeyVersion.getKeyVersionName(), "versionName");
++    checkNotNull(encryptedKeyVersion.getIv(), "iv");
++    Preconditions.checkArgument(encryptedKeyVersion.getEncryptedKey()
++        .getVersionName().equals(KeyProviderCryptoExtension.EEK),
++        "encryptedKey version name must be '%s', is '%s'",
++        KeyProviderCryptoExtension.EK, encryptedKeyVersion.getEncryptedKey()
++            .getVersionName());
++    checkNotNull(encryptedKeyVersion.getEncryptedKey(), "encryptedKey");
++    Map<String, String> params = new HashMap<String, String>();
++    params.put(KMSRESTConstants.EEK_OP, KMSRESTConstants.EEK_DECRYPT);
++    Map<String, Object> jsonPayload = new HashMap<String, Object>();
++    jsonPayload.put(KMSRESTConstants.NAME_FIELD,
++        encryptedKeyVersion.getKeyName());
++    jsonPayload.put(KMSRESTConstants.IV_FIELD, Base64.encodeBase64String(
++        encryptedKeyVersion.getIv()));
++    jsonPayload.put(KMSRESTConstants.MATERIAL_FIELD, Base64.encodeBase64String(
++            encryptedKeyVersion.getEncryptedKey().getMaterial()));
++    URL url = createURL(KMSRESTConstants.KEY_VERSION_RESOURCE,
++        encryptedKeyVersion.getKeyVersionName(),
++        KMSRESTConstants.EEK_SUB_RESOURCE, params);
++    HttpURLConnection conn = createConnection(url, HTTP_POST);
++    conn.setRequestProperty(CONTENT_TYPE, APPLICATION_JSON_MIME);
++    Map response =
++        call(conn, jsonPayload, HttpURLConnection.HTTP_OK, Map.class);
++    return parseJSONKeyVersion(response);
++  }
++
++  @Override
++  @Override
++  public void warmUpEncryptedKeys(String... keyNames)
++      throws IOException {
++    try {
++      encKeyVersionQueue.initializeQueuesForKeys(keyNames);
++    } catch (ExecutionException e) {
++      throw new IOException(e);
++    }
++  }
++
+
+INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS43 INS23 INS55 INS55 INS31 INS31 INS31 INS31 INS42 INS83 INS83 INS74 INS59 INS83 INS42 INS74 INS31 INS83 INS83 INS42 INS43 INS31 INS79 INS83 INS83 INS74 INS42 INS44 INS44 INS8 INS78 INS83 INS43 INS42 INS44 INS43 INS43 INS8 INS79 INS78 INS83 INS43 INS42 INS44 INS43 INS43 INS8 INS78 INS83 INS39 INS42 INS44 INS43 INS8 INS43 INS43 INS42 INS43 INS43 INS78 INS83 INS39 INS42 INS44 INS44 INS44 INS43 INS8 INS42 INS83 INS42 INS44 INS44 INS44 INS44 INS44 INS8 INS42 INS45 INS43 INS43 INS43 INS42 INS43 INS42 INS60 INS25 INS41 INS21 INS42 INS42 INS43 INS42 INS42 INS42 INS54 INS42 INS45 INS42 INS42 INS43 INS42 INS42 INS42 INS21 INS21 INS21 INS21 INS60 INS21 INS60 INS21 INS21 INS21 INS60 INS60 INS21 INS60 INS41 INS42 INS43 INS42 INS42 INS54 INS42 INS42 INS40 INS42 INS42 INS43 INS42 INS74 INS42 INS39 INS42 INS42 INS21 INS60 INS21 INS21 INS60 INS60 INS21 INS60 INS60 INS21 INS43 INS42 INS43 INS42 INS5 INS42 INS43 INS42 INS5 INS42 INS46 INS42 INS42 INS42 INS42 INS74 INS59 INS38 INS8 INS42 INS7 INS42 INS8 INS12 INS42 INS32 INS32 INS32 INS32 INS74 INS59 INS32 INS74 INS59 INS32 INS32 INS32 INS43 INS59 INS43 INS59 INS32 INS43 INS59 INS32 INS42 INS8 INS12 INS42 INS43 INS43 INS32 INS74 INS59 INS32 INS32 INS43 INS59 INS43 INS59 INS32 INS43 INS59 INS74 INS59 INS32 INS42 INS42 INS39 INS85 INS42 INS39 INS85 INS42 INS42 INS42 INS14 INS43 INS43 INS42 INS14 INS32 INS70 INS42 INS14 INS41 INS44 INS8 INS42 INS32 INS45 INS42 INS32 INS45 INS42 INS42 INS32 INS45 INS40 INS32 INS42 INS32 INS45 INS43 INS43 INS43 INS42 INS14 INS42 INS42 INS40 INS40 INS43 INS43 INS43 INS42 INS14 INS42 INS42 INS40 INS32 INS42 INS42 INS40 INS32 INS42 INS42 INS40 INS32 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS21 INS44 INS8 INS42 INS42 INS42 INS42 INS45 INS43 INS43 INS43 INS42 INS14 INS42 INS42 INS40 INS40 INS42 INS42 INS40 INS27 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS43 INS43 INS42 INS32 INS42 INS42 INS42 INS43 INS33 INS42 INS42 INS42 INS42 INS74 INS42 INS42 INS44 INS42 INS8 INS74 INS32 INS32 INS32 INS32 INS14 INS32 INS43 INS42 INS25 INS53 INS42 INS42 INS42 INS42 INS32 INS42 INS40 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS74 INS42 INS42 INS42 INS74 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS40 INS32 INS40 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS40 INS57 INS32 INS43 INS42 INS53 INS42 INS42 INS42 INS74 INS45 INS42 INS42 INS40 INS42 INS40 INS42 INS42 INS42 INS42 INS42 INS42 INS33 INS40 INS57 INS42 INS42 INS42 INS42 INS42 INS42 INS43 INS43 INS43 INS42 INS60 INS60 INS60 INS60 INS60 INS60 INS21 INS43 INS43 INS42 INS42 INS40 INS40 INS42 INS42 INS40 INS40 INS42 INS42 INS40 INS40 INS42 INS42 INS40 INS40 INS43 INS42 INS42 INS42 INS42 INS62 INS8 INS14 INS32 INS42 INS42 INS42 INS43 INS43 INS43 INS43 INS43 INS43 INS42 INS42 INS32 INS42 INS42 INS42 INS43 INS42 INS42 INS42 INS42 INS14 INS43 INS43 INS43 INS43 INS42 INS42 INS42 INS43 INS59 INS43 INS59 INS5 INS59 INS43 INS59 INS43 INS59 INS5 INS59 INS32 INS42 INS40 INS42 INS32 INS43 INS53 INS43 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS43 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS11 INS42 INS42 INS32 INS39 INS85 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS32 INS39 INS85 INS42 INS32 INS42 INS42 INS14 INS42 INS42 INS42 INS11 INS42 INS42 INS43 INS42 INS42 INS11 INS40 INS42 INS42 INS32 INS42 INS11 INS40 INS42 INS11 INS40 INS42 INS42 INS32 INS43 INS42 INS42 INS42 INS42 INS42 INS43 INS32 INS42 INS43 INS32 INS42 INS11 INS40 INS43 INS32 INS43 INS32 INS42 INS11 INS40 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS40 INS43 INS32 INS42 INS42 INS42 INS40 INS42 INS42 INS42 INS40 INS43 INS32 INS42 INS42 INS42 INS40 INS42 INS42 INS42 INS40

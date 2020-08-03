@@ -1,0 +1,218 @@
+HDFS-6930. Improve replica eviction from RAM disk. (Arpit Agarwal)
+
+-  /**
+-   * Attempt to evict one or more transient block replicas we have at least
+-   * spaceNeeded bytes free.
+-   *
+-   * @return true if we were able to free up at least spaceNeeded bytes, false
+-   *          otherwise.
+-   */
+-  private boolean tryToEvictBlocks(final String bpid, final long spaceNeeded)
+-      throws IOException {
+-
+-    boolean isAvailable = false;
+-
+-    LOG.info("Attempting to evict blocks from transient storage");
+-
+-    // Reverse the map so we can iterate in order of replica creation times,
+-    // evicting oldest replicas one at a time until we have sufficient space.
+-    TreeMultimap<Long, LazyWriteReplicaTracker.ReplicaState> lruMap =
+-        lazyWriteReplicaTracker.getLruMap();
+-    int blocksEvicted = 0;
+-
+-    // TODO: It is really inefficient to do this with the Object lock held!
+-    // TODO: This logic is here just for prototyping.
+-    // TODO: We should replace it with proactive discard when ram_disk free space
+-    // TODO:   falls below a low watermark. That way we avoid fs operations on the
+-    // TODO:   hot path with the lock held.
+-    synchronized (this) {
+-      long currentTime = System.currentTimeMillis() / 1000;
+-      for (Map.Entry<Long, LazyWriteReplicaTracker.ReplicaState> entry : lruMap.entries()) {
+-        LazyWriteReplicaTracker.ReplicaState lazyWriteReplica = entry.getValue();
+-        LOG.info("RAM_DISK: Evicting blockId=" + lazyWriteReplica.blockId +
+-                     "; block LMT=" + entry.getKey() +
+-                     "; currentTime=" + currentTime);
+-        ReplicaInfo replicaInfo = getReplicaInfo(bpid, lazyWriteReplica.blockId);
+-        Preconditions.checkState(replicaInfo.getVolume().isTransientStorage());
+-        File blockFile = replicaInfo.getBlockFile();
+-        File metaFile = replicaInfo.getMetaFile();
+-        long used = blockFile.length() + metaFile.length();
+-        lazyWriteReplicaTracker.discardReplica(bpid, entry.getValue().blockId, false);
+-
+-        // Move the persisted replica to the finalized directory of
+-        // the target volume.
+-        BlockPoolSlice bpSlice =
+-            lazyWriteReplica.lazyPersistVolume.getBlockPoolSlice(bpid);
+-        File newBlockFile = bpSlice.activateSavedReplica(
+-            replicaInfo, lazyWriteReplica.savedBlockFile);
+-
+-        ReplicaInfo newReplicaInfo =
+-            new FinalizedReplica(replicaInfo.getBlockId(),
+-                                 replicaInfo.getBytesOnDisk(),
+-                                 replicaInfo.getGenerationStamp(),
+-                                 lazyWriteReplica.lazyPersistVolume,
+-                                 newBlockFile.getParentFile());
+-
+-        // Update the volumeMap entry. This removes the old entry.
+-        volumeMap.add(bpid, newReplicaInfo);
+-
+-        // Remove the old replicas.
+-        blockFile.delete();
+-        metaFile.delete();
+-        ((FsVolumeImpl) replicaInfo.getVolume()).decDfsUsed(bpid, used);
+-        ++blocksEvicted;
+-
+-        if (replicaInfo.getVolume().getAvailable() > spaceNeeded) {
+-          LOG.info("RAM_DISK: freed up " + spaceNeeded + " bytes for new block");
+-          isAvailable = true;
+-          break;
+-        }
+-
+-        if (blocksEvicted == MAX_BLOCK_EVICTIONS_PER_ITERATION) {
+-          break;
+-        }
+-      }
+-    }
+-
+-    return isAvailable;
+-  }
+-
+-          if (!tryToEvictBlocks(b.getBlockPoolId(), b.getNumBytes())) {
+-            // Eviction did not work, we'll just fallback to DEFAULT storage.
+-            LOG.info("RAM_DISK: Failed to free up " + b.getNumBytes() +
+-                         " bytes for new block. Will fallback to DEFAULT " +
+-                         "storage");
+-            allowLazyPersist = false;
+-          }
++          allowLazyPersist = false;
++    final long estimateBlockSize;
++
++    public static final int LOW_WATERMARK_FREE_SPACE_PERCENT = 10;
++    public static final int LOW_WATERMARK_FREE_SPACE_REPLICAS = 3;
++
++      this.estimateBlockSize = conf.getLongBytes(
++          DFSConfigKeys.DFS_BLOCK_SIZE_KEY,
++          DFSConfigKeys.DFS_BLOCK_SIZE_DEFAULT);
+-      LOG.info("LazyWriter invoked to save blockId=" + blockId + "; bpid=" + bpid);
+-
+-      synchronized (this) {
++      synchronized (FsDatasetImpl.this) {
+-      }
+-      if (LOG.isDebugEnabled()) {
+-        LOG.debug("LazyWriter starting to save blockId=" + blockId + "; bpid=" + bpid);
+-      }
++        if (LOG.isDebugEnabled()) {
++          LOG.debug("LazyWriter starting to save blockId=" + blockId + "; bpid=" + bpid);
++        }
+-      lazyWriteReplicaTracker.recordStartLazyPersist(bpid, blockId, targetVolume);
+-      File savedBlockFile = targetVolume.getBlockPoolSlice(bpid)
+-                                        .lazyPersistReplica(replicaInfo);
+-      lazyWriteReplicaTracker.recordEndLazyPersist(bpid, blockId, savedBlockFile);
++        lazyWriteReplicaTracker.recordStartLazyPersist(bpid, blockId, targetVolume);
++        File savedBlockFile = targetVolume.getBlockPoolSlice(bpid)
++                                          .lazyPersistReplica(replicaInfo);
++        lazyWriteReplicaTracker.recordEndLazyPersist(bpid, blockId, savedBlockFile);
+-      if (LOG.isDebugEnabled()) {
+-        LOG.debug("LazyWriter finished saving blockId=" + blockId + "; bpid=" + bpid +
+-                 " to file " + savedBlockFile);
++        if (LOG.isDebugEnabled()) {
++          LOG.debug("LazyWriter finished saving blockId=" + blockId + "; bpid=" + bpid +
++                        " to file " + savedBlockFile);
++        }
+-        synchronized (this) {
+-          replicaState = lazyWriteReplicaTracker.dequeueNextReplicaToPersist();
+-          if (replicaState == null) {
+-            return false;
+-          }
++        replicaState = lazyWriteReplicaTracker.dequeueNextReplicaToPersist();
++        if (replicaState != null) {
++          // Move the replica outside the lock.
++          moveReplicaToNewVolume(replicaState.bpid, replicaState.blockId);
+-
+-        // Move the replica outside the lock.
+-        moveReplicaToNewVolume(replicaState.bpid, replicaState.blockId);
+-          lazyWriteReplicaTracker.reenqueueReplica(replicaState);
++          lazyWriteReplicaTracker.reenqueueReplicaNotPersisted(replicaState);
++    private boolean transientFreeSpaceBelowThreshold() throws IOException {
++      long free = 0;
++      long capacity = 0;
++
++      // Don't worry about fragmentation for now. We don't expect more than one
++      // transient volume per DN.
++      for (FsVolumeImpl v : volumes.volumes) {
++        if (v.isTransientStorage()) {
++          capacity += v.getCapacity();
++          free += v.getAvailable();
++        }
++      }
++
++      if (capacity == 0) {
++        return false;
++      }
++
++      int percentFree = (int) (free * 100 / capacity);
++      return percentFree < LOW_WATERMARK_FREE_SPACE_PERCENT ||
++             free < (estimateBlockSize * LOW_WATERMARK_FREE_SPACE_REPLICAS);
++    }
++
++    /**
++     * Attempt to evict one or more transient block replicas we have at least
++     * spaceNeeded bytes free.
++     */
++    private synchronized void evictBlocks() throws IOException {
++      int iterations = 0;
++
++      LazyWriteReplicaTracker.ReplicaState replicaState =
++          lazyWriteReplicaTracker.getNextCandidateForEviction();
++
++      while (replicaState != null &&
++             iterations++ < MAX_BLOCK_EVICTIONS_PER_ITERATION &
++             transientFreeSpaceBelowThreshold()) {
++        if (LOG.isDebugEnabled()) {
++          LOG.info("Evicting block " + replicaState);
++        }
++        ReplicaInfo replicaInfo = getReplicaInfo(replicaState.bpid, replicaState.blockId);
++        Preconditions.checkState(replicaInfo.getVolume().isTransientStorage());
++        File blockFile = replicaInfo.getBlockFile();
++        File metaFile = replicaInfo.getMetaFile();
++        long blockFileUsed = blockFile.length();
++        long metaFileUsed = metaFile.length();
++        lazyWriteReplicaTracker.discardReplica(replicaState, false);
++
++        // Move the replica from lazyPersist/ to finalized/ on target volume
++        BlockPoolSlice bpSlice =
++            replicaState.lazyPersistVolume.getBlockPoolSlice(replicaState.bpid);
++        File newBlockFile = bpSlice.activateSavedReplica(
++            replicaInfo, replicaState.savedBlockFile);
++
++        ReplicaInfo newReplicaInfo =
++            new FinalizedReplica(replicaInfo.getBlockId(),
++                                 replicaInfo.getBytesOnDisk(),
++                                 replicaInfo.getGenerationStamp(),
++                                 replicaState.lazyPersistVolume,
++                                 newBlockFile.getParentFile());
++
++        // Update the volumeMap entry. This removes the old entry.
++        volumeMap.add(replicaState.bpid, newReplicaInfo);
++
++        // Remove the old replicas from transient storage.
++        if (blockFile.delete() || !blockFile.exists()) {
++          ((FsVolumeImpl) replicaInfo.getVolume()).decDfsUsed(replicaState.bpid, blockFileUsed);
++        }
++        if (metaFile.delete() || !metaFile.exists()) {
++          ((FsVolumeImpl) replicaInfo.getVolume()).decDfsUsed(replicaState.bpid, metaFileUsed);
++        }
++
++        // If deletion failed then the directory scanner will cleanup the blocks
++        // eventually.
++        replicaState = lazyWriteReplicaTracker.getNextCandidateForEviction();
++      }
++    }
++
++          evictBlocks();
+-          if (numSuccessiveFailures == lazyWriteReplicaTracker.numReplicasNotPersisted()) {
++          if (numSuccessiveFailures >= lazyWriteReplicaTracker.numReplicasNotPersisted()) {
+-          LOG.error("Ignoring exception in LazyWriter:", e);
++          LOG.warn("Ignoring exception in LazyWriter:", e);
+
+INS23 INS23 INS23 INS31 MOV31 INS83 INS39 INS59 INS83 INS83 INS83 INS39 INS59 INS83 INS83 INS83 INS39 INS59 INS83 INS39 INS42 INS43 INS8 INS83 INS39 INS42 MOV8 INS42 INS42 INS34 INS42 INS34 INS21 INS42 INS60 INS60 INS70 MOV25 INS60 INS41 INS60 INS60 INS61 INS7 INS39 INS59 INS39 INS59 INS44 INS40 INS8 INS39 INS59 INS27 UPD39 MOV39 INS59 MOV43 MOV59 INS27 MOV8 INS22 INS32 INS42 MOV25 MOV21 MOV60 MOV21 MOV25 MOV21 INS25 INS42 INS34 INS42 INS34 INS43 INS42 INS25 UPD42 INS34 INS42 INS11 INS27 INS27 INS42 INS34 UPD42 INS32 INS27 INS27 INS25 INS60 INS25 INS25 MOV21 INS52 INS42 INS42 INS42 INS40 INS40 INS27 INS8 INS42 INS32 INS8 INS39 INS36 INS42 INS42 INS42 INS36 UPD42 MOV42 UPD42 MOV42 INS42 INS33 INS27 INS32 INS32 INS8 INS39 INS59 INS27 INS8 UPD27 MOV27 INS8 INS42 INS33 MOV21 INS42 INS42 INS21 INS21 INS27 INS27 INS37 INS42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 MOV21 UPD42 MOV32 INS42 MOV32 UPD42 MOV42 INS40 MOV32 INS38 MOV21 MOV32 INS38 MOV21 UPD42 INS32 INS21 INS7 INS7 INS27 INS42 INS42 INS42 INS42 INS40 UPD40 UPD40 INS40 UPD40 UPD40 INS32 INS32 INS42 INS42 INS32 UPD27 MOV21 UPD42 INS42 INS32 INS42 INS32 INS42 INS34 INS42 INS42 INS40 UPD42 UPD42 MOV42 UPD42 MOV42 INS36 INS42 INS40 INS42 INS42 INS42 INS42 INS42 INS42 UPD45 UPD42 INS11 UPD42 INS43 INS32 INS42 UPD42 MOV42 INS42 DEL42 DEL42 DEL42 DEL32 DEL42 DEL42 DEL32 DEL32 DEL38 DEL42 DEL42 DEL45 DEL42 DEL42 DEL32 DEL45 DEL45 DEL27 DEL32 DEL21 DEL8 DEL25 DEL42 DEL42 DEL45 DEL42 DEL45 DEL42 DEL27 DEL32 DEL21 DEL52 DEL8 DEL51 DEL33 DEL66 DEL66 DEL65 DEL39 DEL42 DEL83 DEL42 DEL43 DEL42 DEL44 DEL83 DEL39 DEL42 DEL44 DEL32 DEL34 DEL27 DEL40 DEL45 DEL42 DEL42 DEL32 DEL45 DEL42 DEL32 DEL59 DEL60 DEL42 DEL27 DEL42 DEL42 DEL32 DEL42 DEL22 DEL42 DEL42 DEL42 DEL42 DEL32 DEL32 DEL42 DEL42 DEL45 DEL42 DEL45 DEL27 DEL9 DEL21 DEL21 DEL42 DEL38 DEL21 DEL10 DEL8 DEL25 DEL42 DEL42 DEL27 DEL10 DEL8 DEL25 DEL60 DEL40 DEL43 DEL42 DEL43 DEL40 DEL43 DEL74 DEL42 DEL44 DEL42 DEL32 DEL70 DEL39 DEL42 DEL9 DEL59 DEL60 DEL42 DEL42 DEL45 DEL32 DEL21 DEL42 DEL43 DEL42 DEL43 DEL40 DEL43 DEL74 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL39 DEL42 DEL34 DEL59 DEL60 DEL52 DEL51 DEL42 DEL41 DEL8

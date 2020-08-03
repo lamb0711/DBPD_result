@@ -1,0 +1,192 @@
+Merge remote-tracking branch 'origin/trunk' into MR-2841
+
+Conflicts:
+	hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/main/java/org/apache/hadoop/mapred/MapTask.java
+
++import java.io.IOException;
++import java.util.Set;
++import java.util.Timer;
++import java.util.TimerTask;
++import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.yarn.api.records.ContainerStatus;
++import org.apache.hadoop.yarn.api.records.ResourceOption;
++import org.apache.hadoop.yarn.conf.YarnConfiguration;
++import org.apache.hadoop.yarn.server.resourcemanager.RMAuditLogger;
++import org.apache.hadoop.yarn.server.resourcemanager.RMAuditLogger.AuditConstants;
++import org.apache.hadoop.yarn.server.resourcemanager.ResourceManager;
++import org.apache.hadoop.yarn.server.resourcemanager.rmapp.RMAppEvent;
++import org.apache.hadoop.yarn.server.resourcemanager.rmapp.RMAppEventType;
++import org.apache.hadoop.yarn.server.resourcemanager.rmapp.RMAppMoveEvent;
++import org.apache.hadoop.yarn.server.resourcemanager.rmcontainer.RMContainerEventType;
++import org.apache.hadoop.yarn.server.resourcemanager.rmcontainer.RMContainerFinishedEvent;
++import com.google.common.util.concurrent.SettableFuture;
++
++
++  protected int nmExpireInterval;
++  @Override
++  public void serviceInit(Configuration conf) throws Exception {
++    nmExpireInterval =
++        conf.getInt(YarnConfiguration.RM_NM_EXPIRY_INTERVAL_MS,
++          YarnConfiguration.DEFAULT_RM_NM_EXPIRY_INTERVAL_MS);
++    createReleaseCache();
++    super.serviceInit(conf);
++  }
++
++      if (!rmApp.getApplicationSubmissionContext()
++        .getKeepContainersAcrossApplicationAttempts()) {
++        // Do not recover containers for stopped attempt or previous attempt.
++        if (schedulerAttempt.isStopped()
++            || !schedulerAttempt.getApplicationAttemptId().equals(
++              container.getContainerId().getApplicationAttemptId())) {
++          LOG.info("Skip recovering container " + container
++              + " for already stopped attempt.");
++          killOrphanContainerOnNode(nm, container);
++          continue;
++        }
++      }
++
++
++      synchronized (schedulerAttempt) {
++        Set<ContainerId> releases = schedulerAttempt.getPendingRelease();
++        if (releases.contains(container.getContainerId())) {
++          // release the container
++          rmContainer.handle(new RMContainerFinishedEvent(container
++            .getContainerId(), SchedulerUtils.createAbnormalContainerStatus(
++            container.getContainerId(), SchedulerUtils.RELEASED_CONTAINER),
++            RMContainerEventType.RELEASED));
++          releases.remove(container.getContainerId());
++          LOG.info(container.getContainerId() + " is released by application.");
++        }
++      }
++  protected void createReleaseCache() {
++    // Cleanup the cache after nm expire interval.
++    new Timer().schedule(new TimerTask() {
++      @Override
++      public void run() {
++        for (SchedulerApplication<T> app : applications.values()) {
++
++          T attempt = app.getCurrentAppAttempt();
++          synchronized (attempt) {
++            for (ContainerId containerId : attempt.getPendingRelease()) {
++              RMAuditLogger.logFailure(
++                app.getUser(),
++                AuditConstants.RELEASE_CONTAINER,
++                "Unauthorized access or invalid container",
++                "Scheduler",
++                "Trying to release container not owned by app or with invalid id.",
++                attempt.getApplicationId(), containerId);
++            }
++            attempt.getPendingRelease().clear();
++          }
++        }
++        LOG.info("Release request cache is cleaned up");
++      }
++    }, nmExpireInterval);
++  }
++
++  // clean up a completed container
++  protected abstract void completedContainer(RMContainer rmContainer,
++      ContainerStatus containerStatus, RMContainerEventType event);
++
++  protected void releaseContainers(List<ContainerId> containers,
++      SchedulerApplicationAttempt attempt) {
++    for (ContainerId containerId : containers) {
++      RMContainer rmContainer = getRMContainer(containerId);
++      if (rmContainer == null) {
++        if (System.currentTimeMillis() - ResourceManager.getClusterTimeStamp()
++            < nmExpireInterval) {
++          LOG.info(containerId + " doesn't exist. Add the container"
++              + " to the release request cache as it maybe on recovery.");
++          synchronized (attempt) {
++            attempt.getPendingRelease().add(containerId);
++          }
++        } else {
++          RMAuditLogger.logFailure(attempt.getUser(),
++            AuditConstants.RELEASE_CONTAINER,
++            "Unauthorized access or invalid container", "Scheduler",
++            "Trying to release container not owned by app or with invalid id.",
++            attempt.getApplicationId(), containerId);
++        }
++      }
++      completedContainer(rmContainer,
++        SchedulerUtils.createAbnormalContainerStatus(containerId,
++          SchedulerUtils.RELEASED_CONTAINER), RMContainerEventType.RELEASED);
++    }
++  }
++
++
++  @Override
++  public synchronized void moveAllApps(String sourceQueue, String destQueue)
++      throws YarnException {
++    // check if destination queue is a valid leaf queue
++    try {
++      getQueueInfo(destQueue, false, false);
++    } catch (IOException e) {
++      LOG.warn(e);
++      throw new YarnException(e);
++    }
++    // check if source queue is a valid
++    List<ApplicationAttemptId> apps = getAppsInQueue(sourceQueue);
++    if (apps == null) {
++      String errMsg = "The specified Queue: " + sourceQueue + " doesn't exist";
++      LOG.warn(errMsg);
++      throw new YarnException(errMsg);
++    }
++    // generate move events for each pending/running app
++    for (ApplicationAttemptId app : apps) {
++      SettableFuture<Object> future = SettableFuture.create();
++      this.rmContext
++          .getDispatcher()
++          .getEventHandler()
++          .handle(new RMAppMoveEvent(app.getApplicationId(), destQueue, future));
++    }
++  }
++
++  @Override
++  public synchronized void killAllAppsInQueue(String queueName)
++      throws YarnException {
++    // check if queue is a valid
++    List<ApplicationAttemptId> apps = getAppsInQueue(queueName);
++    if (apps == null) {
++      String errMsg = "The specified Queue: " + queueName + " doesn't exist";
++      LOG.warn(errMsg);
++      throw new YarnException(errMsg);
++    }
++    // generate kill events for each pending/running app
++    for (ApplicationAttemptId app : apps) {
++      this.rmContext
++          .getDispatcher()
++          .getEventHandler()
++          .handle(new RMAppEvent(app.getApplicationId(), RMAppEventType.KILL));
++    }
++  }
++  
++  /**
++   * Process resource update on a node.
++   */
++  public synchronized void updateNodeResource(RMNode nm, 
++      ResourceOption resourceOption) {
++  
++    SchedulerNode node = getSchedulerNode(nm.getNodeID());
++    Resource newResource = resourceOption.getResource();
++    Resource oldResource = node.getTotalResource();
++    if(!oldResource.equals(newResource)) {
++      // Log resource change
++      LOG.info("Update resource on node: " + node.getNodeName() 
++          + " from: " + oldResource + ", to: "
++          + newResource);
++
++      // update resource to node
++      node.setTotalResource(newResource);
++    
++      // update resource to clusterResource
++      Resources.subtractFrom(clusterResource, oldResource);
++      Resources.addTo(clusterResource, newResource);
++    } else {
++      // Log resource change
++      LOG.warn("Update resource on node: " + node.getNodeName() 
++          + " with the same resource: " + newResource);
++    }
++  }
+
+INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS23 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS83 INS39 INS59 INS78 INS83 INS39 INS42 INS44 INS43 INS8 INS83 INS39 INS42 INS8 INS83 INS83 INS39 INS42 INS44 INS44 INS44 INS83 INS39 INS42 INS44 INS44 INS8 INS78 INS83 INS83 INS39 INS42 INS44 INS44 INS43 INS8 INS78 INS83 INS83 INS39 INS42 INS44 INS43 INS8 INS29 INS83 INS83 INS39 INS42 INS44 INS44 INS8 INS42 INS42 INS43 INS42 INS42 INS21 INS21 INS21 INS21 INS43 INS42 INS43 INS42 INS43 INS42 INS74 INS42 INS43 INS42 INS70 INS42 INS43 INS42 INS43 INS42 INS42 INS54 INS60 INS25 INS70 INS42 INS43 INS42 INS42 INS60 INS25 INS70 INS65 INS43 INS42 INS43 INS42 INS60 INS60 INS60 INS25 INS42 INS7 INS32 INS48 INS32 INS42 INS42 INS42 INS43 INS43 INS42 INS44 INS42 INS8 INS42 INS42 INS8 INS12 INS74 INS59 INS27 INS8 INS44 INS42 INS8 INS42 INS74 INS59 INS27 INS8 INS44 INS42 INS8 INS66 INS42 INS42 INS43 INS59 INS43 INS59 INS43 INS59 INS38 INS8 INS8 INS42 INS32 INS42 INS42 INS42 INS25 INS51 INS14 INS42 INS14 INS42 INS42 INS42 INS43 INS42 INS60 INS25 INS21 INS21 INS44 INS8 INS43 INS43 INS42 INS32 INS42 INS33 INS60 INS21 INS53 INS43 INS42 INS60 INS21 INS43 INS43 INS42 INS32 INS42 INS33 INS60 INS21 INS53 INS43 INS42 INS21 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS32 INS32 INS21 INS21 INS21 INS21 INS21 INS42 INS42 INS40 INS40 INS38 INS8 INS42 INS8 INS43 INS43 INS1 INS42 INS43 INS59 INS27 INS8 INS32 INS32 INS43 INS42 INS21 INS53 INS42 INS42 INS42 INS42 INS43 INS59 INS32 INS14 INS42 INS74 INS59 INS32 INS42 INS42 INS42 INS42 INS43 INS59 INS32 INS14 INS42 INS32 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS32 INS32 INS32 INS32 INS32 INS25 INS60 INS25 INS42 INS42 INS31 INS42 INS42 INS32 INS42 INS33 INS25 INS42 INS42 INS32 INS40 INS42 INS42 INS9 INS9 INS42 INS32 INS14 INS42 INS42 INS27 INS42 INS42 INS42 INS43 INS42 INS43 INS43 INS42 INS32 INS32 INS42 INS14 INS42 INS42 INS27 INS42 INS42 INS42 INS43 INS42 INS32 INS42 INS14 INS42 INS42 INS42 INS42 INS27 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS27 INS32 INS42 INS27 INS8 INS74 INS59 INS32 INS8 INS78 INS83 INS39 INS42 INS8 INS42 INS42 INS27 INS8 INS8 INS42 INS42 INS42 INS40 INS42 INS42 INS42 INS43 INS42 INS45 INS42 INS45 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS43 INS32 INS42 INS42 INS45 INS42 INS45 INS42 INS32 INS42 INS43 INS32 INS40 INS45 INS32 INS45 INS42 INS45 INS42 INS45 INS32 INS45 INS42 INS42 INS42 INS32 INS38 INS21 INS21 INS18 INS43 INS43 INS42 INS32 INS42 INS42 INS32 INS21 INS21 INS21 INS42 INS70 INS21 INS27 INS42 INS21 INS51 INS21 INS42 INS22 INS42 INS42 INS42 INS42 INS22 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS32 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS32 INS32 INS44 INS32 INS8 INS32 INS32 INS32 INS32 INS42 INS8 INS32 INS52 INS42 INS52 INS42 INS32 INS42 INS32 INS42 INS42 INS27 INS42 INS42 INS42 INS42 INS42 INS14 INS42 INS42 INS32 INS42 INS42 INS27 INS74 INS42 INS42 INS42 INS60 INS51 INS42 INS42 INS45 INS42 INS42 INS42 INS42 INS42 INS42 INS27 INS21 INS42 INS42 INS32 INS40 INS45 INS45 INS45 INS32 INS42 INS42 INS42 INS32 INS42 INS45 INS42 INS45 INS43 INS32 INS32 INS40 INS42 INS42 INS32 INS45 INS43 INS43 INS43 INS59 INS42 INS8 INS42 INS45 INS45 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS40 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS70 INS21 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS44 INS32 INS8 INS32 INS42 INS42 INS43 INS42 INS42 INS42 INS21 INS32 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS32 INS40 INS45 INS45 INS45 INS32 INS42 INS42 INS42 INS42 INS42

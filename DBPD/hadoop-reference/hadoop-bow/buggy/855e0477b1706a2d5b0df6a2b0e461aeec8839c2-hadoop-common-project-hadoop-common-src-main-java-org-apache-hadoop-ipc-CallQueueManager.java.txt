@@ -1,0 +1,129 @@
+HADOOP-14035. Reduce fair call queue backoff's impact on clients. Contributed by Daryn Sharp.
+
++import java.io.IOException;
++import java.util.AbstractQueue;
++import java.util.Collection;
++import java.util.Iterator;
++import org.apache.hadoop.ipc.protobuf.RpcHeaderProtos.RpcResponseHeaderProto.RpcStatusProto;
++
++import com.google.common.annotations.VisibleForTesting;
+-public class CallQueueManager<E> {
++public class CallQueueManager<E extends Schedulable>
++    extends AbstractQueue<E> implements BlockingQueue<E> {
++  @VisibleForTesting // only!
++  CallQueueManager(BlockingQueue<E> queue, RpcScheduler scheduler,
++      boolean clientBackOffEnabled) {
++    this.putRef = new AtomicReference<BlockingQueue<E>>(queue);
++    this.takeRef = new AtomicReference<BlockingQueue<E>>(queue);
++    this.scheduler = scheduler;
++    this.clientBackOffEnabled = clientBackOffEnabled;
++  }
++
+-   * Insert e into the backing queue or block until we can.
++   * Insert e into the backing queue or block until we can.  If client
++   * backoff is enabled this method behaves like add which throws if
++   * the queue overflows.
++  @Override
+-    putRef.get().put(e);
++    if (!isClientBackoffEnabled()) {
++      putRef.get().put(e);
++    } else if (shouldBackOff(e)) {
++      throwBackoff();
++    } else {
++      add(e);
++    }
++  }
++
++  @Override
++  public boolean add(E e) {
++    try {
++      return putRef.get().add(e);
++    } catch (CallQueueOverflowException ex) {
++      // queue provided a custom exception that may control if the client
++      // should be disconnected.
++      throw ex;
++    } catch (IllegalStateException ise) {
++      throwBackoff();
++    }
++    return true;
++  }
++
++  // ideally this behavior should be controllable too.
++  private void throwBackoff() throws IllegalStateException {
++    throw CallQueueOverflowException.DISCONNECT;
+-  public boolean offer(E e) throws InterruptedException {
++  @Override
++  public boolean offer(E e) {
++  @Override
++  public boolean offer(E e, long timeout, TimeUnit unit)
++      throws InterruptedException {
++    return putRef.get().offer(e, timeout, unit);
++  }
++
++  @Override
++  public E peek() {
++    return takeRef.get().peek();
++  }
++
++  @Override
++  public E poll() {
++    return takeRef.get().poll();
++  }
++
++  @Override
++  public E poll(long timeout, TimeUnit unit) throws InterruptedException {
++    return takeRef.get().poll(timeout, unit);
++  }
++
++  @Override
++  @Override
++  @Override
++  public int remainingCapacity() {
++    return takeRef.get().remainingCapacity();
++  }
++
++
++  @Override
++  public int drainTo(Collection<? super E> c) {
++    return takeRef.get().drainTo(c);
++  }
++
++  @Override
++  public int drainTo(Collection<? super E> c, int maxElements) {
++    return takeRef.get().drainTo(c, maxElements);
++  }
++
++  @Override
++  public Iterator<E> iterator() {
++    return takeRef.get().iterator();
++  }
++
++  // exception that mimics the standard ISE thrown by blocking queues but
++  // embeds a rpc server exception for the client to retry and indicate
++  // if the client should be disconnected.
++  @SuppressWarnings("serial")
++  static class CallQueueOverflowException extends IllegalStateException {
++    private static String TOO_BUSY = "Server too busy";
++    static final CallQueueOverflowException KEEPALIVE =
++        new CallQueueOverflowException(
++            new RetriableException(TOO_BUSY),
++            RpcStatusProto.ERROR);
++    static final CallQueueOverflowException DISCONNECT =
++        new CallQueueOverflowException(
++            new RetriableException(TOO_BUSY + " - disconnecting"),
++            RpcStatusProto.FATAL);
++
++    CallQueueOverflowException(final IOException ioe,
++        final RpcStatusProto status) {
++      super("Queue full", new RpcServerException(ioe.getMessage(), ioe){
++        @Override
++        public RpcStatusProto getRpcStatusProto() {
++          return status;
++        }
++      });
++    }
++    @Override
++    public IOException getCause() {
++      return (IOException)super.getCause();
++    }
++  }

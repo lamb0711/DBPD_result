@@ -1,0 +1,211 @@
+HDFS-12911. [SPS]: Modularize the SPS code and expose necessary interfaces for external/internal implementations. Contributed by Uma Maheswara Rao G
+
+-import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_STORAGE_POLICY_SATISFIER_QUEUE_LIMIT_DEFAULT;
+-import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_STORAGE_POLICY_SATISFIER_QUEUE_LIMIT_KEY;
+-
+-import java.util.ArrayList;
+-import org.apache.hadoop.hdfs.protocol.HdfsFileStatus;
+-import org.apache.hadoop.hdfs.server.namenode.FSDirectory;
+-import org.apache.hadoop.hdfs.server.namenode.FSTreeTraverser;
+-import org.apache.hadoop.hdfs.server.namenode.FSTreeTraverser.TraverseInfo;
+-import org.apache.hadoop.hdfs.server.namenode.INode;
+-import org.apache.hadoop.hdfs.server.namenode.sps.StoragePolicySatisfier.ItemInfo;
+-  // List of pending dir to satisfy the policy
+-  private final Queue<Long> spsDirsToBeTraveresed = new LinkedList<Long>();
++  private Daemon pathIdCollector;
+-  private Daemon inodeIdCollector;
++  private FileIdCollector fileIDCollector;
+-  private final int maxQueuedItem;
++  private SPSPathIdProcessor pathIDProcessor;
+-  public BlockStorageMovementNeeded(Context context) {
++  public BlockStorageMovementNeeded(Context context,
++      FileIdCollector fileIDCollector) {
+-    this.maxQueuedItem = ctxt.getConf().getInt(
+-                  DFS_STORAGE_POLICY_SATISFIER_QUEUE_LIMIT_KEY,
+-                  DFS_STORAGE_POLICY_SATISFIER_QUEUE_LIMIT_DEFAULT);
++    this.fileIDCollector = fileIDCollector;
++    pathIDProcessor = new SPSPathIdProcessor();
+-  public synchronized void addToPendingDirQueue(long id) {
+-    spsStatus.put(id, new StoragePolicySatisfyPathStatusInfo(
+-        StoragePolicySatisfyPathStatus.PENDING));
+-    spsDirsToBeTraveresed.add(id);
+-    // Notify waiting FileInodeIdCollector thread about the newly
+-    // added SPS path.
+-    synchronized (spsDirsToBeTraveresed) {
+-      spsDirsToBeTraveresed.notify();
+-    }
+-  }
+-
+-  /**
+-   * Returns queue remaining capacity.
+-   */
+-  public synchronized int remainingCapacity() {
+-    int size = storageMovementNeeded.size();
+-    if (size >= maxQueuedItem) {
+-      return 0;
+-    } else {
+-      return (maxQueuedItem - size);
+-    }
+-  }
+-
+-    spsDirsToBeTraveresed.clear();
++    ctxt.removeAllSPSPathIds();
+-      ctxt.removeSPSHint(trackInfo.getTrackId());
++      ctxt.removeSPSHint(trackInfo.getFileId());
+-    spsDirsToBeTraveresed.remove(trackId);
++    ctxt.removeSPSPathId(trackId);
+-    while ((trackId = spsDirsToBeTraveresed.poll()) != null) {
++    while ((trackId = ctxt.getNextSPSPathId()) != null) {
+-          ctxt.removeSPSHint(itemInfo.getTrackId());
++          ctxt.removeSPSHint(itemInfo.getFileId());
+-                + itemInfo.getTrackId(), ie);
++                + itemInfo.getFileId(), ie);
+-  private class StorageMovementPendingInodeIdCollector extends FSTreeTraverser
+-      implements Runnable {
+-
+-    private int remainingCapacity = 0;
+-
+-    private List<ItemInfo> currentBatch = new ArrayList<>(maxQueuedItem);
+-
+-    StorageMovementPendingInodeIdCollector(FSDirectory dir) {
+-      super(dir);
+-    }
++  private class SPSPathIdProcessor implements Runnable {
++        LOG.info("Running FileInodeIdCollector!.");
+-            Long startINodeId = spsDirsToBeTraveresed.poll();
++            Long startINodeId = ctxt.getNextSPSPathId();
+-              synchronized (spsDirsToBeTraveresed) {
+-                spsDirsToBeTraveresed.wait(5000);
+-              }
++              Thread.sleep(3000);
+-              INode startInode = getFSDirectory().getInode(startINodeId);
+-              if (startInode != null) {
+-                try {
+-                  remainingCapacity = remainingCapacity();
+-                  spsStatus.put(startINodeId,
+-                      new StoragePolicySatisfyPathStatusInfo(
+-                          StoragePolicySatisfyPathStatus.IN_PROGRESS));
+-                  readLock();
+-                  traverseDir(startInode.asDirectory(), startINodeId,
+-                      HdfsFileStatus.EMPTY_NAME,
+-                      new SPSTraverseInfo(startINodeId));
+-                } finally {
+-                  readUnlock();
+-                }
+-                // Mark startInode traverse is done
+-                addAll(startInode.getId(), currentBatch, true);
+-                currentBatch.clear();
+-
+-                // check if directory was empty and no child added to queue
+-                DirPendingWorkInfo dirPendingWorkInfo =
+-                    pendingWorkForDirectory.get(startInode.getId());
+-                if (dirPendingWorkInfo.isDirWorkDone()) {
+-                  ctxt.removeSPSHint(startInode.getId());
+-                  pendingWorkForDirectory.remove(startInode.getId());
+-                  updateStatus(startInode.getId(), true);
+-                }
++              spsStatus.put(startINodeId,
++                  new StoragePolicySatisfyPathStatusInfo(
++                      StoragePolicySatisfyPathStatus.IN_PROGRESS));
++              fileIDCollector.scanAndCollectFileIds(startINodeId);
++              // check if directory was empty and no child added to queue
++              DirPendingWorkInfo dirPendingWorkInfo =
++                  pendingWorkForDirectory.get(startINodeId);
++              if (dirPendingWorkInfo != null
++                  && dirPendingWorkInfo.isDirWorkDone()) {
++                ctxt.removeSPSHint(startINodeId);
++                pendingWorkForDirectory.remove(startINodeId);
++                updateStatus(startINodeId, true);
+-
+-    @Override
+-    protected void checkPauseForTesting() throws InterruptedException {
+-      // TODO implement if needed
+-    }
+-
+-    @Override
+-    protected boolean processFileInode(INode inode, TraverseInfo traverseInfo)
+-        throws IOException, InterruptedException {
+-      if (LOG.isTraceEnabled()) {
+-        LOG.trace("Processing {} for statisy the policy",
+-            inode.getFullPathName());
+-      }
+-      if (!inode.isFile()) {
+-        return false;
+-      }
+-      if (inode.isFile() && inode.asFile().numBlocks() != 0) {
+-        currentBatch.add(new ItemInfo(
+-            ((SPSTraverseInfo) traverseInfo).getStartId(), inode.getId()));
+-        remainingCapacity--;
+-      }
+-      return true;
+-    }
+-
+-    @Override
+-    protected boolean canSubmitCurrentBatch() {
+-      return remainingCapacity <= 0;
+-    }
+-
+-    @Override
+-    protected void checkINodeReady(long startId) throws IOException {
+-      // SPS work won't be scheduled if NN is in standby. So, skipping NN
+-      // standby check.
+-      return;
+-    }
+-
+-    @Override
+-    protected void submitCurrentBatch(long startId)
+-        throws IOException, InterruptedException {
+-      // Add current child's to queue
+-      addAll(startId, currentBatch, false);
+-      currentBatch.clear();
+-    }
+-
+-    @Override
+-    protected void throttle() throws InterruptedException {
+-      if (LOG.isDebugEnabled()) {
+-        LOG.debug("StorageMovementNeeded queue remaining capacity is zero,"
+-            + " waiting for some free slots.");
+-      }
+-      remainingCapacity = remainingCapacity();
+-      // wait for queue to be free
+-      while (remainingCapacity <= 0) {
+-        if (LOG.isDebugEnabled()) {
+-          LOG.debug("Waiting for storageMovementNeeded queue to be free!");
+-        }
+-        Thread.sleep(5000);
+-        remainingCapacity = remainingCapacity();
+-      }
+-    }
+-
+-    @Override
+-    protected boolean canTraverseDir(INode inode) throws IOException {
+-      return true;
+-    }
+-  // TODO: FSDirectory will get removed via HDFS-12911 modularization work
+-  public void init(FSDirectory fsd) {
+-    inodeIdCollector = new Daemon(new StorageMovementPendingInodeIdCollector(
+-        fsd));
+-    inodeIdCollector.setName("FileInodeIdCollector");
+-    inodeIdCollector.start();
++  public void activate() {
++    pathIdCollector = new Daemon(pathIDProcessor);
++    pathIdCollector.setName("SPSPathIdProcessor");
++    pathIdCollector.start();
+-    if (inodeIdCollector != null) {
+-      inodeIdCollector.interrupt();
+-    }
+-  }
+-
+-  class SPSTraverseInfo extends TraverseInfo {
+-    private long startId;
+-
+-    SPSTraverseInfo(long startId) {
+-      this.startId = startId;
+-    }
+-
+-    public long getStartId() {
+-      return startId;
++    if (pathIdCollector != null) {
++      pathIdCollector.interrupt();
+
+INS31 MOV43 INS43 INS43 MOV83 MOV42 MOV44 INS44 INS8 UPD42 UPD42 UPD42 INS42 UPD42 INS42 UPD42 INS43 INS42 MOV21 MOV21 MOV21 INS42 INS7 INS42 INS42 INS14 UPD42 UPD42 UPD42 UPD42 UPD42 INS14 UPD42 UPD45 UPD42 UPD42 UPD42 UPD43 MOV43 INS21 MOV43 INS42 UPD42 INS32 UPD42 UPD42 UPD42 UPD42 INS42 INS42 INS45 INS8 MOV8 UPD42 UPD42 MOV21 MOV21 MOV21 UPD42 UPD42 INS27 UPD42 UPD42 UPD34 UPD42 MOV42 UPD42 INS42 INS27 MOV32 UPD42 MOV42 INS42 INS33 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 DEL40 DEL26 DEL40 DEL26 DEL40 DEL26 DEL40 DEL26 DEL40 DEL26 DEL40 DEL26 DEL40 DEL26 DEL40 DEL26 DEL40 DEL26 DEL83 DEL42 DEL43 DEL42 DEL43 DEL74 DEL42 DEL43 DEL42 DEL43 DEL74 DEL14 DEL83 DEL39 DEL42 DEL42 DEL32 DEL42 DEL42 DEL42 DEL32 DEL42 DEL42 DEL42 DEL40 DEL14 DEL32 DEL8 DEL31 DEL83 DEL83 DEL39 DEL42 DEL39 DEL42 DEL44 DEL42 DEL42 DEL42 DEL32 DEL21 DEL42 DEL42 DEL42 DEL32 DEL21 DEL8 DEL51 DEL8 DEL31 DEL66 DEL65 DEL29 DEL83 DEL83 DEL39 DEL42 DEL39 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL42 DEL27 DEL34 DEL41 DEL8 DEL42 DEL42 DEL27 DEL36 DEL41 DEL8 DEL25 DEL8 DEL31 DEL42 DEL43 DEL83 DEL39 DEL42 DEL34 DEL59 DEL23 DEL83 DEL42 DEL43 DEL42 DEL43 DEL74 DEL42 DEL42 DEL43 DEL74 DEL42 DEL14 DEL59 DEL23 DEL42 DEL42 DEL43 DEL42 DEL44 DEL42 DEL46 DEL8 DEL31 DEL42 DEL42 DEL32 DEL40 DEL42 DEL43 DEL42 DEL14 DEL42 DEL42 DEL32 DEL7 DEL21 DEL42 DEL32 DEL21 DEL8 DEL42 DEL32 DEL21 DEL8 DEL54 DEL42 DEL42 DEL42 DEL32 DEL42 DEL9 DEL32 DEL21 DEL42 DEL42 DEL32 DEL21 DEL42 DEL32 DEL42 DEL32 DEL42 DEL32 DEL42 DEL32 DEL42 DEL8 DEL51 DEL8 DEL42 DEL43 DEL42 DEL42 DEL32 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL33 DEL27 DEL25 DEL8 DEL42 DEL78 DEL83 DEL39 DEL42 DEL42 DEL43 DEL8 DEL31 DEL42 DEL78 DEL83 DEL39 DEL42 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL43 DEL42 DEL42 DEL32 DEL42 DEL42 DEL45 DEL42 DEL42 DEL32 DEL32 DEL21 DEL8 DEL25 DEL42 DEL42 DEL32 DEL38 DEL9 DEL41 DEL8 DEL25 DEL42 DEL42 DEL32 DEL42 DEL42 DEL32 DEL42 DEL32 DEL34 DEL27 DEL27 DEL42 DEL42 DEL42 DEL43 DEL42 DEL43 DEL42 DEL11 DEL36 DEL42 DEL32 DEL42 DEL42 DEL32 DEL14 DEL32 DEL21 DEL42 DEL37 DEL21 DEL8 DEL25 DEL9 DEL41 DEL8 DEL31 DEL42 DEL78 DEL83 DEL39 DEL42 DEL42 DEL34 DEL27 DEL41 DEL8 DEL31 DEL42 DEL78 DEL83 DEL39 DEL42 DEL39 DEL42 DEL44 DEL42 DEL43 DEL41 DEL8 DEL31 DEL42 DEL78 DEL83 DEL39 DEL42 DEL39 DEL42 DEL44 DEL42 DEL43 DEL42 DEL43 DEL42 DEL42 DEL42 DEL9 DEL32 DEL21 DEL42 DEL42 DEL32 DEL21 DEL8 DEL31 DEL42 DEL78 DEL83 DEL39 DEL42 DEL42 DEL43 DEL42 DEL42 DEL32 DEL42 DEL42 DEL45 DEL45 DEL27 DEL32 DEL21 DEL8 DEL25 DEL42 DEL42 DEL32 DEL7 DEL21 DEL42 DEL34 DEL27 DEL42 DEL42 DEL32 DEL42 DEL42 DEL45 DEL32 DEL21 DEL8 DEL25 DEL42 DEL42 DEL34 DEL32 DEL21 DEL42 DEL42 DEL32 DEL7 DEL21 DEL8 DEL61 DEL8 DEL31 DEL42 DEL78 DEL83 DEL39 DEL42 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL9 DEL41 DEL8 DEL31 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL14 DEL14 DEL42 DEL42 DEL43 DEL83 DEL39 DEL42 DEL59 DEL23 DEL42 DEL39 DEL42 DEL44 DEL52 DEL42 DEL22 DEL42 DEL7 DEL21 DEL8 DEL31 DEL83 DEL39 DEL42 DEL42 DEL41 DEL8 DEL31 DEL55

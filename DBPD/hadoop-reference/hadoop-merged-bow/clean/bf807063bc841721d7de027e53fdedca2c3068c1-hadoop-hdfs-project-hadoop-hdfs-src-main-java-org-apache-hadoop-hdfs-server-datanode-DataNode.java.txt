@@ -1,0 +1,189 @@
+Merging r1466653 through r1467712 from trunk.
+
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/branches/HDFS-2802@1467713 13f79535-47bb-0310-9956-ffa450edef68
+
++import java.io.FileInputStream;
+-import java.net.ServerSocket;
+-import java.nio.channels.ServerSocketChannel;
++import org.apache.hadoop.hdfs.net.DomainPeerServer;
++import org.apache.hadoop.hdfs.net.TcpPeerServer;
+-import org.apache.hadoop.ipc.Server;
++import org.apache.hadoop.net.unix.DomainSocket;
++  static final int CURRENT_BLOCK_FORMAT_VERSION = 1;
++  Daemon localDataXceiverServer = null;
++  final private String fileDescriptorPassingDisabledReason;
++
++    // Determine whether we should try to pass file descriptors to clients.
++    if (conf.getBoolean(DFSConfigKeys.DFS_CLIENT_READ_SHORTCIRCUIT_KEY,
++              DFSConfigKeys.DFS_CLIENT_READ_SHORTCIRCUIT_DEFAULT)) {
++      String reason = DomainSocket.getLoadingFailureReason();
++      if (reason != null) {
++        LOG.warn("File descriptor passing is disabled because " + reason);
++        this.fileDescriptorPassingDisabledReason = reason;
++      } else {
++        LOG.info("File descriptor passing is enabled.");
++        this.fileDescriptorPassingDisabledReason = null;
++      }
++    } else {
++      this.fileDescriptorPassingDisabledReason =
++          "File descriptor passing was not configured.";
++      LOG.debug(this.fileDescriptorPassingDisabledReason);
++    }
++
+-    ServerSocket ss;
+-    if (secureResources == null) {
+-      InetSocketAddress addr = DataNode.getStreamingAddr(conf);
+-      ss = (dnConf.socketWriteTimeout > 0) ? 
+-          ServerSocketChannel.open().socket() : new ServerSocket();
+-          Server.bind(ss, addr, 0);
++    TcpPeerServer tcpPeerServer;
++    if (secureResources != null) {
++      tcpPeerServer = new TcpPeerServer(secureResources);
+-      ss = secureResources.getStreamingSocket();
++      tcpPeerServer = new TcpPeerServer(dnConf.socketWriteTimeout,
++          DataNode.getStreamingAddr(conf));
+-    ss.setReceiveBufferSize(HdfsConstants.DEFAULT_DATA_SOCKET_SIZE); 
+-
+-    streamingAddr = new InetSocketAddress(ss.getInetAddress().getHostAddress(),
+-                                     ss.getLocalPort());
+-
++    tcpPeerServer.setReceiveBufferSize(HdfsConstants.DEFAULT_DATA_SOCKET_SIZE);
++    streamingAddr = tcpPeerServer.getStreamingAddr();
+-        new DataXceiverServer(ss, conf, this));
++        new DataXceiverServer(tcpPeerServer, conf, this));
++
++    if (conf.getBoolean(DFSConfigKeys.DFS_CLIENT_READ_SHORTCIRCUIT_KEY,
++              DFSConfigKeys.DFS_CLIENT_READ_SHORTCIRCUIT_DEFAULT) ||
++        conf.getBoolean(DFSConfigKeys.DFS_CLIENT_DOMAIN_SOCKET_DATA_TRAFFIC,
++              DFSConfigKeys.DFS_CLIENT_DOMAIN_SOCKET_DATA_TRAFFIC_DEFAULT)) {
++      DomainPeerServer domainPeerServer =
++                getDomainPeerServer(conf, streamingAddr.getPort());
++      if (domainPeerServer != null) {
++        this.localDataXceiverServer = new Daemon(threadGroup,
++            new DataXceiverServer(domainPeerServer, conf, this));
++        LOG.info("Listening on UNIX domain socket: " +
++            domainPeerServer.getBindPath());
++      }
++    }
++  }
++
++  static DomainPeerServer getDomainPeerServer(Configuration conf,
++      int port) throws IOException {
++    String domainSocketPath =
++        conf.getTrimmed(DFSConfigKeys.DFS_DOMAIN_SOCKET_PATH_KEY,
++            DFSConfigKeys.DFS_DOMAIN_SOCKET_PATH_DEFAULT);
++    if (domainSocketPath.isEmpty()) {
++      if (conf.getBoolean(DFSConfigKeys.DFS_CLIENT_READ_SHORTCIRCUIT_KEY,
++            DFSConfigKeys.DFS_CLIENT_READ_SHORTCIRCUIT_DEFAULT) &&
++         (!conf.getBoolean(DFSConfigKeys.DFS_CLIENT_USE_LEGACY_BLOCKREADERLOCAL,
++          DFSConfigKeys.DFS_CLIENT_USE_LEGACY_BLOCKREADERLOCAL_DEFAULT))) {
++        LOG.warn("Although short-circuit local reads are configured, " +
++            "they are disabled because you didn't configure " +
++            DFSConfigKeys.DFS_DOMAIN_SOCKET_PATH_KEY);
++      }
++      return null;
++    }
++    if (DomainSocket.getLoadingFailureReason() != null) {
++      throw new RuntimeException("Although a UNIX domain socket " +
++          "path is configured as " + domainSocketPath + ", we cannot " +
++          "start a localDataXceiverServer because " +
++          DomainSocket.getLoadingFailureReason());
++    }
++    DomainPeerServer domainPeerServer =
++      new DomainPeerServer(domainSocketPath, port);
++    domainPeerServer.setReceiveBufferSize(
++        HdfsConstants.DEFAULT_DATA_SOCKET_SIZE);
++    return domainPeerServer;
++  @InterfaceAudience.LimitedPrivate("HDFS")
++  static public class ShortCircuitFdsUnsupportedException extends IOException {
++    private static final long serialVersionUID = 1L;
++    public ShortCircuitFdsUnsupportedException(String msg) {
++      super(msg);
++    }
++  }
++
++  @InterfaceAudience.LimitedPrivate("HDFS")
++  static public class ShortCircuitFdsVersionException extends IOException {
++    private static final long serialVersionUID = 1L;
++    public ShortCircuitFdsVersionException(String msg) {
++      super(msg);
++    }
++  }
++
++  FileInputStream[] requestShortCircuitFdsForRead(final ExtendedBlock blk,
++      final Token<BlockTokenIdentifier> token, int maxVersion) 
++          throws ShortCircuitFdsUnsupportedException,
++            ShortCircuitFdsVersionException, IOException {
++    if (fileDescriptorPassingDisabledReason != null) {
++      throw new ShortCircuitFdsUnsupportedException(
++          fileDescriptorPassingDisabledReason);
++    }
++    checkBlockToken(blk, token, BlockTokenSecretManager.AccessMode.READ);
++    int blkVersion = CURRENT_BLOCK_FORMAT_VERSION;
++    if (maxVersion < blkVersion) {
++      throw new ShortCircuitFdsVersionException("Your client is too old " +
++        "to read this block!  Its format version is " + 
++        blkVersion + ", but the highest format version you can read is " +
++        maxVersion);
++    }
++    metrics.incrBlocksGetLocalPathInfo();
++    return data.getShortCircuitFdsForRead(blk);
++  }
++
+-
+-      // wait for all data receiver threads to exit
+-      if (this.threadGroup != null) {
+-        int sleepMs = 2;
+-        while (true) {
+-          this.threadGroup.interrupt();
+-          LOG.info("Waiting for threadgroup to exit, active threads is " +
+-                   this.threadGroup.activeCount());
+-          if (this.threadGroup.activeCount() == 0) {
+-            break;
+-          }
+-          try {
+-            Thread.sleep(sleepMs);
+-          } catch (InterruptedException e) {}
+-          sleepMs = sleepMs * 3 / 2; // exponential backoff
+-          if (sleepMs > 1000) {
+-            sleepMs = 1000;
+-          }
++    }
++    if (localDataXceiverServer != null) {
++      ((DataXceiverServer) this.localDataXceiverServer.getRunnable()).kill();
++      this.localDataXceiverServer.interrupt();
++    }
++    // wait for all data receiver threads to exit
++    if (this.threadGroup != null) {
++      int sleepMs = 2;
++      while (true) {
++        this.threadGroup.interrupt();
++        LOG.info("Waiting for threadgroup to exit, active threads is " +
++                 this.threadGroup.activeCount());
++        if (this.threadGroup.activeCount() == 0) {
++          break;
++        }
++        try {
++          Thread.sleep(sleepMs);
++        } catch (InterruptedException e) {}
++        sleepMs = sleepMs * 3 / 2; // exponential backoff
++        if (sleepMs > 1000) {
++          sleepMs = 1000;
+-      // wait for dataXceiveServer to terminate
++      this.threadGroup = null;
++    }
++    if (this.dataXceiverServer != null) {
++      // wait for dataXceiverServer to terminate
++    if (this.localDataXceiverServer != null) {
++      // wait for localDataXceiverServer to terminate
++      try {
++        this.localDataXceiverServer.join();
++      } catch (InterruptedException ie) {
++      }
++    }
++    if (localDataXceiverServer != null) {
++      localDataXceiverServer.start();
++    }
+
+MOV26 MOV26 MOV26 INS26 UPD40 UPD40 UPD40 INS40 INS23 INS23 INS23 INS31 INS31 INS55 INS55 INS31 INS83 INS83 INS39 INS59 INS43 INS59 INS83 INS83 INS43 INS59 INS83 MOV39 MOV42 MOV44 MOV43 INS8 INS83 INS43 INS42 INS44 INS44 INS43 INS8 INS79 INS83 INS83 INS42 INS43 INS23 INS31 INS79 INS83 INS83 INS42 INS43 INS23 INS31 INS5 INS42 INS44 INS44 INS44 INS43 INS43 INS43 INS8 MOV8 INS42 INS34 INS42 INS42 INS33 INS42 INS42 INS25 MOV60 INS25 INS21 INS21 MOV21 MOV21 MOV21 MOV21 INS25 INS42 INS43 INS42 INS39 INS42 INS42 INS60 INS25 INS25 INS60 MOV21 INS41 INS40 INS45 INS42 INS83 INS83 INS83 INS39 INS59 INS83 INS42 INS44 INS8 INS40 INS45 INS42 INS83 INS83 INS83 INS39 INS59 INS83 INS42 INS44 INS8 INS43 INS85 INS83 INS43 INS42 INS83 INS74 INS42 INS39 INS42 INS42 INS42 UPD42 MOV42 INS25 INS21 INS60 INS25 INS21 INS41 MOV25 MOV60 MOV21 MOV21 MOV25 MOV25 INS25 INS25 INS25 INS25 MOV25 MOV25 MOV25 MOV25 INS25 INS32 INS8 INS8 UPD43 UPD27 MOV27 INS8 INS8 INS32 INS7 INS27 MOV8 INS42 INS43 INS59 INS32 MOV8 INS27 INS8 INS43 INS59 INS42 INS42 INS34 INS43 INS42 INS46 INS42 INS34 INS43 INS42 INS46 INS42 INS42 INS43 INS43 INS27 INS8 INS32 INS39 INS59 INS27 INS8 INS32 INS32 MOV27 INS8 INS27 INS8 INS27 INS8 INS27 INS8 INS27 INS8 INS42 INS42 INS40 INS40 INS60 INS25 INS21 INS21 UPD42 UPD42 INS21 INS21 INS42 INS42 INS40 INS42 INS32 INS32 INS32 INS25 INS42 INS42 INS32 INS42 INS42 INS25 INS41 INS32 INS33 INS53 INS42 INS42 INS14 UPD42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS33 INS53 UPD42 MOV42 UPD42 MOV42 INS42 INS40 INS42 INS42 INS42 INS42 INS53 UPD42 MOV42 UPD42 MOV42 INS42 INS42 INS42 MOV21 MOV21 INS42 INS33 INS21 INS21 INS21 INS22 INS33 MOV54 INS22 INS33 INS54 INS42 INS33 INS21 INS43 INS59 INS27 INS8 INS8 INS7 INS32 INS7 INS7 INS42 INS42 INS42 INS42 INS40 INS40 INS42 INS42 INS40 INS40 UPD43 INS27 INS8 INS42 INS42 INS40 INS40 INS27 INS8 INS33 INS42 INS42 INS14 INS43 INS42 INS42 INS14 INS14 INS32 INS32 INS7 INS52 INS42 INS52 INS42 INS8 INS12 INS32 INS42 INS42 INS32 INS42 INS33 INS21 INS21 INS21 INS21 INS22 INS45 INS42 INS42 INS22 INS42 INS14 INS42 INS14 UPD42 UPD42 INS42 INS32 INS42 INS33 MOV21 MOV21 INS32 INS36 INS21 INS43 INS27 INS42 INS43 INS42 INS43 INS27 INS36 INS42 INS22 INS42 INS22 INS33 INS21 INS44 INS8 INS42 INS42 INS42 INS42 INS32 INS7 INS32 INS7 INS52 INS42 INS52 INS42 INS43 INS42 INS43 INS40 MOV32 INS42 INS42 INS32 INS42 INS42 INS40 INS40 INS38 INS32 INS42 INS27 INS42 INS45 INS45 INS32 INS42 INS42 INS27 INS42 INS45 INS42 INS11 INS52 INS42 INS52 INS42 INS32 INS43 INS42 INS42 INS42 INS27 INS22 INS42 INS42 INS42 INS45 INS22 INS33 INS42 INS42 INS42 INS42 INS22 INS14 UPD42 UPD42 INS27 INS32 INS42 INS42 INS27 INS45 INS45 INS42 INS42 INS45 INS45 INS43 INS32 INS22 INS42 INS42 INS45 INS42 INS52 INS42 INS52 INS42 INS52 INS42 INS43 INS42 INS14 INS45 INS32 UPD42 MOV42 UPD42 MOV42 INS40 INS40 INS45 INS45 INS40 INS42 INS22 INS42 INS52 INS42 INS42 UPD43 MOV43 INS42 INS42 INS52 UPD42 MOV42 UPD42 MOV42 INS52 INS42 UPD42 DEL42 DEL42 DEL40 DEL34 DEL27 DEL36 DEL42 DEL42 DEL32 DEL42 DEL32 DEL14 DEL16 DEL34 DEL42 DEL32 DEL7 DEL21 DEL83 DEL25 DEL42 DEL43 DEL32 DEL42 DEL32 DEL32 DEL14 DEL7 DEL21 DEL8 DEL31 DEL25 DEL8

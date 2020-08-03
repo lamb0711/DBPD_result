@@ -1,0 +1,198 @@
+YARN-4359. Update LowCost agents logic to take advantage of YARN-4358. (Jonathan Yaniv and Ishai Menache via Subru).
+
+-import java.util.HashMap;
++import org.apache.hadoop.yarn.server.resourcemanager.reservation.RLESparseResourceAllocation.RLEOperator;
+-import org.apache.hadoop.yarn.server.resourcemanager.reservation.RLESparseResourceAllocation.RLEOperator;
+- * over the job stages in descending order. For each stage, the algorithm: 1.
+- * Determines an interval [stageArrivalTime, stageDeadline) in which the stage
+- * is allocated. 2. Computes an allocation for the stage inside the interval.
+- *
+- * For ANY and ALL jobs, phase 1 sets the allocation window of each stage to be
+- * [jobArrival, jobDeadline]. For ORDER and ORDER_NO_GAP jobs, the deadline of
+- * each stage is set as succcessorStartTime - the starting time of its
+- * succeeding stage (or jobDeadline if it is the last stage).
+- *
+- * The phases are set using the two functions: 1. setAlgEarliestStartTime 2.
+- * setAlgComputeStageAllocation
++ * over the job stages in ascending/descending order, depending on the flag
++ * allocateLeft. For each stage, the algorithm: 1. Determines an interval
++ * [stageArrival, stageDeadline) in which the stage is allocated. 2. Computes an
++ * allocation for the stage inside the interval. For ANY and ALL jobs, phase 1
++ * sets the allocation window of each stage to be [jobArrival, jobDeadline]. For
++ * ORDER and ORDER_NO_GAP jobs, the deadline of each stage is set as
++ * succcessorStartTime - the starting time of its succeeding stage (or
++ * jobDeadline if it is the last stage). The phases are set using the two
++ * functions: 1. setAlgStageExecutionInterval 2.setAlgStageAllocator
+-  private Map<Long, Resource> planLoads;
++  private RLESparseResourceAllocation planLoads;
+-  private StageEarliestStart algStageEarliestStart = null;
++  private StageExecutionInterval algStageExecutionInterval = null;
+-  public IterativePlanner(StageEarliestStart algEarliestStartTime,
++  public IterativePlanner(StageExecutionInterval algStageExecutionInterval,
+-    setAlgStageEarliestStart(algEarliestStartTime);
++    setAlgStageExecutionInterval(algStageExecutionInterval);
+-    // Stage deadlines
+-    long stageDeadline = stepRoundDown(reservation.getDeadline(), step);
+-    long successorStartingTime = -1;
+-    long predecessorEndTime = stepRoundDown(reservation.getArrival(), step);
+-    long stageArrivalTime = -1;
+-
+-      // Compute an adjusted earliestStart for this resource
+-      // (we need this to provision some space for the ORDER contracts)
++      // Set the stageArrival and stageDeadline
++      ReservationInterval stageInterval =
++          setStageExecutionInterval(plan, reservation, currentReservationStage,
++              allocations);
++      Long stageArrival = stageInterval.getStartTime();
++      Long stageDeadline = stageInterval.getEndTime();
+-      if (allocateLeft) {
+-        stageArrivalTime = predecessorEndTime;
+-      } else {
+-        stageArrivalTime = reservation.getArrival();
+-        if (jobType == ReservationRequestInterpreter.R_ORDER
+-            || jobType == ReservationRequestInterpreter.R_ORDER_NO_GAP) {
+-          stageArrivalTime =
+-              computeEarliestStartingTime(plan, reservation,
+-                  stageProvider.getCurrentIndex(), currentReservationStage,
+-                  stageDeadline);
+-        }
+-        stageArrivalTime = stepRoundUp(stageArrivalTime, step);
+-        stageArrivalTime = Math.max(stageArrivalTime, reservation.getArrival());
+-      }
+-      // Compute the allocation of a single stage
++      // Compute stage allocation
+-          computeStageAllocation(plan, currentReservationStage,
+-              stageArrivalTime, stageDeadline, user, reservationId);
++          computeStageAllocation(plan, currentReservationStage, stageArrival,
++              stageDeadline, user, reservationId);
+-      // Get the start & end time of the current allocation
+-      Long stageStartTime = findEarliestTime(curAlloc);
+-      Long stageEndTime = findLatestTime(curAlloc);
++      // Validate ORDER_NO_GAP
++      if (jobType == ReservationRequestInterpreter.R_ORDER_NO_GAP) {
++        if (!validateOrderNoGap(allocations, curAlloc, allocateLeft)) {
++          throw new PlanningException(
++              "The allocation found does not respect ORDER_NO_GAP");
++        }
++      }
+-
+-      // If ORDER job, set the stageDeadline of the next stage to be processed
+-      if (jobType == ReservationRequestInterpreter.R_ORDER
+-          || jobType == ReservationRequestInterpreter.R_ORDER_NO_GAP) {
+-
+-        // CHECK ORDER_NO_GAP
+-        // Verify that there is no gap, in case the job is ORDER_NO_GAP
+-        // note that the test is different left-to-right and right-to-left
+-        if (jobType == ReservationRequestInterpreter.R_ORDER_NO_GAP
+-            && successorStartingTime != -1
+-            && ((allocateLeft && predecessorEndTime < stageStartTime) ||
+-                (!allocateLeft && (stageEndTime < successorStartingTime))
+-               )
+-            || (!isNonPreemptiveAllocation(curAlloc))) {
+-          throw new PlanningException(
+-              "The allocation found does not respect ORDER_NO_GAP");
+-        }
+-
+-        if (allocateLeft) {
+-          // Store the stageStartTime and set the new stageDeadline
+-          predecessorEndTime = stageEndTime;
+-        } else {
+-          // Store the stageStartTime and set the new stageDeadline
+-          successorStartingTime = stageStartTime;
+-          stageDeadline = stageStartTime;
+-        }
+-      }
++  }
++  protected static boolean validateOrderNoGap(
++      RLESparseResourceAllocation allocations,
++      Map<ReservationInterval, Resource> curAlloc, boolean allocateLeft) {
++
++    // Left to right
++    if (allocateLeft) {
++      Long stageStartTime = findEarliestTime(curAlloc);
++      Long allocationEndTime = allocations.getLatestNonNullTime();
++
++      // Check that there is no gap between stages
++      if ((allocationEndTime != -1) && (allocationEndTime < stageStartTime)) {
++        return false;
++      }
++      // Right to left
++    } else {
++      Long stageEndTime = findLatestTime(curAlloc);
++      Long allocationStartTime = allocations.getEarliestStartTime();
++
++      // Check that there is no gap between stages
++      if ((allocationStartTime != -1) && (stageEndTime < allocationStartTime)) {
++        return false;
++      }
++    }
++
++    // Check that the stage allocation does not violate ORDER_NO_GAP
++    if (!isNonPreemptiveAllocation(curAlloc)) {
++      return false;
++    }
++
++    // The allocation is legal
++    return true;
+-    if (this.algStageAllocator instanceof StageAllocatorLowCostAligned) {
+-      planLoads = getAllLoadsInInterval(plan, jobArrival, jobDeadline);
+-      ReservationAllocation oldRes = plan.getReservationById(reservationId);
+-      if (oldRes != null) {
+-        planModifications =
+-            RLESparseResourceAllocation.merge(plan.getResourceCalculator(),
+-                plan.getTotalCapacity(), planModifications,
+-                oldRes.getResourcesOverTime(), RLEOperator.subtract,
+-                jobArrival, jobDeadline);
+-      }
++    planLoads = plan.getCumulativeLoadOverTime(jobArrival, jobDeadline);
++    ReservationAllocation oldRes = plan.getReservationById(reservationId);
++    if (oldRes != null) {
++      planLoads =
++          RLESparseResourceAllocation.merge(plan.getResourceCalculator(),
++              plan.getTotalCapacity(), planLoads,
++              oldRes.getResourcesOverTime(), RLEOperator.subtract, jobArrival,
++              jobDeadline);
+-
+-  }
+-
+-  private Map<Long, Resource> getAllLoadsInInterval(Plan plan, long startTime,
+-      long endTime) {
+-
+-    // Create map
+-    Map<Long, Resource> loads = new HashMap<Long, Resource>();
+-
+-    // Calculate the load for every time slot between [start,end)
+-    for (long t = startTime; t < endTime; t += step) {
+-      Resource load = plan.getTotalCommittedResources(t);
+-      loads.put(t, load);
+-    }
+-
+-    // Return map
+-    return loads;
+-
+-  private boolean isNonPreemptiveAllocation(
++  private static boolean isNonPreemptiveAllocation(
+-  // Call algEarliestStartTime()
+-  protected long computeEarliestStartingTime(Plan plan,
+-      ReservationDefinition reservation, int index,
+-      ReservationRequest currentReservationStage, long stageDeadline) {
+-
+-    return algStageEarliestStart.setEarliestStartTime(plan, reservation, index,
+-        currentReservationStage, stageDeadline);
+-
++  // Call setStageExecutionInterval()
++  protected ReservationInterval setStageExecutionInterval(Plan plan,
++      ReservationDefinition reservation,
++      ReservationRequest currentReservationStage,
++      RLESparseResourceAllocation allocations) {
++    return algStageExecutionInterval.computeExecutionInterval(plan,
++        reservation, currentReservationStage, allocateLeft, allocations);
+-  // Set the algorithm: algStageEarliestStart
+-  public IterativePlanner setAlgStageEarliestStart(StageEarliestStart alg) {
++  // Set the algorithm: algStageExecutionInterval
++  public IterativePlanner setAlgStageExecutionInterval(
++      StageExecutionInterval alg) {
+-    this.algStageEarliestStart = alg;
++    this.algStageExecutionInterval = alg;
+-    private ListIterator<ReservationRequest> li;
++    private final ListIterator<ReservationRequest> li;

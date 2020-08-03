@@ -1,0 +1,216 @@
+YARN-6128. Add support for AMRMProxy HA. (Botong Huang via Subru).
+
++import org.apache.hadoop.yarn.api.records.Container;
++import org.apache.hadoop.yarn.api.records.NMToken;
+-  private ApplicationAttemptId attemptId;
++  private boolean keepContainersAcrossApplicationAttempts;
++  /*
++   * This flag is used as an indication that this method launchUAM/reAttachUAM
++   * is called (and perhaps blocked in initializeUnmanagedAM below due to RM
++   * connection/failover issue and not finished yet). Set the flag before
++   * calling the blocking call to RM.
++   */
++  private boolean connectionInitiated;
++
++  /**
++   * Constructor.
++   *
++   * @param conf configuration
++   * @param appId application Id to use for this UAM
++   * @param queueName the queue of the UAM
++   * @param submitter user name of the app
++   * @param appNameSuffix the app name suffix to use
++   * @param keepContainersAcrossApplicationAttempts keep container flag for UAM
++   *          recovery. See {@link ApplicationSubmissionContext
++   *          #setKeepContainersAcrossApplicationAttempts(boolean)}
++   */
+-      String queueName, String submitter, String appNameSuffix) {
++      String queueName, String submitter, String appNameSuffix,
++      boolean keepContainersAcrossApplicationAttempts) {
++    this.connectionInitiated = false;
++    this.keepContainersAcrossApplicationAttempts =
++        keepContainersAcrossApplicationAttempts;
++  }
++
++  /**
++   * Launch a new UAM in the resource manager.
++   *
++   * @return identifier uam identifier
++   * @throws YarnException if fails
++   * @throws IOException if fails
++   */
++  public Token<AMRMTokenIdentifier> launchUAM()
++      throws YarnException, IOException {
++    this.connectionInitiated = true;
++
++    // Blocking call to RM
++    Token<AMRMTokenIdentifier> amrmToken =
++        initializeUnmanagedAM(this.applicationId);
++
++    // Creates the UAM connection
++    createUAMProxy(amrmToken);
++    return amrmToken;
++  }
++
++  /**
++   * Re-attach to an existing UAM in the resource manager.
++   *
++   * @param amrmToken the UAM token
++   * @throws IOException if re-attach fails
++   * @throws YarnException if re-attach fails
++   */
++  public void reAttachUAM(Token<AMRMTokenIdentifier> amrmToken)
++      throws IOException, YarnException {
++    this.connectionInitiated = true;
++
++    // Creates the UAM connection
++    createUAMProxy(amrmToken);
++  }
++
++  protected void createUAMProxy(Token<AMRMTokenIdentifier> amrmToken)
++      throws IOException {
++    this.userUgi = UserGroupInformation.createProxyUser(
++        this.applicationId.toString(), UserGroupInformation.getCurrentUser());
++    this.rmProxy = createRMProxy(ApplicationMasterProtocol.class, this.conf,
++        this.userUgi, amrmToken);
+-   * @param request the register request
+-   * @return the register response
++   * @param request RegisterApplicationMasterRequest
++   * @return register response
+-  public RegisterApplicationMasterResponse createAndRegisterApplicationMaster(
++  public RegisterApplicationMasterResponse registerApplicationMaster(
+-    // This need to be done first in this method, because it is used as an
+-    // indication that this method is called (and perhaps blocked due to RM
+-    // connection and not finished yet)
++    // Save the register request for re-register later
+-    // attemptId will be available after this call
+-    UnmanagedAMIdentifier identifier =
+-        initializeUnmanagedAM(this.applicationId);
+-
+-    try {
+-      this.userUgi = UserGroupInformation.createProxyUser(
+-          identifier.getAttemptId().toString(),
+-          UserGroupInformation.getCurrentUser());
+-    } catch (IOException e) {
+-      LOG.error("Exception while trying to get current user", e);
+-      throw new YarnRuntimeException(e);
+-    }
+-
+-    this.rmProxy = createRMProxy(ApplicationMasterProtocol.class, this.conf,
+-        this.userUgi, identifier.getToken());
+-
+-    LOG.info("Registering the Unmanaged application master {}", this.attemptId);
++    // Since we have setKeepContainersAcrossApplicationAttempts = true for UAM.
++    // We do not expect application already registered exception here
++    LOG.info("Registering the Unmanaged application master {}",
++        this.applicationId);
++    for (Container container : response.getContainersFromPreviousAttempts()) {
++      LOG.info("RegisterUAM returned existing running container "
++          + container.getId());
++    }
++    for (NMToken nmToken : response.getNMTokensFromPreviousAttempts()) {
++      LOG.info("RegisterUAM returned existing NM token for node "
++          + nmToken.getNodeId());
++    }
++
+-      if (this.registerRequest != null) {
+-        // This is possible if the async registerApplicationMaster is still
++      if (this.connectionInitiated) {
++        // This is possible if the async launchUAM is still
+-            + " Stopping the UAM client thread anyways.");
++            + " Stopping the UAM heartbeat thread anyways.");
+-        this.registerRequest, this.attemptId);
++        this.registerRequest, this.applicationId);
+-        KillApplicationRequest.newInstance(this.attemptId.getApplicationId());
++        KillApplicationRequest.newInstance(this.applicationId);
+-    // 1. registerApplicationMaster is not called at all. Should throw here.
+-    // 2. registerApplicationMaster is called but hasn't successfully returned.
++    // 1. launchUAM is not called at all. Should throw here.
++    // 2. launchUAM is called but hasn't successfully returned.
+-      if (this.registerRequest != null) {
++      if (this.connectionInitiated) {
+-            "AllocateAsync should not be called before createAndRegister");
++            "AllocateAsync should not be called before launchUAM");
+-   * Returns the application attempt id of the UAM.
++   * Returns the application id of the UAM.
+-   * @return attempt id of the UAM
++   * @return application id of the UAM
+-  public ApplicationAttemptId getAttemptId() {
+-    return this.attemptId;
++  public ApplicationId getAppId() {
++    return this.applicationId;
+-   * after which it returns the AM-RM token and the attemptId.
++   * after which it returns the AM-RM token.
+-   * @return the UAM identifier
++   * @return the UAM token
+-  protected UnmanagedAMIdentifier initializeUnmanagedAM(ApplicationId appId)
+-      throws IOException, YarnException {
++  protected Token<AMRMTokenIdentifier> initializeUnmanagedAM(
++      ApplicationId appId) throws IOException, YarnException {
+-      ApplicationAttemptReport attemptReport = monitorCurrentAppAttempt(appId,
++      monitorCurrentAppAttempt(appId,
+-      this.attemptId = attemptReport.getApplicationAttemptId();
+-      return getUAMIdentifier();
++      return getUAMToken();
++    context.setKeepContainersAcrossApplicationAttempts(
++        this.keepContainersAcrossApplicationAttempts);
+-                "Received non-accepted application state: " + state
+-                    + ". Application " + appId + " not the first attempt?");
++                "Received non-accepted application state: " + state + " for "
++                    + appId + ". This is likely because this is not the first "
++                    + "app attempt in home sub-cluster, and AMRMProxy HA "
++                    + "(yarn.nodemanager.amrmproxy.ha.enable) is not enabled.");
+-   * Gets the identifier of the unmanaged AM.
++   * Gets the amrmToken of the unmanaged AM.
+-   * @return the identifier of the unmanaged AM.
++   * @return the amrmToken of the unmanaged AM.
+-  protected UnmanagedAMIdentifier getUAMIdentifier()
++  protected Token<AMRMTokenIdentifier> getUAMToken()
+-        getApplicationReport(this.attemptId.getApplicationId()).getAMRMToken();
++        getApplicationReport(this.applicationId).getAMRMToken();
+-          this.attemptId.getApplicationId());
++          this.applicationId);
+-    return new UnmanagedAMIdentifier(this.attemptId, token);
++    return token;
+-   * Data structure that encapsulates the application attempt identifier and the
+-   * AMRMTokenIdentifier. Make it public because clients with HA need it.
+-   */
+-  public static class UnmanagedAMIdentifier {
+-    private ApplicationAttemptId attemptId;
+-    private Token<AMRMTokenIdentifier> token;
+-
+-    public UnmanagedAMIdentifier(ApplicationAttemptId attemptId,
+-        Token<AMRMTokenIdentifier> token) {
+-      this.attemptId = attemptId;
+-      this.token = token;
+-    }
+-
+-    public ApplicationAttemptId getAttemptId() {
+-      return this.attemptId;
+-    }
+-
+-    public Token<AMRMTokenIdentifier> getToken() {
+-      return this.token;
+-    }
+-  }
+-
+-  /**
++
+-              request, rmProxy, registerRequest, attemptId);
++              request, rmProxy, registerRequest, applicationId);
++
+-          LOG.warn(
+-              "IO Error occurred while processing heart beat for " + attemptId,
+-              ex);
++          LOG.warn("IO Error occurred while processing heart beat for "
++              + applicationId, ex);
+-              "Error occurred while processing heart beat for " + attemptId,
++              "Error occurred while processing heart beat for " + applicationId,
+-          + "AMRequestHandlerThread thread is exiting", attemptId);
++          + "AMRequestHandlerThread thread is exiting", applicationId);
+-      LOG.error("Heartbeat thread {} for application attempt {} crashed!",
+-          t.getName(), attemptId, e);
++      LOG.error("Heartbeat thread {} for application {} crashed!",
++          t.getName(), applicationId, e);
+
+INS26 INS26 MOV31 INS40 INS40 INS23 INS23 INS31 MOV31 MOV31 MOV83 INS39 INS59 INS83 INS39 MOV59 INS29 INS44 INS74 INS42 UPD43 INS43 INS29 INS83 INS39 INS42 INS44 MOV43 INS43 MOV8 UPD83 INS39 INS42 MOV44 UPD43 INS8 UPD42 INS29 INS43 UPD42 MOV74 MOV74 UPD42 INS42 UPD42 INS65 INS65 INS65 INS65 INS65 INS65 INS65 INS39 INS42 INS21 INS21 INS65 INS65 INS43 INS43 UPD42 INS42 INS21 MOV60 INS21 INS41 MOV65 INS65 INS65 INS65 INS74 INS42 UPD42 MOV42 UPD42 UPD42 INS21 MOV21 MOV21 INS70 INS70 INS65 INS65 UPD42 MOV42 INS43 INS43 INS21 INS66 INS42 INS66 INS42 INS66 INS42 INS66 INS42 INS66 INS42 INS66 INS42 INS66 INS66 INS65 INS7 INS7 UPD66 UPD66 INS42 INS66 INS42 INS66 INS42 INS42 INS7 INS74 INS32 INS42 UPD66 INS42 INS66 INS42 INS66 INS42 INS66 MOV43 MOV43 INS32 INS7 UPD66 UPD66 INS32 INS44 INS32 INS8 INS44 INS32 INS8 INS66 INS66 UPD66 UPD66 INS42 UPD42 MOV42 INS32 UPD66 UPD66 UPD42 MOV42 INS42 INS68 INS22 INS9 INS22 INS42 INS22 INS9 INS43 INS43 UPD42 INS42 INS42 INS9 INS42 INS42 MOV22 INS32 UPD42 MOV42 UPD42 MOV42 INS45 INS22 INS43 INS42 INS42 INS42 MOV21 INS43 INS42 INS42 INS42 MOV21 UPD42 INS42 INS42 INS22 INS42 INS42 INS69 INS52 INS42 INS52 INS42 MOV52 UPD42 MOV42 INS42 UPD42 MOV42 UPD42 INS42 INS42 INS32 MOV32 UPD42 MOV42 INS52 INS42 INS42 UPD42 MOV42 INS22 UPD42 MOV22 INS22 MOV32 INS52 INS42 UPD42 UPD45 UPD42 INS39 INS22 INS42 UPD42 INS27 INS27 MOV52 UPD42 MOV42 UPD42 MOV52 UPD42 MOV42 UPD42 MOV22 MOV22 MOV52 UPD42 MOV42 INS45 INS32 INS45 INS32 UPD42 UPD42 UPD42 MOV42 INS42 INS42 INS42 UPD45 UPD45 UPD42 UPD42 UPD42 UPD45 UPD45 INS45 INS45 DEL42 DEL43 DEL23 DEL42 DEL43 DEL22 DEL41 DEL66 DEL42 DEL52 DEL42 DEL22 DEL42 DEL7 DEL42 DEL32 DEL42 DEL22 DEL41 DEL8 DEL42 DEL42 DEL32 DEL42 DEL32 DEL32 DEL7 DEL8 DEL42 DEL44 DEL43 DEL42 DEL14 DEL53 DEL8 DEL12 DEL54 DEL45 DEL45 DEL52 DEL42 DEL22 DEL22 DEL33 DEL27 DEL42 DEL32 DEL22 DEL33 DEL27 DEL43 DEL42 DEL43 DEL42 DEL59 DEL60 DEL52 DEL42 DEL22 DEL42 DEL42 DEL32 DEL7 DEL43 DEL42 DEL32 DEL42 DEL32 DEL42 DEL43 DEL52 DEL42 DEL22 DEL42 DEL14 DEL29 DEL83 DEL83 DEL42 DEL83 DEL42 DEL43 DEL42 DEL59 DEL23 DEL83 DEL42 DEL59 DEL23 DEL83 DEL42 DEL43 DEL42 DEL44 DEL31 DEL55

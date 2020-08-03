@@ -1,0 +1,189 @@
+YARN-3901. Populate flow run data in the flow_run & flow activity tables (Vrushali C via sjlee)
+
+-import org.apache.hadoop.yarn.api.records.timelineservice.TimelineEntityType;
+-import org.apache.hadoop.yarn.server.metrics.ApplicationMetricsConstants;
++import org.apache.hadoop.yarn.server.timeline.GenericObjectMapper;
++import org.apache.hadoop.yarn.server.timelineservice.storage.flow.AggregationCompactionDimension;
++import org.apache.hadoop.yarn.server.timelineservice.storage.flow.Attribute;
++import org.apache.hadoop.yarn.server.timelineservice.storage.flow.FlowActivityColumnPrefix;
++import org.apache.hadoop.yarn.server.timelineservice.storage.flow.FlowActivityRowKey;
++import org.apache.hadoop.yarn.server.timelineservice.storage.flow.FlowActivityTable;
++import org.apache.hadoop.yarn.server.timelineservice.storage.flow.AggregationOperation;
++import org.apache.hadoop.yarn.server.timelineservice.storage.flow.FlowRunColumn;
++import org.apache.hadoop.yarn.server.timelineservice.storage.flow.FlowRunColumnPrefix;
++import org.apache.hadoop.yarn.server.timelineservice.storage.flow.FlowRunRowKey;
++import org.apache.hadoop.yarn.server.timelineservice.storage.flow.FlowRunTable;
+- * This implements a hbase based backend for storing application timeline entity
++ * This implements a hbase based backend for storing the timeline entity
++ * It writes to multiple tables at the backend
++  private static final Log LOG = LogFactory
++      .getLog(HBaseTimelineWriterImpl.class);
++
+-
+-  private static final Log LOG = LogFactory
+-      .getLog(HBaseTimelineWriterImpl.class);
++  private TypedBufferedMutator<FlowActivityTable> flowActivityTable;
++  private TypedBufferedMutator<FlowRunTable> flowRunTable;
++    flowRunTable = new FlowRunTable().getTableMutator(hbaseConf, conn);
++    flowActivityTable = new FlowActivityTable().getTableMutator(hbaseConf, conn);
+-      boolean isApplication = isApplicationEntity(te);
++      boolean isApplication = TimelineWriterUtils.isApplicationEntity(te);
+-      if (isApplicationCreated(te)) {
+-        onApplicationCreated(
+-            clusterId, userId, flowName, flowVersion, flowRunId, appId, te);
++      if (isApplication) {
++        if (TimelineWriterUtils.isApplicationCreated(te)) {
++          onApplicationCreated(clusterId, userId, flowName, flowVersion,
++              flowRunId, appId, te);
++        }
++        // if it's an application entity, store metrics
++        storeFlowMetricsAppRunning(clusterId, userId, flowName, flowRunId,
++            appId, te);
++        // if application has finished, store it's finish time and write final
++        // values
++        // of all metrics
++        if (TimelineWriterUtils.isApplicationFinished(te)) {
++          onApplicationFinished(clusterId, userId, flowName, flowVersion,
++              flowRunId, appId, te);
++        }
+-  private static boolean isApplicationEntity(TimelineEntity te) {
+-    return te.getType().equals(TimelineEntityType.YARN_APPLICATION.toString());
+-  }
+-
+-  private static boolean isApplicationCreated(TimelineEntity te) {
+-    if (isApplicationEntity(te)) {
+-      for (TimelineEvent event : te.getEvents()) {
+-        if (event.getId().equals(
+-            ApplicationMetricsConstants.CREATED_EVENT_TYPE)) {
+-          return true;
+-        }
+-      }
+-    }
+-    return false;
+-  }
+-
++    // store in App to flow table
++    storeInAppToFlowTable(clusterId, userId, flowName, flowVersion, flowRunId,
++        appId, te);
++    // store in flow run table
++    storeAppCreatedInFlowRunTable(clusterId, userId, flowName, flowVersion,
++        flowRunId, appId, te);
++    // store in flow activity table
++    storeInFlowActivityTable(clusterId, userId, flowName, flowVersion,
++        flowRunId, appId, te);
++  }
++
++  /*
++   * updates the {@link FlowActivityTable} with the Application TimelineEntity
++   * information
++   */
++  private void storeInFlowActivityTable(String clusterId, String userId,
++      String flowName, String flowVersion, long flowRunId, String appId,
++      TimelineEntity te) throws IOException {
++    byte[] rowKey = FlowActivityRowKey.getRowKey(clusterId, userId, flowName);
++    byte[] qualifier = GenericObjectMapper.write(flowRunId);
++    FlowActivityColumnPrefix.RUN_ID.store(rowKey, flowActivityTable, qualifier,
++        null, flowVersion,
++        AggregationCompactionDimension.APPLICATION_ID.getAttribute(appId));
++  }
++
++  /*
++   * updates the {@link FlowRunTable} with Application Created information
++   */
++  private void storeAppCreatedInFlowRunTable(String clusterId, String userId,
++      String flowName, String flowVersion, long flowRunId, String appId,
++      TimelineEntity te) throws IOException {
++    byte[] rowKey = FlowRunRowKey.getRowKey(clusterId, userId, flowName,
++        flowRunId);
++    FlowRunColumn.MIN_START_TIME.store(rowKey, flowRunTable, null,
++        te.getCreatedTime(),
++        AggregationCompactionDimension.APPLICATION_ID.getAttribute(appId));
++  }
++
++  private void storeInAppToFlowTable(String clusterId, String userId,
++      String flowName, String flowVersion, long flowRunId, String appId,
++      TimelineEntity te) throws IOException {
+-    AppToFlowColumn.FLOW_RUN_ID.store(
+-        rowKey, appToFlowTable, null, flowRunId);
++    AppToFlowColumn.FLOW_RUN_ID.store(rowKey, appToFlowTable, null, flowRunId);
++  }
++
++  /*
++   * updates the {@link FlowRunTable} and {@link FlowActivityTable} when an
++   * application has finished
++   */
++  private void onApplicationFinished(String clusterId, String userId,
++      String flowName, String flowVersion, long flowRunId, String appId,
++      TimelineEntity te) throws IOException {
++    // store in flow run table
++    storeAppFinishedInFlowRunTable(clusterId, userId, flowName, flowRunId,
++        appId, te);
++
++    // indicate in the flow activity table that the app has finished
++    storeInFlowActivityTable(clusterId, userId, flowName, flowVersion,
++        flowRunId, appId, te);
++  }
++
++  /*
++   * Update the {@link FlowRunTable} with Application Finished information
++   */
++  private void storeAppFinishedInFlowRunTable(String clusterId, String userId,
++      String flowName, long flowRunId, String appId, TimelineEntity te)
++      throws IOException {
++    byte[] rowKey = FlowRunRowKey.getRowKey(clusterId, userId, flowName,
++        flowRunId);
++    Attribute attributeAppId = AggregationCompactionDimension.APPLICATION_ID
++        .getAttribute(appId);
++    FlowRunColumn.MAX_END_TIME.store(rowKey, flowRunTable, null,
++        TimelineWriterUtils.getApplicationFinishedTime(te), attributeAppId);
++
++    // store the final value of metrics since application has finished
++    Set<TimelineMetric> metrics = te.getMetrics();
++    if (metrics != null) {
++      storeFlowMetrics(rowKey, metrics, attributeAppId,
++          AggregationOperation.SUM_FINAL.getAttribute());
++    }
++  }
++
++  /*
++   * Updates the {@link FlowRunTable} with Application Metrics
++   */
++  private void storeFlowMetricsAppRunning(String clusterId, String userId,
++      String flowName, long flowRunId, String appId, TimelineEntity te)
++      throws IOException {
++    Set<TimelineMetric> metrics = te.getMetrics();
++    if (metrics != null) {
++      byte[] rowKey = FlowRunRowKey.getRowKey(clusterId, userId, flowName,
++          flowRunId);
++      storeFlowMetrics(rowKey, metrics,
++          AggregationCompactionDimension.APPLICATION_ID.getAttribute(appId));
++    }
++  }
++
++  private void storeFlowMetrics(byte[] rowKey, Set<TimelineMetric> metrics,
++      Attribute... attributes) throws IOException {
++    for (TimelineMetric metric : metrics) {
++      String metricColumnQualifier = metric.getId();
++      Map<Long, Number> timeseries = metric.getValues();
++      for (Map.Entry<Long, Number> timeseriesEntry : timeseries.entrySet()) {
++        Long timestamp = timeseriesEntry.getKey();
++        FlowRunColumnPrefix.METRIC.store(rowKey, flowRunTable,
++            metricColumnQualifier, timestamp, timeseriesEntry.getValue(),
++            attributes);
++      }
++    }
+-
++    flowRunTable.flush();
++    flowActivityTable.flush();
++    if (flowRunTable != null) {
++      LOG.info("closing the flow run table");
++      // The close API performs flushing and releases any resources held
++      flowRunTable.close();
++    }
++    if (flowActivityTable != null) {
++      LOG.info("closing the flowActivityTable table");
++      // The close API performs flushing and releases any resources held
++      flowActivityTable.close();
++    }
+
+MOV26 MOV26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 MOV23 INS40 INS40 UPD40 INS40 INS40 INS40 UPD40 INS40 INS40 INS40 INS40 INS23 INS23 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS83 INS74 INS59 INS83 INS74 INS59 INS83 INS39 INS42 INS44 INS44 INS44 INS44 INS44 INS44 INS44 INS43 INS8 INS83 INS39 INS42 INS44 INS44 INS44 INS44 INS44 INS44 INS44 INS43 INS8 INS83 INS39 INS42 INS44 INS44 INS44 INS44 INS44 INS44 INS44 INS43 MOV8 UPD42 MOV83 INS39 INS42 INS44 INS44 INS44 INS44 INS44 INS44 INS44 INS43 INS8 UPD83 MOV83 INS39 INS42 INS44 INS44 INS44 INS44 INS44 MOV44 INS43 INS8 INS83 INS39 INS42 INS44 INS44 INS44 INS44 INS44 MOV44 INS43 INS8 INS83 INS39 INS42 INS44 INS44 INS44 INS43 INS8 UPD66 INS66 INS43 INS43 INS42 INS43 INS43 INS42 INS21 INS21 INS43 INS42 INS43 INS42 INS43 INS42 INS43 INS42 INS39 INS42 INS43 INS42 INS43 INS42 INS42 INS21 INS21 INS21 INS43 INS42 INS43 INS42 INS43 INS42 INS43 INS42 INS39 INS42 INS43 INS42 INS43 INS42 INS42 INS60 INS60 INS21 INS43 INS42 INS43 INS42 INS43 INS42 INS43 INS42 INS39 INS42 INS43 INS42 INS43 INS42 INS42 INS60 INS21 INS43 INS42 INS43 INS42 INS43 INS42 INS43 INS42 INS39 INS42 INS43 INS42 INS43 INS42 INS42 INS21 INS21 INS43 INS42 INS43 INS42 INS43 INS42 INS39 INS42 INS43 INS42 INS42 INS60 INS60 INS21 INS60 INS25 INS43 INS42 INS43 INS42 INS43 INS42 INS39 INS42 INS43 INS42 INS42 INS60 INS25 INS5 INS42 INS74 INS42 INS43 INS42 INS42 MOV70 INS21 INS21 INS25 INS25 INS42 INS42 INS42 INS42 INS7 INS7 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS32 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS5 INS59 INS5 INS59 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS5 INS59 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS32 INS42 INS42 INS42 INS42 INS5 INS59 INS43 INS59 INS32 INS74 INS59 INS27 INS8 INS42 INS42 INS42 INS42 INS74 INS59 INS27 INS8 INS39 INS85 INS43 INS43 INS42 INS42 INS8 INS32 INS32 INS27 INS8 INS27 INS8 INS42 INS32 INS42 INS32 INS25 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS39 INS85 INS42 INS32 INS39 INS85 INS42 INS32 INS40 INS42 INS42 INS42 INS42 INS33 INS42 INS32 INS39 INS85 INS42 INS32 INS40 INS42 INS42 INS42 INS33 MOV32 MOV32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS39 INS85 INS42 INS32 INS42 INS42 INS32 INS40 INS42 INS42 INS42 INS33 INS32 INS42 INS43 INS43 INS42 INS32 INS42 INS33 INS21 INS43 INS43 INS42 INS32 INS42 INS33 INS60 INS21 INS42 INS42 UPD43 UPD42 INS60 INS60 INS70 INS42 INS42 INS42 INS42 INS42 INS33 INS21 INS21 INS42 INS33 INS21 INS21 INS14 INS42 INS42 INS42 INS14 INS42 INS42 INS42 INS42 INS8 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS40 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 UPD42 UPD40 UPD42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS40 INS42 INS42 INS42 UPD42 MOV42 MOV42 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS5 INS59 INS32 UPD42 INS43 INS59 INS74 INS59 INS44 INS32 MOV8 INS32 INS32 INS32 INS32 INS43 INS43 MOV25 INS21 INS25 INS42 INS42 INS42 INS42 INS32 INS39 INS85 INS42 INS32 INS42 INS42 INS42 INS32 INS42 INS42 INS32 INS43 INS43 INS43 INS42 INS32 INS74 INS42 INS42 INS42 INS60 INS21 INS42 INS42 INS45 INS42 INS42 INS42 INS42 INS45 INS42 INS42 INS42 INS42 INS42 INS32 INS32 INS8 INS40 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS40 INS42 INS42 INS42 INS42 INS42 INS42 INS42 UPD42 MOV42 UPD42 MOV42 INS43 INS43 INS43 INS43 INS59 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS21 INS40 INS42 INS42 INS42 INS42 INS32 INS40 INS42 INS42 INS42 INS42 INS42 MOV32 UPD42 MOV42 INS32 INS42 INS42 UPD42 UPD42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 DEL42 DEL32 DEL41 DEL83 DEL83 DEL39 DEL42 DEL31 DEL39 DEL42 DEL32 DEL8 DEL25 DEL9 DEL41 DEL8 DEL31 DEL40 DEL32 DEL9 DEL41 DEL8 DEL25 DEL32

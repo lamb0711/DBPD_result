@@ -1,0 +1,199 @@
+Merging r1527684 through r1532876 from trunk to branch HDFS-2832
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/branches/HDFS-2832@1532910 13f79535-47bb-0310-9956-ffa450edef68
+
++import java.util.concurrent.locks.ReentrantReadWriteLock;
++import java.util.concurrent.locks.ReentrantReadWriteLock.ReadLock;
++import java.util.concurrent.locks.ReentrantReadWriteLock.WriteLock;
++import org.apache.hadoop.yarn.exceptions.InvalidAuxServiceException;
++import org.apache.hadoop.yarn.exceptions.YarnRuntimeException;
++  /**
++   * Extra duration to wait for applications to be killed on shutdown.
++   */
++  private static final int SHUTDOWN_CLEANUP_SLOP_MS = 1000;
++
++  private boolean serviceStopped = false;
++  private final ReadLock readLock;
++  private final WriteLock writeLock;
++
++  private long waitForContainersOnShutdownMillis;
++
++    ReentrantReadWriteLock lock = new ReentrantReadWriteLock();
++    this.readLock = lock.readLock();
++    this.writeLock = lock.writeLock();
++    waitForContainersOnShutdownMillis =
++        conf.getLong(YarnConfiguration.NM_SLEEP_DELAY_BEFORE_SIGKILL_MS,
++            YarnConfiguration.DEFAULT_NM_SLEEP_DELAY_BEFORE_SIGKILL_MS) +
++        conf.getLong(YarnConfiguration.NM_PROCESS_KILL_WAIT_MS,
++            YarnConfiguration.DEFAULT_NM_PROCESS_KILL_WAIT_MS) +
++        SHUTDOWN_CLEANUP_SLOP_MS;
++
++    setBlockNewContainerRequests(true);
++    this.writeLock.lock();
++    try {
++      serviceStopped = true;
++      if (context != null) {
++        cleanUpApplicationsOnNMShutDown();
++      }
++    } finally {
++      this.writeLock.unlock();
++    }
++  public void cleanUpApplicationsOnNMShutDown() {
++    Map<ApplicationId, Application> applications =
++        this.context.getApplications();
++    if (applications.isEmpty()) {
++      return;
++    }
++    LOG.info("Applications still running : " + applications.keySet());
++
++    List<ApplicationId> appIds =
++        new ArrayList<ApplicationId>(applications.keySet());
++    this.handle(
++        new CMgrCompletedAppsEvent(appIds,
++            CMgrCompletedAppsEvent.Reason.ON_SHUTDOWN));
++
++    LOG.info("Waiting for Applications to be Finished");
++
++    long waitStartTime = System.currentTimeMillis();
++    while (!applications.isEmpty()
++        && System.currentTimeMillis() - waitStartTime < waitForContainersOnShutdownMillis) {
++      try {
++        Thread.sleep(1000);
++      } catch (InterruptedException ex) {
++        LOG.warn(
++          "Interrupted while sleeping on applications finish on shutdown", ex);
++      }
++    }
++
++    // All applications Finished
++    if (applications.isEmpty()) {
++      LOG.info("All applications in FINISHED state");
++    } else {
++      LOG.info("Done waiting for Applications to be Finished. Still alive: " +
++          applications.keySet());
++    }
++  }
++
++  public void cleanupContainersOnNMResync() {
++    Map<ContainerId, Container> containers = context.getContainers();
++    if (containers.isEmpty()) {
++      return;
++    }
++    LOG.info("Containers still running on "
++        + CMgrCompletedContainersEvent.Reason.ON_NODEMANAGER_RESYNC + " : "
++        + containers.keySet());
++
++    List<ContainerId> containerIds =
++      new ArrayList<ContainerId>(containers.keySet());
++
++    LOG.info("Waiting for containers to be killed");
++
++    this.handle(new CMgrCompletedContainersEvent(containerIds,
++      CMgrCompletedContainersEvent.Reason.ON_NODEMANAGER_RESYNC));
++    while (!containers.isEmpty()) {
++      try {
++        Thread.sleep(1000);
++        nodeStatusUpdater.getNodeStatusAndUpdateContainersInContext();
++      } catch (InterruptedException ex) {
++        LOG.warn("Interrupted while sleeping on container kill on resync", ex);
++      }
++    }
++
++    // All containers killed
++    if (containers.isEmpty()) {
++      LOG.info("All containers in DONE state");
++    } else {
++      LOG.info("Done waiting for containers to be killed. Still alive: " +
++        containers.keySet());
++    }
++  }
++
++    Map<String, ByteBuffer> serviceData = getAuxServiceMetaData();
++    if (launchContext.getServiceData()!=null && 
++        !launchContext.getServiceData().isEmpty()) {
++      for (Map.Entry<String, ByteBuffer> meta : launchContext.getServiceData()
++          .entrySet()) {
++        if (null == serviceData.get(meta.getKey())) {
++          throw new InvalidAuxServiceException("The auxService:" + meta.getKey()
++              + " does not exist");
++        }
++      }
++    }
++
+-    // Create the application
+-    Application application =
+-        new ApplicationImpl(dispatcher, user, applicationID, credentials, context);
+-    if (null == context.getApplications().putIfAbsent(applicationID,
+-      application)) {
+-      LOG.info("Creating a new application reference for app " + applicationID);
++    this.readLock.lock();
++    try {
++      if (!serviceStopped) {
++        // Create the application
++        Application application =
++            new ApplicationImpl(dispatcher, user, applicationID, credentials, context);
++        if (null == context.getApplications().putIfAbsent(applicationID,
++          application)) {
++          LOG.info("Creating a new application reference for app " + applicationID);
+-      dispatcher.getEventHandler().handle(
+-        new ApplicationInitEvent(applicationID, container.getLaunchContext()
+-          .getApplicationACLs()));
++          dispatcher.getEventHandler().handle(
++            new ApplicationInitEvent(applicationID, container.getLaunchContext()
++              .getApplicationACLs()));
++        }
++
++        dispatcher.getEventHandler().handle(
++          new ApplicationContainerInitEvent(container));
++
++        this.context.getContainerTokenSecretManager().startContainerSuccessful(
++          containerTokenIdentifier);
++        NMAuditLogger.logSuccess(user, AuditConstants.START_CONTAINER,
++          "ContainerManageImpl", applicationID, containerId);
++        // TODO launchedContainer misplaced -> doesn't necessarily mean a container
++        // launch. A finished Application will not launch containers.
++        metrics.launchedContainer();
++        metrics.allocateContainer(containerTokenIdentifier.getResource());
++      } else {
++        throw new YarnException(
++            "Container start failed as the NodeManager is " +
++            "in the process of shutting down");
++      }
++    } finally {
++      this.readLock.unlock();
+-
+-    dispatcher.getEventHandler().handle(
+-      new ApplicationContainerInitEvent(container));
+-
+-    this.context.getContainerTokenSecretManager().startContainerSuccessful(
+-      containerTokenIdentifier);
+-    NMAuditLogger.logSuccess(user, AuditConstants.START_CONTAINER,
+-      "ContainerManageImpl", applicationID, containerId);
+-    // TODO launchedContainer misplaced -> doesn't necessarily mean a container
+-    // launch. A finished Application will not launch containers.
+-    metrics.launchedContainer();
+-    metrics.allocateContainer(containerTokenIdentifier.getResource()); 
++        String diagnostic = "";
++        if (appsFinishedEvent.getReason() == CMgrCompletedAppsEvent.Reason.ON_SHUTDOWN) {
++          diagnostic = "Application killed on shutdown";
++        } else if (appsFinishedEvent.getReason() == CMgrCompletedAppsEvent.Reason.BY_RESOURCEMANAGER) {
++          diagnostic = "Application killed by ResourceManager";
++        }
+-                "Application Killed by ResourceManager"));
++                diagnostic));
+-        String diagnostic = "";
+-        if (containersFinishedEvent.getReason() == 
+-            CMgrCompletedContainersEvent.Reason.ON_SHUTDOWN) {
+-          diagnostic = "Container Killed on Shutdown";
+-        } else if (containersFinishedEvent.getReason() == 
+-            CMgrCompletedContainersEvent.Reason.BY_RESOURCEMANAGER) {
+-          diagnostic = "Container Killed by ResourceManager";
+-        }
+-        this.dispatcher.getEventHandler().handle(
+-            new ContainerKillEvent(container, diagnostic));
++          this.dispatcher.getEventHandler().handle(
++              new ContainerKillEvent(container,
++                  "Container Killed by ResourceManager"));
+-      LOG.warn("Invalid event " + event.getType() + ". Ignoring.");
++        throw new YarnRuntimeException(
++            "Got an unknown ContainerManagerEvent type: " + event.getType());

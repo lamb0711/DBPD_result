@@ -1,0 +1,171 @@
+Merge trunk into branch.
+
+Conflicts resolved:
+C       hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestShortCircuitLocalRead.java
+!     C hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/SocketCache.java
+C       hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSInputStream.java
+C       hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSClient.java
+C       hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/DataNode.java
+C       hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/BlockReaderLocal.java
+
+(thanks to Colin for help resolving)
+
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/branches/HDFS-347@1462652 13f79535-47bb-0310-9956-ffa450edef68
+
+-import java.util.ArrayList;
++import java.security.PrivilegedExceptionAction;
+-import org.apache.hadoop.hdfs.server.common.JspHelper;
++import org.apache.hadoop.hdfs.web.resources.DelegationParam;
++import org.apache.hadoop.hdfs.web.resources.DoAsParam;
+-import org.apache.hadoop.util.StringUtils;
++import com.google.common.annotations.VisibleForTesting;
++import com.google.common.collect.Lists;
+-  private synchronized void addRenewAction(final WebHdfsFileSystem webhdfs) {
++  @VisibleForTesting
++  protected synchronized void addRenewAction(final WebHdfsFileSystem webhdfs) {
+-  private final UserGroupInformation ugi;
++  private UserGroupInformation ugi;
++  private boolean hasInitedToken;
+-  {
+-    try {
+-      ugi = UserGroupInformation.getCurrentUser();
+-    } catch (IOException e) {
+-      throw new RuntimeException(e);
+-    }
+-  }
+-
++    ugi = UserGroupInformation.getCurrentUser();
+-
+-    //since we don't already have a token, go get one
+-    boolean createdToken = false;
+-    if (token == null) {
+-      token = getDelegationToken(null);
+-      createdToken = (token != null);
+-    }
+-
+-    // security might be disabled
++      LOG.debug("Found existing DT for " + token.getService());        
+-      if (createdToken) {
++      hasInitedToken = true;
++    }
++  }
++
++  protected synchronized Token<?> getDelegationToken() throws IOException {
++    if (!hasInitedToken) {
++      //since we don't already have a token, go get one
++      Token<?> token = getDelegationToken(null);
++      // security might be disabled
++      if (token != null) {
++        setDelegationToken(token);
+-      } else {
+-        LOG.debug("Found existing DT for " + token.getService());        
++      hasInitedToken = true;
++    return delegationToken;
++  
++  @Override
++  protected URI canonicalizeUri(URI uri) {
++    return NetUtils.getCanonicalUri(uri, getDefaultPort());
++  }
+-  private String addDt2Query(String query) throws IOException {
+-    if (UserGroupInformation.isSecurityEnabled()) {
+-      synchronized (this) {
+-        if (delegationToken != null) {
+-          final String encoded = delegationToken.encodeToUrlString();
+-          return query + JspHelper.getDelegationTokenUrlParam(encoded);
+-        } // else we are talking to an insecure cluster
+-      }
++  Param<?,?>[] getAuthParameters(final HttpOpParam.Op op) throws IOException {
++    List<Param<?,?>> authParams = Lists.newArrayList();    
++    // Skip adding delegation token for token operations because these
++    // operations require authentication.
++    Token<?> token = null;
++    if (UserGroupInformation.isSecurityEnabled() && !op.getRequireAuth()) {
++      token = getDelegationToken();
+-    return query;
++    if (token != null) {
++      authParams.add(new DelegationParam(token.encodeToUrlString()));
++    } else {
++      UserGroupInformation userUgi = ugi;
++      UserGroupInformation realUgi = userUgi.getRealUser();
++      if (realUgi != null) { // proxy user
++        authParams.add(new DoAsParam(userUgi.getShortUserName()));
++        userUgi = realUgi;
++      }
++      authParams.add(new UserParam(userUgi.getShortUserName()));
++    }
++    return authParams.toArray(new Param<?,?>[0]);
+-        + '&' + new UserParam(ugi)
++        + Param.toSortedString("&", getAuthParameters(op))
+-    final URL url;
+-    if (op == PutOpParam.Op.RENEWDELEGATIONTOKEN
+-        || op == GetOpParam.Op.GETDELEGATIONTOKEN) {
+-      // Skip adding delegation token for getting or renewing delegation token,
+-      // because these operations require kerberos authentication.
+-      url = getNamenodeURL(path, query);
+-    } else {
+-      url = getNamenodeURL(path, addDt2Query(query));
+-    }
++    final URL url = getNamenodeURL(path, query);
+-  private HttpURLConnection getHttpUrlConnection(URL url)
+-      throws IOException, AuthenticationException {
+-    final HttpURLConnection conn;
+-    if (ugi.hasKerberosCredentials()) { 
+-      conn = new AuthenticatedURL(AUTH).openConnection(url, authToken);
+-    } else {
+-      conn = (HttpURLConnection)url.openConnection();
+-    }
+-    return conn;
+-  }
+-
++    private HttpURLConnection getHttpUrlConnection(final URL url)
++        throws IOException, AuthenticationException {
++      UserGroupInformation connectUgi = ugi.getRealUser();
++      if (connectUgi == null) {
++        connectUgi = ugi;
++      }
++      try {
++        return connectUgi.doAs(
++            new PrivilegedExceptionAction<HttpURLConnection>() {
++              @Override
++              public HttpURLConnection run() throws IOException {
++                return openHttpUrlConnection(url);
++              }
++            });
++      } catch (IOException ioe) {
++        Throwable cause = ioe.getCause();
++        if (cause != null && cause instanceof AuthenticationException) {
++          throw (AuthenticationException)cause;
++        }
++        throw ioe;
++      } catch (InterruptedException e) {
++        throw new IOException(e);
++      }
++    }
++    
++    private HttpURLConnection openHttpUrlConnection(final URL url)
++        throws IOException {
++      final HttpURLConnection conn;
++      try {
++        if (op.getRequireAuth()) {
++          LOG.debug("open AuthenticatedURL connection");
++          conn = new AuthenticatedURL(AUTH).openConnection(url, authToken);
++        } else {
++          LOG.debug("open URL connection");
++          conn = (HttpURLConnection)url.openConnection();
++        }
++      } catch (AuthenticationException e) {
++        throw new IOException(e);
++      }
++      return conn;
++    }
++  
+-  public void concat(final Path trg, final Path [] psrcs) throws IOException {
++  public void concat(final Path trg, final Path [] srcs) throws IOException {
+-    List<String> strPaths = new ArrayList<String>(psrcs.length);
+-    for(Path psrc : psrcs) {
+-       strPaths.add(psrc.toUri().getPath());
+-    }
+-
+-    String srcs = StringUtils.join(",", strPaths);
+-

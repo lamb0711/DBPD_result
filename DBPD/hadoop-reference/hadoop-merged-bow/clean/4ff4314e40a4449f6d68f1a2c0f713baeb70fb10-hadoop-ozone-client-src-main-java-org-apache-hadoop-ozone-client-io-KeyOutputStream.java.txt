@@ -1,0 +1,205 @@
+Merge pull request #729 from bshashikant/HDDS-1373
+
+HDDS-1373. KeyOutputStream, close after write request fails after retries, runs into IllegalArgumentException. Contributed by Shashikant Banerjee.
+-      if (streamEntries.size() <= currentStreamIndex) {
+-        Preconditions.checkNotNull(omClient);
+-        // allocate a new block, if a exception happens, log an error and
+-        // throw exception to the caller directly, and the write fails.
+-        try {
+-          allocateNewBlock(currentStreamIndex);
+-          succeededAllocates += 1;
+-        } catch (IOException ioe) {
+-          LOG.error("Try to allocate more blocks for write failed, already "
+-              + "allocated " + succeededAllocates + " blocks for this write.");
+-          throw ioe;
+-        }
+-      }
+-      // in theory, this condition should never violate due the check above
+-      // still do a sanity check.
+-      Preconditions.checkArgument(currentStreamIndex < streamEntries.size());
+-      BlockOutputStreamEntry current = streamEntries.get(currentStreamIndex);
+-
+-      // length(len) will be in int range if the call is happening through
+-      // write API of blockOutputStream. Length can be in long range if it comes
+-      // via Exception path.
+-      int writeLen = Math.min((int)len, (int) current.getRemaining());
+-      long currentPos = current.getWrittenDataLength();
+-        if (retry) {
+-          current.writeOnRetry(len);
+-        } else {
+-          current.write(b, off, writeLen);
+-          offset += writeLen;
++        if (streamEntries.size() <= currentStreamIndex) {
++          Preconditions.checkNotNull(omClient);
++          // allocate a new block, if a exception happens, log an error and
++          // throw exception to the caller directly, and the write fails.
++          try {
++            allocateNewBlock(currentStreamIndex);
++            succeededAllocates += 1;
++          } catch (IOException ioe) {
++            LOG.error("Try to allocate more blocks for write failed, already "
++                + "allocated " + succeededAllocates
++                + " blocks for this write.");
++            throw ioe;
++          }
+-      } catch (IOException ioe) {
+-        // for the current iteration, totalDataWritten - currentPos gives the
+-        // amount of data already written to the buffer
++        // in theory, this condition should never violate due the check above
++        // still do a sanity check.
++        Preconditions.checkArgument(currentStreamIndex < streamEntries.size());
++        BlockOutputStreamEntry current = streamEntries.get(currentStreamIndex);
+-        // In the retryPath, the total data to be written will always be equal
+-        // to or less than the max length of the buffer allocated.
+-        // The len specified here is the combined sum of the data length of
+-        // the buffers
+-        Preconditions.checkState(!retry || len <= streamBufferMaxSize);
+-        int dataWritten  = (int) (current.getWrittenDataLength() - currentPos);
+-        writeLen = retry ? (int) len : dataWritten;
+-        // In retry path, the data written is already accounted in offset.
+-        if (!retry) {
+-          offset += writeLen;
++        // length(len) will be in int range if the call is happening through
++        // write API of blockOutputStream. Length can be in long range if it comes
++        // via Exception path.
++        int writeLen = Math.min((int) len, (int) current.getRemaining());
++        long currentPos = current.getWrittenDataLength();
++        try {
++          if (retry) {
++            current.writeOnRetry(len);
++          } else {
++            current.write(b, off, writeLen);
++            offset += writeLen;
++          }
++        } catch (IOException ioe) {
++          // for the current iteration, totalDataWritten - currentPos gives the
++          // amount of data already written to the buffer
++
++          // In the retryPath, the total data to be written will always be equal
++          // to or less than the max length of the buffer allocated.
++          // The len specified here is the combined sum of the data length of
++          // the buffers
++          Preconditions.checkState(!retry || len <= streamBufferMaxSize);
++          int dataWritten = (int) (current.getWrittenDataLength() - currentPos);
++          writeLen = retry ? (int) len : dataWritten;
++          // In retry path, the data written is already accounted in offset.
++          if (!retry) {
++            offset += writeLen;
++          }
++          LOG.debug("writeLen {}, total len {}", writeLen, len);
++          handleException(current, currentStreamIndex, ioe);
+-        LOG.debug("writeLen {}, total len {}", writeLen, len);
+-        handleException(current, currentStreamIndex, ioe);
++        if (current.getRemaining() <= 0) {
++          // since the current block is already written close the stream.
++          handleFlushOrClose(StreamAction.FULL);
++        }
++        len -= writeLen;
++        off += writeLen;
++      } catch (Exception e) {
++        markStreamClosed();
++        throw e;
+-      if (current.getRemaining() <= 0) {
+-        // since the current block is already written close the stream.
+-        handleFlushOrClose(StreamAction.FULL);
+-      }
+-      len -= writeLen;
+-      off += writeLen;
+-    // in the sreamEntryList.
++    // in the streamEntryList.
++
++  private void cleanup() {
++    if (excludeList != null) {
++      excludeList.clear();
++      excludeList = null;
++    }
++    if (bufferPool != null) {
++      bufferPool.clearBufferPool();
++    }
++
++    if (streamEntries != null) {
++      streamEntries.clear();
++    }
++  }
+-    long totalSuccessfulFlushedData =
+-        streamEntry.getTotalAckDataLength();
++    long totalSuccessfulFlushedData = streamEntry.getTotalAckDataLength();
+-      discardPreallocatedBlocks(streamEntry.getBlockID().getContainerID(),
+-          null, streamIndex + 1);
++      discardPreallocatedBlocks(streamEntry.getBlockID().getContainerID(), null,
++          streamIndex + 1);
++  private void markStreamClosed() {
++    cleanup();
++    closed = true;
++  }
++
+-      int size = streamEntries.size();
+-      int streamIndex =
+-          currentStreamIndex >= size ? size - 1 : currentStreamIndex;
+-      BlockOutputStreamEntry entry = streamEntries.get(streamIndex);
+-      if (entry != null) {
+-        try {
+-          Collection<DatanodeDetails> failedServers = entry.getFailedServers();
+-          // failed servers can be null in case there is no data written in the
+-          // stream
+-          if (failedServers != null && !failedServers.isEmpty()) {
+-            excludeList.addDatanodes(failedServers);
+-          }
+-          switch (op) {
+-          case CLOSE:
+-            entry.close();
+-            break;
+-          case FULL:
+-            if (entry.getRemaining() == 0) {
+-              entry.close();
+-              currentStreamIndex++;
++      try {
++        int size = streamEntries.size();
++        int streamIndex =
++            currentStreamIndex >= size ? size - 1 : currentStreamIndex;
++        BlockOutputStreamEntry entry = streamEntries.get(streamIndex);
++        if (entry != null) {
++          try {
++            Collection<DatanodeDetails> failedServers =
++                entry.getFailedServers();
++            // failed servers can be null in case there is no data written in the
++            // stream
++            if (failedServers != null && !failedServers.isEmpty()) {
++              excludeList.addDatanodes(failedServers);
+-            break;
+-          case FLUSH:
+-            entry.flush();
+-            break;
+-          default:
+-            throw new IOException("Invalid Operation");
++            switch (op) {
++            case CLOSE:
++              entry.close();
++              break;
++            case FULL:
++              if (entry.getRemaining() == 0) {
++                entry.close();
++                currentStreamIndex++;
++              }
++              break;
++            case FLUSH:
++              entry.flush();
++              break;
++            default:
++              throw new IOException("Invalid Operation");
++            }
++          } catch (IOException ioe) {
++            handleException(entry, streamIndex, ioe);
++            continue;
+-        } catch (IOException ioe) {
+-          handleException(entry, streamIndex, ioe);
+-          continue;
++        break;
++      } catch (Exception e) {
++        markStreamClosed();
++        throw e;
+-      break;
+-      bufferPool.clearBufferPool();
++      cleanup();
+
+INS31 INS31 INS83 INS39 INS42 INS8 INS83 INS39 INS42 INS8 INS25 INS25 INS25 INS21 INS21 INS8 INS27 INS8 INS27 MOV8 INS27 INS8 INS32 INS7 INS8 INS8 INS54 INS42 INS33 INS21 INS21 INS42 INS33 INS42 INS33 INS21 INS42 INS42 INS9 INS54 INS21 MOV8 INS12 INS32 INS7 INS32 MOV8 INS12 INS32 INS44 INS8 INS42 INS42 INS42 INS33 INS42 INS42 INS44 INS8 INS42 INS43 INS42 INS21 INS53 INS43 INS42 INS21 INS53 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS42

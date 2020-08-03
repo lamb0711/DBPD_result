@@ -1,0 +1,969 @@
+Merge commit '456e901a4c5c639267ee87b8e5f1319f256d20c2' (HDFS-6407. Add sorting and pagination in the datanode tab of the NN Web UI. Contributed by Haohui Mai.) into HDFS-7285-merge
+
+-import org.apache.commons.lang.mutable.MutableObject;
+-import org.apache.hadoop.yarn.api.records.ContainerId;
+-import org.apache.hadoop.yarn.api.records.NodeId;
+-import org.apache.hadoop.yarn.api.records.ResourceRequest;
+-import org.apache.hadoop.yarn.server.resourcemanager.RMContext;
+-import org.apache.hadoop.yarn.server.resourcemanager.rmapp.attempt.RMAppAttempt;
+-import org.apache.hadoop.yarn.server.resourcemanager.scheduler.NodeType;
+-import org.apache.hadoop.yarn.server.resourcemanager.scheduler.SchedulerAppUtils;
+-  private int nodeLocalityDelay;
++  private volatile int nodeLocalityDelay;
+-  Map<ApplicationAttemptId, FiCaSchedulerApp> applicationAttemptMap = 
++  Map<ApplicationAttemptId, FiCaSchedulerApp> applicationAttemptMap =
++
++  private Priority defaultAppPriorityPerQueue;
++
++  private OrderingPolicy<FiCaSchedulerApp> pendingOrderingPolicy = null;
+-  Set<FiCaSchedulerApp> pendingApplications;
+-  
+-  private float minimumAllocationFactor;
++  private volatile float minimumAllocationFactor;
+-  private OrderingPolicy<FiCaSchedulerApp> 
+-    orderingPolicy = new FifoOrderingPolicy<FiCaSchedulerApp>();
++  private OrderingPolicy<FiCaSchedulerApp> orderingPolicy = null;
+-
+-    Comparator<FiCaSchedulerApp> applicationComparator =
+-        cs.getApplicationComparator();
+-    this.pendingApplications = 
+-        new TreeSet<FiCaSchedulerApp>(applicationComparator);
++    setPendingAppsOrderingPolicy(conf
++        .<FiCaSchedulerApp> getOrderingPolicy(getQueuePath()));
++    defaultAppPriorityPerQueue = Priority.newInstance(conf
++        .getDefaultApplicationPriorityConfPerQueue(getQueuePath()));
++
+-        "preemptionDisabled = " + getPreemptionDisabled() + "\n");
++        "preemptionDisabled = " + getPreemptionDisabled() + "\n" +
++        "defaultAppPriorityPerQueue = " + defaultAppPriorityPerQueue);
+-    return pendingApplications.size();
++    return pendingOrderingPolicy.getNumSchedulableEntities();
+-  @Private
+-  public int getNodeLocalityDelay() {
+-    return nodeLocalityDelay;
+-  }
+-  
+-          .getUsed()), user.getActiveApplications(), user
++          .getAllUsed()), user.getActiveApplications(), user
+-    for (Iterator<FiCaSchedulerApp> i=pendingApplications.iterator(); 
+-         i.hasNext(); ) {
++    for (Iterator<FiCaSchedulerApp> i = getPendingAppsOrderingPolicy()
++        .getAssignmentIterator(); i.hasNext();) {
+-      
++      ApplicationId applicationId = application.getApplicationId();
+-          LOG.info("not starting application as amIfStarted exceeds amLimit");
++          LOG.info("Not activating application " + applicationId
++              + " as  amIfStarted: " + amIfStarted + " exceeds amLimit: "
++              + amLimit);
+-          LOG.info("not starting application as amIfStarted exceeds " +
+-            "userAmLimit");
++          LOG.info("Not activating application " + applicationId
++              + " for user: " + user + " as userAmIfStarted: "
++              + userAmIfStarted + " exceeds userAmLimit: " + userAMLimit);
+-      LOG.info("Application " + application.getApplicationId() +
+-          " from user: " + application.getUser() + 
+-          " activated in queue: " + getQueueName());
++      LOG.info("Application " + applicationId + " from user: "
++          + application.getUser() + " activated in queue: " + getQueueName());
+-    pendingApplications.add(application);
++    getPendingAppsOrderingPolicy().addSchedulableEntity(application);
+-        " user: " + user + "," + " leaf-queue: " + getQueueName() +
++        " user: " + application.getUser() + "," +
++        " leaf-queue: " + getQueueName() +
+-      pendingApplications.remove(application);
++      pendingOrderingPolicy.removeSchedulableEntity(application);
++  private void handleExcessReservedContainer(Resource clusterResource,
++      CSAssignment assignment) {
++    if (assignment.getExcessReservation() != null) {
++      RMContainer excessReservedContainer = assignment.getExcessReservation();
++
++      completedContainer(clusterResource, assignment.getApplication(),
++          scheduler.getNode(excessReservedContainer.getAllocatedNode()),
++          excessReservedContainer,
++          SchedulerUtils.createAbnormalContainerStatus(
++              excessReservedContainer.getContainerId(),
++              SchedulerUtils.UNRESERVED_CONTAINER),
++          RMContainerEventType.RELEASED, null, false);
++
++      assignment.setExcessReservation(null);
++    }
++  }
++  
+-    
+-    if(LOG.isDebugEnabled()) {
++
++    if (LOG.isDebugEnabled()) {
+-        + " #applications=" + 
+-        orderingPolicy.getNumSchedulableEntities());
++          + " #applications=" + orderingPolicy.getNumSchedulableEntities());
+-    
++
+-      FiCaSchedulerApp application = 
++      FiCaSchedulerApp application =
+-        return assignReservedContainer(application, node, reservedContainer,
+-            clusterResource, schedulingMode);
++        CSAssignment assignment =
++            application.assignContainers(clusterResource, node,
++                currentResourceLimits, schedulingMode, reservedContainer);
++        handleExcessReservedContainer(clusterResource, assignment);
++        return assignment;
+-    
++
+-      return NULL_ASSIGNMENT;
++      return CSAssignment.NULL_ASSIGNMENT;
+-    
++
+-    if (!hasPendingResourceRequest(node.getPartition(),
+-        clusterResource, schedulingMode)) {
++    if (!hasPendingResourceRequest(node.getPartition(), clusterResource,
++        schedulingMode)) {
+-      return NULL_ASSIGNMENT;
++      return CSAssignment.NULL_ASSIGNMENT;
+-    
++
+-        orderingPolicy.getAssignmentIterator();
+-        assignmentIterator.hasNext();) {
++        orderingPolicy.getAssignmentIterator(); assignmentIterator.hasNext();) {
+-      if(LOG.isDebugEnabled()) {
+-        LOG.debug("pre-assignContainers for application "
+-        + application.getApplicationId());
+-        application.showRequests();
++
++      // Check queue max-capacity limit
++      if (!super.canAssignToThisQueue(clusterResource, node.getPartition(),
++          currentResourceLimits, application.getCurrentReservation(),
++          schedulingMode)) {
++        return CSAssignment.NULL_ASSIGNMENT;
+-      // Check if application needs more resource, skip if it doesn't need more.
+-      if (!application.hasPendingResourceRequest(resourceCalculator,
+-          node.getPartition(), clusterResource, schedulingMode)) {
+-        if (LOG.isDebugEnabled()) {
+-          LOG.debug("Skip app_attempt=" + application.getApplicationAttemptId()
+-              + ", because it doesn't need more resource, schedulingMode="
+-              + schedulingMode.name() + " node-label=" + node.getPartition());
+-        }
++      Resource userLimit =
++          computeUserLimitAndSetHeadroom(application, clusterResource,
++              node.getPartition(), schedulingMode);
++
++      // Check user limit
++      if (!canAssignToUser(clusterResource, application.getUser(), userLimit,
++          application, node.getPartition(), currentResourceLimits)) {
+-      synchronized (application) {
+-        // Check if this resource is on the blacklist
+-        if (SchedulerAppUtils.isBlacklisted(application, node, LOG)) {
+-          continue;
+-        }
+-        
+-        // Schedule in priority order
+-        for (Priority priority : application.getPriorities()) {
+-          ResourceRequest anyRequest =
+-              application.getResourceRequest(priority, ResourceRequest.ANY);
+-          if (null == anyRequest) {
+-            continue;
+-          }
+-          
+-          // Required resource
+-          Resource required = anyRequest.getCapability();
++      // Try to schedule
++      CSAssignment assignment =
++          application.assignContainers(clusterResource, node,
++              currentResourceLimits, schedulingMode, null);
+-          // Do we need containers at this 'priority'?
+-          if (application.getTotalRequiredResources(priority) <= 0) {
+-            continue;
+-          }
+-          
+-          // AM container allocation doesn't support non-exclusive allocation to
+-          // avoid painful of preempt an AM container
+-          if (schedulingMode == SchedulingMode.IGNORE_PARTITION_EXCLUSIVITY) {
+-            RMAppAttempt rmAppAttempt =
+-                csContext.getRMContext().getRMApps()
+-                    .get(application.getApplicationId()).getCurrentAppAttempt();
+-            if (null == rmAppAttempt.getMasterContainer()) {
+-              if (LOG.isDebugEnabled()) {
+-                LOG.debug("Skip allocating AM container to app_attempt="
+-                    + application.getApplicationAttemptId()
+-                    + ", don't allow to allocate AM container in non-exclusive mode");
+-              }
+-              break;
+-            }
+-          }
+-          
+-          // Is the node-label-expression of this offswitch resource request
+-          // matches the node's label?
+-          // If not match, jump to next priority.
+-          if (!SchedulerUtils.checkResourceRequestMatchingNodePartition(
+-              anyRequest, node.getPartition(), schedulingMode)) {
+-            continue;
+-          }
+-          
+-          if (!this.reservationsContinueLooking) {
+-            if (!shouldAllocOrReserveNewContainer(application, priority, required)) {
+-              if (LOG.isDebugEnabled()) {
+-                LOG.debug("doesn't need containers based on reservation algo!");
+-              }
+-              continue;
+-            }
+-          }
+-          
+-          // Compute user-limit & set headroom
+-          // Note: We compute both user-limit & headroom with the highest 
+-          //       priority request as the target. 
+-          //       This works since we never assign lower priority requests
+-          //       before all higher priority ones are serviced.
+-          Resource userLimit = 
+-              computeUserLimitAndSetHeadroom(application, clusterResource, 
+-                  required, node.getPartition(), schedulingMode);
+-
+-          // Check queue max-capacity limit
+-          if (!super.canAssignToThisQueue(clusterResource, node.getPartition(),
+-              currentResourceLimits, required,
+-              application.getCurrentReservation(), schedulingMode)) {
+-            return NULL_ASSIGNMENT;
+-          }
+-
+-          // Check user limit
+-          if (!canAssignToUser(clusterResource, application.getUser(), userLimit,
+-              application, node.getPartition(), currentResourceLimits)) {
+-            break;
+-          }
+-
+-          // Inform the application it is about to get a scheduling opportunity
+-          application.addSchedulingOpportunity(priority);
+-          
+-          // Increase missed-non-partitioned-resource-request-opportunity.
+-          // This is to make sure non-partitioned-resource-request will prefer
+-          // to be allocated to non-partitioned nodes
+-          int missedNonPartitionedRequestSchedulingOpportunity = 0;
+-          if (anyRequest.getNodeLabelExpression().equals(
+-              RMNodeLabelsManager.NO_LABEL)) {
+-            missedNonPartitionedRequestSchedulingOpportunity =
+-                application
+-                    .addMissedNonPartitionedRequestSchedulingOpportunity(priority);
+-          }
+-          
+-          if (schedulingMode == SchedulingMode.IGNORE_PARTITION_EXCLUSIVITY) {
+-            // Before doing allocation, we need to check scheduling opportunity to
+-            // make sure : non-partitioned resource request should be scheduled to
+-            // non-partitioned partition first.
+-            if (missedNonPartitionedRequestSchedulingOpportunity < scheduler
+-                .getNumClusterNodes()) {
+-              if (LOG.isDebugEnabled()) {
+-                LOG.debug("Skip app_attempt="
+-                    + application.getApplicationAttemptId()
+-                    + " priority="
+-                    + priority
+-                    + " because missed-non-partitioned-resource-request"
+-                    + " opportunity under requred:"
+-                    + " Now=" + missedNonPartitionedRequestSchedulingOpportunity
+-                    + " required="
+-                    + scheduler.getNumClusterNodes());
+-              }
+-
+-              break;
+-            }
+-          }
+-          
+-          // Try to schedule
+-          CSAssignment assignment =
+-            assignContainersOnNode(clusterResource, node, application, priority,
+-                null, schedulingMode, currentResourceLimits);
+-
+-          // Did the application skip this node?
+-          if (assignment.getSkipped()) {
+-            // Don't count 'skipped nodes' as a scheduling opportunity!
+-            application.subtractSchedulingOpportunity(priority);
+-            continue;
+-          }
+-          
+-          // Did we schedule or reserve a container?
+-          Resource assigned = assignment.getResource();
+-          if (Resources.greaterThan(
+-              resourceCalculator, clusterResource, assigned, Resources.none())) {
+-            // Get reserved or allocated container from application
+-            RMContainer reservedOrAllocatedRMContainer =
+-                application.getRMContainer(assignment
+-                    .getAssignmentInformation()
+-                    .getFirstAllocatedOrReservedContainerId());
+-
+-            // Book-keeping 
+-            // Note: Update headroom to account for current allocation too...
+-            allocateResource(clusterResource, application, assigned,
+-                node.getPartition(), reservedOrAllocatedRMContainer);
+-            
+-            // Don't reset scheduling opportunities for offswitch assignments
+-            // otherwise the app will be delayed for each non-local assignment.
+-            // This helps apps with many off-cluster requests schedule faster.
+-            if (assignment.getType() != NodeType.OFF_SWITCH) {
+-              if (LOG.isDebugEnabled()) {
+-                LOG.debug("Resetting scheduling opportunities");
+-              }
+-              application.resetSchedulingOpportunities(priority);
+-            }
+-            // Non-exclusive scheduling opportunity is different: we need reset
+-            // it every time to make sure non-labeled resource request will be
+-            // most likely allocated on non-labeled nodes first. 
+-            application.resetMissedNonPartitionedRequestSchedulingOpportunity(priority);
+-            
+-            // Done
+-            return assignment;
+-          } else {
+-            // Do not assign out of order w.r.t priorities
+-            break;
+-          }
+-        }
+-      }
+-
+-      if(LOG.isDebugEnabled()) {
++      if (LOG.isDebugEnabled()) {
+-          + application.getApplicationId());
++            + application.getApplicationId());
++        application.showRequests();
+-      application.showRequests();
+-    }
+-  
+-    return NULL_ASSIGNMENT;
++      // Did we schedule or reserve a container?
++      Resource assigned = assignment.getResource();
++      
++      handleExcessReservedContainer(clusterResource, assignment);
++
++      if (Resources.greaterThan(resourceCalculator, clusterResource, assigned,
++          Resources.none())) {
++        // Get reserved or allocated container from application
++        RMContainer reservedOrAllocatedRMContainer =
++            application.getRMContainer(assignment.getAssignmentInformation()
++                .getFirstAllocatedOrReservedContainerId());
++
++        // Book-keeping
++        // Note: Update headroom to account for current allocation too...
++        allocateResource(clusterResource, application, assigned,
++            node.getPartition(), reservedOrAllocatedRMContainer);
++
++        // Done
++        return assignment;
++      } else if (!assignment.getSkipped()) {
++        // If we don't allocate anything, and it is not skipped by application,
++        // we will return to respect FIFO of applications
++        return CSAssignment.NULL_ASSIGNMENT;
++      }
++    }
++
++    return CSAssignment.NULL_ASSIGNMENT;
+-  private synchronized CSAssignment assignReservedContainer(
+-      FiCaSchedulerApp application, FiCaSchedulerNode node,
+-      RMContainer rmContainer, Resource clusterResource,
+-      SchedulingMode schedulingMode) {
+-    // Do we still need this reservation?
+-    Priority priority = rmContainer.getReservedPriority();
+-    if (application.getTotalRequiredResources(priority) == 0) {
+-      // Release
+-      return new CSAssignment(application, rmContainer);
+-    }
+-
+-    // Try to assign if we have sufficient resources
+-    CSAssignment tmp =
+-        assignContainersOnNode(clusterResource, node, application, priority,
+-          rmContainer, schedulingMode, new ResourceLimits(Resources.none()));
+-    
+-    // Doesn't matter... since it's already charged for at time of reservation
+-    // "re-reservation" is *free*
+-    CSAssignment ret = new CSAssignment(Resources.none(), NodeType.NODE_LOCAL);
+-    if (tmp.getAssignmentInformation().getNumAllocations() > 0) {
+-      ret.setFulfilledReservation(true);
+-    }
+-    return ret;
+-  }
+-  
+-      Resource clusterResource, FiCaSchedulerApp application, Resource required) {
++      Resource clusterResource, FiCaSchedulerApp application) {
+-        computeUserLimit(application, clusterResource, required, user,
+-            RMNodeLabelsManager.NO_LABEL, SchedulingMode.RESPECT_PARTITION_EXCLUSIVITY));
++        computeUserLimit(application, clusterResource, user,
++            RMNodeLabelsManager.NO_LABEL,
++            SchedulingMode.RESPECT_PARTITION_EXCLUSIVITY));
+-      Resource clusterResource, Resource required, String nodePartition,
++      Resource clusterResource, String nodePartition,
+-        computeUserLimit(application, clusterResource, required,
+-            queueUser, nodePartition, schedulingMode);
++        computeUserLimit(application, clusterResource, queueUser,
++            nodePartition, schedulingMode);
+-      queueUser, this, application, required, queueResourceLimitsInfo);
++      queueUser, this, application, queueResourceLimitsInfo);
++  public int getNodeLocalityDelay() {
++    return nodeLocalityDelay;
++  }
++
++  @Lock(NoLock.class)
+-      Resource clusterResource, Resource required, User user,
++      Resource clusterResource, User user,
++    // Assume we have required resource equals to minimumAllocation, this can
++    // make sure user limit can continuously increase till queueMaxResource
++    // reached.
++    Resource required = minimumAllocation;
++
+-            Resources.subtract(user.getUsed(),application.getCurrentReservation()),
+-            limit)) {
++            Resources.subtract(user.getUsed(),
++                application.getCurrentReservation()), limit)) {
+-          Resource amountNeededToUnreserve = Resources.subtract(user.getUsed(nodePartition), limit);
+-          // we can only acquire a new container if we unreserve first since we ignored the
+-          // user limit. Choose the max of user limit or what was previously set by max
+-          // capacity.
+-          currentResoureLimits.setAmountNeededUnreserve(
+-              Resources.max(resourceCalculator, clusterResource,
+-                  currentResoureLimits.getAmountNeededUnreserve(), amountNeededToUnreserve));
++          Resource amountNeededToUnreserve =
++              Resources.subtract(user.getUsed(nodePartition), limit);
++          // we can only acquire a new container if we unreserve first to
++          // respect user-limit
++          currentResoureLimits.setAmountNeededUnreserve(amountNeededToUnreserve);
+-  boolean shouldAllocOrReserveNewContainer(FiCaSchedulerApp application,
+-      Priority priority, Resource required) {
+-    int requiredContainers = application.getTotalRequiredResources(priority);
+-    int reservedContainers = application.getNumReservedContainers(priority);
+-    int starvation = 0;
+-    if (reservedContainers > 0) {
+-      float nodeFactor = 
+-          Resources.ratio(
+-              resourceCalculator, required, getMaximumAllocation()
+-              );
+-      
+-      // Use percentage of node required to bias against large containers...
+-      // Protect against corner case where you need the whole node with
+-      // Math.min(nodeFactor, minimumAllocationFactor)
+-      starvation = 
+-          (int)((application.getReReservations(priority) / (float)reservedContainers) * 
+-                (1.0f - (Math.min(nodeFactor, getMinimumAllocationFactor())))
+-               );
+-      
+-      if (LOG.isDebugEnabled()) {
+-        LOG.debug("needsContainers:" +
+-            " app.#re-reserve=" + application.getReReservations(priority) + 
+-            " reserved=" + reservedContainers + 
+-            " nodeFactor=" + nodeFactor + 
+-            " minAllocFactor=" + getMinimumAllocationFactor() +
+-            " starvation=" + starvation);
+-      }
+-    }
+-    return (((starvation + requiredContainers) - reservedContainers) > 0);
+-  }
+-
+-  private CSAssignment assignContainersOnNode(Resource clusterResource,
+-      FiCaSchedulerNode node, FiCaSchedulerApp application, Priority priority,
+-      RMContainer reservedContainer, SchedulingMode schedulingMode,
+-      ResourceLimits currentResoureLimits) {
+-
+-    CSAssignment assigned;
+-
+-    NodeType requestType = null;
+-    MutableObject allocatedContainer = new MutableObject();
+-    // Data-local
+-    ResourceRequest nodeLocalResourceRequest =
+-        application.getResourceRequest(priority, node.getNodeName());
+-    if (nodeLocalResourceRequest != null) {
+-      requestType = NodeType.NODE_LOCAL;
+-      assigned =
+-          assignNodeLocalContainers(clusterResource, nodeLocalResourceRequest, 
+-            node, application, priority, reservedContainer,
+-            allocatedContainer, schedulingMode, currentResoureLimits);
+-      if (Resources.greaterThan(resourceCalculator, clusterResource,
+-        assigned.getResource(), Resources.none())) {
+-
+-        //update locality statistics
+-        if (allocatedContainer.getValue() != null) {
+-          application.incNumAllocatedContainers(NodeType.NODE_LOCAL,
+-            requestType);
+-        }
+-        assigned.setType(NodeType.NODE_LOCAL);
+-        return assigned;
+-      }
+-    }
+-
+-    // Rack-local
+-    ResourceRequest rackLocalResourceRequest =
+-        application.getResourceRequest(priority, node.getRackName());
+-    if (rackLocalResourceRequest != null) {
+-      if (!rackLocalResourceRequest.getRelaxLocality()) {
+-        return SKIP_ASSIGNMENT;
+-      }
+-
+-      if (requestType != NodeType.NODE_LOCAL) {
+-        requestType = NodeType.RACK_LOCAL;
+-      }
+-
+-      assigned = 
+-          assignRackLocalContainers(clusterResource, rackLocalResourceRequest, 
+-            node, application, priority, reservedContainer,
+-            allocatedContainer, schedulingMode, currentResoureLimits);
+-      if (Resources.greaterThan(resourceCalculator, clusterResource,
+-        assigned.getResource(), Resources.none())) {
+-
+-        //update locality statistics
+-        if (allocatedContainer.getValue() != null) {
+-          application.incNumAllocatedContainers(NodeType.RACK_LOCAL,
+-            requestType);
+-        }
+-        assigned.setType(NodeType.RACK_LOCAL);
+-        return assigned;
+-      }
+-    }
+-    
+-    // Off-switch
+-    ResourceRequest offSwitchResourceRequest =
+-        application.getResourceRequest(priority, ResourceRequest.ANY);
+-    if (offSwitchResourceRequest != null) {
+-      if (!offSwitchResourceRequest.getRelaxLocality()) {
+-        return SKIP_ASSIGNMENT;
+-      }
+-      if (requestType != NodeType.NODE_LOCAL
+-          && requestType != NodeType.RACK_LOCAL) {
+-        requestType = NodeType.OFF_SWITCH;
+-      }
+-
+-      assigned =
+-          assignOffSwitchContainers(clusterResource, offSwitchResourceRequest,
+-            node, application, priority, reservedContainer,
+-            allocatedContainer, schedulingMode, currentResoureLimits);
+-
+-      // update locality statistics
+-      if (allocatedContainer.getValue() != null) {
+-        application.incNumAllocatedContainers(NodeType.OFF_SWITCH, requestType);
+-      }
+-      assigned.setType(NodeType.OFF_SWITCH);
+-      return assigned;
+-    }
+-    
+-    return SKIP_ASSIGNMENT;
+-  }
+-
+-  @Private
+-  protected boolean findNodeToUnreserve(Resource clusterResource,
+-      FiCaSchedulerNode node, FiCaSchedulerApp application, Priority priority,
+-      Resource minimumUnreservedResource) {
+-    // need to unreserve some other container first
+-    NodeId idToUnreserve =
+-        application.getNodeIdToUnreserve(priority, minimumUnreservedResource,
+-            resourceCalculator, clusterResource);
+-    if (idToUnreserve == null) {
+-      if (LOG.isDebugEnabled()) {
+-        LOG.debug("checked to see if could unreserve for app but nothing "
+-            + "reserved that matches for this app");
+-      }
+-      return false;
+-    }
+-    FiCaSchedulerNode nodeToUnreserve = scheduler.getNode(idToUnreserve);
+-    if (nodeToUnreserve == null) {
+-      LOG.error("node to unreserve doesn't exist, nodeid: " + idToUnreserve);
+-      return false;
+-    }
+-    if (LOG.isDebugEnabled()) {
+-      LOG.debug("unreserving for app: " + application.getApplicationId()
+-        + " on nodeId: " + idToUnreserve
+-        + " in order to replace reserved application and place it on node: "
+-        + node.getNodeID() + " needing: " + minimumUnreservedResource);
+-    }
+-
+-    // headroom
+-    Resources.addTo(application.getHeadroom(), nodeToUnreserve
+-        .getReservedContainer().getReservedResource());
+-
+-    // Make sure to not have completedContainers sort the queues here since
+-    // we are already inside an iterator loop for the queues and this would
+-    // cause an concurrent modification exception.
+-    completedContainer(clusterResource, application, nodeToUnreserve,
+-        nodeToUnreserve.getReservedContainer(),
+-        SchedulerUtils.createAbnormalContainerStatus(nodeToUnreserve
+-            .getReservedContainer().getContainerId(),
+-            SchedulerUtils.UNRESERVED_CONTAINER),
+-        RMContainerEventType.RELEASED, null, false);
+-    return true;
+-  }
+-
+-  private CSAssignment assignNodeLocalContainers(Resource clusterResource,
+-      ResourceRequest nodeLocalResourceRequest, FiCaSchedulerNode node,
+-      FiCaSchedulerApp application, Priority priority,
+-      RMContainer reservedContainer, MutableObject allocatedContainer,
+-      SchedulingMode schedulingMode, ResourceLimits currentResoureLimits) {
+-    if (canAssign(application, priority, node, NodeType.NODE_LOCAL, 
+-        reservedContainer)) {
+-      return assignContainer(clusterResource, node, application, priority,
+-          nodeLocalResourceRequest, NodeType.NODE_LOCAL, reservedContainer,
+-          allocatedContainer, schedulingMode, currentResoureLimits);
+-    }
+-
+-    return new CSAssignment(Resources.none(), NodeType.NODE_LOCAL);
+-  }
+-
+-  private CSAssignment assignRackLocalContainers(Resource clusterResource,
+-      ResourceRequest rackLocalResourceRequest, FiCaSchedulerNode node,
+-      FiCaSchedulerApp application, Priority priority,
+-      RMContainer reservedContainer, MutableObject allocatedContainer,
+-      SchedulingMode schedulingMode, ResourceLimits currentResoureLimits) {
+-    if (canAssign(application, priority, node, NodeType.RACK_LOCAL,
+-        reservedContainer)) {
+-      return assignContainer(clusterResource, node, application, priority,
+-          rackLocalResourceRequest, NodeType.RACK_LOCAL, reservedContainer,
+-          allocatedContainer, schedulingMode, currentResoureLimits);
+-    }
+-
+-    return new CSAssignment(Resources.none(), NodeType.RACK_LOCAL);
+-  }
+-
+-  private CSAssignment assignOffSwitchContainers(Resource clusterResource,
+-      ResourceRequest offSwitchResourceRequest, FiCaSchedulerNode node,
+-      FiCaSchedulerApp application, Priority priority,
+-      RMContainer reservedContainer, MutableObject allocatedContainer,
+-      SchedulingMode schedulingMode, ResourceLimits currentResoureLimits) {
+-    if (canAssign(application, priority, node, NodeType.OFF_SWITCH,
+-        reservedContainer)) {
+-      return assignContainer(clusterResource, node, application, priority,
+-          offSwitchResourceRequest, NodeType.OFF_SWITCH, reservedContainer,
+-          allocatedContainer, schedulingMode, currentResoureLimits);
+-    }
+-    
+-    return new CSAssignment(Resources.none(), NodeType.OFF_SWITCH);
+-  }
+-  
+-  private int getActualNodeLocalityDelay() {
+-    return Math.min(scheduler.getNumClusterNodes(), getNodeLocalityDelay());
+-  }
+-
+-  boolean canAssign(FiCaSchedulerApp application, Priority priority, 
+-      FiCaSchedulerNode node, NodeType type, RMContainer reservedContainer) {
+-
+-    // Clearly we need containers for this application...
+-    if (type == NodeType.OFF_SWITCH) {
+-      if (reservedContainer != null) {
+-        return true;
+-      }
+-
+-      // 'Delay' off-switch
+-      ResourceRequest offSwitchRequest = 
+-          application.getResourceRequest(priority, ResourceRequest.ANY);
+-      long missedOpportunities = application.getSchedulingOpportunities(priority);
+-      long requiredContainers = offSwitchRequest.getNumContainers(); 
+-      
+-      float localityWaitFactor = 
+-        application.getLocalityWaitFactor(priority, 
+-            scheduler.getNumClusterNodes());
+-      
+-      return ((requiredContainers * localityWaitFactor) < missedOpportunities);
+-    }
+-
+-    // Check if we need containers on this rack 
+-    ResourceRequest rackLocalRequest = 
+-      application.getResourceRequest(priority, node.getRackName());
+-    if (rackLocalRequest == null || rackLocalRequest.getNumContainers() <= 0) {
+-      return false;
+-    }
+-      
+-    // If we are here, we do need containers on this rack for RACK_LOCAL req
+-    if (type == NodeType.RACK_LOCAL) {
+-      // 'Delay' rack-local just a little bit...
+-      long missedOpportunities = application.getSchedulingOpportunities(priority);
+-      return getActualNodeLocalityDelay() < missedOpportunities;
+-    }
+-
+-    // Check if we need containers on this host
+-    if (type == NodeType.NODE_LOCAL) {
+-      // Now check if we need containers on this host...
+-      ResourceRequest nodeLocalRequest = 
+-        application.getResourceRequest(priority, node.getNodeName());
+-      if (nodeLocalRequest != null) {
+-        return nodeLocalRequest.getNumContainers() > 0;
+-      }
+-    }
+-
+-    return false;
+-  }
+-  
+-  private Container getContainer(RMContainer rmContainer, 
+-      FiCaSchedulerApp application, FiCaSchedulerNode node, 
+-      Resource capability, Priority priority) {
+-    return (rmContainer != null) ? rmContainer.getContainer() :
+-      createContainer(application, node, capability, priority);
+-  }
+-
+-  Container createContainer(FiCaSchedulerApp application, FiCaSchedulerNode node, 
+-      Resource capability, Priority priority) {
+-  
+-    NodeId nodeId = node.getRMNode().getNodeID();
+-    ContainerId containerId = BuilderUtils.newContainerId(application
+-        .getApplicationAttemptId(), application.getNewContainerId());
+-  
+-    // Create the container
+-    return BuilderUtils.newContainer(containerId, nodeId, node.getRMNode()
+-      .getHttpAddress(), capability, priority, null);
+-
+-  }
+-
+-
+-  private CSAssignment assignContainer(Resource clusterResource, FiCaSchedulerNode node,
+-      FiCaSchedulerApp application, Priority priority, 
+-      ResourceRequest request, NodeType type, RMContainer rmContainer,
+-      MutableObject createdContainer, SchedulingMode schedulingMode,
+-      ResourceLimits currentResoureLimits) {
+-    if (LOG.isDebugEnabled()) {
+-      LOG.debug("assignContainers: node=" + node.getNodeName()
+-        + " application=" + application.getApplicationId()
+-        + " priority=" + priority.getPriority()
+-        + " request=" + request + " type=" + type);
+-    }
+-    
+-    // check if the resource request can access the label
+-    if (!SchedulerUtils.checkResourceRequestMatchingNodePartition(request,
+-        node.getPartition(), schedulingMode)) {
+-      // this is a reserved container, but we cannot allocate it now according
+-      // to label not match. This can be caused by node label changed
+-      // We should un-reserve this container.
+-      if (rmContainer != null) {
+-        unreserve(application, priority, node, rmContainer);
+-      }
+-      return new CSAssignment(Resources.none(), type);
+-    }
+-    
+-    Resource capability = request.getCapability();
+-    Resource available = node.getAvailableResource();
+-    Resource totalResource = node.getTotalResource();
+-
+-    if (!Resources.lessThanOrEqual(resourceCalculator, clusterResource,
+-        capability, totalResource)) {
+-      LOG.warn("Node : " + node.getNodeID()
+-          + " does not have sufficient resource for request : " + request
+-          + " node total capability : " + node.getTotalResource());
+-      return new CSAssignment(Resources.none(), type);
+-    }
+-
+-    assert Resources.greaterThan(
+-        resourceCalculator, clusterResource, available, Resources.none());
+-
+-    // Create the container if necessary
+-    Container container = 
+-        getContainer(rmContainer, application, node, capability, priority);
+-  
+-    // something went wrong getting/creating the container 
+-    if (container == null) {
+-      LOG.warn("Couldn't get container for allocation!");
+-      return new CSAssignment(Resources.none(), type);
+-    }
+-
+-    boolean shouldAllocOrReserveNewContainer = shouldAllocOrReserveNewContainer(
+-        application, priority, capability);
+-
+-    // Can we allocate a container on this node?
+-    int availableContainers = 
+-        resourceCalculator.computeAvailableContainers(available, capability);
+-
+-    boolean needToUnreserve = Resources.greaterThan(resourceCalculator,clusterResource,
+-        currentResoureLimits.getAmountNeededUnreserve(), Resources.none());
+-
+-    if (availableContainers > 0) {
+-      // Allocate...
+-
+-      // Did we previously reserve containers at this 'priority'?
+-      if (rmContainer != null) {
+-        unreserve(application, priority, node, rmContainer);
+-      } else if (this.reservationsContinueLooking && node.getLabels().isEmpty()) {
+-        // when reservationsContinueLooking is set, we may need to unreserve
+-        // some containers to meet this queue, its parents', or the users' resource limits.
+-        // TODO, need change here when we want to support continuous reservation
+-        // looking for labeled partitions.
+-        if (!shouldAllocOrReserveNewContainer || needToUnreserve) {
+-          // If we shouldn't allocate/reserve new container then we should unreserve one the same
+-          // size we are asking for since the currentResoureLimits.getAmountNeededUnreserve
+-          // could be zero. If the limit was hit then use the amount we need to unreserve to be
+-          // under the limit.
+-          Resource amountToUnreserve = capability;
+-          if (needToUnreserve) {
+-            amountToUnreserve = currentResoureLimits.getAmountNeededUnreserve();
+-          }
+-          boolean containerUnreserved =
+-              findNodeToUnreserve(clusterResource, node, application, priority,
+-                  amountToUnreserve);
+-          // When (minimum-unreserved-resource > 0 OR we cannot allocate new/reserved 
+-          // container (That means we *have to* unreserve some resource to
+-          // continue)). If we failed to unreserve some resource, we can't continue.
+-          if (!containerUnreserved) {
+-            return new CSAssignment(Resources.none(), type);
+-          }
+-        }
+-      }
+-
+-      // Inform the application
+-      RMContainer allocatedContainer = 
+-          application.allocate(type, node, priority, request, container);
+-
+-      // Does the application need this resource?
+-      if (allocatedContainer == null) {
+-        return new CSAssignment(Resources.none(), type);
+-      }
+-
+-      // Inform the node
+-      node.allocateContainer(allocatedContainer);
+-            
+-      // Inform the ordering policy
+-      orderingPolicy.containerAllocated(application, allocatedContainer);
+-
+-      LOG.info("assignedContainer" +
+-          " application attempt=" + application.getApplicationAttemptId() +
+-          " container=" + container + 
+-          " queue=" + this + 
+-          " clusterResource=" + clusterResource);
+-      createdContainer.setValue(allocatedContainer);
+-      CSAssignment assignment = new CSAssignment(container.getResource(), type);
+-      assignment.getAssignmentInformation().addAllocationDetails(
+-        container.getId(), getQueuePath());
+-      assignment.getAssignmentInformation().incrAllocations();
+-      Resources.addTo(assignment.getAssignmentInformation().getAllocated(),
+-        container.getResource());
+-      return assignment;
+-    } else {
+-      // if we are allowed to allocate but this node doesn't have space, reserve it or
+-      // if this was an already a reserved container, reserve it again
+-      if (shouldAllocOrReserveNewContainer || rmContainer != null) {
+-
+-        if (reservationsContinueLooking && rmContainer == null) {
+-          // we could possibly ignoring queue capacity or user limits when
+-          // reservationsContinueLooking is set. Make sure we didn't need to unreserve
+-          // one.
+-          if (needToUnreserve) {
+-            if (LOG.isDebugEnabled()) {
+-              LOG.debug("we needed to unreserve to be able to allocate");
+-            }
+-            return new CSAssignment(Resources.none(), type);
+-          }
+-        }
+-
+-        // Reserve by 'charging' in advance...
+-        reserve(application, priority, node, rmContainer, container);
+-
+-        LOG.info("Reserved container " + 
+-            " application=" + application.getApplicationId() + 
+-            " resource=" + request.getCapability() + 
+-            " queue=" + this.toString() + 
+-            " usedCapacity=" + getUsedCapacity() + 
+-            " absoluteUsedCapacity=" + getAbsoluteUsedCapacity() + 
+-            " used=" + queueUsage.getUsed() +
+-            " cluster=" + clusterResource);
+-        CSAssignment assignment =
+-            new CSAssignment(request.getCapability(), type);
+-        assignment.getAssignmentInformation().addReservationDetails(
+-          container.getId(), getQueuePath());
+-        assignment.getAssignmentInformation().incrReservations();
+-        Resources.addTo(assignment.getAssignmentInformation().getReserved(),
+-          request.getCapability());
+-        return assignment;
+-      }
+-      return new CSAssignment(Resources.none(), type);
+-    }
+-  }
+-
+-  private void reserve(FiCaSchedulerApp application, Priority priority, 
+-      FiCaSchedulerNode node, RMContainer rmContainer, Container container) {
+-    // Update reserved metrics if this is the first reservation
+-    if (rmContainer == null) {
+-      getMetrics().reserveResource(
+-          application.getUser(), container.getResource());
+-    }
+-
+-    // Inform the application 
+-    rmContainer = application.reserve(node, priority, rmContainer, container);
+-    
+-    // Update the node
+-    node.reserveResource(application, priority, rmContainer);
+-  }
+-
+-  private boolean unreserve(FiCaSchedulerApp application, Priority priority,
+-      FiCaSchedulerNode node, RMContainer rmContainer) {
+-    // Done with the reservation?
+-    if (application.unreserve(node, priority)) {
+-      node.unreserveResource(application);
+-
+-      // Update reserved metrics
+-      getMetrics().unreserveResource(application.getUser(),
+-          rmContainer.getContainer().getResource());
+-      return true;
+-    }
+-    return false;
+-  }
+-
+-          removed = unreserve(application, rmContainer.getReservedPriority(),
++          removed = application.unreserve(rmContainer.getReservedPriority(),
+-          releaseResource(clusterResource, application,
+-              container.getResource(), node.getPartition(), rmContainer);
+-          LOG.info("completedContainer" +
+-              " container=" + container +
+-              " queue=" + this +
+-              " cluster=" + clusterResource);
++          releaseResource(clusterResource, application, container.getResource(),
++              node.getPartition(), rmContainer);
+-      
+-    LOG.info(getQueueName() + 
+-        " used=" + queueUsage.getUsed() + " numContainers=" + numContainers + 
+-        " user=" + userName + " user-resources=" + user.getUsed());
++
++    if (LOG.isDebugEnabled()) {
++      LOG.debug(getQueueName() +
++          " used=" + queueUsage.getUsed() + " numContainers=" + numContainers +
++          " user=" + userName + " user-resources=" + user.getUsed());
++    }
+-    this.cachedResourceLimitsForHeadroom = new ResourceLimits(currentResourceLimits.getLimit());
++    this.cachedResourceLimitsForHeadroom =
++        new ResourceLimits(currentResourceLimits.getLimit());
+-    this.cachedResourceLimitsForHeadroom.setLimit(Resources.min(resourceCalculator,
+-        clusterResource, queueMaxResource, currentResourceLimits.getLimit()));
++    this.cachedResourceLimitsForHeadroom.setLimit(Resources.min(
++        resourceCalculator, clusterResource, queueMaxResource,
++        currentResourceLimits.getLimit()));
+-            Resources.none(), RMNodeLabelsManager.NO_LABEL,
++            RMNodeLabelsManager.NO_LABEL,
+-    
++
++    public Resource getAllUsed() {
++      return userResourceUsage.getAllUsed();
++    }
++
+-  
++
++  /**
++   * Obtain (read-only) collection of pending applications.
++   */
++  public Collection<FiCaSchedulerApp> getPendingApplications() {
++    return pendingOrderingPolicy.getSchedulableEntities();
++  }
++
+-    for (FiCaSchedulerApp pendingApp : pendingApplications) {
++    for (FiCaSchedulerApp pendingApp : pendingOrderingPolicy
++        .getSchedulableEntities()) {
+-   orderingPolicy.addAllSchedulableEntities(
+-     this.orderingPolicy.getSchedulableEntities()
+-     );
++    if (null != this.orderingPolicy) {
++      orderingPolicy.addAllSchedulableEntities(this.orderingPolicy
++          .getSchedulableEntities());
++    }
+-  
++
++  @Override
++  public Priority getDefaultApplicationPriority() {
++    return defaultAppPriorityPerQueue;
++  }
++
++  public synchronized OrderingPolicy<FiCaSchedulerApp>
++      getPendingAppsOrderingPolicy() {
++    return pendingOrderingPolicy;
++  }
++  public synchronized void setPendingAppsOrderingPolicy(
++      OrderingPolicy<FiCaSchedulerApp> pendingOrderingPolicy) {
++    if (null != this.pendingOrderingPolicy) {
++      pendingOrderingPolicy
++          .addAllSchedulableEntities(this.pendingOrderingPolicy
++              .getSchedulableEntities());
++    }
++    this.pendingOrderingPolicy = pendingOrderingPolicy;
++  }
++
+
+MOV31 MOV31 MOV31 MOV31 INS23 INS31 INS31 INS83 INS83 MOV43 INS59 INS83 UPD74 INS83 MOV83 UPD39 MOV39 INS42 MOV44 MOV44 INS8 INS79 UPD83 MOV83 MOV39 INS42 MOV8 INS31 INS29 UPD83 UPD74 MOV74 INS42 INS78 INS83 MOV43 INS42 UPD83 INS83 INS74 INS42 INS8 UPD83 INS83 INS42 INS44 INS42 UPD43 UPD42 INS33 INS33 INS21 INS21 MOV43 UPD42 INS25 INS25 INS24 INS42 INS57 INS60 INS25 INS83 MOV43 INS42 INS8 INS65 UPD43 INS25 INS42 INS43 INS43 MOV41 INS74 UPD42 MOV42 UPD42 INS32 INS7 MOV27 INS8 MOV27 INS8 MOV58 MOV32 INS8 INS40 MOV43 MOV43 INS43 MOV43 INS59 MOV32 INS8 INS41 INS66 UPD42 INS32 INS32 INS27 INS8 INS42 UPD42 MOV42 MOV42 INS42 INS43 INS43 UPD27 INS42 INS32 INS42 INS32 UPD42 UPD42 INS60 INS32 UPD42 MOV60 INS21 INS21 MOV60 INS51 MOV60 MOV25 MOV60 MOV25 MOV60 MOV25 MOV60 MOV21 MOV25 UPD42 MOV42 INS42 INS42 MOV21 INS32 UPD42 MOV42 UPD42 MOV42 INS42 INS42 INS33 INS22 MOV21 UPD42 MOV42 UPD42 MOV42 INS33 INS22 INS22 INS42 INS42 MOV43 INS42 MOV32 INS42 INS42 INS32 INS45 INS42 INS43 INS59 UPD42 MOV42 INS32 UPD42 UPD42 MOV43 INS32 INS32 MOV42 INS8 INS40 INS40 MOV43 MOV8 INS25 MOV43 INS42 INS42 INS52 INS42 INS52 INS42 INS52 INS42 INS42 INS42 MOV32 INS32 UPD42 INS42 INS42 MOV32 MOV42 INS42 UPD42 UPD42 UPD42 UPD42 MOV42 MOV42 INS32 INS32 UPD42 MOV42 MOV32 MOV40 MOV33 MOV9 UPD42 MOV42 UPD42 MOV42 INS33 INS60 MOV21 MOV41 MOV21 UPD42 UPD42 UPD42 INS38 MOV8 UPD42 UPD42 MOV42 UPD42 UPD42 MOV42 INS42 UPD42 UPD42 UPD42 MOV42 UPD42 MOV42 MOV42 MOV42 MOV32 MOV43 INS59 INS40 MOV32 INS42 UPD42 UPD42 UPD42 MOV32 INS41 INS22 UPD42 UPD42 MOV42 UPD42 UPD42 MOV42 INS42 INS32 UPD42 UPD42 UPD42 MOV42 INS40 INS52 INS42 UPD42 MOV42 UPD42 MOV42 MOV42 MOV42 UPD42 MOV42 INS42 UPD42 MOV42 INS27 MOV42 INS45 INS42 INS45 INS42 INS45 INS42 UPD45 INS42 INS45 INS42 INS45 INS42 UPD45 INS42 INS42 DEL40 DEL26 DEL40 DEL26 DEL40 DEL26 DEL40 DEL26 DEL40 DEL26 DEL40 DEL26 DEL40 DEL26 DEL40 DEL26 DEL42 DEL43 DEL42 DEL43 DEL74 DEL14 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL52 DEL42 DEL22 DEL42 DEL43 DEL74 DEL42 DEL14 DEL7 DEL21 DEL42 DEL78 DEL83 DEL39 DEL42 DEL31 DEL45 DEL42 DEL42 DEL43 DEL42 DEL43 DEL42 DEL42 DEL42 DEL32 DEL42 DEL32 DEL42 DEL32 DEL45 DEL42 DEL32 DEL45 DEL27 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL41 DEL8 DEL51 DEL8 DEL25 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL10 DEL8 DEL42 DEL42 DEL42 DEL42 DEL32 DEL40 DEL27 DEL42 DEL42 DEL32 DEL42 DEL42 DEL45 DEL32 DEL21 DEL8 DEL25 DEL42 DEL42 DEL42 DEL32 DEL21 DEL8 DEL25 DEL42 DEL42 DEL42 DEL32 DEL21 DEL10 DEL42 DEL42 DEL32 DEL42 DEL42 DEL45 DEL42 DEL32 DEL27 DEL32 DEL21 DEL8 DEL25 DEL42 DEL42 DEL42 DEL42 DEL32 DEL42 DEL32 DEL38 DEL42 DEL42 DEL32 DEL42 DEL42 DEL45 DEL42 DEL42 DEL32 DEL45 DEL42 DEL42 DEL32 DEL45 DEL42 DEL32 DEL27 DEL32 DEL21 DEL8 DEL25 DEL18 DEL8 DEL25 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL18 DEL8 DEL25 DEL42 DEL44 DEL42 DEL42 DEL32 DEL42 DEL43 DEL42 DEL42 DEL42 DEL40 DEL32 DEL59 DEL60 DEL33 DEL42 DEL27 DEL18 DEL8 DEL25 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL42 DEL42 DEL32 DEL34 DEL27 DEL25 DEL42 DEL40 DEL27 DEL42 DEL43 DEL42 DEL42 DEL42 DEL32 DEL42 DEL32 DEL42 DEL42 DEL42 DEL32 DEL32 DEL42 DEL32 DEL59 DEL60 DEL33 DEL42 DEL32 DEL27 DEL42 DEL42 DEL32 DEL8 DEL25 DEL10 DEL8 DEL25 DEL8 DEL25 DEL42 DEL42 DEL42 DEL42 DEL32 DEL38 DEL18 DEL8 DEL25 DEL52 DEL42 DEL22 DEL38 DEL42 DEL42 DEL42 DEL42 DEL32 DEL38 DEL42 DEL42 DEL32 DEL42 DEL42 DEL45 DEL32 DEL21 DEL8 DEL25 DEL18 DEL8 DEL25 DEL8 DEL25 DEL42 DEL42 DEL42 DEL32 DEL21 DEL39 DEL42 DEL34 DEL59 DEL60 DEL42 DEL42 DEL32 DEL42 DEL40 DEL32 DEL42 DEL42 DEL42 DEL42 DEL32 DEL7 DEL21 DEL8 DEL25 DEL42 DEL40 DEL27 DEL42 DEL42 DEL42 DEL32 DEL27 DEL42 DEL42 DEL32 DEL42 DEL42 DEL45 DEL42 DEL42 DEL32 DEL45 DEL42 DEL45 DEL45 DEL45 DEL42 DEL45 DEL42 DEL42 DEL32 DEL27 DEL32 DEL21 DEL8 DEL25 DEL10 DEL8 DEL25 DEL8 DEL25 DEL18 DEL8 DEL25 DEL8 DEL70 DEL8 DEL51 DEL42 DEL42 DEL32 DEL21 DEL8 DEL24 DEL42 DEL83 DEL42 DEL43 DEL42 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL42 DEL42 DEL32 DEL34 DEL27 DEL42 DEL42 DEL14 DEL41 DEL8 DEL25 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL43 DEL42 DEL42 DEL32 DEL14 DEL32 DEL59 DEL60 DEL42 DEL43 DEL42 DEL42 DEL43 DEL42 DEL42 DEL32 DEL40 DEL14 DEL59 DEL60 DEL42 DEL42 DEL32 DEL42 DEL32 DEL34 DEL27 DEL42 DEL42 DEL9 DEL32 DEL21 DEL8 DEL25 DEL42 DEL41 DEL8 DEL31 DEL42 DEL44 DEL42 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL42 DEL42 DEL43 DEL42 DEL44 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL32 DEL42 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL44 DEL39 DEL42 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL39 DEL42 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL39 DEL42 DEL34 DEL59 DEL60 DEL42 DEL34 DEL27 DEL39 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL32 DEL59 DEL60 DEL42 DEL39 DEL42 DEL42 DEL42 DEL32 DEL39 DEL42 DEL11 DEL27 DEL36 DEL34 DEL42 DEL42 DEL42 DEL42 DEL32 DEL32 DEL36 DEL27 DEL36 DEL27 DEL36 DEL11 DEL7 DEL21 DEL42 DEL42 DEL45 DEL45 DEL27 DEL42 DEL42 DEL42 DEL32 DEL45 DEL42 DEL45 DEL42 DEL45 DEL42 DEL32 DEL45 DEL42 DEL27 DEL32 DEL21 DEL8 DEL25 DEL8 DEL25 DEL42 DEL42 DEL27 DEL36 DEL42 DEL27 DEL36 DEL34 DEL27 DEL36 DEL41 DEL8 DEL31 DEL83 DEL42 DEL43 DEL42 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL44 DEL42 DEL44 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL59 DEL60 DEL42 DEL43 DEL42 DEL33 DEL59 DEL60 DEL42 DEL43 DEL42 DEL42 DEL43 DEL14 DEL59 DEL60 DEL42 DEL43 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL32 DEL59 DEL60 DEL42 DEL33 DEL27 DEL42 DEL40 DEL7 DEL21 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL7 DEL21 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL42 DEL42 DEL32 DEL32 DEL42 DEL42 DEL40 DEL42 DEL32 DEL21 DEL8 DEL25 DEL42 DEL42 DEL40 DEL32 DEL21 DEL42 DEL41 DEL8 DEL25 DEL8 DEL25 DEL42 DEL33 DEL27 DEL42 DEL42 DEL32 DEL38 DEL42 DEL41 DEL8 DEL25 DEL42 DEL40 DEL27 DEL42 DEL40 DEL7 DEL21 DEL8 DEL25 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL7 DEL21 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL42 DEL42 DEL32 DEL32 DEL42 DEL42 DEL32 DEL33 DEL27 DEL42 DEL42 DEL40 DEL42 DEL32 DEL21 DEL8 DEL25 DEL42 DEL42 DEL40 DEL32 DEL21 DEL42 DEL41 DEL8 DEL25 DEL8 DEL25 DEL42 DEL43 DEL42 DEL42 DEL42 DEL42 DEL40 DEL32 DEL59 DEL60 DEL42 DEL33 DEL27 DEL42 DEL42 DEL32 DEL38 DEL42 DEL41 DEL8 DEL25 DEL42 DEL40 DEL27 DEL42 DEL40 DEL27 DEL27 DEL42 DEL40 DEL7 DEL21 DEL8 DEL25 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL7 DEL21 DEL42 DEL42 DEL32 DEL33 DEL27 DEL42 DEL42 DEL40 DEL42 DEL32 DEL21 DEL8 DEL25 DEL42 DEL42 DEL40 DEL32 DEL21 DEL42 DEL41 DEL8 DEL25 DEL42 DEL41 DEL8 DEL31 DEL42 DEL78 DEL83 DEL39 DEL42 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL44 DEL42 DEL44 DEL42 DEL43 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL33 DEL27 DEL42 DEL42 DEL32 DEL42 DEL42 DEL45 DEL45 DEL27 DEL32 DEL21 DEL8 DEL25 DEL9 DEL41 DEL8 DEL25 DEL42 DEL43 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL33 DEL27 DEL42 DEL42 DEL45 DEL42 DEL27 DEL32 DEL21 DEL9 DEL41 DEL8 DEL25 DEL42 DEL42 DEL32 DEL42 DEL42 DEL45 DEL42 DEL42 DEL32 DEL45 DEL42 DEL45 DEL42 DEL42 DEL32 DEL45 DEL42 DEL27 DEL32 DEL21 DEL8 DEL25 DEL42 DEL42 DEL42 DEL42 DEL32 DEL32 DEL21 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL32 DEL21 DEL9 DEL41 DEL8 DEL31 DEL83 DEL42 DEL43 DEL42 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL44 DEL42 DEL42 DEL42 DEL42 DEL40 DEL42 DEL32 DEL42 DEL42 DEL42 DEL42 DEL40 DEL42 DEL42 DEL42 DEL42 DEL32 DEL41 DEL8 DEL25 DEL42 DEL43 DEL42 DEL42 DEL32 DEL40 DEL14 DEL41 DEL8 DEL31 DEL83 DEL42 DEL43 DEL42 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL44 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL44 DEL42 DEL42 DEL42 DEL42 DEL40 DEL42 DEL32 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL40 DEL42 DEL42 DEL42 DEL42 DEL32 DEL41 DEL8 DEL25 DEL42 DEL43 DEL42 DEL42 DEL32 DEL40 DEL14 DEL41 DEL8 DEL31 DEL42 DEL43 DEL42 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL44 DEL42 DEL42 DEL42 DEL42 DEL40 DEL42 DEL32 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL40 DEL42 DEL42 DEL42 DEL42 DEL32 DEL41 DEL8 DEL25 DEL42 DEL43 DEL42 DEL42 DEL32 DEL40 DEL14 DEL41 DEL8 DEL31 DEL83 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL42 DEL32 DEL32 DEL41 DEL8 DEL31 DEL39 DEL42 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL44 DEL42 DEL40 DEL27 DEL42 DEL33 DEL27 DEL9 DEL41 DEL8 DEL25 DEL42 DEL43 DEL42 DEL42 DEL42 DEL42 DEL40 DEL32 DEL59 DEL60 DEL39 DEL42 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL39 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL39 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL32 DEL59 DEL60 DEL42 DEL42 DEL27 DEL36 DEL42 DEL27 DEL36 DEL41 DEL8 DEL25 DEL42 DEL43 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL32 DEL59 DEL60 DEL42 DEL33 DEL27 DEL42 DEL42 DEL32 DEL34 DEL27 DEL27 DEL9 DEL41 DEL8 DEL25 DEL42 DEL40 DEL27 DEL39 DEL42 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL32 DEL42 DEL27 DEL41 DEL8 DEL25 DEL42 DEL40 DEL27 DEL42 DEL43 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL32 DEL59 DEL60 DEL42 DEL33 DEL27 DEL42 DEL42 DEL32 DEL34 DEL27 DEL41 DEL8 DEL25 DEL8 DEL25 DEL9 DEL41 DEL8 DEL31 DEL83 DEL39 DEL42 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL44 DEL42 DEL42 DEL42 DEL42 DEL32 DEL42 DEL42 DEL42 DEL32 DEL21 DEL42 DEL32 DEL42 DEL42 DEL42 DEL32 DEL42 DEL42 DEL32 DEL42 DEL32 DEL32 DEL21 DEL9 DEL41 DEL8 DEL25 DEL9 DEL41 DEL8 DEL31 DEL42 DEL42 DEL42 DEL45 DEL45 DEL27 DEL42 DEL45 DEL52 DEL45 DEL42 DEL27 DEL32 DEL21 DEL42 DEL42 DEL32 DEL42 DEL43 DEL42 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL44 DEL42 DEL44 DEL42 DEL33 DEL27 DEL36 DEL32 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL16 DEL42 DEL42 DEL43 DEL42 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL42 DEL42 DEL32 DEL42 DEL32 DEL59 DEL60 DEL42 DEL43 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL42 DEL42 DEL32 DEL32 DEL59 DEL60 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL42 DEL32 DEL42 DEL42 DEL33 DEL32 DEL42 DEL43 DEL42 DEL42 DEL32 DEL42 DEL14 DEL43 DEL42 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL44 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL44 DEL42 DEL42 DEL32 DEL42 DEL42 DEL45 DEL42 DEL42 DEL32 DEL45 DEL42 DEL42 DEL32 DEL45 DEL42 DEL42 DEL32 DEL45 DEL42 DEL45 DEL42 DEL27 DEL32 DEL21 DEL8 DEL25 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL42 DEL32 DEL38 DEL42 DEL33 DEL27 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL21 DEL8 DEL25 DEL42 DEL43 DEL42 DEL42 DEL32 DEL42 DEL14 DEL41 DEL8 DEL25 DEL42 DEL43 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL43 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL43 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL38 DEL42 DEL42 DEL45 DEL42 DEL42 DEL32 DEL45 DEL42 DEL45 DEL42 DEL42 DEL32 DEL27 DEL32 DEL21 DEL42 DEL43 DEL42 DEL42 DEL32 DEL42 DEL14 DEL41 DEL8 DEL25 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL32 DEL6 DEL42 DEL43 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL33 DEL27 DEL42 DEL42 DEL45 DEL32 DEL21 DEL42 DEL43 DEL42 DEL42 DEL32 DEL42 DEL14 DEL41 DEL8 DEL25 DEL39 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL39 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL39 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL42 DEL42 DEL32 DEL32 DEL59 DEL60 DEL42 DEL34 DEL27 DEL42 DEL33 DEL27 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL21 DEL8 DEL52 DEL42 DEL22 DEL42 DEL42 DEL32 DEL42 DEL32 DEL27 DEL42 DEL38 DEL42 DEL27 DEL42 DEL43 DEL42 DEL42 DEL59 DEL60 DEL42 DEL42 DEL42 DEL42 DEL32 DEL7 DEL21 DEL8 DEL25 DEL39 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL38 DEL42 DEL43 DEL42 DEL42 DEL32 DEL42 DEL14 DEL41 DEL8 DEL25 DEL8 DEL25 DEL8 DEL25 DEL25 DEL42 DEL43 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL33 DEL27 DEL42 DEL43 DEL42 DEL42 DEL32 DEL42 DEL14 DEL41 DEL8 DEL25 DEL42 DEL42 DEL42 DEL32 DEL21 DEL42 DEL42 DEL42 DEL42 DEL32 DEL21 DEL42 DEL42 DEL45 DEL45 DEL27 DEL42 DEL42 DEL32 DEL45 DEL42 DEL45 DEL52 DEL45 DEL42 DEL27 DEL32 DEL21 DEL42 DEL42 DEL42 DEL32 DEL21 DEL42 DEL43 DEL42 DEL42 DEL43 DEL42 DEL42 DEL32 DEL42 DEL14 DEL59 DEL60 DEL42 DEL42 DEL32 DEL42 DEL42 DEL42 DEL32 DEL32 DEL21 DEL42 DEL42 DEL32 DEL42 DEL32 DEL21 DEL42 DEL42 DEL42 DEL42 DEL32 DEL42 DEL32 DEL42 DEL42 DEL32 DEL32 DEL21 DEL42 DEL41 DEL8 DEL42 DEL42 DEL33 DEL27 DEL27 DEL42 DEL42 DEL33 DEL27 DEL27 DEL42 DEL42 DEL42 DEL32 DEL42 DEL42 DEL45 DEL32 DEL21 DEL8 DEL25 DEL8 DEL25 DEL8 DEL25 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL21 DEL42 DEL42 DEL45 DEL45 DEL27 DEL42 DEL42 DEL32 DEL45 DEL42 DEL42 DEL32 DEL45 DEL52 DEL42 DEL32 DEL45 DEL42 DEL32 DEL45 DEL42 DEL32 DEL45 DEL42 DEL42 DEL32 DEL45 DEL42 DEL27 DEL32 DEL21 DEL42 DEL43 DEL42 DEL42 DEL43 DEL42 DEL42 DEL32 DEL42 DEL14 DEL59 DEL60 DEL42 DEL42 DEL32 DEL42 DEL42 DEL42 DEL32 DEL32 DEL21 DEL42 DEL42 DEL32 DEL42 DEL32 DEL21 DEL42 DEL42 DEL42 DEL42 DEL32 DEL42 DEL32 DEL42 DEL42 DEL32 DEL32 DEL21 DEL8 DEL25 DEL42 DEL43 DEL42 DEL42 DEL32 DEL42 DEL14 DEL41 DEL8 DEL25 DEL8 DEL42 DEL42 DEL43 DEL42 DEL44 DEL43 DEL42 DEL44 DEL43 DEL44 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL44 DEL42 DEL33 DEL32 DEL42 DEL42 DEL32 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL21

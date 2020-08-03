@@ -1,0 +1,146 @@
+HDDS-230. ContainerStateMachine should implement readStateMachineData api to read data from Containers if required during replication. Contributed by Mukul Kumar Singh.
+
++import org.apache.hadoop.hdds.HddsUtils;
++import org.apache.ratis.protocol.RaftGroupId;
++import org.apache.ratis.server.RaftServer;
+-import org.apache.hadoop.hdds.protocol.datanode.proto.ContainerProtos;
++import org.apache.hadoop.hdds.protocol.datanode.proto.ContainerProtos.Type;
++import org.apache.hadoop.hdds.protocol.datanode.proto.ContainerProtos.Stage;
++import org.apache.hadoop.hdds.protocol.datanode.proto.ContainerProtos
++    .ReadChunkRequestProto;
++import org.apache.hadoop.hdds.protocol.datanode.proto.ContainerProtos
++    .ReadChunkResponseProto;
+-import org.apache.ratis.conf.RaftProperties;
+-import org.apache.ratis.protocol.RaftPeerId;
+-  private ThreadPoolExecutor writeChunkExecutor;
++  private ThreadPoolExecutor chunkExecutor;
+-      ThreadPoolExecutor writeChunkExecutor) {
++      ThreadPoolExecutor chunkExecutor) {
+-    this.writeChunkExecutor = writeChunkExecutor;
++    this.chunkExecutor = chunkExecutor;
+-      RaftPeerId id, RaftProperties properties, RaftStorage raftStorage)
++      RaftServer server, RaftGroupId id, RaftStorage raftStorage)
+-    super.initialize(id, properties, raftStorage);
++    super.initialize(server, id, raftStorage);
+-    if (proto.getCmdType() == ContainerProtos.Type.WriteChunk) {
++    if (proto.getCmdType() == Type.WriteChunk) {
+-              .setStage(ContainerProtos.Stage.WRITE_DATA)
++              .setStage(Stage.WRITE_DATA)
+-              .setStage(ContainerProtos.Stage.COMMIT_DATA)
++              .setStage(Stage.COMMIT_DATA)
+-    } else if (proto.getCmdType() == ContainerProtos.Type.CreateContainer) {
++    } else if (proto.getCmdType() == Type.CreateContainer) {
+-  private Message runCommand(ContainerCommandRequestProto requestProto) {
++  private ContainerCommandResponseProto dispatchCommand(
++      ContainerCommandRequestProto requestProto) {
+-    return () -> response.toByteString();
++    return response;
++  }
++
++  private Message runCommand(ContainerCommandRequestProto requestProto) {
++    return dispatchCommand(requestProto)::toByteString;
+-          v -> runCommand(requestProto), writeChunkExecutor);
++          v -> runCommand(requestProto), chunkExecutor);
+-          () -> runCommand(requestProto), writeChunkExecutor);
++          () -> runCommand(requestProto), chunkExecutor);
+-      ContainerProtos.Type cmdType = requestProto.getCmdType();
++      Type cmdType = requestProto.getCmdType();
++  private LogEntryProto readStateMachineData(SMLogEntryProto smLogEntryProto,
++      ContainerCommandRequestProto requestProto) {
++    WriteChunkRequestProto writeChunkRequestProto =
++        requestProto.getWriteChunk();
++    // Assert that store log entry is for COMMIT_DATA, the WRITE_DATA is
++    // written through writeStateMachineData.
++    Preconditions.checkArgument(writeChunkRequestProto.getStage()
++        == Stage.COMMIT_DATA);
++
++    // prepare the chunk to be read
++    ReadChunkRequestProto.Builder readChunkRequestProto =
++        ReadChunkRequestProto.newBuilder()
++            .setBlockID(writeChunkRequestProto.getBlockID())
++            .setChunkData(writeChunkRequestProto.getChunkData());
++    ContainerCommandRequestProto dataContainerCommandProto =
++        ContainerCommandRequestProto.newBuilder(requestProto)
++            .setCmdType(Type.ReadChunk)
++            .setReadChunk(readChunkRequestProto)
++            .build();
++
++    // read the chunk
++    ContainerCommandResponseProto response =
++        dispatchCommand(dataContainerCommandProto);
++    ReadChunkResponseProto responseProto = response.getReadChunk();
++
++    // assert that the response has data in it.
++    Preconditions.checkNotNull(responseProto.getData());
++
++    // reconstruct the write chunk request
++    final WriteChunkRequestProto.Builder dataWriteChunkProto =
++        WriteChunkRequestProto.newBuilder(writeChunkRequestProto)
++            // adding the state machine data
++            .setData(responseProto.getData())
++            .setStage(Stage.WRITE_DATA);
++
++    ContainerCommandRequestProto.Builder newStateMachineProto =
++        ContainerCommandRequestProto.newBuilder(requestProto)
++            .setWriteChunk(dataWriteChunkProto);
++
++    return recreateLogEntryProto(smLogEntryProto,
++        newStateMachineProto.build().toByteString());
++  }
++
++  private LogEntryProto recreateLogEntryProto(SMLogEntryProto smLogEntryProto,
++      ByteString stateMachineData) {
++    // recreate the log entry
++    final SMLogEntryProto log =
++        SMLogEntryProto.newBuilder(smLogEntryProto)
++            .setStateMachineData(stateMachineData)
++            .build();
++    return LogEntryProto.newBuilder().setSmLogEntry(log).build();
++  }
++
++  /*
++   * This api is used by the leader while appending logs to the follower
++   * This allows the leader to read the state machine data from the
++   * state machine implementation in case cached state machine data has been
++   * evicted.
++   */
++  @Override
++  public CompletableFuture<LogEntryProto> readStateMachineData(
++      LogEntryProto entry) {
++    SMLogEntryProto smLogEntryProto = entry.getSmLogEntry();
++    if (!smLogEntryProto.getStateMachineData().isEmpty()) {
++      return CompletableFuture.completedFuture(entry);
++    }
++
++    try {
++      final ContainerCommandRequestProto requestProto =
++          getRequestProto(entry.getSmLogEntry().getData());
++      // readStateMachineData should only be called for "write" to Ratis.
++      Preconditions.checkArgument(!HddsUtils.isReadOnly(requestProto));
++
++      if (requestProto.getCmdType() == Type.WriteChunk) {
++        return CompletableFuture.supplyAsync(() ->
++                readStateMachineData(smLogEntryProto, requestProto),
++            chunkExecutor);
++      } else if (requestProto.getCmdType() == Type.CreateContainer) {
++        LogEntryProto log =
++            recreateLogEntryProto(smLogEntryProto, requestProto.toByteString());
++        return CompletableFuture.completedFuture(log);
++      } else {
++        throw new IllegalStateException("Cmd type:" + requestProto.getCmdType()
++            + " cannot have state machine data");
++      }
++    } catch (Exception e) {
++      LOG.error("unable to read stateMachineData:" + e);
++      return completeExceptionally(e);
++    }
++  }
++
+-      ContainerProtos.Type cmdType = requestProto.getCmdType();
++      Type cmdType = requestProto.getCmdType();
+-      if (cmdType == ContainerProtos.Type.WriteChunk) {
++      if (cmdType == Type.WriteChunk) {
+-        if (cmdType == ContainerProtos.Type.CreateContainer) {
++        if (cmdType == Type.CreateContainer) {
+
+MOV26 MOV26 MOV26 INS26 INS26 INS26 INS26 UPD40 UPD40 UPD40 INS40 INS40 INS40 INS40 INS31 INS31 INS31 INS31 INS43 UPD42 INS83 MOV43 INS42 INS44 INS8 INS83 INS43 INS42 INS44 INS44 INS8 INS83 INS43 INS42 INS44 INS44 INS8 INS78 INS83 INS74 INS42 INS44 INS8 UPD42 UPD42 UPD43 UPD42 UPD43 UPD42 INS42 INS43 INS42 INS41 INS42 INS43 INS42 INS43 INS42 INS60 INS21 INS60 INS60 INS60 INS60 INS21 INS60 INS60 INS41 INS42 INS43 INS42 INS43 INS42 INS60 INS41 INS42 INS43 INS43 INS43 INS42 INS60 INS25 INS54 UPD42 UPD42 INS42 INS42 INS90 INS42 INS42 INS43 INS59 INS32 INS43 INS59 INS43 INS59 INS43 INS59 INS43 INS59 INS32 INS83 INS43 INS59 INS43 INS59 INS32 INS42 INS42 INS83 INS43 INS59 INS32 INS42 INS42 INS42 INS43 INS59 INS38 INS8 INS8 INS12 UPD42 INS42 UPD40 INS32 INS42 INS42 INS42 INS32 INS42 INS42 INS27 INS40 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS32 INS40 INS42 INS32 INS40 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS32 INS32 INS42 INS42 INS42 INS32 INS32 INS41 INS60 INS21 INS25 INS44 INS8 UPD42 UPD40 INS42 INS42 UPD43 INS42 INS42 INS32 INS40 INS32 INS42 INS32 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS40 INS32 INS42 INS42 INS32 INS42 INS32 INS42 INS32 INS42 INS42 INS42 INS42 INS32 INS42 INS32 INS83 INS43 INS59 INS32 INS27 INS8 INS25 INS43 INS42 INS21 INS41 UPD43 INS42 INS42 INS42 INS32 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS38 INS32 INS40 INS41 INS27 INS8 INS8 INS42 INS32 INS32 INS42 UPD40 UPD42 UPD42 INS42 INS42 INS42 INS42 INS32 INS42 INS40 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS32 INS42 INS42 INS32 INS32 INS40 INS60 INS41 INS53 INS42 INS42 INS27 INS42 INS42 UPD40 UPD40 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS86 INS42 INS42 INS42 INS43 INS59 INS32 INS14 INS45 INS42 UPD40 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS42 INS43 INS27 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS45 INS32 INS45 INS42 INS42 INS42 INS42 DEL42 DEL42 DEL42 DEL32 DEL86 DEL40 DEL40

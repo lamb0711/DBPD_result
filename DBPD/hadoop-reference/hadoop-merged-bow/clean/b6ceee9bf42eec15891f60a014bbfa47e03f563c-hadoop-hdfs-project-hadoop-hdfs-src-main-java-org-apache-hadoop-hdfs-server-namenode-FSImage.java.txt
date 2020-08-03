@@ -1,0 +1,153 @@
+HDFS-8865. Improve quota initialization performance. Contributed by Kihwal Lee.
+
++import java.util.concurrent.ForkJoinPool;
++import java.util.concurrent.RecursiveAction;
++import org.apache.hadoop.hdfs.util.ReadOnlyList;
++  private int quotaInitThreads;
++    this.quotaInitThreads = conf.getInt(
++        DFSConfigKeys.DFS_NAMENODE_QUOTA_INIT_THREADS_KEY,
++        DFSConfigKeys.DFS_NAMENODE_QUOTA_INIT_THREADS_DEFAULT);
++
+-          target.dir.rootDir);
++          target.dir.rootDir, quotaInitThreads);
+-                                  INodeDirectory root) {
+-    updateCountForQuotaRecursively(bsps, root.getStoragePolicyID(), root,
+-        new QuotaCounts.Builder().build());
+- }
++      INodeDirectory root, int threads) {
++    threads = (threads < 1) ? 1 : threads;
++    LOG.info("Initializing quota with " + threads + " thread(s)");
++    long start = Time.now();
++    QuotaCounts counts = new QuotaCounts.Builder().build();
++    ForkJoinPool p = new ForkJoinPool(threads);
++    RecursiveAction task = new InitQuotaTask(bsps, root.getStoragePolicyID(),
++        root, counts);
++    p.execute(task);
++    task.join();
++    LOG.info("Quota initialization completed in " + (Time.now() - start) +
++        " milliseconds\n" + counts);
++  }
+-  private static void updateCountForQuotaRecursively(BlockStoragePolicySuite bsps,
+-      byte blockStoragePolicyId, INodeDirectory dir, QuotaCounts counts) {
+-    final long parentNamespace = counts.getNameSpace();
+-    final long parentStoragespace = counts.getStorageSpace();
+-    final EnumCounters<StorageType> parentTypeSpaces = counts.getTypeSpaces();
++  /**
++   * parallel initialization using fork-join.
++   */
++  private static class InitQuotaTask extends RecursiveAction {
++    private final INodeDirectory dir;
++    private final QuotaCounts counts;
++    private final BlockStoragePolicySuite bsps;
++    private final byte blockStoragePolicyId;
+-    dir.computeQuotaUsage4CurrentDirectory(bsps, blockStoragePolicyId, counts);
+-    
+-    for (INode child : dir.getChildrenList(Snapshot.CURRENT_STATE_ID)) {
+-      final byte childPolicyId = child.getStoragePolicyIDForQuota(blockStoragePolicyId);
+-      if (child.isDirectory()) {
+-        updateCountForQuotaRecursively(bsps, childPolicyId,
+-            child.asDirectory(), counts);
+-      } else {
+-        // file or symlink: count here to reduce recursive calls.
+-        counts.add(child.computeQuotaUsage(bsps, childPolicyId, false,
+-            Snapshot.CURRENT_STATE_ID));
+-      }
++    public InitQuotaTask(BlockStoragePolicySuite bsps,
++        byte blockStoragePolicyId, INodeDirectory dir, QuotaCounts counts) {
++      this.dir = dir;
++      this.counts = counts;
++      this.bsps = bsps;
++      this.blockStoragePolicyId = blockStoragePolicyId;
+-      
+-    if (dir.isQuotaSet()) {
+-      // check if quota is violated. It indicates a software bug.
+-      final QuotaCounts q = dir.getQuotaCounts();
+-      final long namespace = counts.getNameSpace() - parentNamespace;
+-      final long nsQuota = q.getNameSpace();
+-      if (Quota.isViolated(nsQuota, namespace)) {
+-        LOG.warn("Namespace quota violation in image for "
+-            + dir.getFullPathName()
+-            + " quota = " + nsQuota + " < consumed = " + namespace);
+-      }
++    public void compute() {
++      QuotaCounts myCounts =  new QuotaCounts.Builder().build();
++      dir.computeQuotaUsage4CurrentDirectory(bsps, blockStoragePolicyId,
++          myCounts);
+-      final long ssConsumed = counts.getStorageSpace() - parentStoragespace;
+-      final long ssQuota = q.getStorageSpace();
+-      if (Quota.isViolated(ssQuota, ssConsumed)) {
+-        LOG.warn("Storagespace quota violation in image for "
+-            + dir.getFullPathName()
+-            + " quota = " + ssQuota + " < consumed = " + ssConsumed);
+-      }
++      ReadOnlyList<INode> children =
++          dir.getChildrenList(Snapshot.CURRENT_STATE_ID);
+-      final EnumCounters<StorageType> typeSpaces = counts.getTypeSpaces();
+-      for (StorageType t : StorageType.getTypesSupportingQuota()) {
+-        final long typeSpace = typeSpaces.get(t) - parentTypeSpaces.get(t);
+-        final long typeQuota = q.getTypeSpaces().get(t);
+-        if (Quota.isViolated(typeQuota, typeSpace)) {
+-          LOG.warn("Storage type quota violation in image for "
+-              + dir.getFullPathName()
+-              + " type = " + t.toString() + " quota = "
+-              + typeQuota + " < consumed " + typeSpace);
++      if (children.size() > 0) {
++        List<InitQuotaTask> subtasks = new ArrayList<InitQuotaTask>();
++        for (INode child : children) {
++          final byte childPolicyId =
++              child.getStoragePolicyIDForQuota(blockStoragePolicyId);
++          if (child.isDirectory()) {
++            subtasks.add(new InitQuotaTask(bsps, childPolicyId,
++                child.asDirectory(), myCounts));
++          } else {
++            // file or symlink. count using the local counts variable
++            myCounts.add(child.computeQuotaUsage(bsps, childPolicyId, false,
++                Snapshot.CURRENT_STATE_ID));
++          }
++        // invoke and wait for completion
++        invokeAll(subtasks);
+-      dir.getDirectoryWithQuotaFeature().setSpaceConsumed(namespace, ssConsumed,
+-          typeSpaces);
++      if (dir.isQuotaSet()) {
++        // check if quota is violated. It indicates a software bug.
++        final QuotaCounts q = dir.getQuotaCounts();
++
++        final long nsConsumed = myCounts.getNameSpace();
++        final long nsQuota = q.getNameSpace();
++        if (Quota.isViolated(nsQuota, nsConsumed)) {
++          LOG.warn("Namespace quota violation in image for "
++              + dir.getFullPathName()
++              + " quota = " + nsQuota + " < consumed = " + nsConsumed);
++        }
++
++        final long ssConsumed = myCounts.getStorageSpace();
++        final long ssQuota = q.getStorageSpace();
++        if (Quota.isViolated(ssQuota, ssConsumed)) {
++          LOG.warn("Storagespace quota violation in image for "
++              + dir.getFullPathName()
++              + " quota = " + ssQuota + " < consumed = " + ssConsumed);
++        }
++
++        final EnumCounters<StorageType> tsConsumed = myCounts.getTypeSpaces();
++        for (StorageType t : StorageType.getTypesSupportingQuota()) {
++          final long typeSpace = tsConsumed.get(t);
++          final long typeQuota = q.getTypeSpaces().get(t);
++          if (Quota.isViolated(typeQuota, typeSpace)) {
++            LOG.warn("Storage type quota violation in image for "
++                + dir.getFullPathName()
++                + " type = " + t.toString() + " quota = "
++                + typeQuota + " < consumed " + typeSpace);
++          }
++        }
++        if (LOG.isDebugEnabled()) {
++          LOG.debug("Setting quota for " + dir + "\n" + myCounts);
++        }
++        dir.getDirectoryWithQuotaFeature().setSpaceConsumed(nsConsumed,
++            ssConsumed, tsConsumed);
++      }
++
++      synchronized(counts) {
++        counts.add(myCounts);
++      }
+
+INS26 INS26 INS26 INS40 INS40 INS40 INS23 INS55 INS83 INS39 INS59 INS44 INS29 INS83 INS83 INS42 INS43 INS23 INS23 INS23 INS23 INS31 MOV31 INS42 INS21 INS39 INS42 INS21 INS21 INS60 INS60 INS60 INS60 INS21 INS21 INS21 INS65 INS42 INS83 INS83 INS43 INS59 INS83 INS83 INS43 INS59 INS83 INS83 INS43 INS59 INS83 INS83 INS39 INS59 INS83 INS42 MOV44 MOV44 MOV44 MOV44 INS8 UPD83 UPD42 INS7 INS7 INS32 INS39 INS59 INS43 INS59 INS43 INS59 INS43 INS59 INS32 INS32 INS32 INS66 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS21 INS21 INS21 INS21 INS21 INS60 INS25 INS51 INS22 INS32 INS42 INS16 INS42 INS42 INS27 INS42 INS32 INS42 INS42 MOV32 INS42 INS42 INS14 INS42 INS42 INS14 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS27 INS7 INS7 INS7 INS7 INS43 INS32 INS74 INS59 INS27 INS8 INS42 INS8 INS52 INS42 INS42 INS42 INS40 INS40 INS36 INS34 INS42 INS45 INS42 INS45 INS42 INS42 INS43 INS42 INS43 INS42 MOV32 INS42 INS42 INS45 INS36 INS45 INS42 INS22 INS42 INS22 INS42 INS22 INS42 INS22 INS42 INS42 UPD42 INS42 INS42 INS42 INS42 INS42 INS43 INS43 INS42 MOV32 INS32 INS34 MOV60 MOV70 INS21 INS25 INS21 INS42 INS27 INS42 INS42 INS27 INS52 INS42 INS52 INS42 INS52 INS42 INS52 INS42 INS14 UPD42 INS42 INS42 UPD42 MOV42 UPD42 MOV42 UPD74 INS42 INS32 INS32 INS8 INS32 INS42 INS34 INS32 INS42 INS43 UPD43 UPD43 UPD42 INS14 UPD42 MOV42 INS42 UPD42 INS32 UPD42 INS32 UPD42 INS42 INS42 INS21 UPD42 UPD42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 INS42 INS42 INS40 UPD42 UPD42 INS74 UPD42 MOV42 MOV42 UPD42 MOV42 MOV42 UPD42 INS32 INS43 INS43 INS32 INS42 INS42 INS27 INS42 INS42 UPD42 UPD42 MOV42 MOV42 MOV42 INS45 INS42 INS45 INS42 INS42 INS42 INS14 UPD42 INS43 INS42 INS42 MOV32 INS42 INS42 DEL42 DEL42 DEL42 DEL32 DEL21 DEL83 DEL83 DEL39 DEL42 DEL83 DEL42 DEL42 DEL32 DEL42 DEL42 DEL42 DEL42 DEL83 DEL39 DEL42 DEL32 DEL59 DEL60 DEL42 DEL32 DEL21 DEL32 DEL42 DEL27 DEL32 DEL42 DEL27 DEL32 DEL42 DEL42 DEL42 DEL32 DEL27

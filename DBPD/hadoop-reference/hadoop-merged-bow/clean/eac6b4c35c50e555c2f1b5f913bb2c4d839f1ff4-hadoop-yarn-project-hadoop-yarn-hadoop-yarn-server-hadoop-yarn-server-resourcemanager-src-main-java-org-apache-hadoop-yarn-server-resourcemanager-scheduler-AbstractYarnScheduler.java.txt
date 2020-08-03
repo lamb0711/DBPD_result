@@ -1,0 +1,175 @@
+YARN-6216. Unify Container Resizing code paths with Container Updates making it scheduler agnostic. (Arun Suresh via wangda)
+
++import java.util.Arrays;
++import org.apache.hadoop.yarn.api.records.ContainerUpdateType;
++
++      completeOustandingUpdatesWhichAreReserved(
++          rmContainer, containerStatus, event);
++  // Optimization:
++  // Check if there are in-flight container updates and complete the
++  // associated temp containers. These are removed when the app completes,
++  // but removing them when the actual container completes would allow the
++  // scheduler to reallocate those resources sooner.
++  private void completeOustandingUpdatesWhichAreReserved(
++      RMContainer rmContainer, ContainerStatus containerStatus,
++      RMContainerEventType event) {
++    N schedulerNode = getSchedulerNode(rmContainer.getNodeId());
++    if (schedulerNode != null &&
++        schedulerNode.getReservedContainer() != null) {
++      RMContainer resContainer = schedulerNode.getReservedContainer();
++      if (resContainer.getReservedSchedulerKey() != null) {
++        ContainerId containerToUpdate = resContainer
++            .getReservedSchedulerKey().getContainerToUpdate();
++        if (containerToUpdate != null &&
++            containerToUpdate.equals(containerStatus.getContainerId())) {
++          completedContainerInternal(resContainer,
++              ContainerStatus.newInstance(resContainer.getContainerId(),
++                  containerStatus.getState(), containerStatus
++                      .getDiagnostics(),
++                  containerStatus.getExitStatus()), event);
++        }
++      }
++    }
++  }
++
+-  protected void decreaseContainers(
+-      List<UpdateContainerRequest> decreaseRequests,
+-      SchedulerApplicationAttempt attempt) {
+-    if (null == decreaseRequests || decreaseRequests.isEmpty()) {
+-      return;
+-    }
+-    // Pre-process decrease requests
+-    List<SchedContainerChangeRequest> schedDecreaseRequests =
+-        createSchedContainerChangeRequests(decreaseRequests, false);
+-    for (SchedContainerChangeRequest request : schedDecreaseRequests) {
+-      if (LOG.isDebugEnabled()) {
+-        LOG.debug("Processing decrease request:" + request);
+-      }
+-      // handle decrease request
+-      decreaseContainer(request, attempt);
+-    }
+-  }
+-
+-  protected abstract void decreaseContainer(
+-      SchedContainerChangeRequest decreaseRequest,
+-      SchedulerApplicationAttempt attempt);
+-
+-  protected void handleExecutionTypeUpdates(
+-      SchedulerApplicationAttempt appAttempt,
+-      List<UpdateContainerRequest> promotionRequests,
+-      List<UpdateContainerRequest> demotionRequests) {
++  protected void handleContainerUpdates(
++      SchedulerApplicationAttempt appAttempt, ContainerUpdates updates) {
++    List<UpdateContainerRequest> promotionRequests =
++        updates.getPromotionRequests();
+-      handlePromotionRequests(appAttempt, promotionRequests);
++      // Promotion is technically an increase request from
++      // 0 resources to target resources.
++      handleIncreaseRequests(appAttempt, promotionRequests);
++    List<UpdateContainerRequest> increaseRequests =
++        updates.getIncreaseRequests();
++    if (increaseRequests != null && !increaseRequests.isEmpty()) {
++      LOG.info("Resource increase requests : " + increaseRequests);
++      handleIncreaseRequests(appAttempt, increaseRequests);
++    }
++    List<UpdateContainerRequest> demotionRequests =
++        updates.getDemotionRequests();
+-      handleDemotionRequests(appAttempt, demotionRequests);
++      // Demotion is technically a decrease request from initial
++      // to 0 resources
++      handleDecreaseRequests(appAttempt, demotionRequests);
++    }
++    List<UpdateContainerRequest> decreaseRequests =
++        updates.getDecreaseRequests();
++    if (decreaseRequests != null && !decreaseRequests.isEmpty()) {
++      LOG.info("Resource decrease requests : " + decreaseRequests);
++      handleDecreaseRequests(appAttempt, decreaseRequests);
+-  private void handlePromotionRequests(
++  private void handleIncreaseRequests(
+-  private void handleDemotionRequests(SchedulerApplicationAttempt appAttempt,
++  private void handleDecreaseRequests(SchedulerApplicationAttempt appAttempt,
+-        if (appAttempt.getUpdateContext().checkAndAddToOutstandingDecreases(
+-            rmContainer.getContainer())) {
+-          RMContainer demotedRMContainer =
+-              createDemotedRMContainer(appAttempt, oppCntxt, rmContainer);
+-          appAttempt.addToNewlyDemotedContainers(
+-              uReq.getContainerId(), demotedRMContainer);
++        SchedulerNode schedulerNode = rmContext.getScheduler()
++            .getSchedulerNode(rmContainer.getContainer().getNodeId());
++        if (appAttempt.getUpdateContext()
++            .checkAndAddToOutstandingDecreases(uReq, schedulerNode,
++                rmContainer.getContainer())) {
++          if (ContainerUpdateType.DEMOTE_EXECUTION_TYPE ==
++              uReq.getContainerUpdateType()) {
++            RMContainer demotedRMContainer =
++                createDemotedRMContainer(appAttempt, oppCntxt, rmContainer);
++            appAttempt.addToNewlyDemotedContainers(
++                uReq.getContainerId(), demotedRMContainer);
++          } else {
++            RMContainer demotedRMContainer = createDecreasedRMContainer(
++                appAttempt, uReq, rmContainer);
++            appAttempt.addToNewlyDecreasedContainers(
++                uReq.getContainerId(), demotedRMContainer);
++          }
+-        LOG.warn("Cannot demote non-existent (or completed) Container ["
+-            + uReq.getContainerId() + "]");
++        LOG.warn("Cannot demote/decrease non-existent (or completed) " +
++            "Container [" + uReq.getContainerId() + "]");
++  private RMContainer createDecreasedRMContainer(
++      SchedulerApplicationAttempt appAttempt, UpdateContainerRequest uReq,
++      RMContainer rmContainer) {
++    SchedulerRequestKey sk =
++        SchedulerRequestKey.extractFrom(rmContainer.getContainer());
++    Container decreasedContainer = BuilderUtils.newContainer(
++        ContainerId.newContainerId(appAttempt.getApplicationAttemptId(),
++            appAttempt.getNewContainerId()),
++        rmContainer.getContainer().getNodeId(),
++        rmContainer.getContainer().getNodeHttpAddress(),
++        Resources.none(),
++        sk.getPriority(), null, rmContainer.getExecutionType(),
++        sk.getAllocationRequestId());
++    decreasedContainer.setVersion(rmContainer.getContainer().getVersion());
++    RMContainer newRmContainer = new RMContainerImpl(decreasedContainer,
++        sk, appAttempt.getApplicationAttemptId(),
++        decreasedContainer.getNodeId(), appAttempt.getUser(), rmContext,
++        rmContainer.isRemotelyAllocated());
++    appAttempt.addRMContainer(decreasedContainer.getId(), rmContainer);
++    ((AbstractYarnScheduler) rmContext.getScheduler()).getNode(
++        decreasedContainer.getNodeId()).allocateContainer(newRmContainer);
++    return newRmContainer;
++  }
++
++
++  /**
++   * Rollback container update after expiry.
++   * @param containerId ContainerId.
++   */
++  protected void rollbackContainerUpdate(
++      ContainerId containerId) {
++    RMContainer rmContainer = getRMContainer(containerId);
++    if (rmContainer == null) {
++      LOG.info("Cannot rollback resource for container " + containerId
++          + ". The container does not exist.");
++      return;
++    }
++    T app = getCurrentAttemptForContainer(containerId);
++    if (getCurrentAttemptForContainer(containerId) == null) {
++      LOG.info("Cannot rollback resource for container " + containerId
++          + ". The application that the container "
++          + "belongs to does not exist.");
++      return;
++    }
++
++    if (Resources.fitsIn(rmContainer.getLastConfirmedResource(),
++        rmContainer.getContainer().getResource())) {
++      LOG.info("Roll back resource for container " + containerId);
++      handleDecreaseRequests(app, Arrays.asList(
++          UpdateContainerRequest.newInstance(
++              rmContainer.getContainer().getVersion(),
++              rmContainer.getContainerId(),
++              ContainerUpdateType.DECREASE_RESOURCE,
++              rmContainer.getLastConfirmedResource(), null)));
++    }
++  }
+
+INS26 INS26 MOV31 INS40 INS40 INS31 INS31 UPD83 MOV83 MOV39 INS42 INS44 MOV44 INS44 INS8 UPD42 UPD42 UPD42 INS83 INS43 INS42 MOV44 INS44 INS44 MOV8 INS29 UPD42 INS8 INS43 INS42 INS43 INS42 INS43 INS42 INS60 INS25 INS43 UPD42 INS60 INS60 INS25 INS60 INS60 INS25 INS42 UPD42 INS43 INS42 INS43 INS42 INS60 INS60 INS21 INS60 MOV21 MOV21 INS41 INS65 INS65 UPD43 UPD42 INS60 INS25 INS60 INS25 INS25 INS42 INS42 INS42 INS43 INS59 INS27 INS8 UPD42 MOV42 MOV74 INS59 MOV74 INS59 INS27 INS8 INS74 INS59 INS74 INS59 UPD27 MOV27 INS8 INS42 INS42 INS43 INS59 INS43 MOV59 INS32 INS43 INS59 INS42 INS66 INS42 INS66 UPD42 INS43 INS59 INS27 INS8 INS43 INS59 INS27 INS8 INS32 INS8 INS21 INS42 INS42 INS32 INS27 INS27 INS60 INS25 INS42 INS32 INS42 INS32 INS27 INS38 INS21 INS21 INS43 INS43 INS42 INS32 INS43 INS43 INS42 INS32 UPD27 INS38 INS21 INS21 UPD42 MOV42 INS42 INS32 UPD42 MOV42 UPD42 INS42 INS42 INS32 UPD42 MOV42 INS42 INS14 UPD42 INS42 INS32 INS42 INS32 UPD42 INS42 UPD42 MOV42 INS42 INS32 INS42 INS33 INS21 INS41 INS42 INS42 INS32 INS32 INS33 INS21 INS41 INS42 INS42 INS32 INS32 INS21 INS21 INS32 INS42 INS32 INS42 INS33 INS32 INS33 INS43 INS59 INS27 INS8 INS42 INS42 INS42 INS42 INS42 INS33 INS32 INS32 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS33 MOV32 INS32 INS32 INS42 INS42 INS32 INS42 INS42 INS32 INS32 INS32 INS32 INS32 INS33 INS32 INS32 INS32 INS42 INS43 INS42 INS42 INS32 INS32 INS32 INS42 INS32 UPD42 MOV42 INS42 INS36 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS32 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS32 INS33 INS60 INS25 UPD42 INS42 INS42 INS42 INS42 INS27 INS42 INS42 INS42 UPD42 INS42 INS42 INS27 INS42 INS42 INS42 INS60 INS42 INS42 UPD42 MOV42 INS42 INS32 INS32 INS32 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 UPD42 MOV42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 UPD42 MOV42 UPD42 MOV42 INS11 UPD42 MOV42 UPD42 MOV42 INS42 INS42 INS27 INS42 INS42 INS27 INS42 INS42 INS42 INS42 INS27 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS43 INS59 INS27 INS8 INS45 INS42 INS45 INS42 INS43 INS59 INS8 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS43 INS32 INS45 INS42 INS45 INS45 INS42 INS45 INS45 INS45 INS42 INS42 INS42 INS32 INS42 INS42 INS32 INS27 INS32 INS21 INS42 INS42 INS32 INS42 INS42 INS25 INS42 INS42 INS42 INS42 INS42 INS32 INS32 INS40 INS32 INS33 INS32 INS42 INS42 INS33 INS42 INS42 INS32 INS32 INS32 INS42 INS32 INS27 MOV8 INS8 INS27 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS32 INS42 INS40 INS32 INS60 INS21 UPD45 MOV45 INS45 INS42 INS42 INS42 INS42 INS32 INS32 INS32 INS32 INS42 INS42 INS42 INS42 INS43 INS59 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 DEL42 DEL42 DEL31 DEL42 DEL44 DEL42 DEL43 DEL43 DEL74 DEL33 DEL9 DEL45 DEL42 DEL27 DEL41 DEL8 DEL25 DEL43 DEL43 DEL74 DEL60 DEL43 DEL42 DEL44 DEL42 DEL32 DEL8 DEL25 DEL8 DEL70 DEL83 DEL43 DEL42 DEL44

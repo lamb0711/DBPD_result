@@ -1,0 +1,429 @@
+HDFS-8320. Erasure coding: consolidate striping-related terminologies. Contributed by Zhe Zhang and Jing Zhao.
+
+- * Utility class for analyzing striped block groups
++ * When accessing a file in striped layout, operations on logical byte ranges
++ * in the file need to be mapped to physical byte ranges on block files stored
++ * on DataNodes. This utility class facilities this mapping by defining and
++ * exposing a number of striping-related concepts. The most basic ones are
++ * illustrated in the following diagram. Unless otherwise specified, all
++ * range-related calculations are inclusive (the end offset of the previous
++ * range should be 1 byte lower than the start offset of the next one).
++ *
++ *  | <----  Block Group ----> |   <- Block Group: logical unit composing
++ *  |                          |        striped HDFS files.
++ *  blk_0      blk_1       blk_2   <- Internal Blocks: each internal block
++ *    |          |           |          represents a physically stored local
++ *    v          v           v          block file
++ * +------+   +------+   +------+
++ * |cell_0|   |cell_1|   |cell_2|  <- {@link StripingCell} represents the
++ * +------+   +------+   +------+       logical order that a Block Group should
++ * |cell_3|   |cell_4|   |cell_5|       be accessed: cell_0, cell_1, ...
++ * +------+   +------+   +------+
++ * |cell_6|   |cell_7|   |cell_8|
++ * +------+   +------+   +------+
++ * |cell_9|
++ * +------+  <- A cell contains cellSize bytes of data
+-  
+-  /**
+-   * This method creates an internal {@link ExtendedBlock} at the given index
+-   * of a block group, for both data and parity block.
+-   */
+-  public static ExtendedBlock constructStripedBlock(ExtendedBlock blockGroup,
+-      int cellSize, int dataBlkNum, int idxInBlockGroup) {
+-    ExtendedBlock block = new ExtendedBlock(blockGroup);
+-    block.setBlockId(blockGroup.getBlockId() + idxInBlockGroup);
+-    block.setNumBytes(getStripedBlockLength(blockGroup.getNumBytes(), cellSize,
+-        dataBlkNum, idxInBlockGroup));
+-    return block;
+-  }
+-
+-  /**
+-   * Returns an internal block length at the given index of a block group,
+-   * for both data and parity block.
+-   */
+-  public static long getStripedBlockLength(long numBytes, int cellSize,
+-      int dataBlkNum, int idxInBlockGroup) {
+-    // parity block length is the same as the first striped block length. 
+-    return StripedBlockUtil.getInternalBlockLength(
+-        numBytes, cellSize, dataBlkNum, 
+-        idxInBlockGroup < dataBlkNum ? idxInBlockGroup : 0);
+-  }
+-  
++
+-   * This method plans the read portion from each block in the stripe
+-   * @param dataBlkNum The number of data blocks in the striping group
+-   * @param cellSize The size of each striping cell
+-   * @param startInBlk Starting offset in the striped block
+-   * @param len Length of the read request
+-   * @param bufOffset  Initial offset in the result buffer
+-   * @return array of {@link ReadPortion}, each representing the portion of I/O
+-   *         for an individual block in the group
+-   */
+-  @VisibleForTesting
+-  public static ReadPortion[] planReadPortions(final int dataBlkNum,
+-      final int cellSize, final long startInBlk, final int len, int bufOffset) {
+-    ReadPortion[] results = new ReadPortion[dataBlkNum];
+-    for (int i = 0; i < dataBlkNum; i++) {
+-      results[i] = new ReadPortion();
+-    }
+-
+-    // cellIdxInBlk is the index of the cell in the block
+-    // E.g., cell_3 is the 2nd cell in blk_0
+-    int cellIdxInBlk = (int) (startInBlk / (cellSize * dataBlkNum));
+-
+-    // blkIdxInGroup is the index of the block in the striped block group
+-    // E.g., blk_2 is the 3rd block in the group
+-    final int blkIdxInGroup = (int) (startInBlk / cellSize % dataBlkNum);
+-    results[blkIdxInGroup].setStartOffsetInBlock(cellSize * cellIdxInBlk +
+-        startInBlk % cellSize);
+-    boolean crossStripe = false;
+-    for (int i = 1; i < dataBlkNum; i++) {
+-      if (blkIdxInGroup + i >= dataBlkNum && !crossStripe) {
+-        cellIdxInBlk++;
+-        crossStripe = true;
+-      }
+-      results[(blkIdxInGroup + i) % dataBlkNum].setStartOffsetInBlock(
+-          cellSize * cellIdxInBlk);
+-    }
+-
+-    int firstCellLen = Math.min(cellSize - (int) (startInBlk % cellSize), len);
+-    results[blkIdxInGroup].offsetsInBuf.add(bufOffset);
+-    results[blkIdxInGroup].lengths.add(firstCellLen);
+-    results[blkIdxInGroup].addReadLength(firstCellLen);
+-
+-    int i = (blkIdxInGroup + 1) % dataBlkNum;
+-    for (int done = firstCellLen; done < len; done += cellSize) {
+-      ReadPortion rp = results[i];
+-      rp.offsetsInBuf.add(done + bufOffset);
+-      final int readLen = Math.min(len - done, cellSize);
+-      rp.lengths.add(readLen);
+-      rp.addReadLength(readLen);
+-      i = (i + 1) % dataBlkNum;
+-    }
+-    return results;
+-  }
+-
+-  /**
+-   * This method divides a requested byte range into an array of
+-   * {@link AlignedStripe}
++   * This method divides a requested byte range into an array of inclusive
++   * {@link AlignedStripe}.
++   * @param ecSchema The codec schema for the file, which carries the numbers
++   *                 of data / parity blocks, as well as cell size
++   * @param blockGroup The striped block group
++   * @param rangeStartInBlockGroup The byte range's start offset in block group
++   * @param rangeEndInBlockGroup The byte range's end offset in block group
++   * @param buf Destination buffer of the read operation for the byte range
++   * @param offsetInBuf Start offset into the destination buffer
+-   *
+-   * At most 5 stripes will be generated from each logical range
+-   * TODO: cleanup and get rid of planReadPortions
++   * At most 5 stripes will be generated from each logical range, as
++   * demonstrated in the header of {@link AlignedStripe}.
+-      ECSchema ecSchema, LocatedStripedBlock blockGroup, long start, long end,
+-      byte[] buf, int offsetInBuf) {
++      ECSchema ecSchema, LocatedStripedBlock blockGroup,
++      long rangeStartInBlockGroup, long rangeEndInBlockGroup, byte[] buf,
++      int offsetInBuf) {
+-    int len = (int) (end - start + 1);
+-    int firstCellIdxInBG = (int) (start / cellSize);
+-    int lastCellIdxInBG = (int) (end / cellSize);
+-    int firstCellSize = Math.min(cellSize - (int) (start % cellSize), len);
+-    long firstCellOffsetInBlk = firstCellIdxInBG / dataBlkNum * cellSize +
+-        start % cellSize;
+-    int lastCellSize = lastCellIdxInBG == firstCellIdxInBG ?
+-        firstCellSize : (int) (end % cellSize) + 1;
+-    // Step 1: get the unmerged ranges on each internal block
+-    // TODO: StripingCell should carry info on size and start offset (HDFS-8320)
+-    VerticalRange[] ranges = getRangesForInternalBlocks(ecSchema,
+-        firstCellIdxInBG, lastCellIdxInBG, firstCellSize, firstCellOffsetInBlk,
+-        lastCellSize);
++    // Step 1: map the byte range to StripingCells
++    StripingCell[] cells = getStripingCellsOfByteRange(ecSchema, blockGroup,
++        rangeStartInBlockGroup, rangeEndInBlockGroup);
+-    // Step 2: merge into at most 5 stripes
++    // Step 2: get the unmerged ranges on each internal block
++    VerticalRange[] ranges = getRangesForInternalBlocks(ecSchema, cells);
++
++    // Step 3: merge into at most 5 stripes
+-    // Step 3: calculate each chunk's position in destination buffer
+-    calcualteChunkPositionsInBuf(ecSchema, blockGroup, buf, offsetInBuf,
+-        firstCellIdxInBG, lastCellIdxInBG, firstCellSize, firstCellOffsetInBlk,
+-        lastCellSize, stripes);
++    // Step 4: calculate each chunk's position in destination buffer
++    calcualteChunkPositionsInBuf(ecSchema, stripes, cells, buf, offsetInBuf);
+-    // Step 4: prepare ALLZERO blocks
++    // Step 5: prepare ALLZERO blocks
+-  private static VerticalRange[] getRangesForInternalBlocks (ECSchema ecSchema,
+-      int firstCellIdxInBG, int lastCellIdxInBG, int firstCellSize,
+-      long firstCellOffsetInBlk, int lastCellSize) {
++  /**
++   * Map the logical byte range to a set of inclusive {@link StripingCell}
++   * instances, each representing the overlap of the byte range to a cell
++   * used by {@link DFSStripedOutputStream} in encoding
++   */
++  @VisibleForTesting
++  private static StripingCell[] getStripingCellsOfByteRange(ECSchema ecSchema,
++      LocatedStripedBlock blockGroup,
++      long rangeStartInBlockGroup, long rangeEndInBlockGroup) {
++    Preconditions.checkArgument(
++        rangeStartInBlockGroup <= rangeEndInBlockGroup &&
++            rangeEndInBlockGroup < blockGroup.getBlockSize());
++    int len = (int) (rangeEndInBlockGroup - rangeStartInBlockGroup + 1);
++    int firstCellIdxInBG = (int) (rangeStartInBlockGroup / cellSize);
++    int lastCellIdxInBG = (int) (rangeEndInBlockGroup / cellSize);
++    int numCells = lastCellIdxInBG - firstCellIdxInBG + 1;
++    StripingCell[] cells = new StripingCell[numCells];
++    cells[0] = new StripingCell(ecSchema, firstCellIdxInBG);
++    cells[numCells - 1] = new StripingCell(ecSchema, lastCellIdxInBG);
++
++    cells[0].offset = (int) (rangeStartInBlockGroup % cellSize);
++    cells[0].size =
++        Math.min(cellSize - (int) (rangeStartInBlockGroup % cellSize), len);
++    if (lastCellIdxInBG != firstCellIdxInBG) {
++      cells[numCells - 1].size = (int) (rangeEndInBlockGroup % cellSize) + 1;
++    }
++
++    for (int i = 1; i < numCells - 1; i++) {
++      cells[i] = new StripingCell(ecSchema, i + firstCellIdxInBG);
++    }
++
++    return cells;
++  }
++
++  /**
++   * Given a logical start offset in a block group, calculate the physical
++   * start offset into each stored internal block.
++   */
++  public static long[] getStartOffsetsForInternalBlocks(
++      ECSchema ecSchema, LocatedStripedBlock blockGroup,
++      long rangeStartInBlockGroup) {
++    Preconditions.checkArgument(
++        rangeStartInBlockGroup < blockGroup.getBlockSize());
+-
++    int parityBlkNum = ecSchema.getNumParityUnits();
++    int cellSize = ecSchema.getChunkSize();
++    long[] startOffsets = new long[dataBlkNum + parityBlkNum];
++    Arrays.fill(startOffsets, -1L);
++    int firstCellIdxInBG = (int) (rangeStartInBlockGroup / cellSize);
+-    StripingCell lastCell = new StripingCell(ecSchema, lastCellIdxInBG);
+-
+-    VerticalRange ranges[] = new VerticalRange[dataBlkNum];
+-    ranges[firstCell.idxInStripe] =
+-        new VerticalRange(firstCellOffsetInBlk, firstCellSize);
+-    for (int i = firstCellIdxInBG + 1; i < lastCellIdxInBG; i++) {
+-      // iterate through all cells and update the list of StripeRanges
+-      StripingCell cell = new StripingCell(ecSchema, i);
+-      if (ranges[cell.idxInStripe] == null) {
+-        ranges[cell.idxInStripe] = new VerticalRange(
+-            cell.idxInInternalBlk * cellSize, cellSize);
+-      } else {
+-        ranges[cell.idxInStripe].spanInBlock += cellSize;
++    firstCell.offset = (int) (rangeStartInBlockGroup % cellSize);
++    startOffsets[firstCell.idxInStripe] =
++        firstCell.idxInInternalBlk * cellSize + firstCell.offset;
++    long earliestStart = startOffsets[firstCell.idxInStripe];
++    for (int i = 1; i < dataBlkNum; i++) {
++      int idx = firstCellIdxInBG + i;
++      if (idx * cellSize >= blockGroup.getBlockSize()) {
++        break;
++      }
++      StripingCell cell = new StripingCell(ecSchema, idx);
++      startOffsets[cell.idxInStripe] = cell.idxInInternalBlk * cellSize;
++      if (startOffsets[cell.idxInStripe] < earliestStart) {
++        earliestStart = startOffsets[cell.idxInStripe];
+-    if (ranges[lastCell.idxInStripe] == null) {
+-      ranges[lastCell.idxInStripe] = new VerticalRange(
+-          lastCell.idxInInternalBlk * cellSize, lastCellSize);
+-    } else if (lastCell.idxInBlkGroup != firstCell.idxInBlkGroup) {
+-      ranges[lastCell.idxInStripe].spanInBlock += lastCellSize;
++    for (int i = dataBlkNum; i < dataBlkNum + parityBlkNum; i++) {
++      startOffsets[i] = earliestStart;
++    }
++    return startOffsets;
++  }
++
++  /**
++   * Given a logical byte range, mapped to each {@link StripingCell}, calculate
++   * the physical byte range (inclusive) on each stored internal block.
++   */
++  @VisibleForTesting
++  private static VerticalRange[] getRangesForInternalBlocks(ECSchema ecSchema,
++      StripingCell[] cells) {
++    int cellSize = ecSchema.getChunkSize();
++    int dataBlkNum = ecSchema.getNumDataUnits();
++    int parityBlkNum = ecSchema.getNumParityUnits();
++
++    VerticalRange ranges[] = new VerticalRange[dataBlkNum + parityBlkNum];
++
++    long earliestStart = Long.MAX_VALUE;
++    long latestEnd = -1;
++    for (StripingCell cell : cells) {
++      // iterate through all cells and update the list of StripeRanges
++      if (ranges[cell.idxInStripe] == null) {
++        ranges[cell.idxInStripe] = new VerticalRange(
++            cell.idxInInternalBlk * cellSize + cell.offset, cell.size);
++      } else {
++        ranges[cell.idxInStripe].spanInBlock += cell.size;
++      }
++      VerticalRange range = ranges[cell.idxInStripe];
++      if (range.offsetInBlock < earliestStart) {
++        earliestStart = range.offsetInBlock;
++      }
++      if (range.offsetInBlock + range.spanInBlock - 1 > latestEnd) {
++        latestEnd = range.offsetInBlock + range.spanInBlock - 1;
++      }
++    }
++
++    // Each parity block should be fetched at maximum range of all data blocks
++    for (int i = dataBlkNum; i < dataBlkNum + parityBlkNum; i++) {
++      ranges[i] = new VerticalRange(earliestStart,
++          latestEnd - earliestStart + 1);
+-  private static AlignedStripe[] mergeRangesForInternalBlocks(ECSchema ecSchema,
+-      VerticalRange[] ranges) {
++  /**
++   * Merge byte ranges on each internal block into a set of inclusive
++   * {@link AlignedStripe} instances.
++   */
++  private static AlignedStripe[] mergeRangesForInternalBlocks(
++      ECSchema ecSchema, VerticalRange[] ranges) {
+-      LocatedStripedBlock blockGroup, byte[] buf, int offsetInBuf,
+-      int firstCellIdxInBG, int lastCellIdxInBG, int firstCellSize,
+-      long firstCellOffsetInBlk, int lastCellSize, AlignedStripe[] stripes) {
+-    int cellSize = ecSchema.getChunkSize();
+-    int dataBlkNum = ecSchema.getNumDataUnits();
+-    // Step 3: calculate each chunk's position in destination buffer
++      AlignedStripe[] stripes, StripingCell[] cells, byte[] buf,
++      int offsetInBuf) {
++    int cellSize = ecSchema.getChunkSize();
+-    for (int i = firstCellIdxInBG; i <= lastCellIdxInBG; i++) {
+-      StripingCell cell  = new StripingCell(ecSchema, i);
+-      long cellStart = i == firstCellIdxInBG ?
+-          firstCellOffsetInBlk : cell.idxInInternalBlk * cellSize;
+-      int cellLen;
+-      if (i == firstCellIdxInBG) {
+-        cellLen = firstCellSize;
+-      } else if (i == lastCellIdxInBG) {
+-        cellLen = lastCellSize;
+-      } else {
+-        cellLen = cellSize;
+-      }
+-      long cellEnd = cellStart + cellLen - 1;
++    for (StripingCell cell : cells) {
++      long cellStart = cell.idxInInternalBlk * cellSize + cell.offset;
++      long cellEnd = cellStart + cell.size - 1;
+-      done += cellLen;
++      done += cell.size;
++  /**
++   * If a {@link StripingChunk} maps to a byte range beyond an internal block's
++   * size, the chunk should be treated as zero bytes in decoding.
++   */
+-   * This class represents the portion of I/O associated with each block in the
+-   * striped block group.
+-   * TODO: consolidate ReadPortion with AlignedStripe
+-   */
+-  public static class ReadPortion {
+-    private long startOffsetInBlock = 0;
+-    private int readLength = 0;
+-    public final List<Integer> offsetsInBuf = new ArrayList<>();
+-    public final List<Integer> lengths = new ArrayList<>();
+-
+-    public int[] getOffsets() {
+-      int[] offsets = new int[offsetsInBuf.size()];
+-      for (int i = 0; i < offsets.length; i++) {
+-        offsets[i] = offsetsInBuf.get(i);
+-      }
+-      return offsets;
+-    }
+-
+-    public int[] getLengths() {
+-      int[] lens = new int[this.lengths.size()];
+-      for (int i = 0; i < lens.length; i++) {
+-        lens[i] = this.lengths.get(i);
+-      }
+-      return lens;
+-    }
+-
+-    public long getStartOffsetInBlock() {
+-      return startOffsetInBlock;
+-    }
+-
+-    public int getReadLength() {
+-      return readLength;
+-    }
+-
+-    public void setStartOffsetInBlock(long startOffsetInBlock) {
+-      this.startOffsetInBlock = startOffsetInBlock;
+-    }
+-
+-    void addReadLength(int extraLength) {
+-      this.readLength += extraLength;
+-    }
+-  }
+-
+-  /**
+-   * The unit of encoding used in {@link DFSStripedOutputStream}
++   * Cell is the unit of encoding used in {@link DFSStripedOutputStream}. This
++   * size impacts how a logical offset in the file or block group translates
++   * to physical byte offset in a stored internal block. The StripingCell util
++   * class facilitates this calculation. Each StripingCell is inclusive with
++   * its start and end offsets -- e.g., the end logical offset of cell_0_0_0
++   * should be 1 byte lower than the start logical offset of cell_1_0_1.
++   *
+-   * |cell_3_1_0|   |cell_4_1_1|   |cell_5_1_2| <- {@link idxInBlkGroup} = 5
+-   * +----------+   +----------+   +----------+    {@link idxInInternalBlk} = 1
+-   *                                               {@link idxInStripe} = 2
++   * |cell_3_1_0|   |cell_4_1_1|   |cell_5_1_2| <- {@link #idxInBlkGroup} = 5
++   * +----------+   +----------+   +----------+    {@link #idxInInternalBlk} = 1
++   *                                               {@link #idxInStripe} = 2
+-  public static class StripingCell {
++  @VisibleForTesting
++  static class StripingCell {
+-    public final int idxInBlkGroup;
+-    public final int idxInInternalBlk;
+-    public final int idxInStripe;
++    final int idxInBlkGroup;
++    final int idxInInternalBlk;
++    final int idxInStripe;
++    /**
++     * When a logical byte range is mapped to a set of cells, it might
++     * partially overlap with the first and last cells. This field and the
++     * {@link #size} variable represent the start offset and size of the
++     * overlap.
++     */
++    int offset;
++    int size;
+-    public StripingCell(ECSchema ecSchema, int idxInBlkGroup) {
++    StripingCell(ECSchema ecSchema, int idxInBlkGroup) {
++      this.offset = 0;
++      this.size = ecSchema.getChunkSize();
+-    public StripingCell(ECSchema ecSchema, int idxInInternalBlk,
++    StripingCell(ECSchema ecSchema, int idxInInternalBlk,
++      this.offset = 0;
++      this.size = ecSchema.getChunkSize();
+-   * represents a {@link VerticalRange} that is aligned with both the byte range
+-   * and boundaries of all internal blocks. As illustrated in the diagram, any
+-   * given byte range on a block group leads to 1~5 AlignedStripe's.
++   * represents an inclusive {@link VerticalRange} that is aligned with both
++   * the byte range and boundaries of all internal blocks. As illustrated in
++   * the diagram, any given byte range on a block group leads to 1~5
++   * AlignedStripe's.
++   *
+-   * starting at {@link offsetInBlock} and lasting for {@link length} bytes in
+-   * an internal block. Note that VerticalRange doesn't necessarily align with
+-   * {@link StripingCell}.
++   * starting at {@link #offsetInBlock} and lasting for {@link #spanInBlock}
++   * bytes in an internal block. Note that VerticalRange doesn't necessarily
++   * align with {@link StripingCell}.
+-   * |~~~~~| <-- {@link offsetInBlock}
++   * |~~~~~| <-- {@link #offsetInBlock}
+-   * |     |  | {@link spanInBlock}
++   * |     |  | {@link #spanInBlock}
+-   * The class also carries {@link buf}, {@link offsetsInBuf}, and
+-   * {@link lengthsInBuf} to define how read task for this chunk should deliver
+-   * the returned data.
++   * The class also carries {@link #buf}, {@link #offsetsInBuf}, and
++   * {@link #lengthsInBuf} to define how read task for this chunk should
++   * deliver the returned data.
+
+MOV31 INS31 INS31 INS31 MOV44 MOV44 MOV29 MOV83 MOV83 MOV5 UPD42 MOV42 MOV44 MOV44 MOV44 MOV44 MOV44 MOV44 INS8 UPD83 UPD5 UPD42 MOV29 MOV83 MOV83 INS5 UPD42 MOV42 MOV44 MOV44 MOV44 INS8 INS29 INS78 INS83 INS83 MOV5 INS42 INS44 INS44 INS8 INS29 INS29 INS78 INS23 INS23 INS66 INS66 UPD66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS65 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS65 INS65 INS65 INS65 INS65 INS65 UPD65 UPD39 UPD42 UPD39 UPD42 MOV60 MOV60 INS60 INS60 MOV60 INS21 MOV21 MOV41 INS65 UPD43 INS43 INS42 INS43 INS42 UPD42 UPD39 UPD42 INS21 INS60 INS60 INS60 INS21 MOV21 MOV21 INS21 INS25 INS39 INS85 UPD42 INS21 MOV60 INS60 MOV60 MOV60 INS21 MOV60 MOV60 INS21 INS21 INS60 INS24 INS24 INS41 MOV65 INS42 INS43 INS42 INS5 INS42 MOV60 MOV60 MOV60 MOV60 INS60 INS60 INS70 MOV24 MOV41 INS65 INS5 UPD42 INS70 INS65 INS42 INS29 INS39 INS59 INS39 INS59 INS42 INS66 MOV65 INS66 INS42 INS66 INS66 INS42 INS66 INS42 INS66 INS42 INS66 INS42 INS66 INS42 INS66 INS66 UPD66 UPD66 INS5 INS59 MOV5 INS59 INS32 UPD66 MOV66 INS65 UPD66 MOV66 UPD66 MOV66 MOV65 UPD66 MOV66 UPD42 INS42 INS42 INS32 INS39 INS59 INS39 INS59 INS39 INS59 INS5 INS7 INS7 INS7 INS27 INS8 MOV58 MOV37 UPD42 UPD66 UPD66 INS32 INS39 INS59 INS5 INS32 INS7 INS7 UPD39 MOV39 INS59 INS58 MOV27 MOV37 INS8 MOV58 MOV27 MOV37 INS8 INS42 UPD66 INS65 UPD66 UPD66 UPD42 MOV42 MOV43 MOV85 INS39 INS39 INS59 INS39 INS59 INS44 INS42 INS8 MOV37 INS66 INS65 INS66 MOV43 INS85 INS44 INS42 MOV8 INS66 INS65 INS66 INS66 UPD66 INS66 INS66 INS66 INS66 INS66 INS66 INS65 INS42 INS42 INS21 INS21 INS21 INS21 UPD66 UPD66 UPD66 UPD66 INS66 UPD66 UPD66 UPD66 UPD66 UPD42 INS43 INS85 UPD42 MOV42 INS32 INS42 INS32 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 INS42 UPD42 MOV42 UPD42 INS42 INS42 INS27 UPD42 MOV42 INS32 INS42 INS11 UPD42 UPD42 INS42 INS27 INS43 INS85 INS42 INS3 INS2 INS14 INS2 MOV14 INS22 INS11 INS22 INS32 INS42 INS42 INS21 UPD42 INS27 INS21 INS42 INS42 INS27 INS42 INS32 UPD42 INS32 INS39 INS85 UPD42 INS3 INS42 INS42 INS42 INS38 UPD42 INS40 INS11 INS2 INS27 UPD42 MOV42 INS2 INS39 INS59 MOV60 INS25 MOV60 INS21 INS25 INS27 MOV21 INS42 UPD42 INS32 INS42 INS40 UPD42 MOV42 INS38 MOV43 INS42 MOV25 INS60 INS25 INS25 INS27 INS42 MOV43 INS42 INS42 INS67 INS67 INS67 INS66 INS66 INS65 INS66 INS66 INS7 INS7 INS7 INS7 INS67 INS67 INS67 INS67 INS67 INS67 INS67 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 MOV42 UPD42 MOV42 INS42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 INS27 INS27 INS42 INS42 INS39 INS36 UPD27 MOV27 INS34 INS42 INS5 INS42 INS42 INS34 INS43 INS42 INS42 INS42 INS27 INS2 INS42 INS39 INS36 INS2 INS42 MOV42 MOV42 MOV27 MOV42 INS7 UPD42 MOV42 INS34 INS7 INS42 INS32 INS42 INS42 INS42 INS42 INS5 INS27 INS34 MOV39 MOV36 INS42 INS40 MOV27 INS40 INS42 INS40 INS42 INS34 INS39 INS27 INS8 INS43 INS7 INS27 INS8 INS42 UPD42 MOV42 INS42 UPD42 MOV42 UPD42 MOV42 INS27 INS34 MOV43 INS59 INS27 INS8 INS27 INS8 INS42 INS42 INS42 INS42 INS42 INS42 INS67 INS22 INS34 INS22 INS32 INS22 INS34 INS22 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS27 INS27 UPD42 UPD42 INS43 INS85 INS42 INS42 INS34 UPD42 MOV42 INS34 INS27 INS42 INS34 INS22 INS27 INS2 INS14 INS42 INS42 INS39 INS85 UPD42 MOV42 UPD42 MOV42 INS40 UPD42 INS27 INS27 INS32 INS10 INS42 INS2 MOV27 INS2 INS42 MOV21 INS42 INS42 INS42 INS42 INS2 UPD40 MOV40 INS42 MOV21 INS27 INS42 INS21 INS14 INS27 INS40 INS42 INS52 INS42 INS52 INS42 INS42 INS42 INS52 INS42 INS52 INS42 INS42 INS42 INS42 INS42 INS27 INS34 UPD42 MOV42 UPD42 MOV42 MOV42 INS42 UPD42 MOV42 UPD42 MOV42 MOV2 UPD42 MOV42 INS11 INS34 UPD42 MOV42 MOV42 INS43 INS42 INS27 UPD42 UPD42 INS42 INS42 INS42 INS42 MOV42 UPD42 MOV42 UPD42 INS42 INS40 INS42 INS40 UPD42 INS42 INS42 INS40 INS27 INS34 INS7 UPD42 MOV43 INS42 INS27 MOV27 INS40 INS42 INS42 UPD42 INS27 INS39 INS36 INS42 MOV42 INS42 INS42 INS40 INS42 INS40 INS40 INS40 INS42 INS27 INS27 INS34 INS40 UPD42 INS42 INS34 INS27 UPD42 UPD40 MOV43 INS27 INS40 INS27 INS34 INS42 INS42 UPD42 MOV42 UPD42 MOV42 INS27 INS40 INS40 INS40 INS40 INS42 DEL42 DEL43 DEL42 DEL43 DEL42 DEL44 DEL39 DEL42 DEL44 DEL43 DEL42 DEL43 DEL42 DEL14 DEL59 DEL60 DEL32 DEL42 DEL27 DEL32 DEL21 DEL42 DEL42 DEL42 DEL32 DEL42 DEL42 DEL32 DEL32 DEL21 DEL42 DEL41 DEL8 DEL31 DEL66 DEL66 DEL65 DEL29 DEL83 DEL83 DEL39 DEL42 DEL39 DEL42 DEL44 DEL39 DEL42 DEL44 DEL39 DEL42 DEL44 DEL39 DEL42 DEL44 DEL42 DEL42 DEL27 DEL42 DEL34 DEL16 DEL32 DEL41 DEL8 DEL31 DEL66 DEL65 DEL66 DEL65 DEL42 DEL65 DEL42 DEL66 DEL65 DEL42 DEL66 DEL65 DEL42 DEL66 DEL65 DEL66 DEL65 DEL83 DEL39 DEL42 DEL83 DEL39 DEL42 DEL83 DEL83 DEL39 DEL42 DEL44 DEL42 DEL43 DEL85 DEL5 DEL42 DEL42 DEL43 DEL85 DEL5 DEL42 DEL3 DEL59 DEL60 DEL39 DEL34 DEL59 DEL58 DEL42 DEL42 DEL27 DEL42 DEL37 DEL42 DEL42 DEL2 DEL42 DEL43 DEL14 DEL7 DEL21 DEL8 DEL24 DEL42 DEL27 DEL36 DEL83 DEL27 DEL42 DEL27 DEL42 DEL42 DEL2 DEL42 DEL42 DEL42 DEL27 DEL27 DEL32 DEL21 DEL39 DEL42 DEL9 DEL42 DEL9 DEL42 DEL42 DEL27 DEL36 DEL42 DEL27 DEL2 DEL42 DEL27 DEL32 DEL42 DEL42 DEL42 DEL27 DEL42 DEL27 DEL42 DEL38 DEL27 DEL42 DEL37 DEL21 DEL8 DEL25 DEL8 DEL24 DEL39 DEL42 DEL32 DEL59 DEL60 DEL42 DEL42 DEL2 DEL42 DEL22 DEL42 DEL42 DEL32 DEL21 DEL22 DEL42 DEL42 DEL32 DEL21 DEL42 DEL42 DEL2 DEL42 DEL42 DEL32 DEL21 DEL39 DEL42 DEL34 DEL27 DEL36 DEL27 DEL59 DEL60 DEL39 DEL42 DEL42 DEL59 DEL58 DEL42 DEL42 DEL7 DEL42 DEL43 DEL42 DEL2 DEL59 DEL60 DEL40 DEL42 DEL42 DEL42 DEL27 DEL32 DEL21 DEL83 DEL39 DEL42 DEL42 DEL42 DEL42 DEL42 DEL27 DEL42 DEL32 DEL59 DEL60 DEL40 DEL42 DEL42 DEL32 DEL21 DEL42 DEL42 DEL42 DEL32 DEL21 DEL42 DEL34 DEL27 DEL36 DEL42 DEL27 DEL7 DEL21 DEL66 DEL39 DEL42 DEL42 DEL27 DEL34 DEL27 DEL36 DEL11 DEL39 DEL39 DEL27 DEL36 DEL11 DEL42 DEL42 DEL27 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL42 DEL42 DEL14 DEL42 DEL34 DEL27 DEL40 DEL40 DEL42 DEL27 DEL42 DEL14 DEL39 DEL85 DEL5 DEL39 DEL85 DEL5 DEL32 DEL3 DEL42 DEL42 DEL42 DEL42 DEL42 DEL2 DEL42 DEL42 DEL42 DEL32 DEL34 DEL40 DEL52 DEL42 DEL22 DEL42 DEL42 DEL32 DEL39 DEL42 DEL44 DEL39 DEL42 DEL42 DEL42 DEL42 DEL11 DEL27 DEL42 DEL32 DEL59 DEL60 DEL39 DEL42 DEL42 DEL42 DEL27 DEL27 DEL59 DEL60 DEL42 DEL42 DEL27 DEL42 DEL39 DEL42 DEL42 DEL27 DEL36 DEL11 DEL34 DEL27 DEL16 DEL59 DEL60 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL21 DEL8 DEL31 DEL83 DEL83 DEL42 DEL39 DEL42 DEL44 DEL39 DEL42 DEL44 DEL39 DEL42 DEL44 DEL39 DEL42 DEL44 DEL39 DEL42 DEL44 DEL42 DEL59 DEL60 DEL8 DEL24 DEL42 DEL40 DEL2 DEL33 DEL27 DEL8 DEL40 DEL40 DEL27 DEL42 DEL40 DEL2 DEL42 DEL22 DEL42 DEL7 DEL21 DEL8 DEL25 DEL25 DEL8 DEL31 DEL39 DEL39 DEL42 DEL44 DEL39 DEL42 DEL44 DEL39 DEL42 DEL44 DEL39 DEL42 DEL44 DEL42 DEL42 DEL42 DEL14 DEL59 DEL60 DEL42 DEL42 DEL27 DEL42 DEL16 DEL39 DEL42 DEL59 DEL60 DEL42 DEL42 DEL27 DEL42 DEL42 DEL7 DEL21 DEL8 DEL42 DEL42 DEL27 DEL42 DEL42 DEL7 DEL21 DEL8 DEL42 DEL42 DEL7 DEL21 DEL8 DEL25 DEL25 DEL42 DEL42 DEL39 DEL42 DEL42 DEL59 DEL58 DEL42 DEL42 DEL27 DEL24 DEL29 DEL83 DEL83 DEL42 DEL83 DEL39 DEL42 DEL34 DEL59 DEL23 DEL83 DEL39 DEL42 DEL34 DEL59 DEL23 DEL83 DEL83 DEL42 DEL43 DEL42 DEL43 DEL74 DEL42 DEL43 DEL74 DEL14 DEL59 DEL23 DEL83 DEL83 DEL42 DEL43 DEL42 DEL43 DEL74 DEL42 DEL42 DEL43 DEL74 DEL14 DEL59 DEL23 DEL83 DEL39 DEL5 DEL42 DEL39 DEL34 DEL59 DEL58 DEL42 DEL27 DEL42 DEL37 DEL8 DEL24 DEL42 DEL41 DEL8 DEL31 DEL83 DEL39 DEL85 DEL5 DEL42 DEL39 DEL85 DEL5 DEL42 DEL39 DEL85 DEL5 DEL52 DEL42 DEL22 DEL42 DEL32 DEL3 DEL59 DEL60 DEL42 DEL41 DEL8 DEL31 DEL83 DEL39 DEL42 DEL42 DEL41 DEL8 DEL31 DEL83 DEL39 DEL42 DEL42 DEL41 DEL8 DEL31 DEL83 DEL39 DEL42 DEL39 DEL42 DEL44 DEL52 DEL42 DEL22 DEL42 DEL7 DEL21 DEL8 DEL31 DEL39 DEL42 DEL39 DEL42 DEL44 DEL52 DEL42 DEL22 DEL42 DEL7 DEL21 DEL8 DEL31 DEL55 DEL42 DEL42 DEL42 DEL83 DEL83 DEL83 DEL83 DEL83 DEL83 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42

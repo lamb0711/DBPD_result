@@ -1,0 +1,396 @@
+HADOOP-12916. Allow RPC scheduler/callqueue backoff using response times. Contributed by Xiaoyu Yao.
+
++import java.util.concurrent.TimeUnit;
++import java.util.concurrent.atomic.AtomicLongArray;
+-import org.apache.commons.logging.Log;
+-import org.apache.commons.logging.LogFactory;
++import com.google.common.util.concurrent.AtomicDoubleArray;
++import org.apache.commons.lang.exception.ExceptionUtils;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
+-  public static final String IPC_CALLQUEUE_DECAYSCHEDULER_PERIOD_KEY =
++  public static final String IPC_SCHEDULER_DECAYSCHEDULER_PERIOD_KEY =
++      "decay-scheduler.period-ms";
++  public static final long IPC_SCHEDULER_DECAYSCHEDULER_PERIOD_DEFAULT =
++      5000;
++  @Deprecated
++  public static final String IPC_FCQ_DECAYSCHEDULER_PERIOD_KEY =
+-  public static final long   IPC_CALLQUEUE_DECAYSCHEDULER_PERIOD_DEFAULT =
+-    5000L;
+-  public static final String IPC_CALLQUEUE_DECAYSCHEDULER_FACTOR_KEY =
++  public static final String IPC_SCHEDULER_DECAYSCHEDULER_FACTOR_KEY =
++      "decay-scheduler.decay-factor";
++  public static final double IPC_SCHEDULER_DECAYSCHEDULER_FACTOR_DEFAULT =
++      0.5;
++  @Deprecated
++  public static final String IPC_FCQ_DECAYSCHEDULER_FACTOR_KEY =
+-  public static final double IPC_CALLQUEUE_DECAYSCHEDULER_FACTOR_DEFAULT =
+-    0.5;
+-  /**
++ /**
+-  public static final String IPC_CALLQUEUE_DECAYSCHEDULER_THRESHOLDS_KEY =
+-    "faircallqueue.decay-scheduler.thresholds";
++  public static final String IPC_DECAYSCHEDULER_THRESHOLDS_KEY =
++      "decay-scheduler.thresholds";
++  @Deprecated
++  public static final String IPC_FCQ_DECAYSCHEDULER_THRESHOLDS_KEY =
++      "faircallqueue.decay-scheduler.thresholds";
+-    "IdentityProvider.Unknown";
++      "IdentityProvider.Unknown";
+-  public static final Log LOG = LogFactory.getLog(DecayRpcScheduler.class);
++  public static final String
++      IPC_DECAYSCHEDULER_BACKOFF_RESPONSETIME_ENABLE_KEY =
++      "decay-scheduler.backoff.responsetime.enable";
++  public static final Boolean
++      IPC_DECAYSCHEDULER_BACKOFF_RESPONSETIME_ENABLE_DEFAULT = false;
++
++  // Specifies the average response time (ms) thresholds of each
++  // level to trigger backoff
++  public static final String
++      IPC_DECAYSCHEDULER_BACKOFF_RESPONSETIME_THRESHOLDS_KEY =
++      "decay-scheduler.backoff.responsetime.thresholds";
++
++  public static final Logger LOG =
++      LoggerFactory.getLogger(DecayRpcScheduler.class);
++  // Track total call count and response time in current decay window
++  private final AtomicLongArray responseTimeCountInCurrWindow;
++  private final AtomicLongArray responseTimeTotalInCurrWindow;
++
++  // Track average response time in previous decay window
++  private final AtomicDoubleArray responseTimeAvgInLastWindow;
++  private final AtomicLongArray responseTimeCountInLastWindow;
++
+-  private final double decayFactor; // nextCount = currentCount / decayFactor
+-  private final int numQueues; // affects scheduling decisions, from 0 to numQueues - 1
++  private final double decayFactor; // nextCount = currentCount * decayFactor
++  private final int numLevels;
++  private final boolean backOffByResponseTimeEnabled;
++  private final long[] backOffResponseTimeThresholds;
+-   * @param numQueues number of queues to schedule for
++   * @param numLevels number of priority levels
+-  public DecayRpcScheduler(int numQueues, String ns, Configuration conf) {
+-    if (numQueues < 1) {
+-      throw new IllegalArgumentException("number of queues must be > 0");
++  public DecayRpcScheduler(int numLevels, String ns, Configuration conf) {
++    if(numLevels < 1) {
++      throw new IllegalArgumentException("Number of Priority Levels must be " +
++          "at least 1");
+-
+-    this.numQueues = numQueues;
++    this.numLevels = numLevels;
+-    this.thresholds = parseThresholds(ns, conf, numQueues);
++    this.thresholds = parseThresholds(ns, conf, numLevels);
++    this.backOffByResponseTimeEnabled = parseBackOffByResponseTimeEnabled(ns,
++        conf);
++    this.backOffResponseTimeThresholds =
++        parseBackOffResponseTimeThreshold(ns, conf, numLevels);
+-    MetricsProxy prox = MetricsProxy.getInstance(ns);
++    // Setup response time metrics
++    responseTimeTotalInCurrWindow = new AtomicLongArray(numLevels);
++    responseTimeCountInCurrWindow = new AtomicLongArray(numLevels);
++    responseTimeAvgInLastWindow = new AtomicDoubleArray(numLevels);
++    responseTimeCountInLastWindow = new AtomicLongArray(numLevels);
++
++    MetricsProxy prox = MetricsProxy.getInstance(ns, numLevels);
+-  private IdentityProvider parseIdentityProvider(String ns, Configuration conf) {
++  private IdentityProvider parseIdentityProvider(String ns,
++      Configuration conf) {
+-      ns + "." + CommonConfigurationKeys.IPC_CALLQUEUE_IDENTITY_PROVIDER_KEY,
++      ns + "." + CommonConfigurationKeys.IPC_IDENTITY_PROVIDER_KEY,
+-        IPC_CALLQUEUE_DECAYSCHEDULER_FACTOR_KEY,
+-      IPC_CALLQUEUE_DECAYSCHEDULER_FACTOR_DEFAULT
+-    );
+-
++        IPC_FCQ_DECAYSCHEDULER_FACTOR_KEY, 0.0);
++    if (factor == 0.0) {
++      factor = conf.getDouble(ns + "." +
++          IPC_SCHEDULER_DECAYSCHEDULER_FACTOR_KEY,
++          IPC_SCHEDULER_DECAYSCHEDULER_FACTOR_DEFAULT);
++    } else if ((factor > 0.0) && (factor < 1)) {
++      LOG.warn(IPC_FCQ_DECAYSCHEDULER_FACTOR_KEY +
++          " is deprecated. Please use " +
++          IPC_SCHEDULER_DECAYSCHEDULER_FACTOR_KEY + ".");
++    }
+-        IPC_CALLQUEUE_DECAYSCHEDULER_PERIOD_KEY,
+-      IPC_CALLQUEUE_DECAYSCHEDULER_PERIOD_DEFAULT
+-    );
+-
++        IPC_FCQ_DECAYSCHEDULER_PERIOD_KEY,
++        0);
++    if (period == 0) {
++      period = conf.getLong(ns + "." +
++          IPC_SCHEDULER_DECAYSCHEDULER_PERIOD_KEY,
++          IPC_SCHEDULER_DECAYSCHEDULER_PERIOD_DEFAULT);
++    } else if (period > 0) {
++      LOG.warn((IPC_FCQ_DECAYSCHEDULER_PERIOD_KEY +
++          " is deprecated. Please use " +
++          IPC_SCHEDULER_DECAYSCHEDULER_PERIOD_KEY));
++    }
+-      int numQueues) {
++      int numLevels) {
+-      IPC_CALLQUEUE_DECAYSCHEDULER_THRESHOLDS_KEY);
++        IPC_FCQ_DECAYSCHEDULER_THRESHOLDS_KEY);
+-      return getDefaultThresholds(numQueues);
+-    } else if (percentages.length != numQueues-1) {
++      percentages = conf.getInts(ns + "." + IPC_DECAYSCHEDULER_THRESHOLDS_KEY);
++      if (percentages.length == 0) {
++        return getDefaultThresholds(numLevels);
++      }
++    } else {
++      LOG.warn(IPC_FCQ_DECAYSCHEDULER_THRESHOLDS_KEY +
++          " is deprecated. Please use " +
++          IPC_DECAYSCHEDULER_THRESHOLDS_KEY);
++    }
++
++    if (percentages.length != numLevels-1) {
+-        (numQueues-1) + ". Was: " + percentages.length);
++        (numLevels-1) + ". Was: " + percentages.length);
+-   * So if numQueues is 4, we would generate: double[]{0.125, 0.25, 0.5}
++   * So if numLevels is 4, we would generate: double[]{0.125, 0.25, 0.5}
+-   * @param numQueues number of queues to compute for
+-   * @return array of boundaries of length numQueues - 1
++   * @param numLevels number of levels to compute for
++   * @return array of boundaries of length numLevels - 1
+-  private static double[] getDefaultThresholds(int numQueues) {
+-    double[] ret = new double[numQueues - 1];
+-    double div = Math.pow(2, numQueues - 1);
++  private static double[] getDefaultThresholds(int numLevels) {
++    double[] ret = new double[numLevels - 1];
++    double div = Math.pow(2, numLevels - 1);
++  private static long[] parseBackOffResponseTimeThreshold(String ns,
++      Configuration conf, int numLevels) {
++    long[] responseTimeThresholds = conf.getTimeDurations(ns + "." +
++            IPC_DECAYSCHEDULER_BACKOFF_RESPONSETIME_THRESHOLDS_KEY,
++        TimeUnit.MILLISECONDS);
++    // backoff thresholds not specified
++    if (responseTimeThresholds.length == 0) {
++      return getDefaultBackOffResponseTimeThresholds(numLevels);
++    }
++    // backoff thresholds specified but not match with the levels
++    if (responseTimeThresholds.length != numLevels) {
++      throw new IllegalArgumentException(
++          "responseTimeThresholds must match with the number of priority " +
++          "levels");
++    }
++    // invalid thresholds
++    for (long responseTimeThreshold: responseTimeThresholds) {
++      if (responseTimeThreshold <= 0) {
++        throw new IllegalArgumentException(
++            "responseTimeThreshold millis must be >= 0");
++      }
++    }
++    return responseTimeThresholds;
++  }
++
++  // 10s for level 0, 20s for level 1, 30s for level 2, ...
++  private static long[] getDefaultBackOffResponseTimeThresholds(int numLevels) {
++    long[] ret = new long[numLevels];
++    for (int i = 0; i < ret.length; i++) {
++      ret[i] = 10000*(i+1);
++    }
++    return ret;
++  }
++
++  private static Boolean parseBackOffByResponseTimeEnabled(String ns,
++      Configuration conf) {
++    return conf.getBoolean(ns + "." +
++        IPC_DECAYSCHEDULER_BACKOFF_RESPONSETIME_ENABLE_KEY,
++        IPC_DECAYSCHEDULER_BACKOFF_RESPONSETIME_ENABLE_DEFAULT);
++  }
++
+-    long total = 0;
+-    Iterator<Map.Entry<Object, AtomicLong>> it =
+-      callCounts.entrySet().iterator();
++    try {
++      long total = 0;
++      Iterator<Map.Entry<Object, AtomicLong>> it =
++          callCounts.entrySet().iterator();
+-    while (it.hasNext()) {
+-      Map.Entry<Object, AtomicLong> entry = it.next();
+-      AtomicLong count = entry.getValue();
++      while (it.hasNext()) {
++        Map.Entry<Object, AtomicLong> entry = it.next();
++        AtomicLong count = entry.getValue();
+-      // Compute the next value by reducing it by the decayFactor
+-      long currentValue = count.get();
+-      long nextValue = (long)(currentValue * decayFactor);
+-      total += nextValue;
+-      count.set(nextValue);
++        // Compute the next value by reducing it by the decayFactor
++        long currentValue = count.get();
++        long nextValue = (long) (currentValue * decayFactor);
++        total += nextValue;
++        count.set(nextValue);
+-      if (nextValue == 0) {
+-        // We will clean up unused keys here. An interesting optimization might
+-        // be to have an upper bound on keyspace in callCounts and only
+-        // clean once we pass it.
+-        it.remove();
++        if (nextValue == 0) {
++          // We will clean up unused keys here. An interesting optimization
++          // might be to have an upper bound on keyspace in callCounts and only
++          // clean once we pass it.
++          it.remove();
++        }
++
++      // Update the total so that we remain in sync
++      totalCalls.set(total);
++
++      // Now refresh the cache of scheduling decisions
++      recomputeScheduleCache();
++
++      // Update average response time with decay
++      updateAverageResponseTime(true);
++    } catch (Exception ex) {
++      LOG.error("decayCurrentCounts exception: " +
++          ExceptionUtils.getFullStackTrace(ex));
++      throw ex;
+-
+-    // Update the total so that we remain in sync
+-    totalCalls.set(total);
+-
+-    // Now refresh the cache of scheduling decisions
+-    recomputeScheduleCache();
+-   * @return scheduling decision from 0 to numQueues - 1
++   * @return scheduling decision from 0 to numLevels - 1
+-    // Start with low priority queues, since they will be most common
+-    for(int i = (numQueues - 1); i > 0; i--) {
++    // Start with low priority levels, since they will be most common
++    for(int i = (numLevels - 1); i > 0; i--) {
+-        return i; // We've found our queue number
++        return i; // We've found our level number
+-    // If we get this far, we're at queue 0
++    // If we get this far, we're at level 0
+-   * @return integer scheduling decision from 0 to numQueues - 1
++   * @return integer scheduling decision from 0 to numLevels - 1
++          LOG.debug("Cache priority for: {} with priority: {}", identity,
++              priority);
+-      return computePriorityLevel(occurrences);
++      int priority = computePriorityLevel(occurrences);
++      LOG.debug("compute priority for " + identity + " priority " + priority);
++      return priority;
++
+-      LOG.warn("Caught InterruptedException, returning low priority queue");
+-      return numQueues - 1;
++      LOG.warn("Caught InterruptedException, returning low priority level");
++      LOG.debug("Fallback priority for: {} with priority: {}", identity,
++          numLevels - 1);
++      return numLevels - 1;
+-   * @return the queue index which we recommend scheduling in
++   * @return the level index which we recommend scheduling in
++  @Override
++  public boolean shouldBackOff(Schedulable obj) {
++    Boolean backOff = false;
++    if (backOffByResponseTimeEnabled) {
++      int priorityLevel = obj.getPriorityLevel();
++      if (LOG.isDebugEnabled()) {
++        double[] responseTimes = getAverageResponseTime();
++        LOG.debug("Current Caller: {}  Priority: {} ",
++            obj.getUserGroupInformation().getUserName(),
++            obj.getPriorityLevel());
++        for (int i = 0; i < numLevels; i++) {
++          LOG.debug("Queue: {} responseTime: {} backoffThreshold: {}", i,
++              responseTimes[i], backOffResponseTimeThresholds[i]);
++        }
++      }
++      // High priority rpc over threshold triggers back off of low priority rpc
++      for (int i = 0; i < priorityLevel + 1; i++) {
++        if (responseTimeAvgInLastWindow.get(i) >
++            backOffResponseTimeThresholds[i]) {
++          backOff = true;
++          break;
++        }
++      }
++    }
++    return backOff;
++  }
++
++  @Override
++  public void addResponseTime(String name, int priorityLevel, int queueTime,
++      int processingTime) {
++    responseTimeCountInCurrWindow.getAndIncrement(priorityLevel);
++    responseTimeTotalInCurrWindow.getAndAdd(priorityLevel,
++        queueTime+processingTime);
++    if (LOG.isDebugEnabled()) {
++      LOG.debug("addResponseTime for call: {}  priority: {} queueTime: {} " +
++          "processingTime: {} ", name, priorityLevel, queueTime,
++          processingTime);
++    }
++  }
++
++  // Update the cached average response time at the end of decay window
++  void updateAverageResponseTime(boolean enableDecay) {
++    for (int i = 0; i < numLevels; i++) {
++      double averageResponseTime = 0;
++      long totalResponseTime = responseTimeTotalInCurrWindow.get(i);
++      long responseTimeCount = responseTimeCountInCurrWindow.get(i);
++      if (responseTimeCount > 0) {
++        averageResponseTime = (double) totalResponseTime / responseTimeCount;
++      }
++      final double lastAvg = responseTimeAvgInLastWindow.get(i);
++      if (enableDecay && lastAvg > 0.0) {
++        final double decayed = decayFactor * lastAvg + averageResponseTime;
++        responseTimeAvgInLastWindow.set(i, decayed);
++      } else {
++        responseTimeAvgInLastWindow.set(i, averageResponseTime);
++      }
++      responseTimeCountInLastWindow.set(i, responseTimeCount);
++      if (LOG.isDebugEnabled()) {
++        LOG.debug("updateAverageResponseTime queue: {} Average: {} Count: {}",
++            i, averageResponseTime, responseTimeCount);
++      }
++      // Reset for next decay window
++      responseTimeTotalInCurrWindow.set(i, 0);
++      responseTimeCountInCurrWindow.set(i, 0);
++    }
++  }
++
++    private double[] averageResponseTimeDefault;
++    private long[] callCountInLastWindowDefault;
+-    private MetricsProxy(String namespace) {
++    private MetricsProxy(String namespace, int numLevels) {
++      averageResponseTimeDefault = new double[numLevels];
++      callCountInLastWindowDefault = new long[numLevels];
+-    public static synchronized MetricsProxy getInstance(String namespace) {
++    public static synchronized MetricsProxy getInstance(String namespace,
++        int numLevels) {
+-        mp = new MetricsProxy(namespace);
++        mp = new MetricsProxy(namespace, numLevels);
++
++    @Override
++    public double[] getAverageResponseTime() {
++      DecayRpcScheduler scheduler = delegate.get();
++      if (scheduler == null) {
++        return averageResponseTimeDefault;
++      } else {
++        return scheduler.getAverageResponseTime();
++      }
++    }
++
++    public long[] getResponseTimeCountInLastWindow() {
++      DecayRpcScheduler scheduler = delegate.get();
++      if (scheduler == null) {
++        return callCountInLastWindowDefault;
++      } else {
++        return scheduler.getResponseTimeCountInLastWindow();
++      }
++    }
++  public long[] getResponseTimeCountInLastWindow() {
++    long[] ret = new long[responseTimeCountInLastWindow.length()];
++    for (int i = 0; i < responseTimeCountInLastWindow.length(); i++) {
++      ret[i] = responseTimeCountInLastWindow.get(i);
++    }
++    return ret;
++  }
++
++  @Override
++  public double[] getAverageResponseTime() {
++    double[] ret = new double[responseTimeAvgInLastWindow.length()];
++    for (int i = 0; i < responseTimeAvgInLastWindow.length(); i++) {
++      ret[i] = responseTimeAvgInLastWindow.get(i);
++    }
++    return ret;
++  }
++
+
+MOV26 INS26 INS26 INS26 INS26 INS40 INS40 INS40 UPD40 INS40 UPD40 INS23 INS23 INS23 INS23 INS23 INS23 INS23 INS23 INS23 INS23 INS23 INS23 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS78 INS83 INS83 INS83 INS43 INS59 INS78 INS83 INS83 INS83 INS43 INS59 INS78 INS83 INS83 INS83 INS43 INS59 INS83 INS83 INS83 INS43 INS59 INS83 INS83 INS83 INS43 INS59 INS83 INS83 INS83 INS43 INS59 UPD43 INS83 INS83 INS43 INS59 INS83 INS83 INS43 INS59 INS83 INS83 INS43 INS59 INS83 INS83 INS43 INS59 INS83 INS83 INS39 INS59 INS83 INS83 INS5 INS59 INS83 INS83 INS5 INS42 INS44 INS44 INS44 INS8 INS83 INS83 INS5 INS42 INS44 INS8 INS83 INS83 INS43 INS42 INS44 INS44 INS8 INS8 INS78 INS83 INS39 INS42 INS44 INS8 INS78 INS83 INS39 INS42 INS44 INS44 INS44 INS44 INS8 INS39 INS42 INS44 INS8 INS23 INS23 INS31 INS31 INS83 INS5 INS42 INS8 INS78 INS83 INS5 INS42 INS8 UPD42 UPD45 UPD42 UPD34 INS42 INS42 INS42 INS45 UPD42 UPD45 UPD42 INS42 INS42 INS42 INS45 UPD42 UPD45 INS42 INS42 INS42 INS45 INS42 INS42 INS45 INS42 INS42 INS9 INS42 INS42 INS45 UPD42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 UPD42 INS42 INS39 INS85 INS42 UPD42 INS21 INS21 INS21 INS21 INS21 INS21 INS25 INS25 UPD42 INS25 INS25 UPD42 INS39 INS85 INS43 INS42 INS43 INS42 INS39 INS42 INS60 INS25 INS25 INS70 INS41 INS39 INS85 INS39 INS42 INS60 INS24 INS41 INS42 INS43 INS42 INS43 INS42 INS41 INS54 INS42 INS43 INS42 INS60 INS25 INS41 INS42 INS43 INS42 INS39 INS42 INS39 INS42 INS39 INS42 INS21 INS21 INS25 INS39 INS42 INS24 INS83 INS5 INS59 INS83 INS5 INS59 INS44 INS44 INS78 INS83 INS5 INS42 INS8 INS83 INS5 INS42 INS8 INS39 INS85 INS60 INS24 INS41 INS42 INS39 INS85 INS60 INS24 INS41 UPD42 UPD42 UPD42 UPD66 INS7 INS7 INS7 INS7 INS7 INS7 INS27 INS8 INS25 INS27 INS8 INS25 MOV27 INS8 INS8 MOV27 MOV8 UPD66 UPD42 UPD66 UPD66 MOV5 INS42 INS42 INS5 INS59 INS27 INS8 INS27 INS8 INS44 INS42 INS8 INS42 INS5 INS59 INS58 INS27 INS37 INS8 INS42 INS42 INS42 INS32 MOV8 INS12 UPD66 UPD66 UPD66 INS42 INS43 INS59 INS42 INS8 INS42 INS42 INS32 INS32 INS32 INS8 INS58 INS27 INS37 INS8 INS39 INS85 INS42 INS39 INS85 INS42 INS39 INS42 INS21 INS21 INS39 INS42 INS42 INS39 INS85 INS60 INS25 INS39 INS85 INS60 INS25 INS5 INS59 INS58 INS27 INS37 INS8 INS42 INS5 INS59 INS58 INS27 INS37 INS8 INS42 UPD42 UPD42 INS22 INS32 INS22 INS32 INS42 INS14 INS42 INS14 INS42 INS14 INS42 INS14 INS42 INS34 INS21 INS27 INS8 INS42 INS34 INS21 INS27 INS8 INS21 INS25 INS21 INS39 INS85 INS42 INS32 INS40 INS34 INS41 INS40 INS42 INS53 INS39 INS42 INS25 INS39 INS85 INS42 INS3 INS39 INS59 INS42 INS40 INS42 INS21 INS42 INS42 INS27 INS42 INS21 INS44 INS8 INS60 INS21 INS42 INS42 INS9 INS60 INS25 INS24 INS42 INS42 INS42 INS42 INS42 INS42 INS27 INS42 INS42 INS21 INS39 INS59 INS42 INS42 INS42 INS60 INS60 INS60 INS25 INS60 INS25 INS21 INS25 INS21 INS21 INS7 INS7 INS43 INS59 INS27 INS8 INS8 INS43 INS59 INS27 INS8 INS8 INS39 INS85 INS42 INS3 INS39 INS59 INS42 INS32 INS42 INS21 INS39 INS85 INS42 INS3 INS39 INS59 INS42 INS32 INS42 INS21 UPD42 UPD42 INS52 INS42 INS42 INS42 INS42 INS52 INS42 INS42 INS42 INS42 INS42 INS43 INS42 INS43 INS42 INS43 INS42 INS43 INS42 INS42 INS34 INS7 INS36 INS36 INS21 INS34 INS7 INS42 INS34 INS21 INS7 INS27 MOV8 INS32 UPD42 MOV5 INS42 INS42 INS27 INS40 INS32 INS14 INS27 INS8 INS5 INS42 INS42 INS34 INS7 INS42 INS45 INS42 INS32 INS43 INS42 INS21 INS53 INS39 INS59 INS32 INS42 INS21 INS39 INS59 INS32 INS8 INS58 INS27 INS37 INS8 INS42 INS42 INS32 INS42 INS34 INS39 INS59 INS39 INS59 INS39 INS59 INS27 INS8 INS83 INS39 INS59 INS27 INS8 INS8 INS32 INS32 INS8 INS32 INS32 INS42 INS3 INS42 INS3 INS42 INS42 INS32 INS42 INS33 INS41 INS41 INS42 INS42 INS32 INS42 INS33 INS41 INS41 INS5 INS32 INS42 INS34 INS42 INS42 INS7 INS5 INS32 INS42 INS34 INS42 INS42 INS7 INS27 INS42 INS42 INS42 INS42 UPD40 UPD42 INS42 INS32 INS27 INS27 INS32 UPD42 INS42 INS32 INS32 UPD42 INS42 INS32 INS40 INS34 INS42 INS42 INS27 UPD42 UPD42 INS42 INS45 INS42 INS42 INS42 INS43 INS27 INS42 INS34 INS53 INS39 INS85 INS2 INS27 INS42 INS9 INS42 INS32 INS42 INS42 MOV32 INS42 INS42 INS27 INS32 INS42 INS32 INS42 INS42 INS60 INS21 INS24 INS39 INS59 INS42 INS27 INS42 INS25 INS42 INS42 INS27 INS42 INS42 INS42 INS42 INS42 INS34 INS42 INS32 INS42 INS32 INS42 INS34 INS21 INS42 INS32 INS42 INS27 INS60 INS21 INS21 INS42 INS42 INS42 INS42 INS42 INS42 INS21 INS42 INS42 INS42 INS34 INS42 INS42 INS42 INS34 INS5 INS42 INS5 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS32 INS39 INS85 INS42 INS42 INS2 INS32 INS39 INS85 INS42 INS42 INS2 INS32 INS45 INS45 INS42 INS42 INS27 INS42 INS42 INS34 INS42 INS34 INS42 INS42 INS27 INS42 INS42 INS27 INS42 INS42 INS42 INS36 INS42 INS42 INS27 INS42 INS45 INS42 INS42 INS45 INS45 INS14 INS42 INS42 INS34 INS36 INS42 INS42 INS27 UPD42 INS45 INS42 INS45 INS42 UPD45 INS42 INS42 INS45 INS42 INS27 UPD42 INS42 INS42 INS5 INS59 INS32 INS58 INS27 INS37 INS8 INS42 INS34 INS42 INS34 INS27 INS8 INS45 INS45 INS42 INS42 INS42 INS42 INS42 INS42 INS7 INS42 INS42 INS42 INS42 INS34 INS83 INS39 INS59 INS32 INS32 INS32 INS39 INS85 INS39 INS85 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS45 INS42 INS42 INS45 INS42 INS45 INS42 INS45 INS42 INS27 INS42 INS45 INS42 UPD42 INS43 INS45 INS27 INS45 INS32 INS21 INS42 INS34 INS39 INS85 INS42 INS32 INS42 INS42 INS45 INS32 INS32 INS39 INS59 INS42 INS42 INS42 INS21 INS32 INS2 INS21 INS10 INS42 INS27 INS42 INS27 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS45 INS42 INS42 INS42 INS42 INS42 INS45 INS42 UPD42 INS42 INS42 INS34 INS42 INS42 INS42 INS32 INS42 INS32 INS42 INS42 INS42 INS42 INS34 INS32 INS42 INS42 INS42 INS42 INS42 INS7 INS11 INS42 INS27 INS42 INS42 INS42 INS45 INS42 INS42 INS42 INS42 INS42 INS42 INS45 INS42 INS2 INS2 INS42 INS9 INS39 INS42 INS42 INS42 INS42 INS42 INS42 INS42 DEL45 DEL42 DEL42 DEL25 DEL25

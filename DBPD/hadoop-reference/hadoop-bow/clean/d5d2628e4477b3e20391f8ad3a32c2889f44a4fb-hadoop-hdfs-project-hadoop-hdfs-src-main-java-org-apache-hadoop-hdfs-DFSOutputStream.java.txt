@@ -1,0 +1,413 @@
+Merge r1360400 through r1399945 from trunk.
+
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/branches/HDFS-2802@1399950 13f79535-47bb-0310-9956-ffa450edef68
+
++import java.io.InputStream;
++import java.io.OutputStream;
+-import java.nio.ByteBuffer;
++import org.apache.hadoop.hdfs.protocol.datatransfer.DataTransferEncryptor;
++import org.apache.hadoop.hdfs.protocol.datatransfer.IOStreamPair;
++import org.apache.hadoop.hdfs.protocol.datatransfer.InvalidEncryptionKeyException;
++import org.apache.hadoop.util.Time;
++
++import com.google.common.annotations.VisibleForTesting;
+-  private final DFSClient dfsClient;
++  private final DFSClient dfsClient;
+-  private int packetSize = 0; // write packet size, including the header.
++  private int packetSize = 0; // write packet size, not including the header.
+-  private class Packet {
+-    long    seqno;               // sequencenumber of buffer in block
+-    long    offsetInBlock;       // offset in block
+-    private boolean lastPacketInBlock;   // is this the last packet in block?
+-    boolean syncBlock;          // this packet forces the current block to disk
+-    int     numChunks;           // number of chunks currently in packet
+-    int     maxChunks;           // max chunks in packet
+-
+-    /** buffer for accumulating packet checksum and data */
+-    ByteBuffer buffer; // wraps buf, only one of these two may be non-null
++  private static class Packet {
++    private static final long HEART_BEAT_SEQNO = -1L;
++    long seqno; // sequencenumber of buffer in block
++    final long offsetInBlock; // offset in block
++    boolean syncBlock; // this packet forces the current block to disk
++    int numChunks; // number of chunks currently in packet
++    final int maxChunks; // max chunks in packet
++    private boolean lastPacketInBlock; // is this the last packet in block?
+-     * [HHHHHCCCCC________________DDDDDDDDDDDDDDDD___]
+-     *       ^    ^               ^               ^
+-     *       |    checksumPos     dataStart       dataPos
+-     *   checksumStart
++     * [_________CCCCCCCCC________________DDDDDDDDDDDDDDDD___]
++     *           ^        ^               ^               ^
++     *           |        checksumPos     dataStart       dataPos
++     *           checksumStart
++     * 
++     * Right before sending, we move the checksum data to immediately precede
++     * the actual data, and then insert the header into the buffer immediately
++     * preceding the checksum data, so we make sure to keep enough space in
++     * front of the checksum data to support the largest conceivable header. 
+-    int dataStart;
+-    int dataPos;
+-
+-    private static final long HEART_BEAT_SEQNO = -1L;
++    final int dataStart;
++    int dataPos;
+-     *  create a heartbeat packet
++     * Create a heartbeat packet.
+-    Packet() {
+-      this.lastPacketInBlock = false;
+-      this.numChunks = 0;
+-      this.offsetInBlock = 0;
+-      this.seqno = HEART_BEAT_SEQNO;
+-      
+-      buffer = null;
+-      int packetSize = PacketHeader.PKT_HEADER_LEN + HdfsConstants.BYTES_IN_INTEGER;
+-      buf = new byte[packetSize];
+-      
+-      checksumStart = dataStart = packetSize;
+-      checksumPos = checksumStart;
+-      dataPos = dataStart;
+-      maxChunks = 0;
++    Packet(int checksumSize) {
++      this(0, 0, 0, HEART_BEAT_SEQNO, checksumSize);
+-    // create a new packet
+-    Packet(int pktSize, int chunksPerPkt, long offsetInBlock) {
++    /**
++     * Create a new packet.
++     * 
++     * @param pktSize maximum size of the packet, 
++     *                including checksum data and actual data.
++     * @param chunksPerPkt maximum number of chunks per packet.
++     * @param offsetInBlock offset in bytes into the HDFS block.
++     */
++    Packet(int pktSize, int chunksPerPkt, long offsetInBlock, 
++                              long seqno, int checksumSize) {
+-      this.seqno = currentSeqno;
+-      currentSeqno++;
++      this.seqno = seqno;
+-      buffer = null;
+-      buf = new byte[pktSize];
++      buf = new byte[PacketHeader.PKT_MAX_HEADER_LEN + pktSize];
+-      checksumStart = PacketHeader.PKT_HEADER_LEN;
++      checksumStart = PacketHeader.PKT_MAX_HEADER_LEN;
+-      dataStart = checksumStart + chunksPerPkt * checksum.getChecksumSize();
++      dataStart = checksumStart + (chunksPerPkt * checksumSize);
+-      if ( dataPos + len > buf.length) {
++      if (dataPos + len > buf.length) {
+-    void  writeChecksum(byte[] inarray, int off, int len) {
++    void writeChecksum(byte[] inarray, int off, int len) {
+-     * Returns ByteBuffer that contains one full packet, including header.
++     * Write the full packet, including the header, to the given output stream.
+-    ByteBuffer getBuffer() {
+-      /* Once this is called, no more data can be added to the packet.
+-       * setting 'buf' to null ensures that.
+-       * This is called only when the packet is ready to be sent.
+-       */
+-      if (buffer != null) {
+-        return buffer;
+-      }
+-      
+-      //prepare the header and close any gap between checksum and data.
+-      
+-      int dataLen = dataPos - dataStart;
+-      int checksumLen = checksumPos - checksumStart;
+-      
+-      if (checksumPos != dataStart) {
+-        /* move the checksum to cover the gap.
+-         * This can happen for the last packet.
+-         */
+-        System.arraycopy(buf, checksumStart, buf, 
+-                         dataStart - checksumLen , checksumLen); 
+-      }
+-      
+-      int pktLen = HdfsConstants.BYTES_IN_INTEGER + dataLen + checksumLen;
+-      
+-      //normally dataStart == checksumPos, i.e., offset is zero.
+-      buffer = ByteBuffer.wrap(
+-        buf, dataStart - checksumPos,
+-        PacketHeader.PKT_HEADER_LEN + pktLen - HdfsConstants.BYTES_IN_INTEGER);
+-      buf = null;
+-      buffer.mark();
++    void writeTo(DataOutputStream stm) throws IOException {
++      final int dataLen = dataPos - dataStart;
++      final int checksumLen = checksumPos - checksumStart;
++      final int pktLen = HdfsConstants.BYTES_IN_INTEGER + dataLen + checksumLen;
+-      header.putInBuffer(buffer);
+-      buffer.reset();
+-      return buffer;
++      if (checksumPos != dataStart) {
++        // Move the checksum to cover the gap. This can happen for the last
++        // packet or during an hflush/hsync call.
++        System.arraycopy(buf, checksumStart, buf, 
++                         dataStart - checksumLen , checksumLen); 
++        checksumPos = dataStart;
++        checksumStart = checksumPos - checksumLen;
++      }
++      
++      final int headerStart = checksumStart - header.getSerializedSize();
++      assert checksumStart + 1 >= header.getSerializedSize();
++      assert checksumPos == dataStart;
++      assert headerStart >= 0;
++      assert headerStart + header.getSerializedSize() == checksumStart;
++      
++      // Copy the header data into the buffer immediately preceding the checksum
++      // data.
++      System.arraycopy(header.getBytes(), 0, buf, headerStart,
++          header.getSerializedSize());
++      
++      // Write the now contiguous full packet to the output stream.
++      stm.write(buf, headerStart, header.getSerializedSize() + checksumLen + dataLen);
++    @Override
++    @Override
+-      long lastPacket = System.currentTimeMillis();
++      long lastPacket = Time.now();
++            DFSClient.LOG.warn("Caught exception ", e);
+-            long now = System.currentTimeMillis();
++            long now = Time.now();
++                DFSClient.LOG.warn("Caught exception ", e);
+-              now = System.currentTimeMillis();
++              now = Time.now();
+-              one = new Packet();  // heartbeat packet
++              one = new Packet(checksum.getChecksumSize());  // heartbeat packet
++                  DFSClient.LOG.warn("Caught exception ", e);
+-          ByteBuffer buf = one.getBuffer();
+-
+-          try {            
+-            blockStream.write(buf.array(), buf.position(), buf.remaining());
++          try {
++            one.writeTo(blockStream);
+-            // write to primary DN 
++            // write to primary DN
+-          lastPacket = System.currentTimeMillis();
++          lastPacket = Time.now();
++          DFSClient.LOG.warn("Caught exception ", e);
++      @Override
+-        out = new DataOutputStream(new BufferedOutputStream(
+-            NetUtils.getOutputStream(sock, writeTimeout),
++        
++        OutputStream unbufOut = NetUtils.getOutputStream(sock, writeTimeout);
++        InputStream unbufIn = NetUtils.getInputStream(sock);
++        if (dfsClient.shouldEncryptData()) {
++          IOStreamPair encryptedStreams =
++              DataTransferEncryptor.getEncryptedStreams(
++                  unbufOut, unbufIn, dfsClient.getDataEncryptionKey());
++          unbufOut = encryptedStreams.out;
++          unbufIn = encryptedStreams.in;
++        }
++        out = new DataOutputStream(new BufferedOutputStream(unbufOut,
++        in = new DataInputStream(unbufIn);
++        out.flush();
+-        in = new DataInputStream(NetUtils.getInputStream(sock));
+-        long startTime = System.currentTimeMillis();
++        long startTime = Time.now();
+-      boolean result = false;
+-      DataOutputStream out = null;
+-      try {
+-        assert null == s : "Previous socket unclosed";
+-        s = createSocketForPipeline(nodes[0], nodes.length, dfsClient);
+-        long writeTimeout = dfsClient.getDatanodeWriteTimeout(nodes.length);
+-
+-        //
+-        // Xmit header info to datanode
+-        //
+-        out = new DataOutputStream(new BufferedOutputStream(
+-            NetUtils.getOutputStream(s, writeTimeout),
+-            HdfsConstants.SMALL_BUFFER_SIZE));
+-        
+-        assert null == blockReplyStream : "Previous blockReplyStream unclosed";
+-        blockReplyStream = new DataInputStream(NetUtils.getInputStream(s));
+-
+-        // send the request
+-        new Sender(out).writeBlock(block, accessToken, dfsClient.clientName,
+-            nodes, null, recoveryFlag? stage.getRecoveryStage() : stage, 
+-            nodes.length, block.getNumBytes(), bytesSent, newGS, checksum);
+-
+-        // receive ack for connect
+-        BlockOpResponseProto resp = BlockOpResponseProto.parseFrom(
+-            HdfsProtoUtil.vintPrefixed(blockReplyStream));
+-        pipelineStatus = resp.getStatus();
+-        firstBadLink = resp.getFirstBadLink();
+-        
+-        if (pipelineStatus != SUCCESS) {
+-          if (pipelineStatus == Status.ERROR_ACCESS_TOKEN) {
+-            throw new InvalidBlockTokenException(
+-                "Got access token error for connect ack with firstBadLink as "
+-                    + firstBadLink);
+-          } else {
+-            throw new IOException("Bad connect ack with firstBadLink as "
+-                + firstBadLink);
++      int refetchEncryptionKey = 1;
++      while (true) {
++        boolean result = false;
++        DataOutputStream out = null;
++        try {
++          assert null == s : "Previous socket unclosed";
++          assert null == blockReplyStream : "Previous blockReplyStream unclosed";
++          s = createSocketForPipeline(nodes[0], nodes.length, dfsClient);
++          long writeTimeout = dfsClient.getDatanodeWriteTimeout(nodes.length);
++          
++          OutputStream unbufOut = NetUtils.getOutputStream(s, writeTimeout);
++          InputStream unbufIn = NetUtils.getInputStream(s);
++          if (dfsClient.shouldEncryptData()) {
++            IOStreamPair encryptedStreams =
++                DataTransferEncryptor.getEncryptedStreams(unbufOut,
++                    unbufIn, dfsClient.getDataEncryptionKey());
++            unbufOut = encryptedStreams.out;
++            unbufIn = encryptedStreams.in;
+-        }
+-        assert null == blockStream : "Previous blockStream unclosed";
+-        blockStream = out;
+-        result =  true; // success
+-
+-      } catch (IOException ie) {
+-
+-        DFSClient.LOG.info("Exception in createBlockOutputStream", ie);
+-
+-        // find the datanode that matches
+-        if (firstBadLink.length() != 0) {
+-          for (int i = 0; i < nodes.length; i++) {
+-            if (nodes[i].getXferAddr().equals(firstBadLink)) {
+-              errorIndex = i;
+-              break;
++          out = new DataOutputStream(new BufferedOutputStream(unbufOut,
++              HdfsConstants.SMALL_BUFFER_SIZE));
++          blockReplyStream = new DataInputStream(unbufIn);
++  
++          //
++          // Xmit header info to datanode
++          //
++  
++          // send the request
++          new Sender(out).writeBlock(block, accessToken, dfsClient.clientName,
++              nodes, null, recoveryFlag? stage.getRecoveryStage() : stage, 
++              nodes.length, block.getNumBytes(), bytesSent, newGS, checksum);
++  
++          // receive ack for connect
++          BlockOpResponseProto resp = BlockOpResponseProto.parseFrom(
++              HdfsProtoUtil.vintPrefixed(blockReplyStream));
++          pipelineStatus = resp.getStatus();
++          firstBadLink = resp.getFirstBadLink();
++          
++          if (pipelineStatus != SUCCESS) {
++            if (pipelineStatus == Status.ERROR_ACCESS_TOKEN) {
++              throw new InvalidBlockTokenException(
++                  "Got access token error for connect ack with firstBadLink as "
++                      + firstBadLink);
++            } else {
++              throw new IOException("Bad connect ack with firstBadLink as "
++                  + firstBadLink);
+-        } else {
+-          errorIndex = 0;
++          assert null == blockStream : "Previous blockStream unclosed";
++          blockStream = out;
++          result =  true; // success
++  
++        } catch (IOException ie) {
++          DFSClient.LOG.info("Exception in createBlockOutputStream", ie);
++          if (ie instanceof InvalidEncryptionKeyException && refetchEncryptionKey > 0) {
++            DFSClient.LOG.info("Will fetch a new encryption key and retry, " 
++                + "encryption key was invalid when connecting to "
++                + nodes[0] + " : " + ie);
++            // The encryption key used is invalid.
++            refetchEncryptionKey--;
++            dfsClient.clearDataEncryptionKey();
++            // Don't close the socket/exclude this node just yet. Try again with
++            // a new encryption key.
++            continue;
++          }
++  
++          // find the datanode that matches
++          if (firstBadLink.length() != 0) {
++            for (int i = 0; i < nodes.length; i++) {
++              // NB: Unconditionally using the xfer addr w/o hostname
++              if (firstBadLink.equals(nodes[i].getXferAddr())) {
++                errorIndex = i;
++                break;
++              }
++            }
++          } else {
++            errorIndex = 0;
++          }
++          hasError = true;
++          setLastException(ie);
++          result =  false;  // error
++        } finally {
++          if (!result) {
++            IOUtils.closeSocket(s);
++            s = null;
++            IOUtils.closeStream(out);
++            out = null;
++            IOUtils.closeStream(blockReplyStream);
++            blockReplyStream = null;
++          }
+-        hasError = true;
+-        setLastException(ie);
+-        result =  false;  // error
+-      } finally {
+-        if (!result) {
+-          IOUtils.closeSocket(s);
+-          s = null;
+-          IOUtils.closeStream(out);
+-          out = null;
+-          IOUtils.closeStream(blockReplyStream);
+-          blockReplyStream = null;
+-        }
++        return result;
+-      return result;
+-        long localstart = System.currentTimeMillis();
++        long localstart = Time.now();
+-                if (System.currentTimeMillis() - localstart > 5000) {
++                if (Time.now() - localstart > 5000) {
+-                      + (System.currentTimeMillis() - localstart) / 1000
++                      + (Time.now() - localstart) / 1000
++                  DFSClient.LOG.warn("Caught exception ", ie);
+-    if(DFSClient.LOG.isDebugEnabled()) {
+-      DFSClient.LOG.debug("Connecting to datanode " + first);
++    final String dnAddr = first.getXferAddr(client.connectToDnViaHostname());
++    if (DFSClient.LOG.isDebugEnabled()) {
++      DFSClient.LOG.debug("Connecting to datanode " + dnAddr);
+-    final InetSocketAddress isa =
+-      NetUtils.createSocketAddr(first.getXferAddr());
++    final InetSocketAddress isa = NetUtils.createSocketAddr(dnAddr);
+-  synchronized DatanodeInfo[] getPipeline() {
++  @VisibleForTesting
++  public synchronized DatanodeInfo[] getPipeline() {
+-    int n = PacketHeader.PKT_HEADER_LEN;
+-    chunksPerPacket = Math.max((psize - n + chunkSize-1)/chunkSize, 1);
+-    packetSize = n + chunkSize*chunksPerPacket;
++    chunksPerPacket = Math.max(psize/chunkSize, 1);
++    packetSize = chunkSize*chunksPerPacket;
+-          bytesCurBlock);
++          bytesCurBlock, currentSeqno++, this.checksum.getChecksumSize());
+-        currentPacket = new Packet(PacketHeader.PKT_HEADER_LEN, 0, 
+-            bytesCurBlock);
++        currentPacket = new Packet(0, 0, bytesCurBlock, 
++            currentSeqno++, this.checksum.getChecksumSize());
+-                bytesCurBlock);
++                bytesCurBlock, currentSeqno++, this.checksum.getChecksumSize());
+-                bytesCurBlock);
++                bytesCurBlock, currentSeqno++, this.checksum.getChecksumSize());
++    dfsClient.endFileLease(src);
+-        currentPacket = new Packet(PacketHeader.PKT_HEADER_LEN, 0, 
+-            bytesCurBlock);
++        currentPacket = new Packet(0, 0, bytesCurBlock, 
++            currentSeqno++, this.checksum.getChecksumSize());
+-      dfsClient.leaserenewer.closeFile(src, dfsClient);
++      dfsClient.endFileLease(src);
+-    long localstart = System.currentTimeMillis();
++    long localstart = Time.now();
+-               localstart + dfsClient.hdfsTimeout < System.currentTimeMillis())) {
++               localstart + dfsClient.hdfsTimeout < Time.now())) {
+-          if (System.currentTimeMillis() - localstart > 5000) {
++          if (Time.now() - localstart > 5000) {
++          DFSClient.LOG.warn("Caught exception ", ie);
+-  void setArtificialSlowdown(long period) {
++  @VisibleForTesting
++  public void setArtificialSlowdown(long period) {
+-  synchronized void setChunksPerPacket(int value) {
++  @VisibleForTesting
++  public synchronized void setChunksPerPacket(int value) {
+-    packetSize = PacketHeader.PKT_HEADER_LEN +
+-                 (checksum.getBytesPerChecksum() + 
++    packetSize = (checksum.getBytesPerChecksum() + 

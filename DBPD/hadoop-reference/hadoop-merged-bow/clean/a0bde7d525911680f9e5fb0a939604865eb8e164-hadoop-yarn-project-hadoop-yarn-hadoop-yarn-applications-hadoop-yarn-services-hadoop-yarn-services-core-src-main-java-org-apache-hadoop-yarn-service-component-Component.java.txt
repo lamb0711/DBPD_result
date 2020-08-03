@@ -1,0 +1,137 @@
+YARN-7142. Support placement policy in yarn native services. (Gour Saha via wangda)
+
+Change-Id: I166c67a7a34430627c17365f60bac75b6da1b434
+
++import org.apache.hadoop.yarn.api.records.ExecutionType;
++import org.apache.hadoop.yarn.api.records.ExecutionTypeRequest;
++import org.apache.hadoop.yarn.api.records.ResourceSizing;
++import org.apache.hadoop.yarn.api.records.SchedulingRequest;
++import org.apache.hadoop.yarn.api.resource.PlacementConstraint;
++import org.apache.hadoop.yarn.api.resource.PlacementConstraint.TargetExpression;
++import org.apache.hadoop.yarn.api.resource.PlacementConstraints;
++import org.apache.hadoop.yarn.api.resource.PlacementConstraints.PlacementTargets;
+-import org.apache.hadoop.yarn.service.api.records.ResourceInformation;
+-import org.apache.hadoop.yarn.service.component.instance.ComponentInstance;
+-import org.apache.hadoop.yarn.service.component.instance.ComponentInstanceId;
+-import org.apache.hadoop.yarn.service.ServiceScheduler;
+-import org.apache.hadoop.yarn.service.api.records.ServiceState;
+-import org.apache.hadoop.yarn.service.component.instance.ComponentInstanceEvent;
++import org.apache.hadoop.yarn.service.ServiceScheduler;
++import org.apache.hadoop.yarn.service.api.records.PlacementPolicy;
++import org.apache.hadoop.yarn.service.api.records.ResourceInformation;
++import org.apache.hadoop.yarn.service.api.records.ServiceState;
++import org.apache.hadoop.yarn.service.component.instance.ComponentInstance;
++import org.apache.hadoop.yarn.service.component.instance.ComponentInstanceEvent;
++import org.apache.hadoop.yarn.service.component.instance.ComponentInstanceId;
++import org.apache.hadoop.yarn.service.monitor.probe.MonitorUtils;
++import org.apache.hadoop.yarn.service.monitor.probe.Probe;
++import org.apache.hadoop.yarn.service.utils.ServiceUtils;
+-import org.apache.hadoop.yarn.service.utils.ServiceUtils;
+-import org.apache.hadoop.yarn.service.monitor.probe.MonitorUtils;
+-import org.apache.hadoop.yarn.service.monitor.probe.Probe;
++import java.util.HashSet;
+-import static org.apache.hadoop.yarn.service.component.instance.ComponentInstanceEventType.START;
+-import static org.apache.hadoop.yarn.service.component.instance.ComponentInstanceEventType.STOP;
++import static org.apache.hadoop.yarn.service.component.instance.ComponentInstanceEventType.*;
++    LOG.info("[COMPONENT {}] Requesting for {} container(s)",
++        componentSpec.getName(), count);
+-    for (int i = 0; i < count; i++) {
+-      //TODO Once YARN-5468 is done, use that for anti-affinity
+-      ContainerRequest request =
+-          ContainerRequest.newBuilder().capability(resource).priority(priority)
+-              .allocationRequestId(allocateId).relaxLocality(true).build();
+-      amrmClient.addContainerRequest(request);
++    if (!scheduler.hasAtLeastOnePlacementConstraint()) {
++      for (int i = 0; i < count; i++) {
++        ContainerRequest request = ContainerRequest.newBuilder()
++            .capability(resource).priority(priority)
++            .allocationRequestId(allocateId).relaxLocality(true).build();
++        LOG.info("[COMPONENT {}] Submitting container request : {}",
++            componentSpec.getName(), request);
++        amrmClient.addContainerRequest(request);
++      }
++    } else {
++      // Schedule placement requests. Validation of non-null target tags and
++      // that they refer to existing component names are already done. So, no
++      // need to validate here.
++      PlacementPolicy placementPolicy = componentSpec.getPlacementPolicy();
++      Collection<SchedulingRequest> schedulingRequests = new HashSet<>();
++      // We prepare an AND-ed composite constraint to be the final composite
++      // constraint. If placement expressions are specified to create advanced
++      // composite constraints then this AND-ed composite constraint is not
++      // used.
++      PlacementConstraint finalConstraint = null;
++      for (org.apache.hadoop.yarn.service.api.records.PlacementConstraint
++          yarnServiceConstraint : placementPolicy.getConstraints()) {
++        List<TargetExpression> targetExpressions = new ArrayList<>();
++        // Currently only intra-application allocation tags are supported.
++        if (!yarnServiceConstraint.getTargetTags().isEmpty()) {
++          targetExpressions.add(PlacementTargets.allocationTagToIntraApp(
++              yarnServiceConstraint.getTargetTags().toArray(new String[0])));
++        }
++        // Add all node attributes
++        for (Map.Entry<String, List<String>> attribute : yarnServiceConstraint
++            .getNodeAttributes().entrySet()) {
++          targetExpressions.add(PlacementTargets.nodeAttribute(
++              attribute.getKey(), attribute.getValue().toArray(new String[0])));
++        }
++        // Add all node partitions
++        if (!yarnServiceConstraint.getNodePartitions().isEmpty()) {
++          targetExpressions
++              .add(PlacementTargets.nodePartition(yarnServiceConstraint
++                  .getNodePartitions().toArray(new String[0])));
++        }
++        PlacementConstraint constraint = null;
++        switch (yarnServiceConstraint.getType()) {
++        case AFFINITY:
++          constraint = PlacementConstraints
++              .targetIn(yarnServiceConstraint.getScope().getValue(),
++                  targetExpressions.toArray(new TargetExpression[0]))
++              .build();
++          break;
++        case ANTI_AFFINITY:
++          constraint = PlacementConstraints
++              .targetNotIn(yarnServiceConstraint.getScope().getValue(),
++                  targetExpressions.toArray(new TargetExpression[0]))
++              .build();
++          break;
++        case AFFINITY_WITH_CARDINALITY:
++          constraint = PlacementConstraints.targetCardinality(
++              yarnServiceConstraint.getScope().name().toLowerCase(),
++              yarnServiceConstraint.getMinCardinality() == null ? 0
++                  : yarnServiceConstraint.getMinCardinality().intValue(),
++              yarnServiceConstraint.getMaxCardinality() == null
++                  ? Integer.MAX_VALUE
++                  : yarnServiceConstraint.getMaxCardinality().intValue(),
++              targetExpressions.toArray(new TargetExpression[0])).build();
++          break;
++        }
++        // The default AND-ed final composite constraint
++        if (finalConstraint != null) {
++          finalConstraint = PlacementConstraints
++              .and(constraint.getConstraintExpr(),
++                  finalConstraint.getConstraintExpr())
++              .build();
++        } else {
++          finalConstraint = constraint;
++        }
++        LOG.debug("[COMPONENT {}] Placement constraint: {}",
++            componentSpec.getName(), constraint.getConstraintExpr().toString());
++      }
++      ResourceSizing resourceSizing = ResourceSizing.newInstance((int) count,
++          resource);
++      LOG.debug("[COMPONENT {}] Resource sizing: {}", componentSpec.getName(),
++          resourceSizing);
++      SchedulingRequest request = SchedulingRequest.newBuilder()
++          .priority(priority).allocationRequestId(allocateId)
++          .allocationTags(Collections.singleton(componentSpec.getName()))
++          .executionType(
++              ExecutionTypeRequest.newInstance(ExecutionType.GUARANTEED, true))
++          .placementConstraintExpression(finalConstraint)
++          .resourceSizing(resourceSizing).build();
++      LOG.info("[COMPONENT {}] Submitting scheduling request: {}",
++          componentSpec.getName(), request);
++      schedulingRequests.add(request);
++      amrmClient.addSchedulingRequests(schedulingRequests);
+
+MOV26 MOV26 MOV26 MOV26 MOV26 MOV26 MOV26 MOV26 MOV26 MOV26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 UPD40 INS40 UPD40 INS8 INS21 MOV60 MOV60 MOV25 INS25 INS32 INS38 INS8 INS8 INS42 INS42 INS45 INS32 INS42 INS32 MOV24 INS60 INS60 INS60 INS70 INS60 INS21 INS60 INS21 INS21 INS21 INS42 INS42 INS42 INS42 INS43 INS59 INS74 INS59 INS43 INS59 INS44 INS32 INS8 INS43 INS59 INS32 INS43 INS59 INS32 INS32 INS32 INS21 INS42 INS42 INS32 INS43 INS43 INS42 INS14 INS42 INS42 INS33 INS43 INS42 INS42 INS42 INS60 INS25 INS70 INS25 INS60 INS50 INS25 INS21 INS42 INS42 INS32 INS42 INS42 INS45 INS32 INS42 INS42 INS42 INS32 INS42 INS42 INS45 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS74 INS40 INS74 INS59 INS38 INS8 INS44 INS32 INS8 INS38 INS8 INS43 INS59 INS32 INS49 INS21 INS10 INS49 INS21 INS10 INS49 INS21 INS10 INS27 INS8 INS8 INS32 INS42 INS42 INS11 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS45 INS32 INS42 INS43 INS43 INS43 INS42 INS14 INS32 INS21 INS74 INS42 INS32 INS42 INS21 INS32 INS21 INS42 INS42 INS33 INS42 INS42 INS42 INS7 INS42 INS7 INS42 INS7 INS42 INS33 INS21 INS21 INS42 INS42 INS45 INS32 INS32 INS39 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS74 INS32 INS42 INS32 INS43 INS43 INS74 INS42 INS42 INS32 INS32 INS42 INS32 INS42 INS32 INS42 INS32 INS42 INS32 INS7 INS7 INS42 INS42 INS32 INS42 INS32 INS42 INS42 INS43 INS42 INS42 INS42 INS42 INS32 INS40 INS42 INS43 INS43 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS32 INS32 INS42 INS32 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS32 INS42 INS32 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS32 INS32 INS42 INS42 INS32 INS42 INS42 INS32 INS32 INS42 INS42 INS32 INS32 INS42 INS42 INS32 INS16 INS16 INS32 INS32 INS42 INS32 INS42 INS32 INS42 INS42 INS40 INS9 INS32 INS42 INS3 INS42 INS42 INS32 INS42 INS3 INS32 INS42 INS3 INS32 INS42 INS42 INS42 INS3 INS32 INS42 INS42 INS42 INS3 INS32 INS42 INS27 INS34 INS32 INS27 INS40 INS32 INS42 INS42 INS3 INS42 INS42 INS32 INS32 INS32 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS5 INS34 INS42 INS42 INS5 INS34 INS42 INS42 INS5 INS34 INS42 INS42 INS5 INS34 INS42 INS42 INS5 INS34 INS32 INS42 INS32 INS33 INS32 INS42 INS32 INS33 INS32 INS42 INS5 INS34 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS43 INS85 INS43 INS85 INS43 INS85 INS43 INS85 INS43 INS85 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS43 INS85 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 DEL8

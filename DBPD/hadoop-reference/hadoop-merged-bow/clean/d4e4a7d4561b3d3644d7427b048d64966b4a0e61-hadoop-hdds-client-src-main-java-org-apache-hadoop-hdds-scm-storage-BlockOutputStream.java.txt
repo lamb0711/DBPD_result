@@ -1,0 +1,203 @@
+HDDS-1317. KeyOutputStream#write throws ArrayIndexOutOfBoundsException when running RandomWrite MR examples. Contributed by Shashikant Banerjee.
+
++import com.google.common.annotations.VisibleForTesting;
+-import java.util.concurrent.*;
++import java.util.Map;
++import java.util.concurrent.ConcurrentSkipListMap;
++import java.util.concurrent.ConcurrentHashMap;
++import java.util.concurrent.ExecutorService;
++import java.util.concurrent.CompletableFuture;
++import java.util.concurrent.TimeoutException;
++import java.util.concurrent.CompletionException;
++import java.util.concurrent.ExecutionException;
++import java.util.concurrent.Executors;
++  // List containing buffers for which the putBlock call will
++  // update the length in the datanodes. This list will just maintain
++  // references to the buffers in the BufferPool which will be cleared
++  // when the watchForCommit acknowledges a putBlock logIndex has been
++  // committed on all datanodes. This list will be a  place holder for buffers
++  // which got written between successive putBlock calls.
++  private List<ByteBuffer> bufferList;
++
+-  // map containing mapping for putBlock logIndex to to flushedDataLength Map.
+-  private ConcurrentSkipListMap<Long, Long> commitIndex2flushedDataMap;
++  // Also, corresponding to the logIndex, the corresponding list of buffers will
++  // be released from the buffer pool.
++  private ConcurrentSkipListMap<Long, List<ByteBuffer>>
++      commitIndex2flushedDataMap;
++    bufferList = null;
++
+-  public long getTotalSuccessfulFlushedData() {
++  public long getTotalAckDataLength() {
++  @VisibleForTesting
++  public XceiverClientSpi getXceiverClient() {
++    return xceiverClient;
++  }
++
++  @VisibleForTesting
++  public long getTotalDataFlushedLength() {
++    return totalDataFlushedLength;
++  }
++
++  @VisibleForTesting
++  public BufferPool getBufferPool() {
++    return bufferPool;
++  }
++
++  @VisibleForTesting
++  public IOException getIoException() {
++    return ioException;
++  }
++
++  @VisibleForTesting
++  public Map<Long, List<ByteBuffer>> getCommitIndex2flushedDataMap() {
++    return commitIndex2flushedDataMap;
++  }
++
++
+-
+-        totalDataFlushedLength += streamBufferFlushSize;
+-        handlePartialFlush();
++        updateFlushLength();
++        executePutBlock();
+-    return writtenDataLength % streamBufferFlushSize == 0;
++    return bufferPool.computeBufferData() % streamBufferFlushSize == 0;
++  }
++
++  private void updateFlushLength() {
++    totalDataFlushedLength += writtenDataLength - totalDataFlushedLength;
+-      if (shouldFlush()) {
++      // we should not call isBufferFull/shouldFlush here.
++      // The buffer might already be full as whole data is already cached in
++      // the buffer. We should just validate
++      // if we wrote data of size streamBufferMaxSize/streamBufferFlushSize to
++      // call for handling full buffer/flush buffer condition.
++      if (writtenDataLength % streamBufferFlushSize == 0) {
+-        totalDataFlushedLength += streamBufferFlushSize;
+-        handlePartialFlush();
++        updateFlushLength();
++        executePutBlock();
+-
+-      // we should not call isBufferFull here. The buffer might already be full
+-      // as whole data is already cached in the buffer. We should just validate
+-      // if we wrote data of size streamBufferMaxSize to call for handling
+-      // full buffer condition.
+-      long length = commitIndex2flushedDataMap.remove(index);
+-
+-      // totalAckDataLength replicated yet should always be less than equal to
+-      // the current length being returned from commitIndex2flushedDataMap.
+-      // The below precondition would ensure commitIndex2flushedDataMap entries
+-      // are removed in order of the insertion to the map.
+-      Preconditions.checkArgument(totalAckDataLength < length);
+-      totalAckDataLength = length;
++      List<ByteBuffer> buffers = commitIndex2flushedDataMap.remove(index);
++      long length = buffers.stream().mapToLong(value -> {
++        int pos = value.position();
++        Preconditions.checkArgument(pos <= chunkSize);
++        return pos;
++      }).sum();
++      // totalAckDataLength replicated yet should always be incremented
++      // with the current length being returned from commitIndex2flushedDataMap.
++      totalAckDataLength += length;
+-      // just release the current buffer from the buffer pool.
+-
+-      // every entry removed from the putBlock future Map signifies
+-      // streamBufferFlushSize/chunkSize no of chunks successfully committed.
+-      // Release the buffers from the buffer pool to be reused again.
+-      int chunkCount = (int) (streamBufferFlushSize / chunkSize);
+-      for (int i = 0; i < chunkCount; i++) {
+-        bufferPool.releaseBuffer();
++      // just release the current buffer from the buffer pool corresponding
++      // to the buffers that have been committed with the putBlock call.
++      for (ByteBuffer byteBuffer : buffers) {
++        bufferPool.releaseBuffer(byteBuffer);
+-      adjustBuffersOnException();
+-      throw new IOException(
++      ioException = new IOException(
++      adjustBuffersOnException();
++      throw ioException;
+-      ContainerCommandResponseProto> handlePartialFlush()
++      ContainerCommandResponseProto> executePutBlock()
++    Preconditions.checkNotNull(bufferList);
++    List<ByteBuffer> byteBufferList = bufferList;
++    bufferList = null;
++    Preconditions.checkNotNull(byteBufferList);
+-          LOG.debug(
+-              "Adding index " + asyncReply.getLogIndex() + " commitMap size "
+-                  + commitIndex2flushedDataMap.size());
++          LOG.debug(
++              "Adding index " + asyncReply.getLogIndex() + " commitMap size "
++                  + commitIndex2flushedDataMap.size() + " flushLength "
++                  + flushPos + " numBuffers " + byteBufferList.size()
++                  + " blockID " + blockID + " bufferPool size" + bufferPool
++                  .getSize() + " currentBufferIndex " + bufferPool
++                  .getCurrentBufferIndex());
+-          commitIndex2flushedDataMap.put(asyncReply.getLogIndex(), flushPos);
++          commitIndex2flushedDataMap
++              .put(asyncReply.getLogIndex(), byteBufferList);
+-        adjustBuffersOnException();
+-        throw new IOException(
++        // just set the exception here as well in order to maintain sanctity of
++        // ioException field
++        ioException = new IOException(
++        adjustBuffersOnException();
++        throw ioException;
++    // This data in the buffer will be pushed to datanode and a reference will
++    // be added to the bufferList. Once putBlock gets executed, this list will
++    // be marked null. Hence, during first writeChunk call after every putBlock
++    // call or during the first call to writeChunk here, the list will be null.
++
++    if (bufferList == null) {
++      bufferList = new ArrayList<>();
++    }
++    bufferList.add(buffer);
+-      ByteBuffer currentBuffer = bufferPool.getBuffer();
+-      int pos = currentBuffer.position();
+-      writeChunk(currentBuffer);
+-      totalDataFlushedLength += pos;
+-      handlePartialFlush();
++      ByteBuffer currentBuffer = bufferPool.getCurrentBuffer();
++      Preconditions.checkArgument(currentBuffer.position() > 0);
++      if (currentBuffer.position() != chunkSize) {
++        writeChunk(currentBuffer);
++      }
++      // This can be a partially filled chunk. Since we are flushing the buffer
++      // here, we just limit this buffer to the current position. So that next
++      // write will happen in new buffer
++      updateFlushLength();
++      executePutBlock();
++    if (!commitIndex2flushedDataMap.isEmpty()) {
++      // wait for the last commit index in the commitIndex2flushedDataMap
++      // to get committed to all or majority of nodes in case timeout
++      // happens.
++      long lastIndex =
++          commitIndex2flushedDataMap.keySet().stream().mapToLong(v -> v)
++              .max().getAsLong();
++      LOG.debug(
++          "waiting for last flush Index " + lastIndex + " to catch up");
++      watchForCommit(lastIndex);
++    }
++
+-
+-        if (!commitIndex2flushedDataMap.isEmpty()) {
+-          // wait for the last commit index in the commitIndex2flushedDataMap
+-          // to get committed to all or majority of nodes in case timeout
+-          // happens.
+-          long lastIndex =
+-              commitIndex2flushedDataMap.keySet().stream().mapToLong(v -> v)
+-                  .max().getAsLong();
+-          LOG.debug(
+-              "waiting for last flush Index " + lastIndex + " to catch up");
+-          watchForCommit(lastIndex);
+-        }
+-        adjustBuffersOnException();
+-        throw new IOException(
++        ioException = new IOException(
++        adjustBuffersOnException();
++        throw ioException;
++    if (bufferList !=  null) {
++      bufferList.clear();
++    }
++    bufferList = null;
+
+INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 MOV31 MOV31 MOV31 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 UPD40 INS23 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS83 INS74 INS59 UPD74 UPD42 INS78 UPD83 INS43 INS42 INS78 UPD39 INS42 INS8 INS78 UPD83 MOV83 INS43 INS42 INS8 INS78 INS83 INS43 INS42 INS8 INS78 INS83 INS74 INS42 INS8 INS83 INS39 INS42 INS8 INS83 INS39 INS42 INS8 UPD42 MOV78 UPD42 MOV43 INS83 INS39 INS42 MOV43 MOV43 MOV43 MOV8 MOV78 INS83 INS39 INS42 MOV43 MOV8 INS43 INS43 INS42 INS74 INS21 INS42 INS42 INS42 INS41 INS42 INS42 INS41 INS42 INS42 INS41 INS42 INS43 MOV43 INS74 INS41 INS41 MOV21 INS21 INS60 INS21 INS21 INS25 INS21 MOV21 INS25 MOV21 MOV21 INS25 INS21 INS42 INS42 INS43 INS43 INS7 INS42 INS42 INS42 INS42 INS42 INS43 INS43 INS42 INS27 INS32 INS74 INS59 INS7 INS32 MOV27 INS27 INS8 INS32 MOV27 INS8 MOV27 INS27 INS8 INS7 INS42 INS42 INS42 INS33 INS42 INS42 INS27 INS34 INS27 INS60 INS70 INS42 INS42 INS42 INS43 INS43 INS42 INS42 INS42 INS33 INS42 INS42 INS42 INS42 INS33 INS21 INS42 INS42 INS42 INS60 INS21 INS25 MOV21 INS21 INS42 INS33 INS21 INS42 INS33 INS32 INS42 INS42 INS42 MOV27 INS74 INS39 INS59 UPD7 INS44 INS42 INS8 INS21 INS42 INS42 MOV8 INS7 MOV43 INS59 INS32 INS27 INS8 INS32 INS8 MOV8 INS32 MOV42 UPD42 MOV42 UPD42 MOV42 INS43 INS43 UPD42 INS42 INS32 INS43 INS42 MOV21 INS7 INS42 INS42 INS14 INS42 INS32 INS42 INS42 INS27 INS32 INS42 MOV21 UPD42 INS42 INS21 INS42 INS42 INS32 INS32 INS42 INS42 INS32 INS42 INS42 INS42 MOV14 INS21 INS74 INS42 INS42 INS32 INS34 INS42 INS42 INS32 INS21 INS42 UPD42 INS42 UPD42 INS32 INS42 INS86 INS42 INS7 INS42 INS43 INS42 INS42 INS42 INS7 INS42 INS42 INS42 INS59 INS8 INS42 MOV14 INS42 INS42 MOV14 INS42 INS60 MOV21 INS41 INS39 INS59 INS42 MOV21 INS42 INS32 UPD27 INS42 INS42 UPD42 UPD42 UPD42 INS45 INS42 INS45 INS32 INS45 INS42 INS45 INS32 INS45 INS32 INS42 INS42 INS42 INS42 INS42 INS42 DEL39 DEL42 DEL42 DEL42 DEL42 DEL7 DEL42 DEL42 DEL42 DEL7 DEL39 DEL39 DEL42 DEL39 DEL42 DEL42 DEL27 DEL36 DEL11 DEL59 DEL60 DEL39 DEL42 DEL34 DEL59 DEL58 DEL42 DEL42 DEL27 DEL42 DEL37 DEL8 DEL24 DEL39 DEL42 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL39 DEL42 DEL32 DEL59 DEL60 DEL42 DEL32 DEL21 DEL8 DEL25 DEL8 DEL31

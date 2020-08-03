@@ -1,0 +1,201 @@
+HDFS-14401. Refine the implementation for HDFS cache on SCM. Contributed by Feilong He.
+
++import java.util.List;
+-public class PmemVolumeManager {
++public final class PmemVolumeManager {
+-  private class UsedBytesCount {
++  private static class UsedBytesCount {
++    private final long maxBytes;
++    UsedBytesCount(long maxBytes) {
++      this.maxBytes = maxBytes;
++    }
++
+-        if (next > cacheCapacity) {
++        if (next > maxBytes) {
+-    long get() {
++    long getUsedBytes() {
++
++    long getMaxBytes() {
++      return maxBytes;
++    }
++
++    long getAvailableBytes() {
++      return maxBytes - usedBytes.get();
++    }
++  public static final String CACHE_DIR = "hdfs_pmem_cache";
++  private static PmemVolumeManager pmemVolumeManager = null;
+-  private final UsedBytesCount usedBytesCount;
++  private final List<UsedBytesCount> usedBytesCounts = new ArrayList<>();
+-   * It is 0L if the specific mappableBlockLoader couldn't cache data to pmem.
+-  private final long cacheCapacity;
++  private long cacheCapacity;
++  private static long maxBytesPerPmem = -1;
+-  // Strict atomic operation is not guaranteed for the performance sake.
+-  private int i = 0;
++  private byte nextIndex = 0;
+-  PmemVolumeManager(long maxBytes, String[] pmemVolumesConfigured)
+-      throws IOException {
+-    if (pmemVolumesConfigured == null || pmemVolumesConfigured.length == 0) {
++  private PmemVolumeManager(String[] pmemVolumesConfig) throws IOException {
++    if (pmemVolumesConfig == null || pmemVolumesConfig.length == 0) {
+-    this.loadVolumes(pmemVolumesConfigured);
+-    this.usedBytesCount = new UsedBytesCount();
+-    this.cacheCapacity = maxBytes;
++    this.loadVolumes(pmemVolumesConfig);
++    cacheCapacity = 0L;
++    for (UsedBytesCount counter : usedBytesCounts) {
++      cacheCapacity += counter.getMaxBytes();
++    }
++  }
++
++  public synchronized static void init(String[] pmemVolumesConfig)
++      throws IOException {
++    if (pmemVolumeManager == null) {
++      pmemVolumeManager = new PmemVolumeManager(pmemVolumesConfig);
++    }
++  }
++
++  public static PmemVolumeManager getInstance() {
++    if (pmemVolumeManager == null) {
++      throw new RuntimeException(
++          "The pmemVolumeManager should be instantiated!");
++    }
++    return pmemVolumeManager;
++  }
++
++  @VisibleForTesting
++  public static void setMaxBytes(long maxBytes) {
++    maxBytesPerPmem = maxBytes;
+-    return usedBytesCount.get();
++    long usedBytes = 0L;
++    for (UsedBytesCount counter : usedBytesCounts) {
++      usedBytes += counter.getUsedBytes();
++    }
++    return usedBytes;
++   * @param key           The ExtendedBlockId for a block.
++   *
+-  long reserve(long bytesCount) {
+-    return usedBytesCount.reserve(bytesCount);
++  synchronized long reserve(ExtendedBlockId key, long bytesCount) {
++    try {
++      byte index = chooseVolume(bytesCount);
++      long usedBytes = usedBytesCounts.get(index).reserve(bytesCount);
++      // Put the entry into blockKeyToVolume if reserving bytes succeeded.
++      if (usedBytes > 0) {
++        blockKeyToVolume.put(key, index);
++      }
++      return usedBytes;
++    } catch (IOException e) {
++      LOG.warn(e.getMessage());
++      return -1L;
++    }
++   * @param key           The ExtendedBlockId for a block.
++   *
+-  long release(long bytesCount) {
+-    return usedBytesCount.release(bytesCount);
++  long release(ExtendedBlockId key, long bytesCount) {
++    Byte index = blockKeyToVolume.remove(key);
++    return usedBytesCounts.get(index).release(bytesCount);
+-  private void loadVolumes(String[] volumes) throws IOException {
++  private void loadVolumes(String[] volumes)
++      throws IOException {
+-    for (String volume: volumes) {
++    for (byte n = 0; n < volumes.length; n++) {
+-        File pmemDir = new File(volume);
+-        verifyIfValidPmemVolume(pmemDir);
+-        // Remove all files under the volume.
+-        FileUtils.cleanDirectory(pmemDir);
++        File pmemDir = new File(volumes[n]);
++        File realPmemDir = verifyIfValidPmemVolume(pmemDir);
++        this.pmemVolumes.add(realPmemDir.getPath());
++        long maxBytes;
++        if (maxBytesPerPmem == -1) {
++          maxBytes = realPmemDir.getUsableSpace();
++        } else {
++          maxBytes = maxBytesPerPmem;
++        }
++        UsedBytesCount usedBytesCount = new UsedBytesCount(maxBytes);
++        this.usedBytesCounts.add(usedBytesCount);
++        LOG.info("Added persistent memory - {} with size={}",
++            volumes[n], maxBytes);
+-        LOG.error("Failed to parse persistent memory volume " + volume, e);
++        LOG.error("Failed to parse persistent memory volume " + volumes[n], e);
+-        LOG.error("Bad persistent memory volume: " + volume, e);
++        LOG.error("Bad persistent memory volume: " + volumes[n], e);
+-      pmemVolumes.add(volume);
+-      LOG.info("Added persistent memory - " + volume);
++    cleanup();
++  }
++
++  void cleanup() {
++    // Remove all files under the volume.
++    for (String pmemDir: pmemVolumes) {
++      try {
++        FileUtils.cleanDirectory(new File(pmemDir));
++      } catch (IOException e) {
++        LOG.error("Failed to clean up " + pmemDir, e);
++      }
++    }
+-  static void verifyIfValidPmemVolume(File pmemDir)
++  static File verifyIfValidPmemVolume(File pmemDir)
+-
++    File realPmemDir = new File(getRealPmemDir(pmemDir.getPath()));
++    if (!realPmemDir.exists() && !realPmemDir.mkdir()) {
++      throw new IOException("Failed to create " + realPmemDir.getPath());
++    }
++
+-    String testFilePath = pmemDir.getPath() + "/.verify.pmem." + uuidStr;
++    String testFilePath = realPmemDir.getPath() + "/.verify.pmem." + uuidStr;
+-        throw new IOException("Failed to map the test file under " + pmemDir);
++        throw new IOException(
++            "Failed to map the test file under " + realPmemDir);
++      return realPmemDir;
+-              pmemDir, e);
++              realPmemDir, e);
++  public static String getRealPmemDir(String rawPmemDir) {
++    return new File(rawPmemDir, CACHE_DIR).getAbsolutePath();
++  }
++
+-  Byte getOneVolumeIndex() throws IOException {
+-    if (count != 0) {
+-      return (byte)(i++ % count);
+-    } else {
++  synchronized Byte chooseVolume(long bytesCount) throws IOException {
++    if (count == 0) {
++    int k = 0;
++    long maxAvailableSpace = 0L;
++    while (k++ != count) {
++      if (nextIndex == count) {
++        nextIndex = 0;
++      }
++      byte index = nextIndex++;
++      long availableBytes = usedBytesCounts.get(index).getAvailableBytes();
++      if (availableBytes >= bytesCount) {
++        return index;
++      }
++      if (availableBytes > maxAvailableSpace) {
++        maxAvailableSpace = availableBytes;
++      }
++    }
++    throw new IOException("There is no enough persistent memory space " +
++        "for caching. The current max available space is " +
++        maxAvailableSpace + ", but " + bytesCount + "is required.");
+-  public String getCacheFilePath(ExtendedBlockId key) {
++  public String getCachePath(ExtendedBlockId key) {
+-
+-  /**
+-   * Add cached block's ExtendedBlockId and its cache volume index to a map
+-   * after cache.
+-   */
+-  public void afterCache(ExtendedBlockId key, Byte volumeIndex) {
+-    blockKeyToVolume.put(key, volumeIndex);
+-  }
+-
+-  /**
+-   * Remove the record in blockKeyToVolume for uncached block after uncache.
+-   */
+-  public void afterUncache(ExtendedBlockId key) {
+-    blockKeyToVolume.remove(key);
+-  }
+
+INS26 INS40 INS83 INS23 INS23 INS23 INS23 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS83 INS23 INS31 INS31 INS31 INS83 INS83 INS83 INS43 INS59 INS83 INS83 INS43 INS59 INS74 MOV29 MOV83 INS39 MOV59 UPD83 MOV83 INS83 MOV39 INS59 UPD39 INS83 INS83 INS83 INS83 INS39 INS42 INS44 INS43 INS8 INS83 INS83 INS43 INS42 INS8 INS78 INS83 INS83 INS39 INS42 INS44 INS8 INS8 INS83 MOV44 INS8 MOV44 MOV29 MOV83 MOV39 MOV42 MOV44 MOV43 INS8 INS39 INS42 INS8 INS43 INS83 INS83 INS43 INS42 INS44 INS8 MOV29 INS83 MOV43 UPD42 MOV42 INS44 MOV43 INS8 UPD42 INS83 INS83 INS39 INS59 INS42 MOV44 INS8 UPD42 INS39 INS42 INS8 INS39 INS42 INS8 INS42 INS42 INS45 INS42 INS42 INS33 INS43 MOV43 UPD42 INS14 INS42 INS38 UPD42 UPD42 INS70 INS5 INS42 INS42 INS25 INS42 INS25 INS41 INS42 INS39 INS42 INS21 INS60 INS70 INS41 INS65 INS54 INS65 INS60 INS24 MOV21 MOV25 INS21 INS70 INS42 INS60 INS25 INS42 INS43 INS42 INS41 INS39 INS42 INS25 INS60 INS60 INS61 INS53 INS42 INS21 INS41 INS41 INS42 INS74 INS34 INS44 INS42 INS8 INS43 INS85 INS27 INS8 INS27 INS8 INS42 INS7 INS39 INS59 INS44 INS42 INS8 INS42 INS42 INS66 INS8 INS12 INS42 INS66 MOV43 INS59 INS58 INS27 INS37 INS8 INS32 INS44 INS42 INS8 INS43 INS59 INS27 INS8 MOV43 INS42 INS32 UPD27 MOV27 MOV8 INS39 INS59 INS39 INS59 INS27 INS8 INS14 INS7 INS42 INS27 INS43 UPD42 INS42 INS34 MOV43 INS42 MOV21 INS42 INS42 INS33 INS21 INS42 INS33 INS53 INS42 INS42 INS42 INS34 INS43 INS42 INS21 INS60 INS60 INS25 INS41 MOV44 INS8 INS42 MOV32 INS32 INS39 INS59 INS42 INS40 INS42 MOV54 INS42 MOV43 INS42 INS54 INS42 INS42 INS14 INS38 INS38 INS53 INS41 INS44 INS14 INS42 INS42 INS34 INS42 INS34 MOV37 MOV42 INS25 INS60 INS60 INS25 INS25 INS43 INS27 INS22 INS42 INS42 INS32 INS42 UPD42 UPD40 UPD7 INS7 INS14 INS42 INS7 INS39 INS59 INS39 INS59 INS27 INS8 INS42 INS21 INS41 UPD42 MOV42 INS42 INS42 INS42 INS34 INS8 INS12 INS43 INS32 INS32 INS32 INS14 INS32 INS42 INS43 INS42 INS43 INS42 INS42 UPD42 INS27 INS8 INS39 INS59 INS39 INS59 INS27 INS8 INS27 INS8 INS42 INS27 INS42 INS45 INS42 INS45 INS52 INS42 INS42 INS42 INS42 INS32 INS42 INS14 INS43 INS45 INS42 INS32 INS42 INS32 INS42 INS32 INS42 INS34 INS21 INS32 INS38 INS60 INS60 INS25 INS60 INS21 MOV21 INS44 INS8 INS42 INS42 MOV32 INS42 INS42 INS42 INS42 MOV43 INS27 INS42 INS42 INS42 INS42 INS42 INS42 INS21 INS42 INS37 INS42 INS32 INS42 INS42 INS41 INS42 INS42 MOV21 INS45 INS45 UPD42 INS42 INS42 INS43 INS42 INS42 UPD42 MOV42 UPD42 MOV42 INS42 INS42 INS32 MOV42 MOV42 INS32 INS42 INS42 INS32 INS34 MOV43 INS43 INS59 INS32 INS39 INS59 INS27 INS8 INS8 INS43 INS59 INS32 INS43 INS42 MOV21 INS45 INS32 INS43 INS7 INS42 INS32 UPD42 MOV42 INS42 INS7 INS42 UPD42 MOV42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 MOV32 INS22 INS42 INS32 INS42 INS42 INS38 INS21 INS21 INS42 INS42 INS14 INS22 INS42 INS42 INS42 INS42 INS45 INS2 UPD42 UPD42 UPD42 INS14 INS42 INS42 INS42 INS42 UPD42 INS42 INS34 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 INS42 INS42 MOV43 INS2 INS52 INS42 INS42 INS42 INS34 INS7 INS7 INS43 INS42 INS52 INS42 INS42 INS42 INS43 INS42 UPD42 INS42 UPD42 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS2 INS2 INS42 UPD45 UPD42 INS42 INS42 INS42 INS42 INS42 INS42 DEL66 DEL23 DEL52 DEL42 DEL22 DEL14 DEL52 DEL42 DEL22 DEL42 DEL32 DEL41 DEL8 DEL32 DEL41 DEL8 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL44 DEL42 DEL8 DEL70 DEL8 DEL31 DEL39 DEL39 DEL27 DEL36 DEL11 DEL41 DEL8 DEL25 DEL8 DEL31 DEL66 DEL66 DEL65 DEL29 DEL83 DEL39 DEL42 DEL42 DEL44 DEL32 DEL21 DEL8 DEL31 DEL66 DEL65 DEL29 DEL83 DEL39 DEL42 DEL8 DEL31

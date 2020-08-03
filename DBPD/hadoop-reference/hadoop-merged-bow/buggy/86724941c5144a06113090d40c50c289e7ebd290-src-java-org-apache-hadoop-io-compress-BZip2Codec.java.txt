@@ -1,0 +1,248 @@
+HADOOP-4012. Provide splitting support for bzip2 compressed files. Contributed by Abdul Qadeer
+
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/trunk@813581 13f79535-47bb-0310-9956-ffa450edef68
+
++
++import org.apache.hadoop.fs.Seekable;
++import org.apache.hadoop.io.compress.bzip2.BZip2Constants;
+-public class BZip2Codec implements
+-    org.apache.hadoop.io.compress.CompressionCodec {
++public class BZip2Codec implements SplittableCompressionCodec {
++  private static final String SUB_HEADER = "h9";
++  private static final int SUB_HEADER_LEN = SUB_HEADER.length();
+-  public BZip2Codec() {
+-  }
++  public BZip2Codec() { }
+-   * This functionality is currently not supported.
++  * Creates a compressor using given OutputStream.
+-   * @throws java.lang.UnsupportedOperationException
+-   *             Throws UnsupportedOperationException
++  * @return CompressionOutputStream
++    @throws java.io.IOException
+-  * @throws java.lang.UnsupportedOperationException
+-  *             Throws UnsupportedOperationException
++  * @return BZip2DummyCompressor.class
+-  * @throws java.lang.UnsupportedOperationException
+-  *             Throws UnsupportedOperationException
++  * @return Compressor
+-  * @throws java.lang.UnsupportedOperationException
+-  *             Throws UnsupportedOperationException
++  * @return CompressionInputStream
++   * Creates CompressionInputStream to be used to read off uncompressed data
++   * in one of the two reading modes. i.e. Continuous or Blocked reading modes
++   *
++   * @param seekableIn The InputStream
++   * @param start The start offset into the compressed stream
++   * @param end The end offset into the compressed stream
++   * @param readMode Controls whether progress is reported continuously or
++   *                 only at block boundaries.
++   *
++   * @return CompressionInputStream for BZip2 aligned at block boundaries
++   */
++  public SplitCompressionInputStream createInputStream(InputStream seekableIn,
++      Decompressor decompressor, long start, long end, READ_MODE readMode)
++      throws IOException {
++
++    if (!(seekableIn instanceof Seekable)) {
++      throw new IOException("seekableIn must be an instance of " +
++          Seekable.class.getName());
++    }
++
++    //find the position of first BZip2 start up marker
++    ((Seekable)seekableIn).seek(0);
++
++    // BZip2 start of block markers are of 6 bytes.  But the very first block
++    // also has "BZh9", making it 10 bytes.  This is the common case.  But at
++    // time stream might start without a leading BZ.
++    final long FIRST_BZIP2_BLOCK_MARKER_POSITION =
++      CBZip2InputStream.numberOfBytesTillNextMarker(seekableIn);
++    long adjStart = Math.max(0L, start - FIRST_BZIP2_BLOCK_MARKER_POSITION);
++
++    ((Seekable)seekableIn).seek(adjStart);
++    SplitCompressionInputStream in =
++      new BZip2CompressionInputStream(seekableIn, adjStart, end, readMode);
++
++
++    // The following if clause handles the following case:
++    // Assume the following scenario in BZip2 compressed stream where
++    // . represent compressed data.
++    // .....[48 bit Block].....[48 bit   Block].....[48 bit Block]...
++    // ........................[47 bits][1 bit].....[48 bit Block]...
++    // ................................^[Assume a Byte alignment here]
++    // ........................................^^[current position of stream]
++    // .....................^^[We go back 10 Bytes in stream and find a Block marker]
++    // ........................................^^[We align at wrong position!]
++    // ...........................................................^^[While this pos is correct]
++
++    if (in.getPos() <= start) {
++      ((Seekable)seekableIn).seek(start);
++      in = new BZip2CompressionInputStream(seekableIn, start, end, readMode);
++    }
++
++    return in;
++  }
++
++  /**
+-  * @throws java.lang.UnsupportedOperationException
+-  *             Throws UnsupportedOperationException
++  * @return BZip2DummyDecompressor.class
+-  * @throws java.lang.UnsupportedOperationException
+-  *             Throws UnsupportedOperationException
++  * @return Decompressor
+-  private static class BZip2CompressionOutputStream extends CompressionOutputStream {
++  private static class BZip2CompressionOutputStream extends
++      CompressionOutputStream {
+-  private static class BZip2CompressionInputStream extends CompressionInputStream {
++  /**
++   * This class is capable to de-compress BZip2 data in two modes;
++   * CONTINOUS and BYBLOCK.  BYBLOCK mode makes it possible to
++   * do decompression starting any arbitrary position in the stream.
++   *
++   * So this facility can easily be used to parallelize decompression
++   * of a large BZip2 file for performance reasons.  (It is exactly
++   * done so for Hadoop framework.  See LineRecordReader for an
++   * example).  So one can break the file (of course logically) into
++   * chunks for parallel processing.  These "splits" should be like
++   * default Hadoop splits (e.g as in FileInputFormat getSplit metod).
++   * So this code is designed and tested for FileInputFormat's way
++   * of splitting only.
++   */
++
++  private static class BZip2CompressionInputStream extends
++      SplitCompressionInputStream {
++    private BufferedInputStream bufferedIn;
++    private boolean isHeaderStripped = false;
++    private boolean isSubHeaderStripped = false;
++    private READ_MODE readMode = READ_MODE.CONTINUOUS;
++    private long startingPos = 0L;
++
++    // Following state machine handles different states of compressed stream
++    // position
++    // HOLD : Don't advertise compressed stream position
++    // ADVERTISE : Read 1 more character and advertise stream position
++    // See more comments about it before updatePos method.
++    private enum POS_ADVERTISEMENT_STATE_MACHINE {
++      HOLD, ADVERTISE
++    };
++
++    POS_ADVERTISEMENT_STATE_MACHINE posSM = POS_ADVERTISEMENT_STATE_MACHINE.HOLD;
++    long compressedStreamPosition = 0;
++
++      this(in, 0L, Long.MAX_VALUE, READ_MODE.CONTINUOUS);
++    }
+-      super(in);
+-      needsReset = true;
++    public BZip2CompressionInputStream(InputStream in, long start, long end,
++        READ_MODE readMode) throws IOException {
++      super(in, start, end);
++      needsReset = false;
++      bufferedIn = new BufferedInputStream(super.in);
++      this.startingPos = super.getPos();
++      this.readMode = readMode;
++      if (this.startingPos == 0) {
++        // We only strip header if it is start of file
++        bufferedIn = readStreamHeader();
++      }
++      input = new CBZip2InputStream(bufferedIn, readMode);
++      if (this.isHeaderStripped) {
++        input.updateReportedByteCount(HEADER_LEN);
++      }
++
++      if (this.isSubHeaderStripped) {
++        input.updateReportedByteCount(SUB_HEADER_LEN);
++      }
++
++      this.updatePos(false);
+-      BufferedInputStream bufferedIn = null;
+-        bufferedIn = new BufferedInputStream(super.in);
++          } else {
++            this.isHeaderStripped = true;
++            // In case of BYBLOCK mode, we also want to strip off
++            // remaining two character of the header.
++            if (this.readMode == READ_MODE.BYBLOCK) {
++              actualRead = bufferedIn.read(headerBytes, 0,
++                  SUB_HEADER_LEN);
++              if (actualRead != -1) {
++                this.isSubHeaderStripped = true;
++              }
++            }
++    /**
++    * This method updates compressed stream position exactly when the
++    * client of this code has read off at least one byte passed any BZip2
++    * end of block marker.
++    *
++    * This mechanism is very helpful to deal with data level record
++    * boundaries. Please see constructor and next methods of
++    * org.apache.hadoop.mapred.LineRecordReader as an example usage of this
++    * feature.  We elaborate it with an example in the following:
++    *
++    * Assume two different scenarios of the BZip2 compressed stream, where
++    * [m] represent end of block, \n is line delimiter and . represent compressed
++    * data.
++    *
++    * ............[m]......\n.......
++    *
++    * ..........\n[m]......\n.......
++    *
++    * Assume that end is right after [m].  In the first case the reading
++    * will stop at \n and there is no need to read one more line.  (To see the
++    * reason of reading one more line in the next() method is explained in LineRecordReader.)
++    * While in the second example LineRecordReader needs to read one more line
++    * (till the second \n).  Now since BZip2Codecs only update position
++    * at least one byte passed a maker, so it is straight forward to differentiate
++    * between the two cases mentioned.
++    *
++    */
++
+-      return this.input.read(b, off, len);
++      int result = 0;
++      result = this.input.read(b, off, len);
++      if (result == BZip2Constants.END_OF_BLOCK) {
++        this.posSM = POS_ADVERTISEMENT_STATE_MACHINE.ADVERTISE;
++      }
++
++      if (this.posSM == POS_ADVERTISEMENT_STATE_MACHINE.ADVERTISE) {
++        result = this.input.read(b, off, off + 1);
++        // This is the precise time to update compressed stream position
++        // to the client of this code.
++        this.updatePos(true);
++        this.posSM = POS_ADVERTISEMENT_STATE_MACHINE.HOLD;
++      }
++
++      return result;
++
++    }
++
++    public int read() throws IOException {
++      byte b[] = new byte[1];
++      int result = this.read(b, 0, 1);
++      return (result < 0) ? result : b[0];
+-        input = new CBZip2InputStream(bufferedIn);
++        input = new CBZip2InputStream(bufferedIn, this.readMode);
+-      // Cannot read from bufferedIn at this point because bufferedIn might not be ready
++      // Cannot read from bufferedIn at this point because bufferedIn
++      // might not be ready
+-    public int read() throws IOException {
+-      if (needsReset) {
+-        internalReset();
++    public long getPos() {
++      return this.compressedStreamPosition;
+-      return this.input.read();
++
++    /*
++     * As the comments before read method tell that
++     * compressed stream is advertised when at least
++     * one byte passed EOB have been read off.  But
++     * there is an exception to this rule.  When we
++     * construct the stream we advertise the position
++     * exactly at EOB.  In the following method
++     * shouldAddOn boolean captures this exception.
++     *
++     */
++    private void updatePos(boolean shouldAddOn) {
++      int addOn = shouldAddOn ? 1 : 0;
++      this.compressedStreamPosition = this.startingPos
++          + this.input.getProcessedByteCount() + addOn;
+
+INS26 INS26 INS40 INS40 UPD43 INS23 INS23 INS31 MOV31 INS42 INS83 INS83 INS83 INS43 INS59 INS83 INS83 INS83 INS39 INS59 INS29 INS83 INS43 INS42 INS44 INS44 INS44 INS44 INS44 INS43 INS8 INS29 UPD43 INS23 INS23 INS23 INS23 INS23 INS71 INS23 INS23 INS31 INS31 INS31 INS42 INS42 INS45 INS42 INS32 INS65 UPD65 UPD65 INS65 UPD65 UPD65 INS65 INS65 INS65 INS65 INS65 INS65 INS42 INS43 INS42 INS43 INS42 INS39 INS42 INS39 INS42 INS43 INS42 INS42 INS25 INS21 INS60 INS60 INS21 INS60 INS25 INS41 UPD65 MOV65 UPD65 INS65 UPD42 INS83 MOV43 INS59 INS83 INS39 INS59 INS83 INS39 INS59 INS83 INS43 INS59 INS83 INS39 INS59 INS83 INS42 INS72 INS72 INS43 INS59 INS39 INS59 INS83 INS42 MOV44 MOV43 INS8 INS44 INS44 INS44 INS44 INS43 INS29 MOV43 INS83 INS39 INS42 INS8 INS83 INS39 INS42 INS44 INS8 INS42 INS42 INS66 UPD66 UPD40 UPD66 INS66 UPD66 UPD66 INS66 INS66 INS42 INS66 INS42 INS66 INS42 INS66 INS42 INS66 INS66 INS66 INS42 INS42 INS42 INS38 INS8 INS32 INS83 INS39 INS59 INS39 INS59 INS32 INS43 INS59 INS27 INS8 INS42 MOV66 UPD66 UPD66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS42 INS42 INS9 INS42 INS9 INS42 INS42 INS40 INS42 INS34 INS42 INS42 INS42 INS42 INS40 INS42 INS34 INS17 INS43 INS42 INS39 INS42 INS39 INS42 INS43 INS42 INS42 MOV21 INS21 INS21 INS25 MOV21 INS25 INS25 INS21 INS65 INS60 INS21 INS25 INS25 INS60 INS60 INS41 INS39 INS42 INS60 INS21 INS36 INS53 INS36 INS42 INS34 INS42 INS32 INS42 INS32 INS36 INS42 INS42 INS42 INS42 INS14 INS32 INS42 INS21 INS21 INS42 INS34 INS40 INS40 INS42 INS42 INS42 INS42 INS7 INS7 INS27 INS8 INS22 INS8 INS22 INS8 INS32 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS39 INS59 INS7 INS27 INS8 INS27 INS8 INS42 INS39 INS59 INS39 INS59 INS16 INS22 INS39 INS59 INS7 INS62 INS14 INS11 INS42 INS42 INS42 INS42 INS42 INS34 INS27 INS11 INS43 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS7 UPD9 INS22 INS48 INS22 INS42 INS22 INS34 INS21 INS52 INS42 INS21 INS52 INS42 INS21 INS52 INS42 INS9 INS42 INS34 INS42 MOV32 INS42 INS40 INS21 INS22 INS40 INS21 INS21 INS21 INS42 INS85 INS3 INS42 INS32 INS36 INS42 INS2 INS21 INS52 INS42 INS42 INS16 INS22 INS27 INS42 INS43 INS43 INS27 INS43 INS42 INS42 INS42 INS43 INS42 INS42 INS36 INS42 INS42 INS42 INS14 INS52 INS42 INS42 INS52 INS42 INS52 INS42 INS7 INS42 INS32 INS32 INS7 INS52 INS42 INS7 INS32 INS7 INS5 INS34 INS52 UPD42 MOV42 INS42 INS34 INS34 INS27 INS42 INS34 INS7 INS42 INS34 INS34 INS52 INS42 INS22 INS32 INS42 INS42 INS42 INS45 INS32 INS42 INS42 INS11 INS43 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS25 INS22 INS40 INS42 MOV32 INS52 INS42 INS9 INS22 INS40 INS39 INS85 INS42 INS34 INS42 INS14 INS52 INS42 INS22 INS42 INS57 INS42 INS43 INS42 INS42 INS42 MOV27 MOV8 INS8 INS52 INS42 INS42 INS42 INS27 INS52 INS42 INS43 INS42 INS22 INS52 INS42 INS43 INS42 INS21 INS25 INS42 INS34 INS42 INS52 INS42 INS42 INS7 INS27 INS8 INS22 INS9 INS22 INS40 INS21 MOV25 INS52 INS42 INS52 INS42 INS7 INS27 INS8 INS42 INS32 INS42 INS38 INS21 INS42 INS42 INS42 INS34 INS42 INS34 INS7 INS22 INS9 INS52 INS42 DEL40 DEL66 DEL40 DEL40 DEL40 DEL40 DEL40 DEL42 DEL33 DEL59 DEL60 DEL42 DEL32 DEL21 DEL8 DEL25

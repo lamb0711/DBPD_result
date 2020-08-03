@@ -1,0 +1,308 @@
+HADOOP-6419. Adds SASL based authentication to RPC. Contributed by Kan Zhang.
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/trunk@905860 13f79535-47bb-0310-9956-ffa450edef68
+
++import java.nio.channels.Channels;
+-import java.security.PrivilegedActionException;
++import javax.security.sasl.Sasl;
++import javax.security.sasl.SaslException;
++import javax.security.sasl.SaslServer;
++
++import org.apache.hadoop.security.AccessControlException;
++import org.apache.hadoop.security.SaslRpcServer;
++import org.apache.hadoop.security.SaslRpcServer.AuthMethod;
++import org.apache.hadoop.security.SaslRpcServer.SaslDigestCallbackHandler;
++import org.apache.hadoop.security.SaslRpcServer.SaslGssCallbackHandler;
++import org.apache.hadoop.security.token.TokenIdentifier;
++import org.apache.hadoop.security.token.SecretManager;
+-  public static final byte CURRENT_VERSION = 3;
++  // 4 : Introduced SASL security layer
++  public static final byte CURRENT_VERSION = 4;
++  private SecretManager<TokenIdentifier> secretManager;
+-                    c.getHostAddress() + ". Number of active connections: "+
++                    c + ". Number of active connections: "+
+-    private boolean versionRead = false; //if initial signature and
+-                                         //version are read
++    private boolean rpcHeaderRead = false; // if initial rpc header is read
++    boolean useSasl;
++    SaslServer saslServer;
++    private AuthMethod authMethod;
++    private boolean saslContextEstablished;
++    private ByteBuffer rpcHeaderBuffer;
++    private ByteBuffer unwrappedData;
++    private ByteBuffer unwrappedDataLengthBuffer;
++    // Fake 'call' for SASL context setup
++    private static final int SASL_CALLID = -33;
++    private final Call saslCall = new Call(SASL_CALLID, null, null);
++    private final ByteArrayOutputStream saslResponse = new ByteArrayOutputStream();
++      this.unwrappedData = null;
++      this.unwrappedDataLengthBuffer = ByteBuffer.allocate(4);
++    private void saslReadAndProcess(byte[] saslToken) throws IOException,
++        InterruptedException {
++      if (!saslContextEstablished) {
++        if (saslServer == null) {
++          switch (authMethod) {
++          case DIGEST:
++            saslServer = Sasl.createSaslServer(AuthMethod.DIGEST
++                .getMechanismName(), null, SaslRpcServer.SASL_DEFAULT_REALM,
++                SaslRpcServer.SASL_PROPS, new SaslDigestCallbackHandler(
++                    secretManager));
++            break;
++          default:
++            UserGroupInformation current = UserGroupInformation
++                .getCurrentUser();
++            String fullName = current.getUserName();
++            if (LOG.isDebugEnabled())
++              LOG.debug("Kerberos principal name is " + fullName);
++            final String names[] = SaslRpcServer.splitKerberosName(fullName);
++            if (names.length != 3) {
++              throw new IOException(
++                  "Kerberos principal name does NOT have the expected "
++                      + "hostname part: " + fullName);
++            }
++            current.doAs(new PrivilegedExceptionAction<Object>() {
++              @Override
++              public Object run() throws IOException {
++                saslServer = Sasl.createSaslServer(AuthMethod.KERBEROS
++                    .getMechanismName(), names[0], names[1],
++                    SaslRpcServer.SASL_PROPS, new SaslGssCallbackHandler());
++                return null;
++              }
++            });
++          }
++          if (saslServer == null)
++            throw new IOException(
++                "Unable to find SASL server implementation for "
++                    + authMethod.getMechanismName());
++          if (LOG.isDebugEnabled())
++            LOG.debug("Created SASL server with mechanism = "
++                + authMethod.getMechanismName());
++        }
++        if (LOG.isDebugEnabled())
++          LOG.debug("Have read input token of size " + saslToken.length
++              + " for processing by saslServer.evaluateResponse()");
++        byte[] replyToken = saslServer.evaluateResponse(saslToken);
++        if (replyToken != null) {
++          if (LOG.isDebugEnabled())
++            LOG.debug("Will send token of size " + replyToken.length
++                + " from saslServer.");
++          saslCall.connection = this;
++          saslResponse.reset();
++          DataOutputStream out = new DataOutputStream(saslResponse);
++          out.writeInt(replyToken.length);
++          out.write(replyToken, 0, replyToken.length);
++          saslCall.setResponse(ByteBuffer.wrap(saslResponse.toByteArray()));
++          responder.doRespond(saslCall);
++        }
++        if (saslServer.isComplete()) {
++          if (LOG.isDebugEnabled()) {
++            LOG.debug("SASL server context established. Negotiated QoP is "
++                + saslServer.getNegotiatedProperty(Sasl.QOP));
++          }
++          user = UserGroupInformation.createRemoteUser(saslServer
++              .getAuthorizationID());
++          LOG.info("SASL server successfully authenticated client: " + user);
++          saslContextEstablished = true;
++        }
++      } else {
++        if (LOG.isDebugEnabled())
++          LOG.debug("Have read input token of size " + saslToken.length
++              + " for processing by saslServer.unwrap()");
++        byte[] plaintextData = saslServer
++            .unwrap(saslToken, 0, saslToken.length);
++        processUnwrappedData(plaintextData);
++      }
++    }
++    
++    private void disposeSasl() {
++      if (saslServer != null) {
++        try {
++          saslServer.dispose();
++        } catch (SaslException ignored) {
++        }
++      }
++    }
++    
+-        if (!versionRead) {
++        if (!rpcHeaderRead) {
+-          ByteBuffer versionBuffer = ByteBuffer.allocate(1);
+-          count = channelRead(channel, versionBuffer);
+-          if (count <= 0) {
++          if (rpcHeaderBuffer == null) {
++            rpcHeaderBuffer = ByteBuffer.allocate(2);
++          }
++          count = channelRead(channel, rpcHeaderBuffer);
++          if (count < 0 || rpcHeaderBuffer.remaining() > 0) {
+-          int version = versionBuffer.get(0);
++          int version = rpcHeaderBuffer.get(0);
++          byte[] method = new byte[] {rpcHeaderBuffer.get(1)};
++          authMethod = AuthMethod.read(new DataInputStream(
++              new ByteArrayInputStream(method)));
++          if (authMethod == null) {
++            throw new IOException("Unable to read authentication method");
++          }
++          if (UserGroupInformation.isSecurityEnabled()
++              && authMethod == AuthMethod.SIMPLE) {
++            throw new IOException("Authentication is required");
++          } 
++          if (!UserGroupInformation.isSecurityEnabled()
++              && authMethod != AuthMethod.SIMPLE) {
++            throw new IOException("Authentication is not supported");
++          }
++          if (authMethod != AuthMethod.SIMPLE) {
++            useSasl = true;
++          }
+-          versionRead = true;
++          rpcHeaderBuffer = null;
++          rpcHeaderRead = true;
+-          if (dataLength == Client.PING_CALL_ID) {
++          if (!useSasl && dataLength == Client.PING_CALL_ID) {
+-          incRpcCount();  // Increment the rpc count
+-          if (headerRead) {
+-            processData();
+-            data = null;
+-            return count;
++          boolean isHeaderRead = headerRead;
++          if (useSasl) {
++            saslReadAndProcess(data.array());
+-            processHeader();
+-            headerRead = true;
+-            data = null;
+-            
+-            // Authorize the connection
+-            try {
+-              authorize(user, header);
+-              
+-              if (LOG.isDebugEnabled()) {
+-                LOG.debug("Successfully authorized " + header);
+-              }
+-            } catch (AuthorizationException ae) {
+-              authFailedCall.connection = this;
+-              setupResponse(authFailedResponse, authFailedCall, 
+-                            Status.FATAL, null, 
+-                            ae.getClass().getName(), ae.getMessage());
+-              responder.doRespond(authFailedCall);
+-              
+-              // Close this connection
+-              return -1;
+-            }
+-
++            processOneRpc(data.array());
++          }
++          data = null;
++          if (!isHeaderRead) {
+-    private void processHeader() throws IOException {
++    private void processHeader(byte[] buf) throws IOException {
+-        new DataInputStream(new ByteArrayInputStream(data.array()));
++        new DataInputStream(new ByteArrayInputStream(buf));
+-      user = header.getUgi();
++      UserGroupInformation protocolUser = header.getUgi();
++      if (!useSasl) {
++        user = protocolUser;
++      } else if (protocolUser != null && !protocolUser.equals(user)) {
++        throw new AccessControlException("Authenticated user (" + user
++            + ") doesn't match what the client claims to be (" + protocolUser
++            + ")");
++      }
+-    private void processData() throws  IOException, InterruptedException {
++    private void processUnwrappedData(byte[] inBuf) throws IOException,
++        InterruptedException {
++      ReadableByteChannel ch = Channels.newChannel(new ByteArrayInputStream(
++          inBuf));
++      // Read all RPCs contained in the inBuf, even partial ones
++      while (true) {
++        int count = -1;
++        if (unwrappedDataLengthBuffer.remaining() > 0) {
++          count = channelRead(ch, unwrappedDataLengthBuffer);
++          if (count <= 0 || unwrappedDataLengthBuffer.remaining() > 0)
++            return;
++        }
++
++        if (unwrappedData == null) {
++          unwrappedDataLengthBuffer.flip();
++          int unwrappedDataLength = unwrappedDataLengthBuffer.getInt();
++
++          if (unwrappedDataLength == Client.PING_CALL_ID) {
++            if (LOG.isDebugEnabled())
++              LOG.debug("Received ping message");
++            unwrappedDataLengthBuffer.clear();
++            continue; // ping message
++          }
++          unwrappedData = ByteBuffer.allocate(unwrappedDataLength);
++        }
++
++        count = channelRead(ch, unwrappedData);
++        if (count <= 0 || unwrappedData.remaining() > 0)
++          return;
++
++        if (unwrappedData.remaining() == 0) {
++          unwrappedDataLengthBuffer.clear();
++          unwrappedData.flip();
++          processOneRpc(unwrappedData.array());
++          unwrappedData = null;
++        }
++      }
++    }
++    
++    private void processOneRpc(byte[] buf) throws IOException,
++        InterruptedException {
++      if (headerRead) {
++        processData(buf);
++      } else {
++        processHeader(buf);
++        headerRead = true;
++        if (!authorizeConnection()) {
++          throw new AccessControlException("Connection from " + this
++              + " for protocol " + header.getProtocol()
++              + " is unauthorized for user " + user);
++        }
++      }
++    }
++    
++    private void processData(byte[] buf) throws  IOException, InterruptedException {
+-        new DataInputStream(new ByteArrayInputStream(data.array()));
++        new DataInputStream(new ByteArrayInputStream(buf));
++      incRpcCount();  // Increment the rpc count
++    private boolean authorizeConnection() throws IOException {
++      try {
++        authorize(user, header);
++        if (LOG.isDebugEnabled()) {
++          LOG.debug("Successfully authorized " + header);
++        }
++      } catch (AuthorizationException ae) {
++        authFailedCall.connection = this;
++        setupResponse(authFailedResponse, authFailedCall, Status.FATAL, null,
++            ae.getClass().getName(), ae.getMessage());
++        responder.doRespond(authFailedCall);
++        return false;
++      }
++      return true;
++    }
++    
++      disposeSasl();
+-    this(bindAddress, port, paramClass, handlerCount,  conf, Integer.toString(port));
++    this(bindAddress, port, paramClass, handlerCount,  conf, Integer.toString(port), null);
++  @SuppressWarnings("unchecked")
+-                  Configuration conf, String serverName) 
++                  Configuration conf, String serverName, SecretManager<? extends TokenIdentifier> secretManager) 
++    this.secretManager = (SecretManager<TokenIdentifier>) secretManager;
++    wrapWithSasl(response, call);
++  private void wrapWithSasl(ByteArrayOutputStream response, Call call)
++      throws IOException {
++    if (call.connection.useSasl) {
++      byte[] token = response.toByteArray();
++      // synchronization may be needed since there can be multiple Handler
++      // threads using saslServer to wrap responses.
++      synchronized (call.connection.saslServer) {
++        token = call.connection.saslServer.wrap(token, 0, token.length);
++      }
++      if (LOG.isDebugEnabled())
++        LOG.debug("Adding saslServer wrapped token of size " + token.length
++            + " as call response.");
++      response.reset();
++      DataOutputStream saslOut = new DataOutputStream(response);
++      saslOut.writeInt(token.length);
++      saslOut.write(token, 0, token.length);
++    }
++  }
++  

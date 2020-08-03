@@ -1,0 +1,137 @@
+HDFS-7686. Re-add rapid rescan of possibly corrupt block feature to the block scanner (cmccabe)
+
++import java.util.LinkedHashSet;
++import com.google.common.cache.Cache;
++import com.google.common.cache.CacheBuilder;
++   * Blocks which are suspect.
++   * The scanner prioritizes scanning these blocks.
++   */
++  private final LinkedHashSet<ExtendedBlock> suspectBlocks =
++      new LinkedHashSet<ExtendedBlock>();
++
++  /**
++   * Blocks which were suspect which we have scanned.
++   * This is used to avoid scanning the same suspect block over and over.
++   */
++  private final Cache<ExtendedBlock, Boolean> recentSuspectBlocks =
++      CacheBuilder.newBuilder().maximumSize(1000)
++        .expireAfterAccess(10, TimeUnit.MINUTES).build();
++
++  /**
++   * @param suspectBlock   A suspect block which we should scan, or null to
++   *                       scan the next regularly scheduled block.
++   *
+-  private long runLoop() {
++  private long runLoop(ExtendedBlock suspectBlock) {
+-      if ((curBlockIter == null) || curBlockIter.atEnd()) {
+-        long timeout = findNextUsableBlockIter();
+-        if (timeout > 0) {
+-          LOG.trace("{}: no block pools are ready to scan yet.  Waiting " +
+-              "{} ms.", this, timeout);
+-          synchronized (stats) {
+-            stats.nextBlockPoolScanStartMs = Time.monotonicNow() + timeout;
++      if (suspectBlock != null) {
++        block = suspectBlock;
++      } else {
++        if ((curBlockIter == null) || curBlockIter.atEnd()) {
++          long timeout = findNextUsableBlockIter();
++          if (timeout > 0) {
++            LOG.trace("{}: no block pools are ready to scan yet.  Waiting " +
++                "{} ms.", this, timeout);
++            synchronized (stats) {
++              stats.nextBlockPoolScanStartMs = Time.monotonicNow() + timeout;
++            }
++            return timeout;
+-          return timeout;
++          synchronized (stats) {
++            stats.scansSinceRestart++;
++            stats.blocksScannedInCurrentPeriod = 0;
++            stats.nextBlockPoolScanStartMs = -1;
++          }
++          return 0L;
+-        synchronized (stats) {
+-          stats.scansSinceRestart++;
+-          stats.blocksScannedInCurrentPeriod = 0;
+-          stats.nextBlockPoolScanStartMs = -1;
++        try {
++          block = curBlockIter.nextBlock();
++        } catch (IOException e) {
++          // There was an error listing the next block in the volume.  This is a
++          // serious issue.
++          LOG.warn("{}: nextBlock error on {}", this, curBlockIter);
++          // On the next loop iteration, curBlockIter#eof will be set to true, and
++          // we will pick a different block iterator.
++          return 0L;
+-        return 0L;
+-      }
+-
+-      try {
+-        block = curBlockIter.nextBlock();
+-      } catch (IOException e) {
+-        // There was an error listing the next block in the volume.  This is a
+-        // serious issue.
+-        LOG.warn("{}: nextBlock error on {}", this, curBlockIter);
+-        // On the next loop iteration, curBlockIter#eof will be set to true, and
+-        // we will pick a different block iterator.
+-        return 0L;
+-      }
+-      if (block == null) {
+-        // The BlockIterator is at EOF.
+-        LOG.info("{}: finished scanning block pool {}",
+-            this, curBlockIter.getBlockPoolId());
+-        saveBlockIterator(curBlockIter);
+-        return 0;
++        if (block == null) {
++          // The BlockIterator is at EOF.
++          LOG.info("{}: finished scanning block pool {}",
++              this, curBlockIter.getBlockPoolId());
++          saveBlockIterator(curBlockIter);
++          return 0;
++        }
+-        if (bytesScanned >= 0) {
++        if (bytesScanned > 0) {
++  /**
++   * If there are elements in the suspectBlocks list, removes
++   * and returns the first one.  Otherwise, returns null.
++   */
++  private synchronized ExtendedBlock popNextSuspectBlock() {
++    Iterator<ExtendedBlock> iter = suspectBlocks.iterator();
++    if (!iter.hasNext()) {
++      return null;
++    }
++    ExtendedBlock block = iter.next();
++    iter.remove();
++    return block;
++  }
++
+-          // Take the lock to check if we should stop.
++          ExtendedBlock suspectBlock = null;
++          // Take the lock to check if we should stop, and access the
++          // suspect block list.
++            suspectBlock = popNextSuspectBlock();
+-          timeout = runLoop();
++          timeout = runLoop(suspectBlock);
++
++  public synchronized void markSuspectBlock(ExtendedBlock block) {
++    if (stopping) {
++      LOG.info("{}: Not scheduling suspect block {} for " +
++          "rescanning, because this volume scanner is stopping.", this, block);
++      return;
++    }
++    Boolean recent = recentSuspectBlocks.getIfPresent(block);
++    if (recent != null) {
++      LOG.info("{}: Not scheduling suspect block {} for " +
++          "rescanning, because we rescanned it recently.", this, block);
++      return;
++    }
++    if (suspectBlocks.contains(block)) {
++      LOG.info("{}: suspect block {} is already queued for " +
++          "rescanning.", this, block);
++      return;
++    }
++    suspectBlocks.add(block);
++    recentSuspectBlocks.put(block, true);
++    LOG.info("{}: Scheduling suspect block {} for rescanning.", this, block);
++    notify(); // wake scanner thread.
++  }
++

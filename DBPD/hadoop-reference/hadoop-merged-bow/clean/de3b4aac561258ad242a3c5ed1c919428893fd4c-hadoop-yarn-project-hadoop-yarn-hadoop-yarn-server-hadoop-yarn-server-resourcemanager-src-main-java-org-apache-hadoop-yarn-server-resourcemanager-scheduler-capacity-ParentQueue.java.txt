@@ -1,0 +1,432 @@
+YARN-5716. Add global scheduler interface definition and update CapacityScheduler to use it. Contributed by Wangda Tan
+
++import org.apache.hadoop.yarn.server.resourcemanager.scheduler.common.ContainerAllocationProposal;
++import org.apache.hadoop.yarn.server.resourcemanager.scheduler.common.ResourceCommitRequest;
++import org.apache.hadoop.yarn.server.resourcemanager.scheduler.common.SchedulerContainer;
++import org.apache.hadoop.yarn.server.resourcemanager.scheduler.placement.PlacementSet;
++import org.apache.hadoop.yarn.server.resourcemanager.scheduler.placement.PlacementSetUtils;
+-  final Comparator<CSQueue> nonPartitionedQueueComparator;
+-  final PartitionedQueueComparator partitionQueueComparator;
+-  volatile int numApplications;
++  private final Comparator<CSQueue> nonPartitionedQueueComparator;
++  private final PartitionedQueueComparator partitionQueueComparator;
++  private volatile int numApplications;
+-  private boolean needToResortQueuesAtNextAllocation = false;
+-  private int offswitchPerHeartbeatLimit;
+-    this.partitionQueueComparator = cs.getPartitionedQueueComparator();
++    this.partitionQueueComparator = new PartitionedQueueComparator();
+-      offswitchPerHeartbeatLimit =
+-        csContext.getConfiguration().getOffSwitchPerHeartbeatLimit();
+-
+-          + ", offswitchPerHeartbeatLimit = " + getOffSwitchPerHeartbeatLimit()
+-  @Private
+-  public int getOffSwitchPerHeartbeatLimit() {
+-    return offswitchPerHeartbeatLimit;
+-  }
+-
+-      FiCaSchedulerNode node, ResourceLimits resourceLimits,
+-      SchedulingMode schedulingMode) {
+-    int offswitchCount = 0;
+-    try {
+-      writeLock.lock();
+-      // if our queue cannot access this node, just return
+-      if (schedulingMode == SchedulingMode.RESPECT_PARTITION_EXCLUSIVITY
+-          && !accessibleToPartition(node.getPartition())) {
+-        if (LOG.isDebugEnabled()) {
+-          LOG.debug("Skip this queue=" + getQueuePath()
+-              + ", because it is not able to access partition=" + node
+-              .getPartition());
+-        }
++      PlacementSet<FiCaSchedulerNode> ps, ResourceLimits resourceLimits,
++    SchedulingMode schedulingMode) {
++    FiCaSchedulerNode node = PlacementSetUtils.getSingleNode(ps);
+-        ActivitiesLogger.QUEUE.recordQueueActivity(activitiesManager, node,
+-            getParentName(), getQueueName(), ActivityState.REJECTED,
+-            ActivityDiagnosticConstant.NOT_ABLE_TO_ACCESS_PARTITION + node
+-                .getPartition());
+-        if (rootQueue) {
+-          ActivitiesLogger.NODE.finishSkippedNodeAllocation(activitiesManager,
+-              node);
+-        }
+-
+-        return CSAssignment.NULL_ASSIGNMENT;
++    // if our queue cannot access this node, just return
++    if (schedulingMode == SchedulingMode.RESPECT_PARTITION_EXCLUSIVITY
++        && !accessibleToPartition(ps.getPartition())) {
++      if (LOG.isDebugEnabled()) {
++        LOG.debug("Skip this queue=" + getQueuePath()
++            + ", because it is not able to access partition=" + ps
++            .getPartition());
+-      // Check if this queue need more resource, simply skip allocation if this
+-      // queue doesn't need more resources.
+-      if (!super.hasPendingResourceRequest(node.getPartition(), clusterResource,
+-          schedulingMode)) {
+-        if (LOG.isDebugEnabled()) {
+-          LOG.debug("Skip this queue=" + getQueuePath()
+-              + ", because it doesn't need more resource, schedulingMode="
+-              + schedulingMode.name() + " node-partition=" + node
++      ActivitiesLogger.QUEUE.recordQueueActivity(activitiesManager, node,
++          getParentName(), getQueueName(), ActivityState.REJECTED,
++          ActivityDiagnosticConstant.NOT_ABLE_TO_ACCESS_PARTITION + node
+-        }
++      if (rootQueue) {
++        ActivitiesLogger.NODE.finishSkippedNodeAllocation(activitiesManager,
++            node);
++      }
++
++      return CSAssignment.NULL_ASSIGNMENT;
++    }
++
++    // Check if this queue need more resource, simply skip allocation if this
++    // queue doesn't need more resources.
++    if (!super.hasPendingResourceRequest(ps.getPartition(), clusterResource,
++        schedulingMode)) {
++      if (LOG.isDebugEnabled()) {
++        LOG.debug("Skip this queue=" + getQueuePath()
++            + ", because it doesn't need more resource, schedulingMode="
++            + schedulingMode.name() + " node-partition=" + ps
++            .getPartition());
++      }
++
++      ActivitiesLogger.QUEUE.recordQueueActivity(activitiesManager, node,
++          getParentName(), getQueueName(), ActivityState.SKIPPED,
++          ActivityDiagnosticConstant.QUEUE_DO_NOT_NEED_MORE_RESOURCE);
++      if (rootQueue) {
++        ActivitiesLogger.NODE.finishSkippedNodeAllocation(activitiesManager,
++            node);
++      }
++
++      return CSAssignment.NULL_ASSIGNMENT;
++    }
++
++    CSAssignment assignment = new CSAssignment(Resources.createResource(0, 0),
++        NodeType.NODE_LOCAL);
++
++    while (canAssign(clusterResource, node)) {
++      if (LOG.isDebugEnabled()) {
++        LOG.debug("Trying to assign containers to child-queue of "
++            + getQueueName());
++      }
++
++      // Are we over maximum-capacity for this queue?
++      // This will also consider parent's limits and also continuous reservation
++      // looking
++      if (!super.canAssignToThisQueue(clusterResource, ps.getPartition(),
++          resourceLimits, Resources
++              .createResource(getMetrics().getReservedMB(),
++                  getMetrics().getReservedVirtualCores()), schedulingMode)) {
+-            ActivityDiagnosticConstant.QUEUE_DO_NOT_NEED_MORE_RESOURCE);
++            ActivityDiagnosticConstant.QUEUE_MAX_CAPACITY_LIMIT);
+-        return CSAssignment.NULL_ASSIGNMENT;
++        break;
+-      CSAssignment assignment = new CSAssignment(Resources.createResource(0, 0),
+-          NodeType.NODE_LOCAL);
++      // Schedule
++      CSAssignment assignedToChild = assignContainersToChildQueues(
++          clusterResource, ps, resourceLimits, schedulingMode);
++      assignment.setType(assignedToChild.getType());
++      assignment.setRequestLocalityType(
++          assignedToChild.getRequestLocalityType());
++      assignment.setExcessReservation(assignedToChild.getExcessReservation());
++      assignment.setContainersToKill(assignedToChild.getContainersToKill());
+-      while (canAssign(clusterResource, node)) {
+-        if (LOG.isDebugEnabled()) {
+-          LOG.debug("Trying to assign containers to child-queue of "
+-              + getQueueName());
+-        }
++      // Done if no child-queue assigned anything
++      if (Resources.greaterThan(resourceCalculator, clusterResource,
++          assignedToChild.getResource(), Resources.none())) {
+-        // Are we over maximum-capacity for this queue?
+-        // This will also consider parent's limits and also continuous reservation
+-        // looking
+-        if (!super.canAssignToThisQueue(clusterResource, node.getPartition(),
+-            resourceLimits, Resources
+-                .createResource(getMetrics().getReservedMB(),
+-                    getMetrics().getReservedVirtualCores()), schedulingMode)) {
++        ActivitiesLogger.QUEUE.recordQueueActivity(activitiesManager, node,
++            getParentName(), getQueueName(), ActivityState.ACCEPTED,
++            ActivityDiagnosticConstant.EMPTY);
+-          ActivitiesLogger.QUEUE.recordQueueActivity(activitiesManager, node,
+-              getParentName(), getQueueName(), ActivityState.SKIPPED,
+-              ActivityDiagnosticConstant.QUEUE_MAX_CAPACITY_LIMIT);
++        boolean isReserved =
++            assignedToChild.getAssignmentInformation().getReservationDetails()
++                != null && !assignedToChild.getAssignmentInformation()
++                .getReservationDetails().isEmpty();
++        if (node != null && !isReserved) {
+-            ActivitiesLogger.NODE.finishSkippedNodeAllocation(activitiesManager,
+-                node);
++            ActivitiesLogger.NODE.finishAllocatedNodeAllocation(
++                activitiesManager, node,
++                assignedToChild.getAssignmentInformation()
++                    .getFirstAllocatedOrReservedContainerId(),
++                AllocationState.ALLOCATED);
+-
+-          break;
+-        }
+-
+-        // Schedule
+-        CSAssignment assignedToChild = assignContainersToChildQueues(
+-            clusterResource, node, resourceLimits, schedulingMode);
+-        assignment.setType(assignedToChild.getType());
+-
+-        // Done if no child-queue assigned anything
+-        if (Resources.greaterThan(resourceCalculator, clusterResource,
+-            assignedToChild.getResource(), Resources.none())) {
+-
+-          ActivitiesLogger.QUEUE.recordQueueActivity(activitiesManager, node,
+-              getParentName(), getQueueName(), ActivityState.ACCEPTED,
+-              ActivityDiagnosticConstant.EMPTY);
+-
+-          if (node.getReservedContainer() == null) {
+-            if (rootQueue) {
+-              ActivitiesLogger.NODE.finishAllocatedNodeAllocation(
+-                  activitiesManager, node,
+-                  assignedToChild.getAssignmentInformation()
+-                      .getFirstAllocatedOrReservedContainerId(),
+-                  AllocationState.ALLOCATED);
+-            }
+-          } else{
+-            if (rootQueue) {
+-              ActivitiesLogger.NODE.finishAllocatedNodeAllocation(
+-                  activitiesManager, node,
+-                  assignedToChild.getAssignmentInformation()
+-                      .getFirstAllocatedOrReservedContainerId(),
+-                  AllocationState.RESERVED);
+-            }
+-          }
+-
+-          // Track resource utilization for the parent-queue
+-          allocateResource(clusterResource, assignedToChild.getResource(),
+-              node.getPartition(), assignedToChild.isIncreasedAllocation());
+-
+-          // Track resource utilization in this pass of the scheduler
+-          Resources.addTo(assignment.getResource(),
+-              assignedToChild.getResource());
+-          Resources.addTo(assignment.getAssignmentInformation().getAllocated(),
+-              assignedToChild.getAssignmentInformation().getAllocated());
+-          Resources.addTo(assignment.getAssignmentInformation().getReserved(),
+-              assignedToChild.getAssignmentInformation().getReserved());
+-          assignment.getAssignmentInformation().incrAllocations(
+-              assignedToChild.getAssignmentInformation().getNumAllocations());
+-          assignment.getAssignmentInformation().incrReservations(
+-              assignedToChild.getAssignmentInformation().getNumReservations());
+-          assignment.getAssignmentInformation().getAllocationDetails().addAll(
+-              assignedToChild.getAssignmentInformation()
+-                  .getAllocationDetails());
+-          assignment.getAssignmentInformation().getReservationDetails().addAll(
+-              assignedToChild.getAssignmentInformation()
+-                  .getReservationDetails());
+-          assignment.setIncreasedAllocation(
+-              assignedToChild.isIncreasedAllocation());
+-
+-          LOG.info("assignedContainer" + " queue=" + getQueueName()
+-              + " usedCapacity=" + getUsedCapacity() + " absoluteUsedCapacity="
+-              + getAbsoluteUsedCapacity() + " used=" + queueUsage.getUsed()
+-              + " cluster=" + clusterResource);
+-
+-          assignment.setSkippedType(assignedToChild.getSkippedType());
+-
+-          ActivitiesLogger.QUEUE.recordQueueActivity(activitiesManager, node,
+-              getParentName(), getQueueName(), ActivityState.SKIPPED,
+-              ActivityDiagnosticConstant.EMPTY);
+-            ActivitiesLogger.NODE.finishSkippedNodeAllocation(activitiesManager,
+-                node);
++            ActivitiesLogger.NODE.finishAllocatedNodeAllocation(
++                activitiesManager, node,
++                assignedToChild.getAssignmentInformation()
++                    .getFirstAllocatedOrReservedContainerId(),
++                AllocationState.RESERVED);
+-
+-          break;
++        // Track resource utilization in this pass of the scheduler
++        Resources.addTo(assignment.getResource(),
++            assignedToChild.getResource());
++        Resources.addTo(assignment.getAssignmentInformation().getAllocated(),
++            assignedToChild.getAssignmentInformation().getAllocated());
++        Resources.addTo(assignment.getAssignmentInformation().getReserved(),
++            assignedToChild.getAssignmentInformation().getReserved());
++        assignment.getAssignmentInformation().incrAllocations(
++            assignedToChild.getAssignmentInformation().getNumAllocations());
++        assignment.getAssignmentInformation().incrReservations(
++            assignedToChild.getAssignmentInformation().getNumReservations());
++        assignment.getAssignmentInformation().getAllocationDetails().addAll(
++            assignedToChild.getAssignmentInformation()
++                .getAllocationDetails());
++        assignment.getAssignmentInformation().getReservationDetails().addAll(
++            assignedToChild.getAssignmentInformation()
++                .getReservationDetails());
++        assignment.setIncreasedAllocation(
++            assignedToChild.isIncreasedAllocation());
++
++        LOG.info("assignedContainer" + " queue=" + getQueueName()
++            + " usedCapacity=" + getUsedCapacity() + " absoluteUsedCapacity="
++            + getAbsoluteUsedCapacity() + " used=" + queueUsage.getUsed()
++            + " cluster=" + clusterResource);
++
++      } else{
++        assignment.setSkippedType(assignedToChild.getSkippedType());
+-        if (assignment.getType() == NodeType.OFF_SWITCH) {
+-          offswitchCount++;
++        ActivitiesLogger.QUEUE.recordQueueActivity(activitiesManager, node,
++            getParentName(), getQueueName(), ActivityState.SKIPPED,
++            ActivityDiagnosticConstant.EMPTY);
++        if (rootQueue) {
++          ActivitiesLogger.NODE.finishSkippedNodeAllocation(activitiesManager,
++              node);
+-        // Do not assign more containers if this isn't the root queue
+-        // or if we've already assigned enough OFF_SWITCH containers in
+-        // this pass
+-        if (!rootQueue || offswitchCount >= getOffSwitchPerHeartbeatLimit()) {
+-          if (LOG.isDebugEnabled()) {
+-            if (rootQueue && offswitchCount >= getOffSwitchPerHeartbeatLimit()) {
+-              LOG.debug("Assigned maximum number of off-switch containers: " +
+-                  offswitchCount + ", assignments so far: " + assignment);
+-            }
+-          }
+-          break;
+-        }
++        break;
+-      return assignment;
+-    } finally {
+-      writeLock.unlock();
++      /*
++       * Previously here, we can allocate more than one container for each
++       * allocation under rootQ. Now this logic is not proper any more
++       * in global scheduling world.
++       *
++       * So here do not try to allocate more than one container for each
++       * allocation, let top scheduler make the decision.
++       */
++      break;
++
++    return assignment;
++    // When node == null means global scheduling is enabled, always return true
++    if (null == node) {
++      return true;
++    }
++
+-            .add(node.getUnallocatedResource(), node.getTotalKillableResources()),
+-        minimumAllocation);
++            .add(node.getUnallocatedResource(),
++                node.getTotalKillableResources()), minimumAllocation);
+-  
+-  private Iterator<CSQueue> sortAndGetChildrenAllocationIterator(FiCaSchedulerNode node) {
+-    if (node.getPartition().equals(RMNodeLabelsManager.NO_LABEL)) {
+-      if (needToResortQueuesAtNextAllocation) {
+-        // If we skipped resort queues last time, we need to re-sort queue
+-        // before allocation
+-        List<CSQueue> childrenList = new ArrayList<>(childQueues);
+-        childQueues.clear();
+-        childQueues.addAll(childrenList);
+-        needToResortQueuesAtNextAllocation = false;
+-      }
+-      return childQueues.iterator();
+-    }
+-    partitionQueueComparator.setPartitionToLookAt(node.getPartition());
++  private Iterator<CSQueue> sortAndGetChildrenAllocationIterator(
++      String partition) {
++    // Previously we keep a sorted list for default partition, it is not good
++    // when multi-threading scheduler is enabled, so to make a simpler code
++    // now re-sort queue every time irrespective to node partition.
++    partitionQueueComparator.setPartitionToLookAt(partition);
+-  
+-  private CSAssignment assignContainersToChildQueues(
+-      Resource cluster, FiCaSchedulerNode node, ResourceLimits limits,
++
++  private CSAssignment assignContainersToChildQueues(Resource cluster,
++      PlacementSet<FiCaSchedulerNode> ps, ResourceLimits limits,
+-    for (Iterator<CSQueue> iter = sortAndGetChildrenAllocationIterator(node); iter
+-        .hasNext();) {
++    for (Iterator<CSQueue> iter = sortAndGetChildrenAllocationIterator(
++        ps.getPartition()); iter.hasNext(); ) {
+-              node.getPartition());
++              ps.getPartition());
+-      CSAssignment childAssignment = childQueue.assignContainers(cluster, node,
++      CSAssignment childAssignment = childQueue.assignContainers(cluster, ps,
+-      // If we do assign, remove the queue and re-insert in-order to re-sort
+-        // Only update childQueues when we doing non-partitioned node
+-        // allocation.
+-        if (RMNodeLabelsManager.NO_LABEL.equals(node.getPartition())) {
+-          // Remove and re-insert to sort
+-          iter.remove();
+-          LOG.info("Re-sorting assigned queue: " + childQueue.getQueuePath()
+-              + " stats: " + childQueue);
+-          childQueues.add(childQueue);
+-          if (LOG.isDebugEnabled()) {
+-            printChildQueues();
+-          }
+-        }
+-  
++
+-      FiCaSchedulerNode node, Resource releasedResource, boolean changeResource,
+-      CSQueue completedChildQueue, boolean sortQueues) {
++      FiCaSchedulerNode node, Resource releasedResource,
++      boolean changeResource) {
+-      // Note that this is using an iterator on the childQueues so this can't
+-      // be called if already within an iterator for the childQueues. Like
+-      // from assignContainersToChildQueues.
+-      if (sortQueues) {
+-        // reinsert the updated queue
+-        for (Iterator<CSQueue> iter = childQueues.iterator();
+-             iter.hasNext(); ) {
+-          CSQueue csqueue = iter.next();
+-          if (csqueue.equals(completedChildQueue)) {
+-            iter.remove();
+-            if (LOG.isDebugEnabled()) {
+-              LOG.debug("Re-sorting completed queue: " + csqueue);
+-            }
+-            childQueues.add(csqueue);
+-            break;
+-          }
+-        }
+-      }
+-
+-      // If we skipped sort queue this time, we need to resort queues to make
+-      // sure we allocate from least usage (or order defined by queue policy)
+-      // queues.
+-      needToResortQueuesAtNextAllocation = !sortQueues;
+-        csContext.getNode(decreaseRequest.getNodeId()), absDeltaCapacity, false,
+-        null, false);
++        csContext.getNode(decreaseRequest.getNodeId()), absDeltaCapacity, false);
+-          rmContainer.getReservedResource(), false, null, false);
++          rmContainer.getReservedResource(), false);
+-          rmContainer.getContainer().getResource(), false, completedChildQueue,
+-          sortQueues);
++          rmContainer.getContainer().getResource(), false);
++
++  public void apply(Resource cluster,
++      ResourceCommitRequest<FiCaSchedulerApp, FiCaSchedulerNode> request) {
++    if (request.anythingAllocatedOrReserved()) {
++      ContainerAllocationProposal<FiCaSchedulerApp, FiCaSchedulerNode>
++          allocation = request.getFirstAllocatedOrReservedContainer();
++      SchedulerContainer<FiCaSchedulerApp, FiCaSchedulerNode>
++          schedulerContainer = allocation.getAllocatedOrReservedContainer();
++
++      // Do not modify queue when allocation from reserved container
++      if (allocation.getAllocateFromReservedContainer() == null) {
++        try {
++          writeLock.lock();
++          // Book-keeping
++          // Note: Update headroom to account for current allocation too...
++          allocateResource(cluster, allocation.getAllocatedOrReservedResource(),
++              schedulerContainer.getNodePartition(),
++              allocation.isIncreasedAllocation());
++
++          LOG.info("assignedContainer" + " queue=" + getQueueName()
++              + " usedCapacity=" + getUsedCapacity() + " absoluteUsedCapacity="
++              + getAbsoluteUsedCapacity() + " used=" + queueUsage.getUsed()
++              + " cluster=" + cluster);
++        } finally {
++          writeLock.unlock();
++        }
++      }
++    }
++
++    if (parent != null) {
++      parent.apply(cluster, request);
++    }
++  }
+
+INS26 INS26 INS26 INS26 INS26 INS40 INS40 INS40 INS40 INS40 INS31 INS83 INS83 INS83 MOV8 INS83 INS39 INS42 INS44 INS44 INS8 INS74 UPD42 INS60 INS25 UPD43 UPD42 INS74 UPD42 INS43 INS42 INS74 INS42 INS25 INS25 INS43 INS43 INS43 INS59 INS27 INS8 UPD42 INS43 INS43 INS42 INS43 INS43 INS43 INS32 INS8 INS27 INS8 INS14 INS42 MOV42 INS42 INS42 INS32 MOV21 INS21 MOV21 MOV10 INS33 INS42 INS41 UPD42 MOV42 INS42 MOV42 INS42 INS42 INS42 INS42 INS42 INS60 INS60 INS25 INS42 INS33 INS21 INS43 INS42 INS42 INS42 INS32 INS9 INS74 INS59 INS74 INS59 INS27 INS8 INS32 INS42 UPD42 UPD42 UPD42 MOV42 INS32 MOV42 UPD42 MOV42 INS32 UPD42 UPD42 INS32 INS60 MOV25 INS32 INS43 INS43 INS43 UPD42 MOV42 INS32 INS43 INS43 INS43 UPD42 MOV42 INS32 INS32 INS33 INS54 INS42 INS42 INS42 INS42 UPD42 UPD42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 INS42 INS42 INS39 INS59 UPD27 UPD42 MOV42 INS42 UPD42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS8 MOV8 UPD42 INS42 INS27 INS27 INS38 INS21 UPD42 MOV21 INS21 INS21 INS27 INS38 INS42 INS33 INS42 INS32 INS32 INS32 UPD42 UPD42 INS32 INS33 INS32 INS42 MOV42 MOV27 INS42 INS42 INS32 INS32 INS32 INS42 INS42 INS27 INS32 UPD42 MOV42 MOV32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS27 INS32 INS45 INS32 INS45 INS32 INS45 INS32 INS45 INS42 INS42 INS42 INS32 UPD42 INS42 UPD42 MOV42 INS42 UPD42 MOV42 INS45 INS45 INS42 INS42 INS42 INS42 INS42 MOV42 INS42 DEL83 DEL39 DEL9 DEL59 DEL23 DEL83 DEL39 DEL59 DEL23 DEL42 DEL42 DEL32 DEL42 DEL42 DEL42 DEL32 DEL42 DEL32 DEL7 DEL21 DEL45 DEL42 DEL32 DEL42 DEL78 DEL83 DEL39 DEL42 DEL42 DEL41 DEL8 DEL31 DEL43 DEL45 DEL42 DEL45 DEL42 DEL27 DEL42 DEL42 DEL32 DEL33 DEL42 DEL32 DEL32 DEL32 DEL21 DEL32 DEL40 DEL27 DEL42 DEL37 DEL21 DEL8 DEL25 DEL42 DEL38 DEL42 DEL42 DEL32 DEL27 DEL27 DEL32 DEL42 DEL42 DEL42 DEL32 DEL27 DEL27 DEL8 DEL25 DEL8 DEL25 DEL8 DEL25 DEL39 DEL42 DEL34 DEL59 DEL60 DEL54 DEL8 DEL42 DEL42 DEL32 DEL42 DEL40 DEL32 DEL42 DEL42 DEL43 DEL42 DEL43 DEL74 DEL42 DEL42 DEL43 DEL74 DEL42 DEL14 DEL59 DEL60 DEL42 DEL42 DEL32 DEL21 DEL42 DEL42 DEL42 DEL32 DEL21 DEL42 DEL9 DEL7 DEL21 DEL8 DEL25 DEL42 DEL42 DEL32 DEL41 DEL8 DEL25 DEL42 DEL32 DEL43 DEL40 DEL42 DEL42 DEL42 DEL32 DEL32 DEL42 DEL42 DEL32 DEL21 DEL42 DEL42 DEL45 DEL42 DEL42 DEL32 DEL45 DEL42 DEL27 DEL32 DEL21 DEL42 DEL42 DEL42 DEL32 DEL21 DEL42 DEL42 DEL32 DEL42 DEL32 DEL21 DEL8 DEL25 DEL8 DEL25 DEL42 DEL43 DEL42 DEL44 DEL39 DEL42 DEL44 DEL42 DEL42 DEL43 DEL42 DEL43 DEL74 DEL42 DEL42 DEL42 DEL32 DEL59 DEL58 DEL42 DEL42 DEL32 DEL42 DEL43 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL42 DEL42 DEL32 DEL42 DEL42 DEL32 DEL21 DEL42 DEL42 DEL32 DEL42 DEL42 DEL45 DEL42 DEL27 DEL32 DEL21 DEL8 DEL25 DEL42 DEL42 DEL42 DEL32 DEL21 DEL10 DEL8 DEL25 DEL8 DEL24 DEL8 DEL25 DEL42 DEL42 DEL38 DEL7 DEL21 DEL33 DEL9 DEL33 DEL9 DEL42 DEL42

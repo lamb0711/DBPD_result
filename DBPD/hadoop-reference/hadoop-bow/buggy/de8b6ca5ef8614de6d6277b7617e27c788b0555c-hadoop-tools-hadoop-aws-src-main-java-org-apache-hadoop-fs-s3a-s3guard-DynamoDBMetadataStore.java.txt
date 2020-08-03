@@ -1,0 +1,373 @@
+HADOOP-13786 Add S3A committer for zero-rename commits to S3 endpoints.
+Contributed by Steve Loughran and Ryan Blue.
+
++import java.util.concurrent.atomic.AtomicInteger;
++import org.apache.hadoop.fs.s3a.Invoker;
++import org.apache.hadoop.fs.s3a.Retries;
++import org.apache.hadoop.fs.s3a.S3ARetryPolicy;
++import org.apache.hadoop.fs.s3a.S3AUtils;
++  /** Owner FS: only valid if configured with an owner FS. */
++  private S3AFileSystem owner;
++
++  /** Invoker for IO. Until configured properly, use try-once. */
++  private Invoker invoker = new Invoker(RetryPolicies.TRY_ONCE_THEN_FAIL,
++      Invoker.NO_OP
++  );
++
++  /** Data access can have its own policies. */
++  private Invoker dataAccess;
++
++  /**
++   * Total limit on the number of throttle events after which
++   * we stop warning in the log. Keeps the noise down.
++   */
++  private static final int THROTTLE_EVENT_LOG_LIMIT = 100;
++
++  /**
++   * Count of the total number of throttle events; used to crank back logging.
++   */
++  private AtomicInteger throttleEventCount = new AtomicInteger(0);
++
++  @Retries.OnceRaw
+-    final S3AFileSystem s3afs = (S3AFileSystem) fs;
+-    instrumentation = s3afs.getInstrumentation().getS3GuardInstrumentation();
+-    final String bucket = s3afs.getBucket();
+-    String confRegion = s3afs.getConf().getTrimmed(S3GUARD_DDB_REGION_KEY);
++    owner = (S3AFileSystem) fs;
++    instrumentation = owner.getInstrumentation().getS3GuardInstrumentation();
++    final String bucket = owner.getBucket();
++    conf = owner.getConf();
++    String confRegion = conf.getTrimmed(S3GUARD_DDB_REGION_KEY);
+-      region = s3afs.getBucketLocation();
++      region = owner.getBucketLocation();
+-    username = s3afs.getUsername();
+-    conf = s3afs.getConf();
++    username = owner.getUsername();
+-    setMaxRetries(conf);
++    initDataAccessRetries(conf);
++
++    // set up a full retry policy
++    invoker = new Invoker(new S3ARetryPolicy(conf),
++        this::retryEvent
++    );
++  @Retries.OnceRaw
+-    setMaxRetries(conf);
++    initDataAccessRetries(conf);
+-   * @param config
++   * @param config configuration for data access
+-  private void setMaxRetries(Configuration config) {
++  private void initDataAccessRetries(Configuration config) {
++    dataAccess = new Invoker(dataAccessRetryPolicy, this::retryEvent);
++  @Retries.RetryTranslated
++  @Retries.RetryTranslated
+-  private void innerDelete(Path path, boolean tombstone)
++  @Retries.RetryTranslated
++  private void innerDelete(final Path path, boolean tombstone)
+-    path = checkPath(path);
++    checkPath(path);
+-
+-    try {
+-      if (tombstone) {
+-        Item item = PathMetadataDynamoDBTranslation.pathMetadataToItem(
+-            PathMetadata.tombstone(path));
+-        table.putItem(item);
+-      } else {
+-        table.deleteItem(pathToKey(path));
+-      }
+-    } catch (AmazonClientException e) {
+-      throw translateException("delete", path, e);
++    // the policy on whether repeating delete operations is based
++    // on that of S3A itself
++    boolean idempotent = S3AFileSystem.DELETE_CONSIDERED_IDEMPOTENT;
++    if (tombstone) {
++      Item item = PathMetadataDynamoDBTranslation.pathMetadataToItem(
++          PathMetadata.tombstone(path));
++      invoker.retry("Put tombstone", path.toString(), idempotent,
++          () -> table.putItem(item));
++    } else {
++      PrimaryKey key = pathToKey(path);
++      invoker.retry("Delete key", path.toString(), idempotent,
++          () -> table.deleteItem(key));
++  @Retries.RetryTranslated
+-    path = checkPath(path);
++    checkPath(path);
++  @Retries.OnceRaw
++  @Retries.OnceTranslated
++  @Retries.OnceTranslated
+-    path = checkPath(path);
++    checkPath(path);
++    return Invoker.once("get", path.toString(),
++        () -> innerGet(path, wantEmptyDirectoryFlag));
++  }
+-    try {
+-      final PathMetadata meta;
+-      if (path.isRoot()) {
+-        // Root does not persist in the table
+-        meta = new PathMetadata(makeDirStatus(username, path));
+-      } else {
+-        final Item item = getConsistentItem(pathToKey(path));
+-        meta = itemToPathMetadata(item, username);
+-        LOG.debug("Get from table {} in region {} returning for {}: {}",
+-            tableName, region, path, meta);
+-      }
+-
+-      if (wantEmptyDirectoryFlag && meta != null) {
+-        final FileStatus status = meta.getFileStatus();
+-        // for directory, we query its direct children to determine isEmpty bit
+-        if (status.isDirectory()) {
+-          final QuerySpec spec = new QuerySpec()
+-              .withHashKey(pathToParentKeyAttribute(path))
+-              .withConsistentRead(true)
+-              .withFilterExpression(IS_DELETED + " = :false")
+-              .withValueMap(deleteTrackingValueMap);
+-          final ItemCollection<QueryOutcome> items = table.query(spec);
+-          boolean hasChildren = items.iterator().hasNext();
+-          // When this class has support for authoritative
+-          // (fully-cached) directory listings, we may also be able to answer
+-          // TRUE here.  Until then, we don't know if we have full listing or
+-          // not, thus the UNKNOWN here:
+-          meta.setIsEmptyDirectory(
+-              hasChildren ? Tristate.FALSE : Tristate.UNKNOWN);
+-        }
+-      }
+-
+-      return meta;
+-    } catch (AmazonClientException e) {
+-      throw translateException("get", path, e);
++  /**
++   * Inner get operation, as invoked in the retry logic.
++   * @param path the path to get
++   * @param wantEmptyDirectoryFlag Set to true to give a hint to the
++   *   MetadataStore that it should try to compute the empty directory flag.
++   * @return metadata for {@code path}, {@code null} if not found
++   * @throws IOException IO problem
++   * @throws AmazonClientException dynamo DB level problem
++   */
++  @Retries.OnceRaw
++  private PathMetadata innerGet(Path path, boolean wantEmptyDirectoryFlag)
++      throws IOException {
++    final PathMetadata meta;
++    if (path.isRoot()) {
++      // Root does not persist in the table
++      meta = new PathMetadata(makeDirStatus(username, path));
++    } else {
++      final Item item = getConsistentItem(pathToKey(path));
++      meta = itemToPathMetadata(item, username);
++      LOG.debug("Get from table {} in region {} returning for {}: {}",
++          tableName, region, path, meta);
++
++    if (wantEmptyDirectoryFlag && meta != null) {
++      final FileStatus status = meta.getFileStatus();
++      // for directory, we query its direct children to determine isEmpty bit
++      if (status.isDirectory()) {
++        final QuerySpec spec = new QuerySpec()
++            .withHashKey(pathToParentKeyAttribute(path))
++            .withConsistentRead(true)
++            .withFilterExpression(IS_DELETED + " = :false")
++            .withValueMap(deleteTrackingValueMap);
++        final ItemCollection<QueryOutcome> items = table.query(spec);
++        boolean hasChildren = items.iterator().hasNext();
++        // When this class has support for authoritative
++        // (fully-cached) directory listings, we may also be able to answer
++        // TRUE here.  Until then, we don't know if we have full listing or
++        // not, thus the UNKNOWN here:
++        meta.setIsEmptyDirectory(
++            hasChildren ? Tristate.FALSE : Tristate.UNKNOWN);
++      }
++    }
++
++    return meta;
+-  public DirListingMetadata listChildren(Path path) throws IOException {
+-    path = checkPath(path);
++  @Retries.OnceTranslated
++  public DirListingMetadata listChildren(final Path path) throws IOException {
++    checkPath(path);
+-    try {
+-      final QuerySpec spec = new QuerySpec()
+-          .withHashKey(pathToParentKeyAttribute(path))
+-          .withConsistentRead(true); // strictly consistent read
+-      final ItemCollection<QueryOutcome> items = table.query(spec);
++    return Invoker.once("listChildren", path.toString(),
++        () -> {
++          final QuerySpec spec = new QuerySpec()
++              .withHashKey(pathToParentKeyAttribute(path))
++              .withConsistentRead(true); // strictly consistent read
++          final ItemCollection<QueryOutcome> items = table.query(spec);
+-      final List<PathMetadata> metas = new ArrayList<>();
+-      for (Item item : items) {
+-        PathMetadata meta = itemToPathMetadata(item, username);
+-        metas.add(meta);
+-      }
+-      LOG.trace("Listing table {} in region {} for {} returning {}",
+-          tableName, region, path, metas);
++          final List<PathMetadata> metas = new ArrayList<>();
++          for (Item item : items) {
++            PathMetadata meta = itemToPathMetadata(item, username);
++            metas.add(meta);
++          }
++          LOG.trace("Listing table {} in region {} for {} returning {}",
++              tableName, region, path, metas);
+-      return (metas.isEmpty() && get(path) == null)
+-          ? null
+-          : new DirListingMetadata(path, metas, false);
+-    } catch (AmazonClientException e) {
+-      // failure, including the path not being present
+-      throw translateException("listChildren", path, e);
+-    }
++          return (metas.isEmpty() && get(path) == null)
++              ? null
++              : new DirListingMetadata(path, metas, false);
++        });
+-  // build the list of all parent entries.
++  /**
++   * build the list of all parent entries.
++   * @param pathsToCreate paths to create
++   * @return the full ancestry paths
++   */
++  @Retries.OnceTranslated
+-    try {
+-      processBatchWriteRequest(null, pathMetadataToItem(newItems));
+-    } catch (AmazonClientException e) {
+-      throw translateException("move", (String) null, e);
+-    }
++    Invoker.once("move", tableName,
++        () -> processBatchWriteRequest(null, pathMetadataToItem(newItems)));
+-   * Callers of this method should catch the {@link AmazonClientException} and
+-   * translate it for better error report and easier debugging.
++   * The retry logic here is limited to repeating the write operations
++   * until all items have been written; there is no other attempt
++   * at recovery/retry. Throttling is handled internally.
++  @Retries.OnceRaw("Outstanding batch items are updated with backoff")
+-      while (unprocessed.size() > 0) {
++      while (!unprocessed.isEmpty()) {
++    } catch (InterruptedException e) {
++      throw (IOException)new InterruptedIOException(e.toString()).initCause(e);
++    } catch (IOException e) {
++      throw e;
++  @Retries.OnceRaw
++  @Retries.OnceRaw
++  @Retries.OnceRaw
++  /**
++   * {@inheritDoc}.
++   * There is retry around building the list of paths to update, but
++   * the call to {@link #processBatchWriteRequest(PrimaryKey[], Item[])}
++   * is only tried once.
++   * @param meta Directory listing metadata.
++   * @throws IOException
++   */
++  @Retries.OnceTranslated("retry(listFullPaths); once(batchWrite)")
+-    PathMetadata p = new PathMetadata(makeDirStatus(meta.getPath(), username),
++    Path path = meta.getPath();
++    PathMetadata p = new PathMetadata(makeDirStatus(path, username),
+-    final Collection<PathMetadata> metasToPut = fullPathsToPut(p);
++    final Collection<PathMetadata> metasToPut = invoker.retry(
++        "paths to put", path.toString(), true,
++        () -> fullPathsToPut(p));
+-    try {
+-      processBatchWriteRequest(null, pathMetadataToItem(metasToPut));
+-    } catch (AmazonClientException e) {
+-      throw translateException("put", (String) null, e);
+-    }
++    Invoker.once("put", path.toString(),
++        () -> processBatchWriteRequest(null, pathMetadataToItem(metasToPut)));
++  @Retries.OnceTranslated
+-      throw translateException("destroy", (String) null, e);
++      throw translateException("destroy", tableName, e);
++  @Retries.OnceRaw
++  @Retries.OnceRaw("once(batchWrite)")
++  @Retries.OnceRaw
+-      throw translateException("initTable", (String) null, e);
++      throw translateException("initTable", tableName, e);
+-   * process, we retry a limited times before we fail to get it.
++   * process, we sleep and retry a limited times before we fail to get it.
++   * This does not include handling any failure other than "item not found",
++   * so this method is tagged as "OnceRaw"
++  @Retries.OnceRaw
++   * @throws IllegalArgumentException if an exception was raised in the waiter
+-  private void waitForTableActive(Table t) throws IOException {
++  @Retries.OnceRaw
++  private void waitForTableActive(Table t) throws InterruptedIOException {
+-      throw (IOException) new InterruptedIOException("DynamoDB table '"
+-          + tableName + "' is not active yet in region " + region).initCause(e);
++      throw (InterruptedIOException)
++          new InterruptedIOException("DynamoDB table '"
++          + tableName + "' is not active yet in region " + region)
++              .initCause(e);
++  @Retries.OnceRaw
++  @Retries.OnceRaw
++   * Call will fail if the table is busy, or the new values match the current
++   * ones.
++   * @param readCapacity read units
++   * @param writeCapacity write units
++   * @throws IOException on a failure
++  @Retries.RetryTranslated
+-    try {
+-      final ProvisionedThroughputDescription p =
+-          table.updateTable(toProvision).getProvisionedThroughput();
+-      LOG.info("Provision table {} in region {}: readCapacityUnits={}, "
+-              + "writeCapacityUnits={}",
+-          tableName, region, p.getReadCapacityUnits(),
+-          p.getWriteCapacityUnits());
+-    } catch (AmazonClientException e) {
+-      throw translateException("provisionTable", (String) null, e);
+-    }
++    invoker.retry("ProvisionTable", tableName, true,
++        () -> {
++          final ProvisionedThroughputDescription p =
++              table.updateTable(toProvision).getProvisionedThroughput();
++          LOG.info("Provision table {} in region {}: readCapacityUnits={}, "
++                  + "writeCapacityUnits={}",
++              tableName, region, p.getReadCapacityUnits(),
++              p.getWriteCapacityUnits());
++        });
+-   * Validates a path object; it must be absolute, and contain a host
+-   * (bucket) component.
++   * Validates a path object; it must be absolute, have an s3a:/// scheme
++   * and contain a host (bucket) component.
++   * @param path path to check
++   * @return the path passed in
++  @Retries.OnceRaw
++  @Retries.OnceRaw
++  @Retries.OnceRaw
++  /**
++   * Callback from {@link Invoker} when an operation is retried.
++   * @param text text of the operation
++   * @param ex exception
++   * @param attempts number of attempts
++   * @param idempotent is the method idempotent
++   */
++  void retryEvent(
++      String text,
++      IOException ex,
++      int attempts,
++      boolean idempotent) {
++    if (S3AUtils.isThrottleException(ex)) {
++      // throttled
++      if (instrumentation != null) {
++        instrumentation.throttled();
++      }
++      int eventCount = throttleEventCount.addAndGet(1);
++      if (attempts == 1 && eventCount < THROTTLE_EVENT_LOG_LIMIT) {
++        LOG.warn("DynamoDB IO limits reached in {};"
++                + " consider increasing capacity: {}", text, ex.toString());
++        LOG.debug("Throttled", ex);
++      } else {
++        // user has been warned already, log at debug only.
++        LOG.debug("DynamoDB IO limits reached in {};"
++                + " consider increasing capacity: {}", text, ex.toString());
++      }
++    } else if (attempts == 1) {
++      // not throttled. Log on the first attempt only
++      LOG.info("Retrying {}: {}", text, ex.toString());
++      LOG.debug("Retrying {}", text, ex);
++    }
++
++    if (instrumentation != null) {
++      // note a retry
++      instrumentation.retrying();
++    }
++    if (owner != null) {
++      owner.metastoreOperationRetried(ex, attempts, idempotent);
++    }
++  }
++

@@ -1,0 +1,302 @@
+HDFS-3721. hsync support broke wire compatibility. Contributed by Todd Lipcon and Aaron T. Myers.
+
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/trunk@1371495 13f79535-47bb-0310-9956-ffa450edef68
+
+-import java.io.EOFException;
++import org.apache.hadoop.fs.ChecksumException;
++import org.apache.hadoop.hdfs.protocol.datatransfer.PacketReceiver;
+-  private ByteBuffer buf; // contains one full packet.
+-  private int bufRead; //amount of valid data in the buf
+-  private int maxPacketReadLen;
++  
++  private PacketReceiver packetReceiver =
++      new PacketReceiver(false);
++  
++    if (packetReceiver != null) {
++      packetReceiver.close();
++    }
++    
+-  private void verifyChunks( byte[] dataBuf, int dataOff, int len, 
+-                             byte[] checksumBuf, int checksumOff ) 
+-                             throws IOException {
+-    while (len > 0) {
+-      int chunkLen = Math.min(len, bytesPerChecksum);
+-      
+-      clientChecksum.update(dataBuf, dataOff, chunkLen);
+-
+-      if (!clientChecksum.compare(checksumBuf, checksumOff)) {
+-        if (srcDataNode != null) {
+-          try {
+-            LOG.info("report corrupt block " + block + " from datanode " +
+-                      srcDataNode + " to namenode");
+-            datanode.reportRemoteBadBlock(srcDataNode, block);
+-          } catch (IOException e) {
+-            LOG.warn("Failed to report bad block " + block + 
+-                      " from datanode " + srcDataNode + " to namenode");
+-          }
++  private void verifyChunks(ByteBuffer dataBuf, ByteBuffer checksumBuf)
++      throws IOException {
++    try {
++      clientChecksum.verifyChunkedSums(dataBuf, checksumBuf, clientname, 0);
++    } catch (ChecksumException ce) {
++      LOG.warn("Checksum error in block " + block + " from " + inAddr, ce);
++      if (srcDataNode != null) {
++        try {
++          LOG.info("report corrupt block " + block + " from datanode " +
++                    srcDataNode + " to namenode");
++          datanode.reportRemoteBadBlock(srcDataNode, block);
++        } catch (IOException e) {
++          LOG.warn("Failed to report bad block " + block + 
++                    " from datanode " + srcDataNode + " to namenode");
+-        throw new IOException("Unexpected checksum mismatch " + 
+-                              "while writing " + block + " from " + inAddr);
+-
+-      clientChecksum.reset();
+-      dataOff += chunkLen;
+-      checksumOff += checksumSize;
+-      len -= chunkLen;
++      throw new IOException("Unexpected checksum mismatch " + 
++                            "while writing " + block + " from " + inAddr);
+-  private void translateChunks( byte[] dataBuf, int dataOff, int len,
+-      byte[] checksumBuf, int checksumOff ) {
+-    if (len == 0) return;
+-    
+-    int numChunks = (len - 1)/bytesPerChecksum + 1;
+-    
+-    diskChecksum.calculateChunkedSums(
+-        ByteBuffer.wrap(dataBuf, dataOff, len),
+-        ByteBuffer.wrap(checksumBuf, checksumOff, numChunks * checksumSize));
++  private void translateChunks(ByteBuffer dataBuf, ByteBuffer checksumBuf) {
++    diskChecksum.calculateChunkedSums(dataBuf, checksumBuf);
+-  /**
+-   * Makes sure buf.position() is zero without modifying buf.remaining().
+-   * It moves the data if position needs to be changed.
+-   */
+-  private void shiftBufData() {
+-    if (bufRead != buf.limit()) {
+-      throw new IllegalStateException("bufRead should be same as " +
+-                                      "buf.limit()");
+-    }
+-    
+-    //shift the remaining data on buf to the front
+-    if (buf.position() > 0) {
+-      int dataLeft = buf.remaining();
+-      if (dataLeft > 0) {
+-        byte[] b = buf.array();
+-        System.arraycopy(b, buf.position(), b, 0, dataLeft);
+-      }
+-      buf.position(0);
+-      bufRead = dataLeft;
+-      buf.limit(bufRead);
+-    }
+-  }
+-  
+-  /**
+-   * reads upto toRead byte to buf at buf.limit() and increments the limit.
+-   * throws an IOException if read does not succeed.
+-   */
+-  private int readToBuf(int toRead) throws IOException {
+-    if (toRead < 0) {
+-      toRead = (maxPacketReadLen > 0 ? maxPacketReadLen : buf.capacity())
+-               - buf.limit();
+-    }
+-    
+-    int nRead = in.read(buf.array(), buf.limit(), toRead);
+-    
+-    if (nRead < 0) {
+-      throw new EOFException("while trying to read " + toRead + " bytes");
+-    }
+-    bufRead = buf.limit() + nRead;
+-    buf.limit(bufRead);
+-    return nRead;
+-  }
+-  
+-  
+-  /**
+-   * Reads (at least) one packet and returns the packet length.
+-   * buf.position() points to the start of the packet and 
+-   * buf.limit() point to the end of the packet. There could 
+-   * be more data from next packet in buf.<br><br>
+-   * 
+-   * It tries to read a full packet with single read call.
+-   * Consecutive packets are usually of the same length.
+-   */
+-  private void readNextPacket() throws IOException {
+-    /* This dances around buf a little bit, mainly to read 
+-     * full packet with single read and to accept arbitrary size  
+-     * for next packet at the same time.
+-     */
+-    if (buf == null) {
+-      /* initialize buffer to the best guess size:
+-       * 'chunksPerPacket' calculation here should match the same 
+-       * calculation in DFSClient to make the guess accurate.
+-       */
+-      int chunkSize = bytesPerChecksum + checksumSize;
+-      int chunksPerPacket = (datanode.getDnConf().writePacketSize - PacketHeader.PKT_HEADER_LEN
+-                             + chunkSize - 1)/chunkSize;
+-      buf = ByteBuffer.allocate(PacketHeader.PKT_HEADER_LEN +
+-                                Math.max(chunksPerPacket, 1) * chunkSize);
+-      buf.limit(0);
+-    }
+-    
+-    // See if there is data left in the buffer :
+-    if (bufRead > buf.limit()) {
+-      buf.limit(bufRead);
+-    }
+-    
+-    while (buf.remaining() < HdfsConstants.BYTES_IN_INTEGER) {
+-      if (buf.position() > 0) {
+-        shiftBufData();
+-      }
+-      readToBuf(-1);
+-    }
+-    
+-    /* We mostly have the full packet or at least enough for an int
+-     */
+-    buf.mark();
+-    int payloadLen = buf.getInt();
+-    buf.reset();
+-    
+-    // check corrupt values for pktLen, 100MB upper limit should be ok?
+-    if (payloadLen < 0 || payloadLen > (100*1024*1024)) {
+-      throw new IOException("Incorrect value for packet payload : " +
+-                            payloadLen);
+-    }
+-    
+-    // Subtract BYTES_IN_INTEGER since that accounts for the payloadLen that
+-    // we read above.
+-    int pktSize = payloadLen + PacketHeader.PKT_HEADER_LEN
+-        - HdfsConstants.BYTES_IN_INTEGER;
+-    
+-    if (buf.remaining() < pktSize) {
+-      //we need to read more data
+-      int toRead = pktSize - buf.remaining();
+-      
+-      // first make sure buf has enough space.        
+-      int spaceLeft = buf.capacity() - buf.limit();
+-      if (toRead > spaceLeft && buf.position() > 0) {
+-        shiftBufData();
+-        spaceLeft = buf.capacity() - buf.limit();
+-      }
+-      if (toRead > spaceLeft) {
+-        byte oldBuf[] = buf.array();
+-        int toCopy = buf.limit();
+-        buf = ByteBuffer.allocate(toCopy + toRead);
+-        System.arraycopy(oldBuf, 0, buf.array(), 0, toCopy);
+-        buf.limit(toCopy);
+-      }
+-      
+-      //now read:
+-      while (toRead > 0) {
+-        toRead -= readToBuf(toRead);
+-      }
+-    }
+-    
+-    if (buf.remaining() > pktSize) {
+-      buf.limit(buf.position() + pktSize);
+-    }
+-    
+-    if (pktSize > maxPacketReadLen) {
+-      maxPacketReadLen = pktSize;
+-    }
+-  }
+-  
++
+-    readNextPacket();
++    packetReceiver.receiveNextPacket(in);
+-    buf.mark();
+-    PacketHeader header = new PacketHeader();
+-    header.readFields(buf);
+-    int endOfHeader = buf.position();
+-    buf.reset();
++    PacketHeader header = packetReceiver.getHeader();
++    if (LOG.isDebugEnabled()){
++      LOG.debug("Receiving one packet for block " + block +
++                ": " + header);
++    }
+-    return receivePacket(
+-      header.getOffsetInBlock(),
+-      header.getSeqno(),
+-      header.isLastPacketInBlock(),
+-      header.getDataLen(),
+-      header.getSyncBlock(),
+-      endOfHeader);
+-  }
++    long offsetInBlock = header.getOffsetInBlock();
++    long seqno = header.getSeqno();
++    boolean lastPacketInBlock = header.isLastPacketInBlock();
++    int len = header.getDataLen();
++    boolean syncBlock = header.getSyncBlock();
+-  /**
+-   * Write the received packet to disk (data only)
+-   */
+-  private void writePacketToDisk(byte[] pktBuf, int startByteToDisk, 
+-      int numBytesToDisk) throws IOException {
+-    out.write(pktBuf, startByteToDisk, numBytesToDisk);
+-  }
+-  
+-  /** 
+-   * Receives and processes a packet. It can contain many chunks.
+-   * returns the number of data bytes that the packet has.
+-   */
+-  private int receivePacket(long offsetInBlock, long seqno,
+-      boolean lastPacketInBlock, int len, boolean syncBlock,
+-      int endOfHeader) throws IOException {
+-    if (LOG.isDebugEnabled()){
+-      LOG.debug("Receiving one packet for block " + block +
+-                " of length " + len +
+-                " seqno " + seqno +
+-                " offsetInBlock " + offsetInBlock +
+-                " syncBlock " + syncBlock +
+-                " lastPacketInBlock " + lastPacketInBlock);
+-    }
+-        mirrorOut.write(buf.array(), buf.position(), buf.remaining());
++        packetReceiver.mirrorPacketTo(mirrorOut);
+-    buf.position(endOfHeader);        
++    ByteBuffer dataBuf = packetReceiver.getDataSlice();
++    ByteBuffer checksumBuf = packetReceiver.getChecksumSlice();
+-      if ( buf.remaining() != (checksumLen + len)) {
+-        throw new IOException("Data remaining in packet does not match" +
+-                              "sum of checksumLen and dataLen " +
+-                              " size remaining: " + buf.remaining() +
+-                              " data len: " + len +
+-                              " checksum Len: " + checksumLen);
+-      }
+-      int checksumOff = buf.position();
+-      int dataOff = checksumOff + checksumLen;
+-      byte pktBuf[] = buf.array();
+-
+-      buf.position(buf.limit()); // move to the end of the data.
++      if ( checksumBuf.capacity() != checksumLen) {
++        throw new IOException("Length of checksums in packet " +
++            checksumBuf.capacity() + " does not match calculated checksum " +
++            "length " + checksumLen);
++     }
+-        verifyChunks(pktBuf, dataOff, len, pktBuf, checksumOff);
++        verifyChunks(dataBuf, checksumBuf);
+-          translateChunks(pktBuf, dataOff, len, pktBuf, checksumOff);
++          translateChunks(dataBuf, checksumBuf);
+-          int startByteToDisk = dataOff+(int)(onDiskLen-firstByteInBlock);
++          int startByteToDisk = (int)(onDiskLen-firstByteInBlock) 
++              + dataBuf.arrayOffset() + dataBuf.position();
++
+-          writePacketToDisk(pktBuf, startByteToDisk, numBytesToDisk);
++          
++          // Write data to disk.
++          out.write(dataBuf.array(), startByteToDisk, numBytesToDisk);
+-            partialCrc.update(pktBuf, startByteToDisk, numBytesToDisk);
++            partialCrc.update(dataBuf.array(), startByteToDisk, numBytesToDisk);
+-              pktBuf, 
+-              checksumOff + checksumLen - checksumSize, 
+-              checksumOff + checksumLen
+-            );
+-            checksumOut.write(pktBuf, checksumOff, checksumLen);
++                checksumBuf.array(),
++                checksumBuf.arrayOffset() + checksumBuf.position() + checksumLen - checksumSize,
++                checksumBuf.arrayOffset() + checksumBuf.position() + checksumLen);
++            checksumOut.write(checksumBuf.array(),
++                checksumBuf.arrayOffset() + checksumBuf.position(),
++                checksumLen);
+
+MOV26 INS26 UPD40 INS40 INS23 MOV83 INS43 INS59 INS44 MOV8 INS44 INS42 UPD42 MOV42 INS14 INS25 MOV43 INS43 MOV42 INS54 INS43 INS43 MOV42 INS21 INS60 INS25 MOV25 MOV25 INS60 INS60 INS60 INS60 INS60 INS60 INS60 INS43 INS9 INS27 INS8 INS42 INS8 INS12 INS42 INS42 INS32 MOV43 INS59 MOV32 INS8 INS39 INS59 INS39 INS59 INS39 INS59 INS39 INS59 INS39 INS59 INS43 INS59 INS43 INS59 INS42 INS42 INS33 INS21 MOV21 INS44 MOV8 MOV42 MOV42 INS42 INS42 INS42 INS42 INS32 INS21 INS42 MOV32 INS42 MOV32 INS42 MOV32 INS42 MOV32 INS42 MOV32 INS42 INS42 INS32 INS42 INS42 INS32 INS32 INS43 INS42 INS21 INS42 INS42 INS32 UPD42 MOV42 INS42 INS42 INS42 INS42 INS42 UPD42 UPD42 UPD42 INS34 INS42 INS32 MOV42 MOV42 INS27 MOV42 INS42 INS42 INS27 INS42 MOV45 MOV42 UPD45 MOV45 UPD42 MOV42 UPD42 UPD42 INS45 INS42 INS45 INS42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 MOV43 UPD42 UPD42 UPD45 MOV45 UPD45 UPD45 UPD42 UPD42 UPD42 UPD42 INS42 UPD42 INS32 INS32 INS32 UPD42 MOV42 INS42 INS42 INS42 INS42 INS42 INS32 INS32 INS27 UPD42 MOV42 INS42 INS32 UPD42 MOV42 INS42 INS32 INS32 UPD42 MOV42 INS42 INS32 INS32 UPD42 MOV42 INS42 INS42 INS42 INS32 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 DEL42 DEL59 DEL23 DEL83 DEL39 DEL59 DEL23 DEL83 DEL39 DEL42 DEL59 DEL23 DEL39 DEL85 DEL5 DEL39 DEL42 DEL44 DEL39 DEL42 DEL44 DEL39 DEL85 DEL5 DEL44 DEL39 DEL42 DEL44 DEL39 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL42 DEL42 DEL42 DEL32 DEL38 DEL25 DEL42 DEL42 DEL32 DEL21 DEL42 DEL42 DEL7 DEL21 DEL42 DEL42 DEL7 DEL21 DEL42 DEL42 DEL7 DEL21 DEL42 DEL34 DEL27 DEL61 DEL8 DEL39 DEL85 DEL5 DEL39 DEL42 DEL44 DEL39 DEL42 DEL44 DEL39 DEL85 DEL5 DEL44 DEL39 DEL42 DEL44 DEL42 DEL34 DEL27 DEL41 DEL25 DEL39 DEL42 DEL42 DEL34 DEL27 DEL36 DEL42 DEL27 DEL34 DEL27 DEL59 DEL60 DEL42 DEL42 DEL42 DEL42 DEL32 DEL42 DEL42 DEL42 DEL42 DEL42 DEL27 DEL32 DEL66 DEL66 DEL65 DEL29 DEL83 DEL39 DEL42 DEL42 DEL42 DEL42 DEL32 DEL27 DEL42 DEL43 DEL45 DEL45 DEL27 DEL14 DEL53 DEL8 DEL25 DEL42 DEL42 DEL32 DEL34 DEL27 DEL39 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL34 DEL27 DEL39 DEL85 DEL5 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL42 DEL34 DEL42 DEL32 DEL21 DEL8 DEL25 DEL42 DEL42 DEL34 DEL32 DEL21 DEL42 DEL42 DEL7 DEL21 DEL42 DEL42 DEL42 DEL32 DEL21 DEL8 DEL25 DEL8 DEL31 DEL66 DEL66 DEL65 DEL29 DEL83 DEL39 DEL42 DEL39 DEL42 DEL44 DEL42 DEL43 DEL42 DEL34 DEL27 DEL42 DEL42 DEL34 DEL27 DEL42 DEL42 DEL42 DEL32 DEL16 DEL36 DEL42 DEL42 DEL32 DEL27 DEL7 DEL21 DEL8 DEL25 DEL39 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL42 DEL42 DEL32 DEL42 DEL32 DEL59 DEL60 DEL42 DEL34 DEL27 DEL42 DEL43 DEL45 DEL42 DEL45 DEL27 DEL14 DEL53 DEL8 DEL25 DEL42 DEL42 DEL42 DEL32 DEL42 DEL27 DEL7 DEL21 DEL42 DEL42 DEL42 DEL32 DEL21 DEL42 DEL41 DEL8 DEL31 DEL66 DEL66 DEL66 DEL66 DEL66 DEL66 DEL65 DEL29 DEL83 DEL39 DEL42 DEL42 DEL43 DEL42 DEL33 DEL27 DEL39 DEL42 DEL42 DEL42 DEL27 DEL59 DEL60 DEL39 DEL42 DEL42 DEL42 DEL32 DEL42 DEL22 DEL40 DEL27 DEL42 DEL27 DEL34 DEL27 DEL36 DEL42 DEL27 DEL59 DEL60 DEL42 DEL42 DEL42 DEL40 DEL42 DEL42 DEL42 DEL34 DEL32 DEL42 DEL27 DEL27 DEL32 DEL7 DEL21 DEL42 DEL42 DEL34 DEL32 DEL21 DEL8 DEL25 DEL42 DEL42 DEL42 DEL32 DEL27 DEL42 DEL42 DEL42 DEL32 DEL21 DEL8 DEL25 DEL42 DEL42 DEL32 DEL40 DEL27 DEL42 DEL42 DEL32 DEL34 DEL27 DEL42 DEL32 DEL21 DEL8 DEL25 DEL42 DEL34 DEL38 DEL32 DEL21 DEL8 DEL61 DEL42 DEL42 DEL32 DEL21 DEL39 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL42 DEL32 DEL21 DEL42 DEL34 DEL27 DEL42 DEL34 DEL34 DEL34 DEL27 DEL36 DEL27 DEL27 DEL45 DEL42 DEL27 DEL14 DEL53 DEL8 DEL25 DEL39 DEL42 DEL42 DEL40 DEL27 DEL40 DEL27 DEL59 DEL60 DEL42 DEL42 DEL32 DEL42 DEL27 DEL39 DEL42 DEL42 DEL42 DEL42 DEL32 DEL27 DEL59 DEL60 DEL39 DEL42 DEL42 DEL42 DEL32 DEL42 DEL42 DEL32 DEL27 DEL59 DEL60 DEL42 DEL42 DEL27 DEL42 DEL42 DEL32 DEL34 DEL27 DEL27 DEL42 DEL32 DEL21 DEL42 DEL42 DEL42 DEL32 DEL42 DEL42 DEL32 DEL27 DEL7 DEL21 DEL8 DEL25 DEL42 DEL42 DEL27 DEL39 DEL42 DEL85 DEL42 DEL42 DEL32 DEL59 DEL60 DEL39 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL42 DEL42 DEL42 DEL42 DEL27 DEL32 DEL7 DEL21 DEL42 DEL42 DEL42 DEL34 DEL42 DEL42 DEL32 DEL34 DEL42 DEL32 DEL21 DEL42 DEL42 DEL42 DEL32 DEL21 DEL8 DEL25 DEL42 DEL34 DEL27 DEL42 DEL42 DEL42 DEL32 DEL7 DEL21 DEL8 DEL61 DEL8 DEL25 DEL42 DEL42 DEL32 DEL42 DEL27 DEL42 DEL42 DEL42 DEL42 DEL32 DEL42 DEL27 DEL32 DEL21 DEL8 DEL25 DEL42 DEL42 DEL27 DEL42 DEL42 DEL7 DEL21 DEL8 DEL25 DEL8 DEL31 DEL66 DEL66 DEL65 DEL29 DEL83 DEL39 DEL42 DEL42 DEL43 DEL42 DEL32 DEL21 DEL42 DEL42 DEL32 DEL21 DEL42 DEL42 DEL43 DEL14 DEL59 DEL60 DEL42 DEL42 DEL42 DEL32 DEL21 DEL39 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL42 DEL32 DEL21 DEL42 DEL42 DEL32 DEL41 DEL8 DEL31 DEL66 DEL65 DEL29 DEL83 DEL39 DEL42 DEL39 DEL85 DEL5 DEL42 DEL44 DEL39 DEL42 DEL44 DEL39 DEL42 DEL44 DEL42 DEL43 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL21 DEL8 DEL31 DEL39 DEL42 DEL44 DEL39 DEL42 DEL44 DEL39 DEL42 DEL44 DEL39 DEL42 DEL44 DEL39 DEL42 DEL44 DEL39 DEL42 DEL44 DEL45 DEL42 DEL45 DEL42 DEL45 DEL42 DEL45 DEL42 DEL27 DEL32 DEL21 DEL8 DEL25 DEL42 DEL42 DEL42 DEL42 DEL32 DEL42 DEL32 DEL32 DEL42 DEL42 DEL32 DEL21 DEL42 DEL27 DEL36 DEL42 DEL43 DEL45 DEL45 DEL27 DEL42 DEL39 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL39 DEL42 DEL42 DEL42 DEL27 DEL59 DEL60 DEL39 DEL42 DEL85 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL42 DEL42 DEL42 DEL32 DEL32 DEL21 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42

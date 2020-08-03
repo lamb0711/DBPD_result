@@ -1,0 +1,228 @@
+MAPREDUCE-3512. Batching JobHistory flushing to DFS so that we don't flush for every event slowing down AM. Contributed by Siddarth Seth.
+
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/trunk@1230353 13f79535-47bb-0310-9956-ffa450edef68
+
++import java.util.EnumSet;
++import java.util.Timer;
++import java.util.TimerTask;
+-  private Configuration conf;
++  private int maxUnflushedCompletionEvents;
++  private int postJobCompletionMultiplier;
++  private long flushTimeout;
++  private int minQueueSizeForBatchingFlushes; // TODO: Rename
+-  private BlockingQueue<JobHistoryEvent> eventQueue =
++  private int numUnflushedCompletionEvents = 0;
++  private boolean isTimerActive;
++
++
++  protected BlockingQueue<JobHistoryEvent> eventQueue =
+-    this.conf = conf;
+-
++    // Maximum number of unflushed completion-events that can stay in the queue
++    // before flush kicks in.
++    maxUnflushedCompletionEvents =
++        conf.getInt(MRJobConfig.MR_AM_HISTORY_MAX_UNFLUSHED_COMPLETE_EVENTS,
++            MRJobConfig.DEFAULT_MR_AM_HISTORY_MAX_UNFLUSHED_COMPLETE_EVENTS);
++    // We want to cut down flushes after job completes so as to write quicker,
++    // so we increase maxUnflushedEvents post Job completion by using the
++    // following multiplier.
++    postJobCompletionMultiplier =
++        conf.getInt(
++            MRJobConfig.MR_AM_HISTORY_JOB_COMPLETE_UNFLUSHED_MULTIPLIER,
++            MRJobConfig.DEFAULT_MR_AM_HISTORY_JOB_COMPLETE_UNFLUSHED_MULTIPLIER);
++    // Max time until which flush doesn't take place.
++    flushTimeout =
++        conf.getLong(MRJobConfig.MR_AM_HISTORY_COMPLETE_EVENT_FLUSH_TIMEOUT_MS,
++            MRJobConfig.DEFAULT_MR_AM_HISTORY_COMPLETE_EVENT_FLUSH_TIMEOUT_MS);
++    minQueueSizeForBatchingFlushes =
++        conf.getInt(
++            MRJobConfig.MR_AM_HISTORY_USE_BATCHED_FLUSH_QUEUE_SIZE_THRESHOLD,
++            MRJobConfig.DEFAULT_MR_AM_HISTORY_USE_BATCHED_FLUSH_QUEUE_SIZE_THRESHOLD);
++    
+-      eventHandlingThread.interrupt();
++      if (eventHandlingThread != null)
++        eventHandlingThread.interrupt();
+-      eventHandlingThread.join();
++      if (eventHandlingThread != null)
++        eventHandlingThread.join();
++
++    // Cancel all timers - so that they aren't invoked during or after
++    // the metaInfo object is wrapped up.
++    for (MetaInfo mi : fileMap.values()) {
++      try {
++        mi.shutDownTimer();
++      } catch (IOException e) {
++        LOG.info("Exception while cancelling delayed flush timer. "
++            + "Likely caused by a failed flush " + e.getMessage());
++      }
++    }
++
++  protected EventWriter createEventWriter(Path historyFilePath)
++      throws IOException {
++    FSDataOutputStream out = stagingDirFS.create(historyFilePath, true);
++    return new EventWriter(out);
++  }
++  
+-        FSDataOutputStream out = stagingDirFS.create(historyFile, true);
+-        writer = new EventWriter(out);
++        writer = createEventWriter(historyFile);
++      if (isJobCompletionEvent(event.getHistoryEvent())) {
++        // When the job is complete, flush slower but write faster.
++        maxUnflushedCompletionEvents =
++            maxUnflushedCompletionEvents * postJobCompletionMultiplier;
++      }
++
++  private boolean isJobCompletionEvent(HistoryEvent historyEvent) {
++    if (EnumSet.of(EventType.JOB_FINISHED, EventType.JOB_FAILED,
++        EventType.JOB_KILLED).contains(historyEvent.getEventType())) {
++      return true;
++    }
++    return false;
++  }
++
++  private class FlushTimerTask extends TimerTask {
++    private MetaInfo metaInfo;
++    private IOException ioe = null;
++    private volatile boolean shouldRun = true;
++
++    FlushTimerTask(MetaInfo metaInfo) {
++      this.metaInfo = metaInfo;
++    }
++
++    @Override
++    public void run() {
++      synchronized (lock) {
++        try {
++          if (!metaInfo.isTimerShutDown() && shouldRun)
++            metaInfo.flush();
++        } catch (IOException e) {
++          ioe = e;
++        }
++      }
++    }
++
++    public IOException getException() {
++      return ioe;
++    }
++
++    public void stop() {
++      shouldRun = false;
++      this.cancel();
++    }
++  }
++
++    Timer flushTimer; 
++    FlushTimerTask flushTimerTask;
++    private boolean isTimerShutDown = false;
+-    MetaInfo(Path historyFile, Path conf, EventWriter writer, 
+-             String user, String jobName, JobId jobId) {
++    MetaInfo(Path historyFile, Path conf, EventWriter writer, String user,
++        String jobName, JobId jobId) {
+-      this.jobIndexInfo = new JobIndexInfo(-1, -1, user, jobName, jobId, -1, -1,
+-          null);
++      this.jobIndexInfo =
++          new JobIndexInfo(-1, -1, user, jobName, jobId, -1, -1, null);
++      this.flushTimer = new Timer("FlushTimer", true);
+-    Path getHistoryFile() { return historyFile; }
++    Path getHistoryFile() {
++      return historyFile;
++    }
+-    Path getConfFile() {return confFile; } 
++    Path getConfFile() {
++      return confFile;
++    }
+-    JobIndexInfo getJobIndexInfo() { return jobIndexInfo; }
++    JobIndexInfo getJobIndexInfo() {
++      return jobIndexInfo;
++    }
+-    JobSummary getJobSummary() { return jobSummary; }
++    JobSummary getJobSummary() {
++      return jobSummary;
++    }
+-    boolean isWriterActive() {return writer != null ; }
++    boolean isWriterActive() {
++      return writer != null;
++    }
++    
++    boolean isTimerShutDown() {
++      return isTimerShutDown;
++    }
+-      if (writer != null) {
+-        writer.close();
++        if (writer != null) {
++          writer.close();
++        }
++        writer = null;
+-      writer = null;
+-    }
+-      if (writer != null) {
+-        writer.write(event);
+-        writer.flush();
++        if (writer != null) {
++          writer.write(event);
++          processEventForFlush(event);
++          maybeFlush(event);
++        }
+-  }
++
++    void processEventForFlush(HistoryEvent historyEvent) throws IOException {
++      if (EnumSet.of(EventType.MAP_ATTEMPT_FINISHED,
++          EventType.MAP_ATTEMPT_FAILED, EventType.MAP_ATTEMPT_KILLED,
++          EventType.REDUCE_ATTEMPT_FINISHED, EventType.REDUCE_ATTEMPT_FAILED,
++          EventType.REDUCE_ATTEMPT_KILLED, EventType.TASK_FINISHED,
++          EventType.TASK_FAILED, EventType.JOB_FINISHED, EventType.JOB_FAILED,
++          EventType.JOB_KILLED).contains(historyEvent.getEventType())) {
++        numUnflushedCompletionEvents++;
++        if (!isTimerActive) {
++          resetFlushTimer();
++          if (!isTimerShutDown) {
++            flushTimerTask = new FlushTimerTask(this);
++            flushTimer.schedule(flushTimerTask, flushTimeout);
++          }
++        }
++      }
++    }
++
++    void resetFlushTimer() throws IOException {
++      if (flushTimerTask != null) {
++        IOException exception = flushTimerTask.getException();
++        flushTimerTask.stop();
++        if (exception != null) {
++          throw exception;
++        }
++        flushTimerTask = null;
++      }
++      isTimerActive = false;
++    }
++
++    void maybeFlush(HistoryEvent historyEvent) throws IOException {
++      if ((eventQueue.size() < minQueueSizeForBatchingFlushes 
++          && numUnflushedCompletionEvents > 0)
++          || numUnflushedCompletionEvents >= maxUnflushedCompletionEvents 
++          || isJobCompletionEvent(historyEvent)) {
++        this.flush();
++      }
++    }
++
++    void flush() throws IOException {
++      synchronized (lock) {
++        if (numUnflushedCompletionEvents != 0) { // skipped timer cancel.
++          writer.flush();
++          numUnflushedCompletionEvents = 0;
++          resetFlushTimer();
++        }
++      }
++    }
++
++    void shutDownTimer() throws IOException {
++      synchronized (lock) {
++        isTimerShutDown = true;
++        flushTimer.cancel();
++        if (flushTimerTask != null && flushTimerTask.getException() != null) {
++          throw flushTimerTask.getException();
++        }
++      }
++    }
+-          false, conf);
++          false, getConfig());

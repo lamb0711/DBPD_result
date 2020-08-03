@@ -1,0 +1,315 @@
+HADOOP-14216. Improve Configuration XML Parsing Performance (jeagles)
+
++import com.fasterxml.aalto.stax.InputFactoryImpl;
+-import javax.xml.parsers.DocumentBuilder;
++import javax.xml.stream.XMLStreamConstants;
++import javax.xml.stream.XMLStreamException;
++import javax.xml.stream.XMLStreamReader;
+-import org.w3c.dom.Attr;
+-import org.w3c.dom.DOMException;
++import org.codehaus.stax2.XMLInputFactory2;
++import org.codehaus.stax2.XMLStreamReader2;
+-import org.w3c.dom.Node;
+-import org.w3c.dom.NodeList;
+-import org.w3c.dom.Text;
+-import org.xml.sax.SAXException;
+- 
++
++  /**
++   * Specify exact input factory to avoid time finding correct one.
++   * Factory is reusable across un-synchronized threads once initialized
++   */
++  private static final XMLInputFactory2 factory = new InputFactoryImpl();
++
+-  
++
+-  private Document parse(DocumentBuilder builder, URL url)
+-      throws IOException, SAXException {
++  private XMLStreamReader parse(URL url)
++      throws IOException, XMLStreamException {
+-    return parse(builder, connection.getInputStream(), url.toString());
++    return parse(connection.getInputStream(), url.toString());
+-  private Document parse(DocumentBuilder builder, InputStream is,
+-      String systemId) throws IOException, SAXException {
++  private XMLStreamReader parse(InputStream is,
++      String systemId) throws IOException, XMLStreamException {
+-    try {
+-      return (systemId == null) ? builder.parse(is) : builder.parse(is,
+-          systemId);
+-    } finally {
+-      is.close();
+-    }
++    return factory.createXMLStreamReader(systemId, is);
+-  private Resource loadResource(Properties properties, Resource wrapper, boolean quiet) {
++  private Resource loadResource(Properties properties,
++                                Resource wrapper, boolean quiet) {
+-      
+-      DocumentBuilderFactory docBuilderFactory 
+-        = DocumentBuilderFactory.newInstance();
+-      //ignore all comments inside the xml file
+-      docBuilderFactory.setIgnoringComments(true);
+-
+-      //allow includes in the xml file
+-      docBuilderFactory.setNamespaceAware(true);
+-      try {
+-          docBuilderFactory.setXIncludeAware(true);
+-      } catch (UnsupportedOperationException e) {
+-        LOG.error("Failed to set setXIncludeAware(true) for parser "
+-                + docBuilderFactory
+-                + ":" + e,
+-                e);
+-      }
+-      DocumentBuilder builder = docBuilderFactory.newDocumentBuilder();
+-      Document doc = null;
+-      Element root = null;
++      XMLStreamReader2 reader = null;
+-      
++
+-        doc = parse(builder, (URL)resource);
++        reader = (XMLStreamReader2)parse((URL)resource);
+-        doc = parse(builder, url);
++        reader = (XMLStreamReader2)parse(url);
+-          doc = parse(builder, new BufferedInputStream(
++          reader = (XMLStreamReader2)parse(new BufferedInputStream(
+-        doc = parse(builder, (InputStream) resource, null);
++        reader = (XMLStreamReader2)parse((InputStream)resource, null);
+-      } else if (resource instanceof Element) {
+-        root = (Element)resource;
+-      if (root == null) {
+-        if (doc == null) {
+-          if (quiet) {
+-            return null;
+-          }
+-          throw new RuntimeException(resource + " not found");
++      if (reader == null) {
++        if (quiet) {
++          return null;
+-        root = doc.getDocumentElement();
++        throw new RuntimeException(resource + " not found");
+-      if (!"configuration".equals(root.getTagName()))
+-        LOG.fatal("bad conf file: top-level element not <configuration>");
+-      NodeList props = root.getChildNodes();
+-      for (int i = 0; i < props.getLength(); i++) {
+-        Node propNode = props.item(i);
+-        if (!(propNode instanceof Element))
+-          continue;
+-        Element prop = (Element)propNode;
+-        if ("configuration".equals(prop.getTagName())) {
+-          loadResource(toAddTo, new Resource(prop, name), quiet);
+-          continue;
+-        }
+-        if (!"property".equals(prop.getTagName()))
+-          LOG.warn("bad conf file: element not <property>");
+-        String attr = null;
+-        String value = null;
+-        boolean finalParameter = false;
+-        LinkedList<String> source = new LinkedList<String>();
++      StringBuilder token = new StringBuilder();
++      String confName = null;
++      String confValue = null;
++      boolean confFinal = false;
++      boolean fallbackAllowed = false;
++      boolean fallbackEntered = false;
++      boolean parseToken = false;
++      LinkedList<String> confSource = new LinkedList<String>();
+-        Attr propAttr = prop.getAttributeNode("name");
+-        if (propAttr != null)
+-          attr = StringInterner.weakIntern(propAttr.getValue());
+-        propAttr = prop.getAttributeNode("value");
+-        if (propAttr != null)
+-          value = StringInterner.weakIntern(propAttr.getValue());
+-        propAttr = prop.getAttributeNode("final");
+-        if (propAttr != null)
+-          finalParameter = "true".equals(propAttr.getValue());
+-        propAttr = prop.getAttributeNode("source");
+-        if (propAttr != null)
+-          source.add(StringInterner.weakIntern(propAttr.getValue()));
++      while (reader.hasNext()) {
++        switch (reader.next()) {
++        case XMLStreamConstants.START_ELEMENT:
++          switch (reader.getLocalName()) {
++          case "property":
++            confName = null;
++            confValue = null;
++            confFinal = false;
++            confSource.clear();
+-        NodeList fields = prop.getChildNodes();
+-        for (int j = 0; j < fields.getLength(); j++) {
+-          Node fieldNode = fields.item(j);
+-          if (!(fieldNode instanceof Element))
+-            continue;
+-          Element field = (Element)fieldNode;
+-          if ("name".equals(field.getTagName()) && field.hasChildNodes())
+-            attr = StringInterner.weakIntern(
+-                ((Text)field.getFirstChild()).getData().trim());
+-          if ("value".equals(field.getTagName()) && field.hasChildNodes())
+-            value = StringInterner.weakIntern(
+-                ((Text)field.getFirstChild()).getData());
+-          if ("final".equals(field.getTagName()) && field.hasChildNodes())
+-            finalParameter = "true".equals(((Text)field.getFirstChild()).getData());
+-          if ("source".equals(field.getTagName()) && field.hasChildNodes())
+-            source.add(StringInterner.weakIntern(
+-                ((Text)field.getFirstChild()).getData()));
+-        }
+-        source.add(name);
+-        
+-        // Ignore this parameter if it has already been marked as 'final'
+-        if (attr != null) {
+-          if (deprecations.getDeprecatedKeyMap().containsKey(attr)) {
+-            DeprecatedKeyInfo keyInfo =
+-                deprecations.getDeprecatedKeyMap().get(attr);
+-            keyInfo.clearAccessed();
+-            for (String key:keyInfo.newKeys) {
+-              // update new keys with deprecated key's value 
+-              loadProperty(toAddTo, name, key, value, finalParameter, 
+-                  source.toArray(new String[source.size()]));
++            // First test for short format configuration
++            int attrCount = reader.getAttributeCount();
++            for (int i = 0; i < attrCount; i++) {
++              String propertyAttr = reader.getAttributeLocalName(i);
++              if ("name".equals(propertyAttr)) {
++                confName = StringInterner.weakIntern(
++                    reader.getAttributeValue(i));
++              } else if ("value".equals(propertyAttr)) {
++                confValue = StringInterner.weakIntern(
++                    reader.getAttributeValue(i));
++              } else if ("final".equals(propertyAttr)) {
++                confFinal = "true".equals(reader.getAttributeValue(i));
++              } else if ("source".equals(propertyAttr)) {
++                confSource.add(StringInterner.weakIntern(
++                    reader.getAttributeValue(i)));
++              }
++            break;
++          case "name":
++          case "value":
++          case "final":
++          case "source":
++            parseToken = true;
++            token.setLength(0);
++            break;
++          case "include":
++            if (!"xi".equals(reader.getPrefix())) {
++              break;
++            }
++            // Determine href for xi:include
++            String confInclude = null;
++            attrCount = reader.getAttributeCount();
++            for (int i = 0; i < attrCount; i++) {
++              String attrName = reader.getAttributeLocalName(i);
++              if ("href".equals(attrName)) {
++                confInclude = reader.getAttributeValue(i);
++              }
++            }
++            if (confInclude == null) {
++              break;
++            }
++            // Determine if the included resource is a classpath resource
++            // otherwise fallback to a file resource
++            // xi:include are treated as inline and retain current source
++            URL include = getResource(confInclude);
++            if (include != null) {
++              Resource classpathResource = new Resource(include, name);
++              loadResource(properties, classpathResource, quiet);
++            } else {
++              File href = new File(confInclude);
++              if (!href.isAbsolute()) {
++                // Included resources are relative to the current resource
++                File baseFile = new File(name).getParentFile();
++                href = new File(baseFile, href.getPath());
++              }
++              if (!href.exists()) {
++                // Resource errors are non-fatal iff there is 1 xi:fallback
++                fallbackAllowed = true;
++                break;
++              }
++              Resource uriResource = new Resource(href.toURI().toURL(), name);
++              loadResource(properties, uriResource, quiet);
++            }
++            break;
++          case "fallback":
++            if (!"xi".equals(reader.getPrefix())) {
++              break;
++            }
++            fallbackEntered = true;
++            break;
++          case "configuration":
++            break;
++          default:
++            break;
+-          else {
+-            loadProperty(toAddTo, name, attr, value, finalParameter, 
+-                source.toArray(new String[source.size()]));
++          break;
++
++        case XMLStreamConstants.CHARACTERS:
++          if (parseToken) {
++            char[] text = reader.getTextCharacters();
++            token.append(text, reader.getTextStart(), reader.getTextLength());
++          break;
++
++        case XMLStreamConstants.END_ELEMENT:
++          switch (reader.getLocalName()) {
++          case "name":
++            if (token.length() > 0) {
++              confName = StringInterner.weakIntern(token.toString().trim());
++            }
++            break;
++          case "value":
++            if (token.length() > 0) {
++              confValue = StringInterner.weakIntern(token.toString());
++            }
++            break;
++          case "final":
++            confFinal = "true".equals(token.toString());
++            break;
++          case "source":
++            confSource.add(StringInterner.weakIntern(token.toString()));
++            break;
++          case "include":
++            if (!"xi".equals(reader.getPrefix())) {
++              break;
++            }
++            if (fallbackAllowed && !fallbackEntered) {
++              throw new IOException("Fetch fail on include with no "
++                  + "fallback while loading '" + name + "'");
++            }
++            fallbackAllowed = false;
++            fallbackEntered = false;
++            break;
++          case "property":
++            if (confName == null || (!fallbackAllowed && fallbackEntered)) {
++              break;
++            }
++            confSource.add(name);
++            DeprecatedKeyInfo keyInfo =
++                deprecations.getDeprecatedKeyMap().get(confName);
++            if (keyInfo != null) {
++              keyInfo.clearAccessed();
++              for (String key : keyInfo.newKeys) {
++                // update new keys with deprecated key's value
++                loadProperty(toAddTo, name, key, confValue, confFinal,
++                    confSource.toArray(new String[confSource.size()]));
++              }
++            } else {
++              loadProperty(toAddTo, name, confName, confValue, confFinal,
++                  confSource.toArray(new String[confSource.size()]));
++            }
++            break;
++          default:
++            break;
++          }
++        default:
++          break;
+-      
++      reader.close();
++
+-    } catch (DOMException e) {
++    } catch (XMLStreamException e) {
+-    } catch (SAXException e) {
+-      LOG.fatal("error parsing conf " + name, e);
+-      throw new RuntimeException(e);
+-    } catch (ParserConfigurationException e) {
+-      LOG.fatal("error parsing conf " + name , e);
+-      throw new RuntimeException(e);
+
+MOV26 MOV26 MOV26 MOV26 MOV26 MOV26 UPD40 UPD40 UPD40 UPD40 UPD40 UPD40 INS23 INS31 INS29 INS83 INS83 INS83 INS43 INS59 UPD43 UPD43 UPD43 UPD43 INS83 MOV43 INS42 MOV44 MOV44 MOV44 INS8 INS65 UPD42 MOV42 UPD42 MOV42 INS14 UPD42 UPD42 UPD42 UPD42 MOV41 MOV60 INS54 INS66 INS66 INS43 INS32 INS8 MOV12 MOV12 INS42 INS42 UPD42 MOV42 UPD42 MOV42 MOV42 MOV60 MOV21 INS60 MOV60 MOV25 MOV25 MOV60 MOV25 MOV60 MOV60 MOV60 MOV60 INS60 INS60 INS60 INS60 MOV60 INS61 INS21 MOV25 MOV41 INS43 INS59 UPD43 UPD43 UPD43 INS39 INS59 INS39 INS59 INS39 INS59 INS39 INS59 INS32 INS8 INS32 UPD43 UPD42 MOV42 INS42 INS33 UPD42 UPD42 UPD42 INS14 UPD42 UPD42 UPD42 UPD42 INS42 INS9 INS42 INS9 INS42 INS9 INS42 INS9 UPD42 UPD42 MOV42 UPD42 MOV42 INS50 INS42 INS42 UPD42 INS43 INS32 INS49 INS50 INS10 INS49 INS25 INS10 INS49 INS50 INS49 INS10 UPD42 INS11 INS42 UPD42 MOV42 INS42 INS40 INS32 INS49 INS21 INS21 INS21 INS21 INS60 INS24 INS10 INS49 INS49 INS49 INS49 INS21 INS21 INS10 INS49 INS25 INS60 INS21 INS24 INS25 INS60 INS25 INS10 INS49 INS25 INS21 INS10 INS49 INS10 INS49 INS10 INS40 INS42 INS8 INS40 INS32 INS49 INS25 INS10 INS49 INS25 INS10 INS49 INS21 INS10 INS49 INS21 INS10 INS49 INS25 INS25 INS21 INS21 INS10 INS49 INS25 INS21 MOV60 MOV25 INS10 INS49 INS10 INS43 MOV32 UPD42 INS11 UPD42 MOV42 UPD42 MOV42 INS45 INS7 INS7 INS7 MOV32 INS39 MOV59 MOV58 MOV27 MOV37 INS8 INS45 INS45 INS45 INS45 MOV7 INS32 INS45 INS38 INS8 MOV43 INS59 MOV7 INS58 INS27 INS37 INS8 INS27 INS8 INS43 INS59 MOV27 INS8 INS8 INS45 INS38 INS8 INS7 INS45 INS60 INS21 UPD42 MOV42 UPD42 MOV42 INS45 INS27 INS8 INS45 UPD27 MOV27 INS8 INS45 INS7 INS45 MOV32 INS45 INS38 INS8 UPD27 MOV27 INS8 INS7 INS7 INS45 INS27 INS8 MOV32 INS27 MOV8 INS42 INS43 INS32 INS42 INS33 INS42 INS33 INS42 INS9 UPD42 UPD42 UPD42 INS42 MOV60 INS25 INS42 INS9 INS42 INS42 INS34 INS32 INS10 INS42 INS33 UPD42 INS39 INS59 INS42 UPD42 MOV42 INS42 INS60 INS25 INS42 INS33 INS10 INS42 INS42 INS32 UPD42 INS60 INS21 MOV60 INS25 MOV25 MOV60 INS21 INS32 INS10 INS42 INS9 INS5 INS59 INS32 MOV32 INS34 INS21 INS32 INS34 INS21 INS42 INS32 UPD42 INS32 INS10 UPD42 INS38 INS53 INS42 INS9 INS42 INS9 INS27 INS36 INS10 UPD42 UPD42 INS42 INS42 INS33 INS42 MOV42 MOV42 UPD42 INS11 UPD42 UPD42 UPD43 INS32 INS8 INS25 INS45 UPD42 MOV42 MOV32 UPD42 UPD42 INS42 INS34 MOV43 INS59 INS32 INS8 INS42 INS42 MOV43 INS59 INS32 UPD43 INS38 INS8 INS8 UPD43 INS32 UPD45 MOV45 MOV42 MOV32 INS39 INS85 INS42 INS32 UPD42 MOV42 UPD42 MOV42 INS42 INS32 INS32 UPD42 UPD42 MOV7 UPD42 MOV42 UPD42 MOV42 MOV7 UPD45 MOV45 MOV42 MOV32 INS32 INS45 UPD42 MOV42 INS32 INS42 INS14 INS42 INS33 INS27 UPD42 MOV8 UPD42 INS11 INS43 MOV32 UPD42 UPD42 INS45 INS42 INS42 INS21 MOV32 MOV8 INS25 UPD42 UPD42 INS42 INS32 UPD45 MOV45 MOV42 UPD42 MOV42 MOV21 INS42 INS14 INS42 UPD42 MOV42 UPD42 MOV42 INS42 UPD42 UPD42 INS14 INS32 INS60 INS21 INS32 INS21 INS10 UPD42 UPD42 INS14 INS42 INS42 INS42 INS42 UPD42 UPD42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 UPD42 UPD42 UPD42 UPD42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 INS43 INS27 INS38 INS42 UPD42 UPD42 UPD42 INS43 MOV32 INS42 UPD42 UPD42 INS7 UPD45 UPD42 MOV42 INS32 INS8 INS25 INS42 INS42 INS42 INS43 INS42 INS42 INS43 INS42 INS42 INS42 INS43 INS59 INS7 INS42 INS42 INS7 INS43 INS32 INS42 UPD42 INS42 INS32 UPD42 MOV42 INS27 MOV42 INS45 INS42 UPD42 INS42 INS42 INS32 INS7 UPD45 MOV45 MOV42 UPD42 MOV42 INS21 INS32 INS8 UPD42 INS42 INS42 INS42 INS42 INS32 INS42 INS14 INS42 INS9 UPD42 MOV42 INS32 INS42 INS32 UPD42 UPD42 MOV42 UPD42 MOV42 INS45 UPD45 MOV45 UPD42 UPD42 UPD42 INS42 INS42 INS32 INS42 INS32 INS7 INS45 UPD42 MOV42 UPD42 MOV42 INS21 UPD42 UPD42 INS42 INS14 UPD42 MOV42 INS43 INS42 INS32 INS42 INS42 UPD42 MOV42 UPD42 MOV42 UPD42 UPD42 INS42 INS42 INS42 UPD42 MOV42 UPD42 MOV42 INS32 INS42 INS32 INS32 INS43 INS42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 INS42 INS42 UPD42 MOV42 UPD45 MOV45 INS42 INS32 INS42 INS42 INS32 INS42 UPD42 INS42 INS42 INS42 MOV42 MOV42 MOV32 UPD42 UPD42 INS42 DEL40 DEL26 DEL42 DEL43 DEL42 DEL44 DEL42 DEL42 DEL43 DEL42 DEL44 DEL42 DEL33 DEL27 DEL36 DEL32 DEL42 DEL42 DEL42 DEL42 DEL32 DEL16 DEL8 DEL42 DEL42 DEL32 DEL21 DEL8 DEL54 DEL42 DEL42 DEL32 DEL42 DEL42 DEL42 DEL42 DEL43 DEL62 DEL42 DEL42 DEL43 DEL42 DEL11 DEL7 DEL21 DEL8 DEL25 DEL42 DEL42 DEL32 DEL45 DEL42 DEL42 DEL32 DEL42 DEL32 DEL42 DEL42 DEL14 DEL32 DEL18 DEL42 DEL42 DEL42 DEL45 DEL32 DEL45 DEL45 DEL42 DEL42 DEL32 DEL42 DEL42 DEL43 DEL62 DEL36 DEL18 DEL43 DEL42 DEL11 DEL42 DEL43 DEL32 DEL11 DEL36 DEL45 DEL42 DEL32 DEL32 DEL42 DEL42 DEL32 DEL45 DEL42 DEL43 DEL32 DEL11 DEL36 DEL42 DEL32 DEL42 DEL43 DEL32 DEL11 DEL36 DEL42 DEL32 DEL33 DEL45 DEL42 DEL27 DEL42 DEL42 DEL42 DEL32 DEL42 DEL42 DEL32 DEL83 DEL42 DEL43 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL42 DEL9 DEL32 DEL21 DEL42 DEL42 DEL9 DEL32 DEL21 DEL42 DEL42 DEL9 DEL32 DEL21 DEL8 DEL43 DEL42 DEL44 DEL42 DEL42 DEL45 DEL42 DEL45 DEL42 DEL27 DEL42 DEL32 DEL21 DEL8 DEL12 DEL54 DEL42 DEL33 DEL27 DEL42 DEL32 DEL7 DEL21 DEL8 DEL25 DEL45 DEL32 DEL32 DEL38 DEL21 DEL25 DEL42 DEL43 DEL60 DEL42 DEL42 DEL43 DEL62 DEL36 DEL38 DEL18 DEL25 DEL42 DEL43 DEL42 DEL42 DEL43 DEL42 DEL11 DEL59 DEL60 DEL25 DEL42 DEL32 DEL32 DEL38 DEL42 DEL42 DEL32 DEL21 DEL25 DEL42 DEL33 DEL59 DEL60 DEL42 DEL33 DEL59 DEL60 DEL39 DEL42 DEL9 DEL59 DEL60 DEL42 DEL43 DEL42 DEL45 DEL32 DEL59 DEL60 DEL42 DEL33 DEL27 DEL42 DEL32 DEL7 DEL21 DEL25 DEL21 DEL42 DEL33 DEL27 DEL42 DEL42 DEL32 DEL7 DEL21 DEL25 DEL21 DEL33 DEL27 DEL42 DEL42 DEL32 DEL32 DEL7 DEL21 DEL25 DEL42 DEL42 DEL42 DEL42 DEL32 DEL32 DEL32 DEL21 DEL25 DEL39 DEL42 DEL34 DEL59 DEL58 DEL42 DEL42 DEL32 DEL27 DEL42 DEL37 DEL43 DEL42 DEL42 DEL32 DEL59 DEL60 DEL32 DEL32 DEL27 DEL42 DEL42 DEL43 DEL32 DEL11 DEL36 DEL32 DEL32 DEL32 DEL7 DEL21 DEL25 DEL45 DEL42 DEL32 DEL32 DEL27 DEL21 DEL25 DEL21 DEL25 DEL32 DEL42 DEL42 DEL32 DEL27 DEL21 DEL25 DEL8 DEL24 DEL32 DEL21 DEL8 DEL25 DEL8 DEL24 DEL8 DEL43 DEL42 DEL44 DEL42 DEL42 DEL27 DEL42 DEL32 DEL21 DEL42 DEL43 DEL42 DEL14 DEL53 DEL8 DEL12 DEL42 DEL43 DEL42 DEL44 DEL21 DEL42 DEL43 DEL42 DEL14 DEL53 DEL8 DEL12 DEL54 DEL8 DEL31

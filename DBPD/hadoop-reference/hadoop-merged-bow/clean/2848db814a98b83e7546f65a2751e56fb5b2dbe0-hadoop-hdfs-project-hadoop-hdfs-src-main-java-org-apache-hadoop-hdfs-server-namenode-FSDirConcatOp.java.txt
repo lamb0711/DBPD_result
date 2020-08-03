@@ -1,0 +1,285 @@
+HDFS-3689. Add support for variable length block. Contributed by Jing Zhao.
+
+-import org.apache.hadoop.fs.Path;
++import org.apache.hadoop.hdfs.protocol.QuotaExceededException;
+-import org.apache.hadoop.hdfs.server.blockmanagement.BlockInfo;
+-  static HdfsFileStatus concat(
+-    FSDirectory fsd, String target, String[] srcs,
++
++  static HdfsFileStatus concat(FSDirectory fsd, String target, String[] srcs,
+-
+-    FSDirectory.LOG.debug("concat {} to {}", Arrays.toString(srcs), target);
+-    // We require all files be in the same directory
+-    String trgParent =
+-      target.substring(0, target.lastIndexOf(Path.SEPARATOR_CHAR));
+-    for (String s : srcs) {
+-      String srcParent = s.substring(0, s.lastIndexOf(Path.SEPARATOR_CHAR));
+-      if (!srcParent.equals(trgParent)) {
+-        throw new IllegalArgumentException(
+-           "Sources and target are not in the same directory");
+-      }
++    if (FSDirectory.LOG.isDebugEnabled()) {
++      FSDirectory.LOG.debug("concat {} to {}", Arrays.toString(srcs), target);
+-    final INodesInPath trgIip = fsd.getINodesInPath4Write(target);
++    final INodesInPath targetIIP = fsd.getINodesInPath4Write(target);
++    FSPermissionChecker pc = null;
+-      FSPermissionChecker pc = fsd.getPermissionChecker();
+-      fsd.checkPathAccess(pc, trgIip, FsAction.WRITE);
+-
+-      // and srcs
+-      for(String aSrc: srcs) {
+-        final INodesInPath srcIip = fsd.getINodesInPath4Write(aSrc);
+-        fsd.checkPathAccess(pc, srcIip, FsAction.READ); // read the file
+-        fsd.checkParentAccess(pc, srcIip, FsAction.WRITE); // for delete
+-      }
++      pc = fsd.getPermissionChecker();
++      fsd.checkPathAccess(pc, targetIIP, FsAction.WRITE);
+-    // to make sure no two files are the same
+-    Set<INode> si = new HashSet<INode>();
+-
+-    // we put the following prerequisite for the operation
+-    // replication and blocks sizes should be the same for ALL the blocks
+-
+-    if (fsd.getEZForPath(trgIip) != null) {
+-      throw new HadoopIllegalArgumentException(
+-          "concat can not be called for files in an encryption zone.");
+-    }
+-    final INodeFile trgInode = INodeFile.valueOf(trgIip.getLastINode(), target);
+-    if(trgInode.isUnderConstruction()) {
+-      throw new HadoopIllegalArgumentException("concat: target file "
+-          + target + " is under construction");
+-    }
+-    // per design target shouldn't be empty and all the blocks same size
+-    if(trgInode.numBlocks() == 0) {
+-      throw new HadoopIllegalArgumentException("concat: target file "
+-          + target + " is empty");
+-    }
+-    if (trgInode.isWithSnapshot()) {
+-      throw new HadoopIllegalArgumentException("concat: target file "
+-          + target + " is in a snapshot");
+-    }
+-
+-    long blockSize = trgInode.getPreferredBlockSize();
+-
+-    // check the end block to be full
+-    final BlockInfo last = trgInode.getLastBlock();
+-    if(blockSize != last.getNumBytes()) {
+-      throw new HadoopIllegalArgumentException("The last block in " + target
+-          + " is not full; last block size = " + last.getNumBytes()
+-          + " but file block size = " + blockSize);
+-    }
+-
+-    si.add(trgInode);
+-    final short repl = trgInode.getFileReplication();
+-
+-    // now check the srcs
+-    boolean endSrc = false; // final src file doesn't have to have full end block
+-    for(int i=0; i< srcs.length; i++) {
+-      String src = srcs[i];
+-      if(i== srcs.length-1)
+-        endSrc=true;
+-
+-      final INodeFile srcInode = INodeFile.valueOf(fsd.getINode4Write(src), src);
+-      if(src.isEmpty()
+-          || srcInode.isUnderConstruction()
+-          || srcInode.numBlocks() == 0) {
+-        throw new HadoopIllegalArgumentException("concat: source file " + src
+-            + " is invalid or empty or underConstruction");
+-      }
+-
+-      // check replication and blocks size
+-      if(repl != srcInode.getBlockReplication()) {
+-        throw new HadoopIllegalArgumentException("concat: the source file "
+-            + src + " and the target file " + target
+-            + " should have the same replication: source replication is "
+-            + srcInode.getBlockReplication()
+-            + " but target replication is " + repl);
+-      }
+-
+-      //boolean endBlock=false;
+-      // verify that all the blocks are of the same length as target
+-      // should be enough to check the end blocks
+-      final BlockInfo[] srcBlocks = srcInode.getBlocks();
+-      int idx = srcBlocks.length-1;
+-      if(endSrc)
+-        idx = srcBlocks.length-2; // end block of endSrc is OK not to be full
+-      if(idx >= 0 && srcBlocks[idx].getNumBytes() != blockSize) {
+-        throw new HadoopIllegalArgumentException("concat: the source file "
+-            + src + " and the target file " + target
+-            + " should have the same blocks sizes: target block size is "
+-            + blockSize + " but the size of source block " + idx + " is "
+-            + srcBlocks[idx].getNumBytes());
+-      }
+-
+-      si.add(srcInode);
+-    }
+-
+-    // make sure no two files are the same
+-    if(si.size() < srcs.length+1) { // trg + srcs
+-      // it means at least two files are the same
+-      throw new HadoopIllegalArgumentException(
+-          "concat: at least two of the source files are the same");
+-    }
++    verifyTargetFile(fsd, target, targetIIP);
++    // check the srcs
++    INodeFile[] srcFiles = verifySrcFiles(fsd, srcs, targetIIP, pc);
+-      unprotectedConcat(fsd, target, srcs, timestamp);
++      unprotectedConcat(fsd, targetIIP, srcFiles, timestamp);
+-    return fsd.getAuditFileInfo(trgIip);
++    return fsd.getAuditFileInfo(targetIIP);
++  }
++
++  private static void verifyTargetFile(FSDirectory fsd, final String target,
++      final INodesInPath targetIIP) throws IOException {
++    // check the target
++    if (fsd.getEZForPath(targetIIP) != null) {
++      throw new HadoopIllegalArgumentException(
++          "concat can not be called for files in an encryption zone.");
++    }
++    final INodeFile targetINode = INodeFile.valueOf(targetIIP.getLastINode(),
++        target);
++    if(targetINode.isUnderConstruction()) {
++      throw new HadoopIllegalArgumentException("concat: target file "
++          + target + " is under construction");
++    }
++  }
++
++  private static INodeFile[] verifySrcFiles(FSDirectory fsd, String[] srcs,
++      INodesInPath targetIIP, FSPermissionChecker pc) throws IOException {
++    // to make sure no two files are the same
++    Set<INodeFile> si = new HashSet<>();
++    final INodeFile targetINode = targetIIP.getLastINode().asFile();
++    final INodeDirectory targetParent = targetINode.getParent();
++    // now check the srcs
++    for(String src : srcs) {
++      final INodesInPath iip = fsd.getINodesInPath4Write(src);
++      // permission check for srcs
++      if (pc != null) {
++        fsd.checkPathAccess(pc, iip, FsAction.READ); // read the file
++        fsd.checkParentAccess(pc, iip, FsAction.WRITE); // for delete
++      }
++      final INode srcINode = iip.getLastINode();
++      final INodeFile srcINodeFile = INodeFile.valueOf(srcINode, src);
++      // make sure the src file and the target file are in the same dir
++      if (srcINodeFile.getParent() != targetParent) {
++        throw new HadoopIllegalArgumentException("Source file " + src
++            + " is not in the same directory with the target "
++            + targetIIP.getPath());
++      }
++      // make sure all the source files are not in snapshot
++      if (srcINode.isInLatestSnapshot(iip.getLatestSnapshotId())) {
++        throw new SnapshotException("Concat: the source file " + src
++            + " is in snapshot");
++      }
++      // check if the file has other references.
++      if (srcINode.isReference() && ((INodeReference.WithCount)
++          srcINode.asReference().getReferredINode()).getReferenceCount() > 1) {
++        throw new SnapshotException("Concat: the source file " + src
++            + " is referred by some other reference in some snapshot.");
++      }
++      if (srcINode == targetINode) {
++        throw new HadoopIllegalArgumentException("concat: the src file " + src
++            + " is the same with the target file " + targetIIP.getPath());
++      }
++      if(srcINodeFile.isUnderConstruction() || srcINodeFile.numBlocks() == 0) {
++        throw new HadoopIllegalArgumentException("concat: source file " + src
++            + " is invalid or empty or underConstruction");
++      }
++      si.add(srcINodeFile);
++    }
++
++    // make sure no two files are the same
++    if(si.size() < srcs.length) {
++      // it means at least two files are the same
++      throw new HadoopIllegalArgumentException(
++          "concat: at least two of the source files are the same");
++    }
++    return si.toArray(new INodeFile[si.size()]);
++  }
++
++  private static long computeQuotaDelta(INodeFile target, INodeFile[] srcList) {
++    long delta = 0;
++    short targetRepl = target.getBlockReplication();
++    for (INodeFile src : srcList) {
++      if (targetRepl != src.getBlockReplication()) {
++        delta += src.computeFileSize() *
++            (targetRepl - src.getBlockReplication());
++      }
++    }
++    return delta;
++  }
++
++  private static void verifyQuota(FSDirectory fsd, INodesInPath targetIIP,
++      long delta) throws QuotaExceededException {
++    if (!fsd.getFSNamesystem().isImageLoaded() || fsd.shouldSkipQuotaChecks()) {
++      // Do not check quota if editlog is still being processed
++      return;
++    }
++    FSDirectory.verifyQuota(targetIIP, targetIIP.length() - 1, 0, delta, null);
+-   * @param target target file to move the blocks to
+-   * @param srcs list of file to move the blocks from
+-  static void unprotectedConcat(
+-    FSDirectory fsd, String target, String[] srcs, long timestamp)
+-    throws IOException {
++  static void unprotectedConcat(FSDirectory fsd, INodesInPath targetIIP,
++      INodeFile[] srcList, long timestamp) throws IOException {
+-      NameNode.stateChangeLog.debug("DIR* FSNamesystem.concat to "+target);
++      NameNode.stateChangeLog.debug("DIR* FSNamesystem.concat to "
++          + targetIIP.getPath());
+-    // do the move
+-    final INodesInPath trgIIP = fsd.getINodesInPath4Write(target, true);
+-    final INodeFile trgInode = trgIIP.getLastINode().asFile();
+-    INodeDirectory trgParent = trgIIP.getINode(-2).asDirectory();
+-    final int trgLatestSnapshot = trgIIP.getLatestSnapshotId();
++    final INodeFile trgInode = targetIIP.getLastINode().asFile();
++    long delta = computeQuotaDelta(trgInode, srcList);
++    verifyQuota(fsd, targetIIP, delta);
+-    final INodeFile [] allSrcInodes = new INodeFile[srcs.length];
+-    for(int i = 0; i < srcs.length; i++) {
+-      final INodesInPath iip = fsd.getINodesInPath4Write(srcs[i]);
+-      final int latest = iip.getLatestSnapshotId();
+-      final INode inode = iip.getLastINode();
+-
+-      // check if the file in the latest snapshot
+-      if (inode.isInLatestSnapshot(latest)) {
+-        throw new SnapshotException("Concat: the source file " + srcs[i]
+-            + " is in snapshot " + latest);
+-      }
+-
+-      // check if the file has other references.
+-      if (inode.isReference() && ((INodeReference.WithCount)
+-          inode.asReference().getReferredINode()).getReferenceCount() > 1) {
+-        throw new SnapshotException("Concat: the source file " + srcs[i]
+-            + " is referred by some other reference in some snapshot.");
+-      }
+-
+-      allSrcInodes[i] = inode.asFile();
+-    }
+-    trgInode.concatBlocks(allSrcInodes);
++    // the target file can be included in a snapshot
++    trgInode.recordModification(targetIIP.getLatestSnapshotId());
++    INodeDirectory trgParent = targetIIP.getINode(-2).asDirectory();
++    trgInode.concatBlocks(srcList);
+-    for(INodeFile nodeToRemove: allSrcInodes) {
+-      if(nodeToRemove == null) continue;
+-
+-      nodeToRemove.setBlocks(null);
+-      trgParent.removeChild(nodeToRemove, trgLatestSnapshot);
+-      fsd.getINodeMap().remove(nodeToRemove);
+-      count++;
++    for (INodeFile nodeToRemove : srcList) {
++      if(nodeToRemove != null) {
++        nodeToRemove.setBlocks(null);
++        nodeToRemove.getParent().removeChild(nodeToRemove);
++        fsd.getINodeMap().remove(nodeToRemove);
++        count++;
++      }
+-    trgInode.setModificationTime(timestamp, trgLatestSnapshot);
+-    trgParent.updateModificationTime(timestamp, trgLatestSnapshot);
++    trgInode.setModificationTime(timestamp, targetIIP.getLatestSnapshotId());
++    trgParent.updateModificationTime(timestamp, targetIIP.getLatestSnapshotId());
+-    FSDirectory.unprotectedUpdateCount(trgIIP, trgIIP.length() - 1, -count, 0);
++    FSDirectory.unprotectedUpdateCount(targetIIP, targetIIP.length() - 1,
++        -count, delta);
+
+MOV26 UPD40 INS31 INS31 INS31 INS31 INS31 MOV83 MOV43 MOV42 MOV44 MOV44 MOV44 MOV44 MOV43 INS8 INS83 INS83 INS39 INS42 INS44 MOV44 INS44 INS43 INS8 INS83 INS83 MOV5 INS42 INS44 MOV44 INS44 INS44 INS43 INS8 INS83 INS83 INS39 INS42 INS44 INS44 INS8 INS83 INS83 INS39 INS42 INS44 INS44 INS44 INS43 INS8 INS44 MOV21 MOV21 MOV6 INS25 MOV60 INS60 INS25 INS21 MOV60 MOV25 MOV60 MOV21 INS54 MOV21 INS41 UPD43 MOV43 UPD42 MOV42 INS83 UPD42 INS83 MOV43 INS42 UPD42 MOV42 MOV25 INS60 MOV25 INS43 INS42 INS43 INS42 INS43 INS42 UPD42 MOV42 MOV60 MOV60 INS60 INS70 MOV25 INS41 INS43 INS42 INS5 INS42 INS60 MOV60 INS70 INS41 INS43 INS42 INS43 INS42 INS39 INS42 INS42 MOV25 MOV21 MOV43 UPD42 MOV5 INS42 INS60 INS21 MOV21 INS32 INS8 MOV43 INS59 MOV32 INS8 INS32 INS5 INS8 MOV8 INS32 UPD42 INS83 MOV43 MOV59 INS42 INS42 INS42 UPD74 INS83 INS43 INS83 INS43 INS59 INS44 MOV42 INS8 INS32 INS42 INS43 INS85 INS39 INS59 INS39 INS44 INS42 INS8 INS42 UPD42 MOV42 INS42 INS27 INS8 UPD39 MOV39 MOV59 INS32 INS32 INS42 INS8 INS40 INS42 MOV21 UPD42 INS42 INS33 INS21 INS21 INS42 INS42 INS42 INS42 INS43 INS85 UPD42 INS21 INS42 INS42 INS42 UPD42 UPD42 UPD43 INS42 UPD42 INS32 INS42 INS42 INS32 MOV43 INS42 MOV60 INS25 MOV60 MOV60 MOV25 MOV25 INS25 MOV25 MOV25 MOV21 MOV40 INS42 INS42 INS3 INS42 UPD42 MOV42 MOV34 UPD42 INS32 INS43 INS42 MOV25 INS38 MOV32 INS41 UPD42 UPD42 UPD42 INS27 INS34 INS42 INS33 UPD42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 INS42 INS42 INS32 UPD42 INS25 INS32 INS32 UPD42 INS42 INS7 INS32 UPD42 MOV42 UPD42 INS42 UPD42 UPD42 MOV42 UPD42 MOV42 INS32 UPD42 UPD42 UPD42 INS42 UPD42 UPD74 INS32 INS42 UPD42 MOV42 UPD42 MOV42 MOV43 INS27 INS8 MOV43 UPD27 INS27 INS8 UPD27 INS5 INS32 INS42 INS42 INS42 INS32 INS42 UPD42 INS32 INS34 UPD42 UPD42 INS42 UPD42 MOV42 UPD42 MOV42 INS27 MOV8 INS42 UPD42 MOV42 INS42 UPD42 MOV42 INS42 MOV32 INS42 INS42 INS42 INS42 INS40 INS42 INS42 INS42 INS42 INS42 UPD42 UPD42 INS42 INS42 UPD42 INS42 INS33 MOV21 MOV21 UPD42 UPD42 INS42 UPD42 UPD42 MOV32 INS32 INS27 INS53 UPD42 INS42 UPD42 INS43 INS85 INS42 INS42 UPD42 INS21 INS32 INS42 UPD42 MOV42 UPD42 MOV42 UPD42 UPD42 INS42 INS33 INS21 UPD42 UPD42 UPD42 MOV42 UPD42 UPD42 UPD42 UPD42 MOV42 UPD42 MOV42 INS32 INS34 INS14 UPD42 INS42 UPD42 INS7 INS42 UPD42 MOV42 INS32 INS32 UPD42 UPD42 MOV43 MOV43 INS36 UPD42 MOV42 MOV43 INS27 MOV43 UPD42 INS42 INS27 INS42 INS42 INS32 MOV42 MOV42 UPD45 UPD42 UPD45 INS32 UPD45 UPD42 UPD45 INS11 INS45 INS42 INS45 UPD45 UPD42 UPD45 INS32 INS36 INS42 UPD42 MOV42 INS42 INS42 MOV43 INS32 UPD42 UPD42 INS42 INS42 INS27 INS32 UPD42 MOV42 UPD42 MOV42 MOV32 INS42 INS42 UPD42 DEL40 DEL26 DEL43 DEL34 DEL40 DEL32 DEL34 DEL40 DEL42 DEL43 DEL42 DEL32 DEL34 DEL42 DEL43 DEL42 DEL43 DEL42 DEL42 DEL32 DEL42 DEL43 DEL45 DEL42 DEL42 DEL42 DEL32 DEL34 DEL27 DEL42 DEL42 DEL2 DEL45 DEL42 DEL45 DEL45 DEL45 DEL42 DEL27 DEL14 DEL53 DEL42 DEL42 DEL2 DEL42 DEL34 DEL27 DEL42 DEL42 DEL2 DEL32 DEL42 DEL27 DEL27 DEL45 DEL42 DEL45 DEL42 DEL45 DEL42 DEL45 DEL42 DEL45 DEL27 DEL14 DEL53 DEL8 DEL44 DEL42 DEL43 DEL60 DEL42 DEL42 DEL42 DEL32 DEL38 DEL43 DEL45 DEL14 DEL53 DEL8 DEL25 DEL8 DEL70 DEL42 DEL42 DEL40 DEL32 DEL21 DEL8 DEL70 DEL8 DEL25 DEL39 DEL42 DEL32 DEL59 DEL60 DEL83 DEL42 DEL43 DEL42 DEL32 DEL59 DEL60 DEL83 DEL39 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL39 DEL42 DEL9 DEL59 DEL60 DEL39 DEL59 DEL58 DEL42 DEL40 DEL27 DEL42 DEL37 DEL42 DEL40 DEL34 DEL27 DEL27 DEL42 DEL9 DEL7 DEL21 DEL25 DEL83 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL42 DEL32 DEL59 DEL60 DEL83 DEL43 DEL85 DEL5 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL39 DEL42 DEL40 DEL34 DEL27 DEL59 DEL60 DEL42 DEL42 DEL40 DEL34 DEL27 DEL7 DEL21 DEL25 DEL42 DEL42 DEL42 DEL32 DEL21 DEL8 DEL24 DEL8 DEL54 DEL42 DEL42 DEL42 DEL32 DEL41 DEL8 DEL31 DEL42 DEL66 DEL65 DEL42 DEL66 DEL65 DEL42 DEL43 DEL42 DEL83 DEL42 DEL42 DEL42 DEL42 DEL9 DEL32 DEL59 DEL60 DEL42 DEL42 DEL2 DEL42 DEL42 DEL2 DEL32 DEL7 DEL83 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL83 DEL42 DEL40 DEL3 DEL59 DEL60 DEL39 DEL42 DEL34 DEL59 DEL58 DEL42 DEL40 DEL27 DEL42 DEL37 DEL83 DEL60 DEL83 DEL39 DEL42 DEL59 DEL60 DEL42 DEL42 DEL42 DEL32 DEL45 DEL42 DEL42 DEL2 DEL45 DEL42 DEL27 DEL14 DEL53 DEL8 DEL25 DEL42 DEL42 DEL32 DEL32 DEL32 DEL11 DEL36 DEL32 DEL34 DEL27 DEL27 DEL45 DEL42 DEL42 DEL2 DEL45 DEL27 DEL14 DEL53 DEL8 DEL25 DEL8 DEL24 DEL42 DEL33 DEL27 DEL18 DEL25 DEL42 DEL32 DEL21 DEL42 DEL34

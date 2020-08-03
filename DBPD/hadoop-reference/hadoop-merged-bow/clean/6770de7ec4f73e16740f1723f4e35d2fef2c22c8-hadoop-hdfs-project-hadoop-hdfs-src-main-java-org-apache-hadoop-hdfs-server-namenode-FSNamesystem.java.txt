@@ -1,0 +1,220 @@
+HDFS-4645.  Move from randomly generated block ID to sequentially generated block ID.  Contributed by Arpit Agarwal
+
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/trunk@1500580 13f79535-47bb-0310-9956-ffa450edef68
+
+-import org.apache.hadoop.hdfs.server.blockmanagement.BlockInfo;
+-import org.apache.hadoop.hdfs.server.blockmanagement.BlockInfoUnderConstruction;
+-import org.apache.hadoop.hdfs.server.blockmanagement.BlockManager;
+-import org.apache.hadoop.hdfs.server.blockmanagement.DatanodeDescriptor;
+-import org.apache.hadoop.hdfs.server.blockmanagement.DatanodeManager;
+-import org.apache.hadoop.hdfs.server.blockmanagement.DatanodeStatistics;
++import org.apache.hadoop.hdfs.server.blockmanagement.*;
+-   * The global generation stamp for this file system. 
++   * The global generation stamp for legacy blocks with randomly
++   * generated block IDs.
+-  private final GenerationStamp generationStamp = new GenerationStamp();
++  private final GenerationStamp generationStampV1 = new GenerationStamp();
++
++  /**
++   * The global generation stamp for this file system.
++   */
++  private final GenerationStamp generationStampV2 = new GenerationStamp();
++
++  /**
++   * The value of the generation stamp when the first switch to sequential
++   * block IDs was made. Blocks with generation stamps below this value
++   * have randomly allocated block IDs. Blocks with generation stamps above
++   * this value had sequentially allocated block IDs. Read from the fsImage
++   * (or initialized as an offset from the V1 (legacy) generation stamp on
++   * upgrade).
++   */
++  private long generationStampV1Limit =
++      GenerationStamp.GRANDFATHER_GENERATION_STAMP;
++
++  /**
++   * The global block ID space for this file system.
++   */
++  @VisibleForTesting
++  private final SequentialBlockIdGenerator blockIdGenerator;
+-    generationStamp.setCurrentValue(GenerationStamp.LAST_RESERVED_STAMP);
++    generationStampV1.setCurrentValue(GenerationStamp.LAST_RESERVED_STAMP);
++    generationStampV2.setCurrentValue(GenerationStamp.LAST_RESERVED_STAMP);
++    blockIdGenerator.setCurrentValue(
++        SequentialBlockIdGenerator.LAST_RESERVED_BLOCK_ID);
++    generationStampV1Limit = GenerationStamp.GRANDFATHER_GENERATION_STAMP;
+-
+-   * @param fnImage The FSImage to associate with
++   *
++   * @param fsImage The FSImage to associate with
++      this.blockIdGenerator = new SequentialBlockIdGenerator(this.blockManager);
+-    Block b = new Block(getFSImage().getUniqueBlockId(), 0, 0); 
++    Block b = new Block(nextBlockId(), 0, 0);
+-    b.setGenerationStamp(nextGenerationStamp());
++    b.setGenerationStamp(nextGenerationStamp(false));
+-      long blockRecoveryId = nextGenerationStamp();
++      long blockRecoveryId = nextGenerationStamp(isLegacyBlock(uc));
+-   * Sets the generation stamp for this filesystem
++   * Sets the current generation stamp for legacy blocks
+-  void setGenerationStamp(long stamp) {
+-    generationStamp.setCurrentValue(stamp);
++  void setGenerationStampV1(long stamp) {
++    generationStampV1.setCurrentValue(stamp);
+-   * Gets the generation stamp for this filesystem
++   * Gets the current generation stamp for legacy blocks
+-  long getGenerationStamp() {
+-    return generationStamp.getCurrentValue();
++  long getGenerationStampV1() {
++    return generationStampV1.getCurrentValue();
++  }
++
++  /**
++   * Gets the current generation stamp for this filesystem
++   */
++  void setGenerationStampV2(long stamp) {
++    generationStampV2.setCurrentValue(stamp);
++  }
++
++  /**
++   * Gets the current generation stamp for this filesystem
++   */
++  long getGenerationStampV2() {
++    return generationStampV2.getCurrentValue();
++  }
++
++  /**
++   * Upgrades the generation stamp for the filesystem
++   * by reserving a sufficient range for all existing blocks.
++   * Should be invoked only during the first upgrade to
++   * sequential block IDs.
++   */
++  long upgradeGenerationStampToV2() {
++    Preconditions.checkState(generationStampV2.getCurrentValue() ==
++        GenerationStamp.LAST_RESERVED_STAMP);
++
++    generationStampV2.skipTo(
++        generationStampV1.getCurrentValue() +
++        HdfsConstants.RESERVED_GENERATION_STAMPS_V1);
++
++    generationStampV1Limit = generationStampV2.getCurrentValue();
++    return generationStampV2.getCurrentValue();
++  }
++
++  /**
++   * Sets the generation stamp that delineates random and sequentially
++   * allocated block IDs.
++   * @param stamp
++   */
++  void setGenerationStampV1Limit(long stamp) {
++    Preconditions.checkState(generationStampV1Limit ==
++                             GenerationStamp.GRANDFATHER_GENERATION_STAMP);
++    generationStampV1Limit = stamp;
++  }
++
++  /**
++   * Gets the value of the generation stamp that delineates sequential
++   * and random block IDs.
++   */
++  long getGenerationStampAtblockIdSwitch() {
++    return generationStampV1Limit;
++  }
++
++  @VisibleForTesting
++  SequentialBlockIdGenerator getBlockIdGenerator() {
++    return blockIdGenerator;
++  }
++
++  /**
++   * Sets the maximum allocated block ID for this filesystem. This is
++   * the basis for allocating new block IDs.
++   */
++  void setLastAllocatedBlockId(long blockId) {
++    blockIdGenerator.skipTo(blockId);
++  }
++
++  /**
++   * Gets the maximum sequentially allocated block ID for this filesystem
++   */
++  long getLastAllocatedBlockId() {
++    return blockIdGenerator.getCurrentValue();
+-  private long nextGenerationStamp() throws SafeModeException {
++  long nextGenerationStamp(boolean legacyBlock)
++      throws IOException, SafeModeException {
+-    final long gs = generationStamp.nextValue();
+-    getEditLog().logGenerationStamp(gs);
++
++    long gs;
++    if (legacyBlock) {
++      gs = getNextGenerationStampV1();
++      getEditLog().logGenerationStampV1(gs);
++    } else {
++      gs = getNextGenerationStampV2();
++      getEditLog().logGenerationStampV2(gs);
++    }
++
++  @VisibleForTesting
++  long getNextGenerationStampV1() throws IOException {
++    long genStampV1 = generationStampV1.nextValue();
++
++    if (genStampV1 >= generationStampV1Limit) {
++      // We ran out of generation stamps for legacy blocks. In practice, it
++      // is extremely unlikely as we reserved 1T v1 generation stamps. The
++      // result is that we can no longer append to the legacy blocks that
++      // were created before the upgrade to sequential block IDs.
++      throw new OutOfV1GenerationStampsException();
++    }
++
++    return genStampV1;
++  }
++
++  @VisibleForTesting
++  long getNextGenerationStampV2() {
++    return generationStampV2.nextValue();
++  }
++
++  long getGenerationStampV1Limit() {
++    return generationStampV1Limit;
++  }
++
++  /**
++   * Determine whether the block ID was randomly generated (legacy) or
++   * sequentially generated. The generation stamp value is used to
++   * make the distinction.
++   * @param block
++   * @return true if the block ID was randomly generated, false otherwise.
++   */
++  boolean isLegacyBlock(Block block) {
++    return block.getGenerationStamp() < getGenerationStampV1Limit();
++  }
++
++  /**
++   * Increments, logs and then returns the block ID
++   */
++  private long nextBlockId() throws SafeModeException {
++    assert hasWriteLock();
++    if (isInSafeMode()) {
++      throw new SafeModeException(
++          "Cannot get next block ID", safeMode);
++    }
++    final long blockId = blockIdGenerator.nextValue();
++    getEditLog().logAllocateBlockId(blockId);
++    // NB: callers sync the log
++    return blockId;
++  }
++
+-      block.setGenerationStamp(nextGenerationStamp());
++      block.setGenerationStamp(
++          nextGenerationStamp(isLegacyBlock(block.getLocalBlock())));
+-   * @param oldblock and old block
++   * @param oldBlock and old block
+-  public boolean isGenStampInFuture(long genStamp) {
+-    return (genStamp > getGenerationStamp());
++  public boolean isGenStampInFuture(Block block) {
++    if (isLegacyBlock(block)) {
++      return block.getGenerationStamp() > getGenerationStampV1();
++    } else {
++      return block.getGenerationStamp() > getGenerationStampV2();
++    }
++
+
+UPD40 INS23 INS23 INS23 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS29 INS83 INS83 INS43 INS59 INS29 INS83 INS39 INS59 INS29 INS78 INS83 INS83 INS43 INS59 MOV65 INS29 INS39 INS42 MOV44 INS8 INS29 INS39 INS42 INS8 UPD42 INS44 UPD42 INS29 INS39 INS42 INS8 INS29 INS39 INS42 INS44 INS8 INS29 INS39 INS42 INS8 INS78 INS43 INS42 INS8 INS29 INS39 INS42 INS44 INS8 INS29 INS39 INS42 INS8 INS44 INS43 INS78 INS39 INS42 INS43 INS8 INS78 INS39 INS42 INS8 INS39 INS42 INS8 INS29 INS39 INS42 INS44 INS8 INS29 INS83 INS39 INS42 INS43 INS8 INS8 INS65 INS42 INS42 INS14 UPD42 INS65 INS42 INS40 INS65 INS42 INS42 INS42 INS21 INS21 INS21 INS65 INS21 INS65 INS41 INS39 INS42 INS65 INS21 INS21 INS21 INS41 INS65 INS65 INS39 INS42 INS21 INS21 INS65 INS41 INS42 INS42 INS41 INS65 INS39 INS42 INS21 INS65 INS41 INS39 INS42 INS42 INS60 INS25 INS42 INS42 INS60 INS25 INS41 INS42 INS41 INS41 INS65 INS65 INS65 INS43 INS42 INS41 INS65 INS42 INS6 INS25 INS60 INS21 INS41 INS43 INS42 INS25 INS66 INS66 INS43 UPD66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS32 INS32 INS7 UPD42 MOV43 INS66 INS32 INS66 INS32 UPD66 UPD66 INS66 INS66 INS66 INS66 INS32 INS32 INS7 INS32 INS66 INS66 INS42 INS32 INS7 INS66 INS66 INS42 INS42 INS66 INS66 INS32 INS66 INS32 MOV39 INS59 INS42 INS8 INS8 INS39 INS59 INS27 INS8 INS42 INS32 INS42 INS66 INS66 INS66 INS42 INS66 INS42 INS27 INS66 INS32 INS32 INS8 INS83 INS39 INS59 INS32 INS42 UPD42 INS42 INS32 INS8 INS8 INS42 UPD42 INS42 INS42 INS40 INS42 INS42 INS40 INS42 INS40 INS21 INS42 INS42 INS42 INS42 INS42 UPD42 UPD42 INS42 INS42 INS27 INS42 INS42 INS27 INS42 INS32 INS42 INS42 INS42 INS42 INS27 INS42 INS42 INS42 INS42 INS42 INS42 INS42 MOV42 INS21 MOV21 INS21 INS21 INS42 INS32 INS42 INS42 INS53 INS42 INS42 INS32 INS32 INS42 INS42 INS53 INS42 INS32 INS32 INS42 INS42 INS42 INS42 MOV41 INS41 INS7 MOV43 INS9 INS32 INS40 INS32 INS40 INS42 INS42 INS42 INS40 INS7 INS7 INS32 INS42 INS42 INS14 INS42 INS42 INS42 INS14 INS42 INS42 INS42 INS27 INS27 INS22 INS14 UPD42 INS32 INS42 INS42 INS42 INS42 INS42 INS32 UPD42 INS42 INS32 INS32 UPD42 MOV42 UPD42 MOV42 INS43 INS43 INS45 INS42 INS32 MOV32 INS32 INS32 INS52 INS42 INS43 INS22 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS42 UPD42 INS42 INS42 INS42 INS42 INS52 INS42 INS42 INS32 INS42 INS42 DEL40 DEL26 DEL40 DEL26 DEL40 DEL26 DEL40 DEL26 DEL40 DEL26 DEL42 DEL32 DEL83 DEL83 DEL32 DEL59 DEL60 DEL39 DEL42 DEL42 DEL27 DEL36 DEL8

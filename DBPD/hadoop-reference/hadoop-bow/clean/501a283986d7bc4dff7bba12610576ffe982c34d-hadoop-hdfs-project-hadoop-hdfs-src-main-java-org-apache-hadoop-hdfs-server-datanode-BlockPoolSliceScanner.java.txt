@@ -1,0 +1,456 @@
+HDFS-3056.  Add a new interface RollingLogs for DataBlockScanner logging.
+
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/trunk@1299139 13f79535-47bb-0310-9956-ffa450edef68
+
+-import java.io.BufferedReader;
+-import java.io.Closeable;
+-import java.io.File;
+-import java.io.FileOutputStream;
+-import java.io.FileReader;
+-import java.io.PrintStream;
++import java.util.Map;
++import java.util.SortedSet;
++import java.util.concurrent.atomic.AtomicInteger;
++import java.util.concurrent.atomic.AtomicLong;
++  private static final String DATA_FORMAT = "yyyy-MM-dd HH:mm:ss,SSS";
++
+-  
+-  static final long DEFAULT_SCAN_PERIOD_HOURS = 21*24L; // three weeks
+-  private final String blockPoolId;
+-  
+-  private static final String dateFormatString = "yyyy-MM-dd HH:mm:ss,SSS";
+-  
+-  static final String verificationLogFile = "dncp_block_verification.log";
+-  static final int verficationLogLimit = 5; // * numBlocks.
++  private static final long DEFAULT_SCAN_PERIOD_HOURS = 21*24L; // three weeks
+-  private long scanPeriod = DEFAULT_SCAN_PERIOD_HOURS * 3600 * 1000;
+-  private DataNode datanode;
++  private static final String VERIFICATION_PREFIX = "dncp_block_verification.log";
++
++  private final String blockPoolId;
++  private final long scanPeriod;
++  private final AtomicLong lastScanTime = new AtomicLong();
++
++  private final DataNode datanode;
+-  // sorted set
+-  private TreeSet<BlockScanInfo> blockInfoSet;
+-  private HashMap<Block, BlockScanInfo> blockMap;
++  private final SortedSet<BlockScanInfo> blockInfoSet
++      = new TreeSet<BlockScanInfo>();
++  private final Map<Block, BlockScanInfo> blockMap
++      = new HashMap<Block, BlockScanInfo>();
+-  private HashMap<Long, Integer> processedBlocks;
++  private volatile HashMap<Long, Integer> processedBlocks;
+-  private long totalBlocksScannedInLastRun = 0; // Used for test only
++  private final AtomicInteger totalBlocksScannedInLastRun = new AtomicInteger(); // Used for test only
+-  private LogFileHandler verificationLog;
++  private final LogFileHandler verificationLog;
+-  private DataTransferThrottler throttler = null;
++  private final DataTransferThrottler throttler = new DataTransferThrottler(
++       200, MAX_SCAN_RATE);
+-  BlockPoolSliceScanner(DataNode datanode,
++  BlockPoolSliceScanner(String bpid, DataNode datanode,
+-      Configuration conf, String bpid) {
++      Configuration conf) {
+-    scanPeriod = conf.getInt(DFSConfigKeys.DFS_DATANODE_SCAN_PERIOD_HOURS_KEY, 
++    
++    long hours = conf.getInt(DFSConfigKeys.DFS_DATANODE_SCAN_PERIOD_HOURS_KEY, 
+-    if ( scanPeriod <= 0 ) {
+-      scanPeriod = DEFAULT_SCAN_PERIOD_HOURS;
++    if (hours <= 0) {
++      hours = DEFAULT_SCAN_PERIOD_HOURS;
+-    scanPeriod *= 3600 * 1000;
+-    LOG.info("Periodic Block Verification scan initialized with interval " + scanPeriod + ".");
++    this.scanPeriod = hours * 3600 * 1000;
++    LOG.info("Periodic Block Verification Scanner initialized with interval "
++        + hours + " hours for block pool " + bpid + ".");
++
++    // get the list of blocks and arrange them in random order
++    List<Block> arr = dataset.getFinalizedBlocks(blockPoolId);
++    Collections.shuffle(arr);
++    
++    long scanTime = -1;
++    for (Block block : arr) {
++      BlockScanInfo info = new BlockScanInfo( block );
++      info.lastScanTime = scanTime--; 
++      //still keep 'info.lastScanType' to NONE.
++      addBlockInfo(info);
++    }
++
++    RollingLogs rollingLogs = null;
++    try {
++       rollingLogs = dataset.createRollingLogs(blockPoolId, VERIFICATION_PREFIX);
++    } catch (IOException e) {
++      LOG.warn("Could not open verfication log. " +
++               "Verification times are not stored.");
++    }
++    verificationLog = rollingLogs == null? null: new LogFileHandler(rollingLogs);
+-  synchronized boolean isInitialized() {
+-    return throttler != null;
+-  }
+-  
+-  void init() throws IOException {
+-    // get the list of blocks and arrange them in random order
+-    List<Block> arr = dataset.getFinalizedBlocks(blockPoolId);
+-    Collections.shuffle(arr);
+-    
+-    blockInfoSet = new TreeSet<BlockScanInfo>();
+-    blockMap = new HashMap<Block, BlockScanInfo>();
+-    
+-    long scanTime = -1;
+-    for (Block block : arr) {
+-      BlockScanInfo info = new BlockScanInfo( block );
+-      info.lastScanTime = scanTime--; 
+-      //still keep 'info.lastScanType' to NONE.
+-      addBlockInfo(info);
+-    }
+-
+-    /* Pick the first directory that has any existing scanner log.
+-     * otherwise, pick the first directory.
+-     */
+-    File dir = null;
+-    final List<? extends FSVolumeInterface> volumes = dataset.getVolumes();
+-    for (FSVolumeInterface vol : volumes) {
+-      File bpDir = vol.getDirectory(blockPoolId);
+-      if (LogFileHandler.isFilePresent(bpDir, verificationLogFile)) {
+-        dir = bpDir;
+-        break;
+-      }
+-    }
+-    if (dir == null) {
+-      dir = volumes.get(0).getDirectory(blockPoolId);
+-    }
+-    
+-    try {
+-      // max lines will be updated later during initialization.
+-      verificationLog = new LogFileHandler(dir, verificationLogFile, 100);
+-    } catch (IOException e) {
+-      LOG.warn("Could not open verfication log. " +
+-               "Verification times are not stored.");
+-    }
+-    
+-    synchronized (this) {
+-      throttler = new DataTransferThrottler(200, MAX_SCAN_RATE);
+-    }
+-  }
+-
+-    if (!isInitialized()) {
+-      return;
+-    }
+-    
+-    if (!isInitialized()) {
+-      return;
+-    }
+-  /** @return the last scan time */
++  /** @return the last scan time for the block pool. */
++  long getLastScanTime() {
++    return lastScanTime.get();
++  }
++
++  /** @return the last scan time the given block. */
+-    if (!isInitialized()) {
+-      return 0;
+-    }
+-    if (!isInitialized()) {
+-      return;
+-    }
+-    LogFileHandler log = verificationLog;
+-    if (log != null) {
+-      log.appendLine(now, block.getGenerationStamp(), block.getBlockId());
++    if (verificationLog != null) {
++      verificationLog.append(now, block.getGenerationStamp(),
++          block.getBlockId());
++
++    static String toString(long verificationTime, long genStamp, long blockId,
++        DateFormat dateFormat) {
++      return "\ndate=\"" + dateFormat.format(new Date(verificationTime))
++          + "\"\t time=\"" + verificationTime
++          + "\"\t genstamp=\"" + genStamp
++          + "\"\t id=\"" + blockId + "\"";
++    }
++
+-  long getBlocksScannedInLastRun() {
+-    return totalBlocksScannedInLastRun;
++  int getBlocksScannedInLastRun() {
++    return totalBlocksScannedInLastRun.get();
+-    int numBlocks = 1;
+-    LogFileHandler log = null;
+-    synchronized (this) {
+-      log = verificationLog;
+-      numBlocks = Math.max(blockMap.size(), 1);
+-    }
+-
+-    long now = System.currentTimeMillis();
+-    LogFileHandler.Reader logReader[] = new LogFileHandler.Reader[2];
+-    try {
+-      if (log != null) {
+-        logReader[0] = log.getCurrentFileReader();
+-        logReader[1] = log.getPreviousFileReader();
+-      }
+-    } catch (IOException e) {
+-      LOG.warn("Could not read previous verification times", e);
+-    }
+-    
+-    try {
+-      for (LogFileHandler.Reader reader : logReader) {
+-      // update verification times from the verificationLog.
+-        while (logReader != null && reader.hasNext()) {
++    //First updates the last verification times from the log file.
++    if (verificationLog != null) {
++      long now = System.currentTimeMillis();
++      RollingLogs.LineIterator logIterator = null;
++      try {
++        logIterator = verificationLog.logs.iterator(false);
++        // update verification times from the verificationLog.
++        while (logIterator.hasNext()) {
+-          LogEntry entry = LogEntry.parseEntry(reader.next());
++          LogEntry entry = LogEntry.parseEntry(logIterator.next());
+-                if (reader.file == log.prevFile) {
++                if (logIterator.isPrevious()) {
+-                  log.appendLine(entry.verificationTime, entry.genStamp,
++                  verificationLog.append(entry.verificationTime, entry.genStamp,
++      } catch (IOException e) {
++        LOG.warn("Failed to read previous verification times.", e);
++      } finally {
++        IOUtils.closeStream(logIterator);
+-    } finally {
+-      IOUtils.closeStream(logReader[0]);
+-      IOUtils.closeStream(logReader[1]);
+-    /* Initially spread the block reads over half of 
+-     * MIN_SCAN_PERIOD so that we don't keep scanning the 
+-     * blocks too quickly when restarted.
+-     */
+-    long verifyInterval = (long) (Math.min( scanPeriod/2.0/numBlocks,
+-                                            10*60*1000 ));
+-    long lastScanTime = System.currentTimeMillis() - scanPeriod;
++      final int numBlocks = Math.max(blockMap.size(), 1);
++      // Initially spread the block reads over half of scan period
++      // so that we don't keep scanning the blocks too quickly when restarted.
++      long verifyInterval = Math.min(scanPeriod/(2L * numBlocks), 10*60*1000L);
++      long lastScanTime = System.currentTimeMillis() - scanPeriod;
++
+-
+-  static File getCurrentFile(FSVolumeInterface vol, String bpid) throws IOException {
+-    return LogFileHandler.getCurrentFile(vol.getDirectory(bpid),
+-        BlockPoolSliceScanner.verificationLogFile);
+-  }
+-    if (processedBlocks != null) {
+-      totalBlocksScannedInLastRun = processedBlocks.size();
+-    }
+-    if (verificationLog != null) {
+-      try {
+-        verificationLog.openCurFile();
+-      } catch (FileNotFoundException ex) {
+-        LOG.warn("Could not open current file");
+-      }
+-    }
+-    scan();
++    try {
++      scan();
++    } finally {
++      totalBlocksScannedInLastRun.set(processedBlocks.size());
++      lastScanTime.set(System.currentTimeMillis());
++    }
+-  public void scan() {
++  private void scan() {
+-        verificationLog.roll();
++        verificationLog.logs.roll();
+-    DateFormat dateFormat = new SimpleDateFormat(dateFormatString);
++    DateFormat dateFormat = new SimpleDateFormat(DATA_FORMAT);
+-   * times of the blocks. It rolls the current file when it is too big etc.
+-   * If there is an error while writing, it stops updating with an error
+-   * message.
++   * times of the blocks.
+-    
+-    private static final String curFileSuffix = ".curr";
+-    private static final String prevFileSuffix = ".prev";
+-    private final DateFormat dateFormat = new SimpleDateFormat(dateFormatString);
+-    
+-    static File getCurrentFile(File dir, String filePrefix) {
+-      return new File(dir, filePrefix + curFileSuffix);
+-    }
+-    
+-    public Reader getPreviousFileReader() throws IOException {
+-      return new Reader(prevFile);
+-    }
+-    
+-    public Reader getCurrentFileReader() throws IOException {
+-      return new Reader(curFile);
++    private final DateFormat dateFormat = new SimpleDateFormat(DATA_FORMAT);
++
++    private final RollingLogs logs;
++
++    private LogFileHandler(RollingLogs logs)  {
++      this.logs = logs;
+-    static boolean isFilePresent(File dir, String filePrefix) {
+-      return new File(dir, filePrefix + curFileSuffix).exists() ||
+-             new File(dir, filePrefix + prevFileSuffix).exists();
+-    }
+-    private File curFile;
+-    private File prevFile;
+-    
+-    private PrintStream out;
+-        
+-    /**
+-     * Opens the log file for appending.
+-     * Note that rolling will happen only after "updateLineCount()" is 
+-     * called. This is so that line count could be updated in a separate
+-     * thread without delaying start up.
+-     * 
+-     * @param dir where the logs files are located.
+-     * @param filePrefix prefix of the file.
+-     * @param maxNumLines max lines in a file (its a soft limit).
+-     * @throws IOException
+-     */
+-    LogFileHandler(File dir, String filePrefix, int maxNumLines) 
+-                                                throws IOException {
+-      curFile = new File(dir, filePrefix + curFileSuffix);
+-      prevFile = new File(dir, filePrefix + prevFileSuffix);
+-    }
+-    
+-    /**
+-     * Append "\n" + line.
+-     * If the log file need to be rolled, it will done after 
+-     * appending the text.
+-     * This does not throw IOException when there is an error while 
+-     * appending. Currently does not throw an error even if rolling 
+-     * fails (may be it should?).
+-     * return true if append was successful.
+-     */
+-    synchronized boolean appendLine(String line) {
+-      if (out == null) {
+-        return false;
++    void append(long verificationTime, long genStamp, long blockId) {
++      final String m = LogEntry.toString(verificationTime, genStamp, blockId,
++          dateFormat);
++      try {
++        logs.appender().append(m);
++      } catch (IOException e) {
++        LOG.warn("Failed to append to " + logs + ", m=" + m, e);
+-      out.println();
+-      out.print(line);
+-      return true;
+-    
+-    boolean appendLine(long verificationTime, long genStamp, long blockId) {
+-      return appendLine("date=\""
+-          + dateFormat.format(new Date(verificationTime)) + "\"\t " + "time=\""
+-          + verificationTime + "\"\t " + "genstamp=\"" + genStamp + "\"\t "
+-          + "id=\"" + blockId + "\"");
+-    }
+-    
+-    private synchronized void openCurFile() throws FileNotFoundException {
+-      close();
+-      out = new PrintStream(new FileOutputStream(curFile, true));
+-    }
+-    
+-    private void roll() throws IOException {
+-      if (LOG.isDebugEnabled()) {
+-        LOG.debug("Rolling current file: " + curFile.getAbsolutePath()
+-            + " to previous file: " + prevFile.getAbsolutePath());
+-      }
+-      if (!prevFile.delete() && prevFile.exists()) {
+-        throw new IOException("Could not delete " + prevFile);
+-      }
+-      
+-      close();
+-
+-      if (!curFile.renameTo(prevFile)) {
+-        throw new IOException("Could not rename " + curFile + 
+-                              " to " + prevFile);
++    void close() {
++      try {
++        logs.appender().close();
++      } catch (IOException e) {
++        LOG.warn("Failed to close the appender of " + logs, e);
+-    
+-    synchronized void close() {
+-      if (out != null) {
+-        out.close();
+-        out = null;
+-      }
+-    }
+-    
+-    /**
+-     * This is used to read the lines in order.
+-     * If the data is not read completely (i.e, untill hasNext() returns
+-     * false), it needs to be explicitly 
+-     */
+-    private static class Reader implements Iterator<String>, Closeable {
+-      
+-      BufferedReader reader;
+-      File file;
+-      String line;
+-      boolean closed = false;
+-      
+-      private Reader(File file) throws IOException {
+-        reader = null;
+-        this.file = file;
+-        readNext();        
+-      }
+-      
+-      private boolean openFile() throws IOException {
+-        if (file == null) {
+-          return false;
+-        }       
+-        if (reader != null ) {
+-          reader.close();
+-          reader = null;
+-        }
+-        if (file.exists()) {
+-          reader = new BufferedReader(new FileReader(file));
+-          return true;
+-        } else {
+-          return false;
+-        }
+-      }
+-      
+-      // read next line if possible.
+-      private void readNext() throws IOException {
+-        line = null;
+-        if (reader == null) {
+-          openFile();
+-        }
+-        try {
+-          if (reader != null && (line = reader.readLine()) != null) {
+-            return;
+-          }
+-        } finally {
+-          if (!hasNext()) {
+-            close();
+-          }
+-        }
+-      }
+-      
+-      public boolean hasNext() {
+-        return line != null;
+-      }
+-
+-      public String next() {
+-        String curLine = line;
+-        try {
+-          readNext();
+-        } catch (IOException e) {
+-          LOG.info("Could not read next line in LogHandler", e);
+-        }
+-        return curLine;
+-      }
+-
+-      public void remove() {
+-        throw new RuntimeException("remove() is not supported.");
+-      }
+-
+-      public void close() throws IOException {
+-        if (!closed) {
+-          try {
+-            if (reader != null) {
+-              reader.close();
+-            }
+-          } finally {
+-            file = null;
+-            reader = null;
+-            closed = true;
+-          }
+-        }
+-      }
+-    } 

@@ -1,0 +1,253 @@
+HDFS-9390. Block management for maintenance states.
+
++ * For block state management, it tries to maintain the  safety
++ * property of "# of live replicas == # of expected redundancy" under
++ * any events such as decommission, namenode failover, datanode failure.
++ *
++ * The motivation of maintenance mode is to allow admins quickly repair nodes
++ * without paying the cost of decommission. Thus with maintenance mode,
++ * # of live replicas doesn't have to be equal to # of expected redundancy.
++ * If any of the replica is in maintenance mode, the safety property
++ * is extended as follows. These property still apply for the case of zero
++ * maintenance replicas, thus we can use these safe property for all scenarios.
++ * a. # of live replicas >= # of min replication for maintenance.
++ * b. # of live replicas <= # of expected redundancy.
++ * c. # of live replicas and maintenance replicas >= # of expected redundancy.
++ *
++ * For regular replication, # of min live replicas for maintenance is determined
++ * by DFS_NAMENODE_MAINTENANCE_REPLICATION_MIN_KEY. This number has to <=
++ * DFS_NAMENODE_REPLICATION_MIN_KEY.
++ * For erasure encoding, # of min live replicas for maintenance is
++ * BlockInfoStriped#getRealDataBlockNum.
++ *
++ * Another safety property is to satisfy the block placement policy. While the
++ * policy is configurable, the replicas the policy is applied to are the live
++ * replicas + maintenance replicas.
++  /** Minimum live replicas needed for the datanode to be transitioned
++   * from ENTERING_MAINTENANCE to IN_MAINTENANCE.
++   */
++  private final short minReplicationToBeInMaintenance;
++
+-    this.defaultReplication = conf.getInt(DFSConfigKeys.DFS_REPLICATION_KEY, 
+-                                          DFSConfigKeys.DFS_REPLICATION_DEFAULT);
++    this.defaultReplication = conf.getInt(DFSConfigKeys.DFS_REPLICATION_KEY,
++        DFSConfigKeys.DFS_REPLICATION_DEFAULT);
+-    final int maxR = conf.getInt(DFSConfigKeys.DFS_REPLICATION_MAX_KEY, 
+-                                 DFSConfigKeys.DFS_REPLICATION_MAX_DEFAULT);
++    final int maxR = conf.getInt(DFSConfigKeys.DFS_REPLICATION_MAX_KEY,
++        DFSConfigKeys.DFS_REPLICATION_MAX_DEFAULT);
+-                                 DFSConfigKeys.DFS_NAMENODE_REPLICATION_MIN_DEFAULT);
++        DFSConfigKeys.DFS_NAMENODE_REPLICATION_MIN_DEFAULT);
+-    this.replicationRecheckInterval = 
++    this.replicationRecheckInterval =
+-    
++
++
++    final int minMaintenanceR = conf.getInt(
++        DFSConfigKeys.DFS_NAMENODE_MAINTENANCE_REPLICATION_MIN_KEY,
++        DFSConfigKeys.DFS_NAMENODE_MAINTENANCE_REPLICATION_MIN_DEFAULT);
++
++    if (minMaintenanceR < 0) {
++      throw new IOException("Unexpected configuration parameters: "
++          + DFSConfigKeys.DFS_NAMENODE_MAINTENANCE_REPLICATION_MIN_KEY
++          + " = " + minMaintenanceR + " < 0");
++    }
++    if (minMaintenanceR > minR) {
++      throw new IOException("Unexpected configuration parameters: "
++          + DFSConfigKeys.DFS_NAMENODE_MAINTENANCE_REPLICATION_MIN_KEY
++          + " = " + minMaintenanceR + " > "
++          + DFSConfigKeys.DFS_NAMENODE_REPLICATION_MIN_KEY
++          + " = " + minR);
++    }
++    this.minReplicationToBeInMaintenance = (short)minMaintenanceR;
++
+-  
++
+-    out.print(block + ((usableReplicas > 0)? "" : " MISSING") + 
++    out.print(block + ((usableReplicas > 0)? "" : " MISSING") +
+-              " e: " + numReplicas.excessReplicas() + ") "); 
++              " e: " + numReplicas.excessReplicas() + ") ");
++  public short getMinReplicationToBeInMaintenance() {
++    return minReplicationToBeInMaintenance;
++  }
++
++  private short getMinMaintenanceStorageNum(BlockInfo block) {
++    if (block.isStriped()) {
++      return ((BlockInfoStriped) block).getRealDataBlockNum();
++    } else {
++      return minReplicationToBeInMaintenance;
++    }
++  }
++
+-        replicas.decommissionedAndDecommissioning(), getRedundancy(lastBlock));
++        replicas.outOfServiceReplicas(), getExpectedRedundancyNum(lastBlock));
+-    final int numMachines = isCorrupt ? numNodes: numNodes - numCorruptReplicas;
++    int numMachines = isCorrupt ? numNodes: numNodes - numCorruptReplicas;
++    numMachines -= numReplicas.maintenanceNotForReadReplicas();
++          final DatanodeDescriptor d = storage.getDatanodeDescriptor();
++          // Don't pick IN_MAINTENANCE or dead ENTERING_MAINTENANCE states.
++          if (d.isInMaintenance()
++              || (d.isEnteringMaintenance() && !d.isAlive())) {
++            continue;
++          }
++
+-            final DatanodeDescriptor d = storage.getDatanodeDescriptor();
+-      "isCorrupt: " + isCorrupt + 
++      "isCorrupt: " + isCorrupt +
++  // Check if the number of live + pending replicas satisfies
++  // the expected redundancy.
+-      NumberReplicas numReplicas, int pendingReplicaNum, int required) {
++      NumberReplicas numReplicas, int pendingReplicaNum) {
++    int required = getExpectedLiveRedundancyNum(block, numReplicas);
+-    short requiredRedundancy = getExpectedRedundancyNum(block);
+-
++    short requiredRedundancy = getExpectedLiveRedundancyNum(block,
++        numReplicas);
+-    if (hasEnoughEffectiveReplicas(block, numReplicas, pendingNum,
+-        requiredRedundancy)) {
++    if (hasEnoughEffectiveReplicas(block, numReplicas, pendingNum)) {
+-      if (additionalReplRequired - numReplicas.decommissioning() > 0) {
+-        additionalReplRequired = additionalReplRequired
+-            - numReplicas.decommissioning();
++      if (additionalReplRequired - numReplicas.decommissioning() -
++          numReplicas.liveEnteringMaintenanceReplicas() > 0) {
++        additionalReplRequired = additionalReplRequired -
++            numReplicas.decommissioning() -
++            numReplicas.liveEnteringMaintenanceReplicas();
+-    final short requiredRedundancy = getExpectedRedundancyNum(block);
++    final short requiredRedundancy =
++        getExpectedLiveRedundancyNum(block, numReplicas);
+-    if (hasEnoughEffectiveReplicas(block, numReplicas, pendingNum,
+-        requiredRedundancy)) {
++    if (hasEnoughEffectiveReplicas(block, numReplicas, pendingNum)) {
+-   *      Set, long, List, BlockStoragePolicy)
++   *      Set, long, List, BlockStoragePolicy, EnumSet)
+-      // never use already decommissioned nodes or unknown state replicas
+-      if (state == null || state == StoredReplicaState.DECOMMISSIONED) {
++      // never use already decommissioned nodes, maintenance node not
++      // suitable for read or unknown state replicas.
++      if (state == null || state == StoredReplicaState.DECOMMISSIONED
++          || state == StoredReplicaState.MAINTENANCE_NOT_FOR_READ) {
+-          && !node.isDecommissionInProgress() 
++          && (!node.isDecommissionInProgress() && !node.isEnteringMaintenance())
+-          if (isNeededReconstruction(bi, num.liveReplicas())) {
++          if (isNeededReconstruction(bi, num)) {
+-                num.readOnlyReplicas(), num.decommissionedAndDecommissioning(),
+-                getRedundancy(bi));
++                num.readOnlyReplicas(), num.outOfServiceReplicas(),
++                getExpectedRedundancyNum(bi));
+-    if (!isNeededReconstruction(storedBlock, numCurrentReplica)) {
++    if (!isNeededReconstruction(storedBlock, num, pendingNum)) {
+-          num.readOnlyReplicas(),
+-          num.decommissionedAndDecommissioning(), fileRedundancy);
++          num.readOnlyReplicas(), num.outOfServiceReplicas(), fileRedundancy);
++  // If there is any maintenance replica, we don't have to restore
++  // the condition of live + maintenance == expected. We allow
++  // live + maintenance >= expected. The extra redundancy will be removed
++  // when the maintenance node changes to live.
+-    if (isNeededReconstruction(block, numCurrentReplica)) {
++    if (isNeededReconstruction(block, num)) {
+-          num.readOnlyReplicas(), num.decommissionedAndDecommissioning(),
++          num.readOnlyReplicas(), num.outOfServiceReplicas(),
++    NumberReplicas num = countNodes(b);
+-
+-    if (oldRepl > newRepl) {
++    if (shouldProcessExtraRedundancy(num, newRepl)) {
+-        LOG.trace("BLOCK* processOverReplicatedBlock: Postponing {}"
++        LOG.trace("BLOCK* processExtraRedundancyBlock: Postponing {}"
+-        if (!cur.isDecommissionInProgress() && !cur.isDecommissioned()) {
++        if (cur.isInService()) {
+-  private NumberReplicas countNodes(BlockInfo b, boolean inStartupSafeMode) {
++  NumberReplicas countNodes(BlockInfo b, boolean inStartupSafeMode) {
++      } else if (node.isMaintenance()) {
++        if (node.isInMaintenance() || !node.isAlive()) {
++          s = StoredReplicaState.MAINTENANCE_NOT_FOR_READ;
++        } else {
++          s = StoredReplicaState.MAINTENANCE_FOR_READ;
++        }
+-   * On stopping decommission, check if the node has excess replicas.
++   * On putting the node in service, check if the node has excess replicas.
+-  void processExtraRedundancyBlocksOnReCommission(
++  void processExtraRedundancyBlocksOnInService(
+-      int expectedReplication = this.getRedundancy(block);
++      int expectedReplication = this.getExpectedRedundancyNum(block);
+-        + " extra redundancy blocks on " + srcNode + " during recommissioning");
++        + " extra redundancy blocks on " + srcNode + " after it is in service");
+-   * Returns whether a node can be safely decommissioned based on its 
+-   * liveness. Dead nodes cannot always be safely decommissioned.
++   * Returns whether a node can be safely decommissioned or in maintenance
++   * based on its liveness. Dead nodes cannot always be safely decommissioned
++   * or in maintenance.
+-  boolean isNodeHealthyForDecommission(DatanodeDescriptor node) {
++  boolean isNodeHealthyForDecommissionOrMaintenance(DatanodeDescriptor node) {
+-          " blocks or blocks pending reconstruction. Safe to decommission.",
+-          node);
++          " blocks or blocks pending reconstruction. Safe to decommission or",
++          " put in maintenance.", node);
+-        "while decommission is in progress. Cannot be safely " +
+-        "decommissioned since there is risk of reduced " +
+-        "data durability or data loss. Either restart the failed node or" +
+-        " force decommissioning by removing, calling refreshNodes, " +
+-        "then re-adding to the excludes files.", node);
++        "while in {}. Cannot be safely " +
++        "decommissioned or be in maintenance since there is risk of reduced " +
++        "data durability or data loss. Either restart the failed node or " +
++        "force decommissioning or maintenance by removing, calling " +
++        "refreshNodes, then re-adding to the excludes or host config files.",
++        node, node.getAdminState());
+-      int curExpectedReplicas = getRedundancy(block);
+-      if (!hasEnoughEffectiveReplicas(block, repl, pendingNum,
+-          curExpectedReplicas)) {
++      int curExpectedReplicas = getExpectedRedundancyNum(block);
++      if (!hasEnoughEffectiveReplicas(block, repl, pendingNum)) {
+-            repl.readOnlyReplicas(), repl.decommissionedAndDecommissioning(),
++            repl.readOnlyReplicas(), repl.outOfServiceReplicas(),
+-            repl.decommissionedAndDecommissioning(), oldExpectedReplicas);
++            repl.outOfServiceReplicas(), oldExpectedReplicas);
+-      if (!hasEnoughEffectiveReplicas(block, n, pending, expected)) {
++      if (!hasEnoughEffectiveReplicas(block, n, pending)) {
+-            n.readOnlyReplicas(),
+-            n.decommissionedAndDecommissioning(), expected);
++            n.readOnlyReplicas(), n.outOfServiceReplicas(), expected);
+-  /** 
+-   * @return 0 if the block is not found;
+-   *         otherwise, return the replication factor of the block.
+-   */
+-  private int getRedundancy(BlockInfo block) {
+-    return getExpectedRedundancyNum(block);
+-  }
+-
++      // Nodes under maintenance should be counted as valid replicas from
++      // rack policy point of view.
++  boolean isNeededReconstructionForMaintenance(BlockInfo storedBlock,
++      NumberReplicas numberReplicas) {
++    return storedBlock.isComplete() && (numberReplicas.liveReplicas() <
++        getMinMaintenanceStorageNum(storedBlock) ||
++        !isPlacementPolicySatisfied(storedBlock));
++  }
++
++  boolean isNeededReconstruction(BlockInfo storedBlock,
++      NumberReplicas numberReplicas) {
++    return isNeededReconstruction(storedBlock, numberReplicas, 0);
++  }
++
+-  boolean isNeededReconstruction(BlockInfo storedBlock, int current) {
+-    int expected = getExpectedRedundancyNum(storedBlock);
+-    return storedBlock.isComplete()
+-        && (current < expected || !isPlacementPolicySatisfied(storedBlock));
++  boolean isNeededReconstruction(BlockInfo storedBlock,
++      NumberReplicas numberReplicas, int pending) {
++    return storedBlock.isComplete() &&
++        !hasEnoughEffectiveReplicas(storedBlock, numberReplicas, pending);
++  }
++
++  // Exclude maintenance, but make sure it has minimal live replicas
++  // to satisfy the maintenance requirement.
++  public short getExpectedLiveRedundancyNum(BlockInfo block,
++      NumberReplicas numberReplicas) {
++    final short expectedRedundancy = getExpectedRedundancyNum(block);
++    return (short)Math.max(expectedRedundancy -
++        numberReplicas.maintenanceReplicas(),
++        getMinMaintenanceStorageNum(block));
+
+INS23 INS31 INS31 INS31 INS31 INS31 INS29 INS83 INS83 INS39 INS59 INS83 INS39 INS42 INS8 INS83 INS39 UPD42 MOV42 INS44 INS8 UPD42 UPD42 INS39 INS42 INS44 INS44 MOV8 INS39 INS42 INS44 INS44 INS8 INS44 INS8 INS83 INS39 INS42 MOV44 INS44 INS8 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 UPD65 MOV65 INS42 INS60 INS25 INS25 INS21 INS41 INS43 INS42 INS25 INS21 INS60 INS60 INS60 INS60 INS43 INS42 INS43 INS42 INS43 INS42 INS43 INS42 INS41 INS43 INS42 UPD42 INS41 INS43 INS42 MOV60 INS41 UPD66 UPD66 INS83 INS39 INS59 INS27 INS8 INS27 INS8 INS7 INS42 INS42 INS32 INS8 INS8 INS7 INS39 INS59 INS39 INS59 INS83 INS39 INS59 INS43 INS59 INS32 UPD66 UPD66 UPD66 INS66 INS42 INS42 INS42 INS42 INS32 INS42 INS27 INS42 INS83 INS11 INS42 INS32 INS42 INS34 INS53 INS42 INS42 INS53 INS22 INS11 INS42 INS42 MOV41 INS41 INS42 INS32 INS42 INS32 INS42 INS32 INS42 INS32 INS69 UPD42 INS42 INS42 INS32 INS42 INS42 INS42 INS32 MOV60 INS42 INS42 INS42 INS34 INS32 INS38 UPD42 INS39 INS32 INS42 INS42 INS40 INS40 INS14 INS14 INS52 INS42 INS39 INS42 INS42 UPD42 UPD42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS43 INS27 UPD42 INS42 INS42 INS42 UPD45 UPD45 UPD45 UPD45 UPD45 UPD45 INS42 INS42 UPD39 INS42 INS42 INS32 INS42 INS42 INS27 INS32 INS43 INS27 INS43 INS27 INS36 INS42 MOV27 INS42 MOV27 INS27 INS45 UPD42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS45 INS40 INS45 INS42 INS45 INS42 INS45 INS40 INS45 INS42 INS45 INS40 INS45 INS42 INS11 INS32 INS42 INS40 INS36 UPD42 UPD42 INS32 UPD42 UPD45 INS32 INS32 INS42 INS42 INS43 INS42 MOV60 INS25 INS42 INS42 MOV27 INS27 MOV42 UPD42 MOV42 INS25 INS42 INS42 INS42 INS42 INS42 INS27 INS8 INS32 MOV38 INS38 UPD45 INS32 INS8 MOV25 UPD42 UPD42 UPD42 INS32 INS36 INS18 INS42 INS42 INS32 MOV42 INS42 INS42 INS25 INS42 INS42 INS27 INS42 INS42 INS27 INS8 INS8 INS32 INS38 INS32 INS38 INS21 INS21 INS42 INS42 INS32 UPD42 UPD42 INS42 INS42 INS32 INS7 INS7 INS42 INS42 INS42 INS42 INS42 INS40 INS42 INS40 DEL42 DEL42 DEL83 DEL39 DEL42 DEL44 DEL42 DEL42 DEL42 DEL32 DEL42 DEL42 DEL27 DEL42 DEL42 DEL32 DEL38 DEL32 DEL38 DEL27 DEL83 DEL83 DEL39 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL42 DEL29 DEL83 DEL39 DEL8 DEL31 DEL39 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL42

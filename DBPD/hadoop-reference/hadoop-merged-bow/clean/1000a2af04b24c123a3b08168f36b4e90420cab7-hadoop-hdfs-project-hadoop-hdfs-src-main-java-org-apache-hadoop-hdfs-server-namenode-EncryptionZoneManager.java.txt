@@ -1,0 +1,355 @@
+HDFS-10899. Add functionality to re-encrypt EDEKs.
+
++import java.util.ArrayList;
++import java.util.concurrent.ExecutorService;
++import java.util.concurrent.Executors;
++import java.util.concurrent.ThreadFactory;
++import com.google.common.annotations.VisibleForTesting;
++import com.google.common.util.concurrent.ThreadFactoryBuilder;
++import org.apache.hadoop.crypto.key.KeyProviderCryptoExtension;
++import org.apache.hadoop.fs.ParentNotDirectoryException;
++import org.apache.hadoop.hdfs.protocol.ReencryptionStatus;
++import org.apache.hadoop.hdfs.protocol.ZoneReencryptionStatus;
++import org.apache.hadoop.security.AccessControlException;
++import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_NAMENODE_LIST_REENCRYPTION_STATUS_NUM_RESPONSES_DEFAULT;
++import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_NAMENODE_LIST_REENCRYPTION_STATUS_NUM_RESPONSES_KEY;
+-  public static Logger LOG = LoggerFactory.getLogger(EncryptionZoneManager
++  public static final Logger LOG = LoggerFactory.getLogger(EncryptionZoneManager
++  private final int maxListRecncryptionStatusResponses;
++
++  private ThreadFactory reencryptionThreadFactory;
++  private ExecutorService reencryptHandlerExecutor;
++  private ReencryptionHandler reencryptionHandler;
++  // Reencryption status is kept here to decouple status listing (which should
++  // work as long as NN is up), with the actual handler (which only exists if
++  // keyprovider exists)
++  private final ReencryptionStatus reencryptionStatus;
++
++  public static final BatchedListEntries<ZoneReencryptionStatus> EMPTY_LIST =
++      new BatchedListEntries<>(new ArrayList<ZoneReencryptionStatus>(), false);
++
++  @VisibleForTesting
++  public void pauseReencryptForTesting() {
++    reencryptionHandler.pauseForTesting();
++  }
++
++  @VisibleForTesting
++  public void resumeReencryptForTesting() {
++    reencryptionHandler.resumeForTesting();
++  }
++
++  @VisibleForTesting
++  public void pauseForTestingAfterNthSubmission(final int count) {
++    reencryptionHandler.pauseForTestingAfterNthSubmission(count);
++  }
++
++  @VisibleForTesting
++  public void pauseReencryptUpdaterForTesting() {
++    reencryptionHandler.pauseUpdaterForTesting();
++  }
++
++  @VisibleForTesting
++  public void resumeReencryptUpdaterForTesting() {
++    reencryptionHandler.resumeUpdaterForTesting();
++  }
++
++  @VisibleForTesting
++  public void pauseForTestingAfterNthCheckpoint(final String zone,
++      final int count) throws IOException {
++    INodesInPath iip;
++    dir.readLock();
++    try {
++      iip = dir.resolvePath(dir.getPermissionChecker(), zone, DirOp.READ);
++    } finally {
++      dir.readUnlock();
++    }
++    reencryptionHandler
++        .pauseForTestingAfterNthCheckpoint(iip.getLastINode().getId(), count);
++  }
++
++  @VisibleForTesting
++  public void resetMetricsForTesting() {
++    reencryptionStatus.resetMetrics();
++  }
++
++  @VisibleForTesting
++  public ReencryptionStatus getReencryptionStatus() {
++    return reencryptionStatus;
++  }
++
++  @VisibleForTesting
++  public ZoneReencryptionStatus getZoneStatus(final String zone)
++      throws IOException {
++    final FSPermissionChecker pc = dir.getPermissionChecker();
++    final INode inode;
++    dir.getFSNamesystem().readLock();
++    dir.readLock();
++    try {
++      final INodesInPath iip = dir.resolvePath(pc, zone, DirOp.READ);
++      inode = iip.getLastINode();
++      if (inode == null) {
++        return null;
++      }
++      return getReencryptionStatus().getZoneStatus(inode.getId());
++    } finally {
++      dir.readUnlock();
++      dir.getFSNamesystem().readUnlock();
++    }
++  }
++
++  FSDirectory getFSDirectory() {
++    return dir;
++  }
++    if (getProvider() != null) {
++      reencryptionHandler = new ReencryptionHandler(this, conf);
++      reencryptionThreadFactory = new ThreadFactoryBuilder().setDaemon(true)
++          .setNameFormat("reencryptionHandlerThread #%d").build();
++    }
++    maxListRecncryptionStatusResponses =
++        conf.getInt(DFS_NAMENODE_LIST_REENCRYPTION_STATUS_NUM_RESPONSES_KEY,
++            DFS_NAMENODE_LIST_REENCRYPTION_STATUS_NUM_RESPONSES_DEFAULT);
++    Preconditions.checkArgument(maxListRecncryptionStatusResponses >= 0,
++        DFS_NAMENODE_LIST_REENCRYPTION_STATUS_NUM_RESPONSES_KEY +
++            " must be a positive integer."
++    );
++    reencryptionStatus = new ReencryptionStatus();
++  }
++
++  KeyProviderCryptoExtension getProvider() {
++    return dir.getProvider();
++  }
++
++  void startReencryptThreads() {
++    if (getProvider() == null) {
++      return;
++    }
++    Preconditions.checkNotNull(reencryptionHandler);
++    reencryptHandlerExecutor =
++        Executors.newSingleThreadExecutor(reencryptionThreadFactory);
++    reencryptHandlerExecutor.execute(reencryptionHandler);
++    reencryptionHandler.startUpdaterThread();
++  }
++
++  void stopReencryptThread() {
++    if (getProvider() == null || reencryptionHandler == null) {
++      return;
++    }
++    dir.writeLock();
++    try {
++      reencryptionHandler.stopThreads();
++    } finally {
++      dir.writeUnlock();
++    }
++    if (reencryptHandlerExecutor != null) {
++      reencryptHandlerExecutor.shutdownNow();
++      reencryptHandlerExecutor = null;
++    }
+-      encryptionZones.remove(inodeId);
++      if (encryptionZones.remove(inodeId) == null
++          || !getReencryptionStatus().hasRunningZone(inodeId)) {
++        return;
++      }
++      if (reencryptionHandler != null) {
++        reencryptionHandler.removeZone(inodeId);
++      }
+-   * Returns the path of the EncryptionZoneInt.
++   * Returns the full path from an INode id.
+-  private String getFullPathName(EncryptionZoneInt ezi) {
++  String getFullPathName(Long nodeId) {
+-    return dir.getInode(ezi.getINodeId()).getFullPathName();
++    INode inode = dir.getInode(nodeId);
++    if (inode == null) {
++      return null;
++    }
++    return inode.getFullPathName();
+-      return new EncryptionZone(ezi.getINodeId(), getFullPathName(ezi),
++      return new EncryptionZone(ezi.getINodeId(),
++          getFullPathName(ezi.getINodeId()),
+-        final String srcEZPath = getFullPathName(srcParentEZI);
+-        final String dstEZPath = getFullPathName(dstParentEZI);
++        final String srcEZPath = getFullPathName(srcParentEZI.getINodeId());
++        final String dstEZPath = getFullPathName(dstParentEZI.getINodeId());
++      checkMoveValidityForReencryption(srcIIP.getPath(),
++          srcParentEZI.getINodeId());
++    } else if (dstInEZ) {
++      checkMoveValidityForReencryption(dstIIP.getPath(),
++          dstParentEZI.getINodeId());
++    }
++  }
++
++  private void checkMoveValidityForReencryption(final String pathName,
++      final long zoneId) throws IOException {
++    assert dir.hasReadLock();
++    final ZoneReencryptionStatus zs = reencryptionStatus.getZoneStatus(zoneId);
++    if (zs != null && zs.getState() != ZoneReencryptionStatus.State.Completed) {
++      final StringBuilder sb = new StringBuilder(pathName);
++      sb.append(" can't be moved because encryption zone ");
++      sb.append(getFullPathName(zoneId));
++      sb.append(" is currently under re-encryption");
++      throw new IOException(sb.toString());
+-       
++
+-       the INode's parents at the time it was snapshotted. It will not 
++       the INode's parents at the time it was snapshotted. It will not
+-      final String pathName = getFullPathName(ezi);
+-      INode inode = dir.getInode(ezi.getINodeId());
+-      INode lastINode = null;
+-      if (inode.getParent() != null || inode.isRoot()) {
+-        INodesInPath iip = dir.getINodesInPath(pathName, DirOp.READ_LINK);
+-        lastINode = iip.getLastINode();
+-      }
+-      if (lastINode == null || lastINode.getId() != ezi.getINodeId()) {
++      final String pathName = getFullPathName(ezi.getINodeId());
++      if (!pathResolvesToId(ezi.getINodeId(), pathName)) {
++   * Resolves the path to inode id, then check if it's the same as the inode id
++   * passed in. This is necessary to filter out zones in snapshots.
++   * @param zoneId
++   * @param zonePath
++   * @return true if path resolve to the id, false if not.
++   * @throws UnresolvedLinkException
++   */
++  private boolean pathResolvesToId(final long zoneId, final String zonePath)
++      throws UnresolvedLinkException, AccessControlException,
++      ParentNotDirectoryException {
++    assert dir.hasReadLock();
++    INode inode = dir.getInode(zoneId);
++    if (inode == null) {
++      return false;
++    }
++    INode lastINode = null;
++    if (inode.getParent() != null || inode.isRoot()) {
++      INodesInPath iip = dir.getINodesInPath(zonePath, DirOp.READ_LINK);
++      lastINode = iip.getLastINode();
++    }
++    if (lastINode == null || lastINode.getId() != zoneId) {
++      return false;
++    }
++    return true;
++  }
++
++  /**
++   * Re-encrypts the given encryption zone path. If the given path is not the
++   * root of an encryption zone, an exception is thrown.
++   */
++  XAttr reencryptEncryptionZone(final INodesInPath zoneIIP,
++      final String keyVersionName) throws IOException {
++    assert dir.hasWriteLock();
++    if (reencryptionHandler == null) {
++      throw new IOException("No key provider configured, re-encryption "
++          + "operation is rejected");
++    }
++    final INode inode = zoneIIP.getLastINode();
++    final String zoneName = zoneIIP.getPath();
++    checkEncryptionZoneRoot(inode, zoneName);
++    if (getReencryptionStatus().hasRunningZone(inode.getId())) {
++      throw new IOException("Zone " + zoneName
++          + " is already submitted for re-encryption.");
++    }
++    LOG.info("Zone {}({}) is submitted for re-encryption.", zoneName,
++        inode.getId());
++    XAttr ret = FSDirEncryptionZoneOp
++        .updateReencryptionSubmitted(dir, zoneIIP, keyVersionName);
++    reencryptionHandler.notifyNewSubmission();
++    return ret;
++  }
++
++  /**
++   * Cancels the currently-running re-encryption of the given encryption zone.
++   * If the given path is not the root of an encryption zone,
++   * * an exception is thrown.
++   */
++  List<XAttr> cancelReencryptEncryptionZone(final INodesInPath zoneIIP)
++      throws IOException {
++    assert dir.hasWriteLock();
++    if (reencryptionHandler == null) {
++      throw new IOException("No key provider configured, re-encryption "
++          + "operation is rejected");
++    }
++    final long zoneId = zoneIIP.getLastINode().getId();
++    final String zoneName = zoneIIP.getPath();
++    checkEncryptionZoneRoot(zoneIIP.getLastINode(), zoneName);
++    reencryptionHandler.cancelZone(zoneId, zoneName);
++    LOG.info("Cancelled zone {}({}) for re-encryption.", zoneName, zoneId);
++    return FSDirEncryptionZoneOp.updateReencryptionFinish(dir, zoneIIP,
++        reencryptionStatus.getZoneStatus(zoneId));
++  }
++
++  /**
++   * Cursor-based listing of zone re-encryption status.
++   * <p/>
++   * Called while holding the FSDirectory lock.
++   */
++  BatchedListEntries<ZoneReencryptionStatus> listReencryptionStatus(
++      final long prevId) throws IOException {
++    assert dir.hasReadLock();
++    if (!hasCreatedEncryptionZone()) {
++      return ReencryptionStatus.EMPTY_LIST;
++    }
++
++    NavigableMap<Long, ZoneReencryptionStatus> stats =
++        reencryptionStatus.getZoneStatuses();
++
++    if (stats.isEmpty()) {
++      return EMPTY_LIST;
++    }
++
++    NavigableMap<Long, ZoneReencryptionStatus> tailMap =
++        stats.tailMap(prevId, false);
++    final int numResp =
++        Math.min(maxListRecncryptionStatusResponses, tailMap.size());
++    final List<ZoneReencryptionStatus> ret =
++        Lists.newArrayListWithExpectedSize(numResp);
++    int count = 0;
++    for (ZoneReencryptionStatus zs : tailMap.values()) {
++      final String name = getFullPathName(zs.getId());
++      if (name == null || !pathResolvesToId(zs.getId(), name)) {
++        continue;
++      }
++      zs.setZoneName(name);
++      ret.add(zs);
++      ++count;
++      if (count >= numResp) {
++        break;
++      }
++    }
++    final boolean hasMore = (numResp < tailMap.size());
++    return new BatchedListEntries<>(ret, hasMore);
++  }
++
++  /**
++   * Return whether an INode is an encryption zone root.
++   */
++  boolean isEncryptionZoneRoot(final INode inode, final String name)
++      throws FileNotFoundException {
++    assert dir.hasReadLock();
++    if (inode == null) {
++      throw new FileNotFoundException("INode does not exist for " + name);
++    }
++    if (!inode.isDirectory()) {
++      return false;
++    }
++    if (!hasCreatedEncryptionZone()
++        || !encryptionZones.containsKey(inode.getId())) {
++      return false;
++    }
++    return true;
++  }
++
++  /**
++   * Return whether an INode is an encryption zone root.
++   *
++   * @param inode the zone inode
++   * @throws IOException if the inode is not a directory,
++   *                     or is a directory but not the root of an EZ.
++   */
++  void checkEncryptionZoneRoot(final INode inode, final String name)
++      throws IOException {
++    if (!isEncryptionZoneRoot(inode, name)) {
++      throw new IOException("Path " + name + " is not the root of an"
++          + " encryption zone.");
++    }
++  }
++
++  /**
+
+INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS23 INS23 INS23 INS23 INS23 INS23 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS83 INS83 INS83 INS39 INS59 INS83 INS43 INS59 INS83 INS43 INS59 INS83 INS43 INS59 INS83 INS83 INS43 INS59 INS83 INS83 INS83 INS74 INS59 INS78 INS83 INS39 INS42 INS8 INS78 INS83 INS39 INS42 INS8 INS78 INS83 INS39 INS42 INS44 INS8 INS78 INS83 INS39 INS42 INS8 INS78 INS83 INS39 INS42 INS8 INS78 INS83 INS39 INS42 INS44 INS44 INS43 INS8 INS78 INS83 INS39 INS42 INS8 INS78 INS83 INS43 INS42 INS8 INS78 INS83 INS43 INS42 INS44 INS43 INS8 INS43 INS42 INS8 INS43 INS42 INS8 INS39 INS42 INS8 INS39 INS42 INS8 INS8 MOV29 MOV43 INS42 INS44 INS8 MOV83 INS39 INS42 INS44 INS44 INS43 INS8 INS29 INS83 INS39 INS42 INS44 INS44 INS43 INS43 INS43 INS8 INS29 INS43 INS42 INS44 INS44 INS43 INS8 INS29 INS74 INS42 INS44 INS43 INS8 INS29 INS74 INS42 INS44 INS43 INS8 INS29 INS39 INS42 INS44 INS44 INS43 INS8 INS29 INS39 INS42 INS44 INS44 INS43 INS8 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS43 INS43 INS42 INS14 INS42 INS21 INS42 INS21 INS42 INS83 INS39 INS42 INS21 INS42 INS21 INS42 INS21 INS42 INS83 MOV43 INS42 INS83 INS39 INS42 INS42 INS60 INS21 INS54 INS21 INS42 INS21 INS42 INS42 INS41 INS42 INS42 INS83 MOV43 INS42 INS42 INS60 INS60 INS21 INS21 INS54 INS42 INS41 INS25 INS21 INS21 INS21 INS42 INS41 INS25 INS21 INS21 INS21 INS21 INS25 INS21 INS54 INS25 MOV6 INS25 INS43 INS42 MOV6 INS60 INS25 INS41 INS83 INS43 INS42 INS83 INS39 INS42 INS42 INS6 INS60 INS25 INS65 INS65 INS65 INS65 INS65 INS83 INS39 INS42 INS83 INS43 INS42 INS42 INS42 INS42 INS6 INS60 INS25 MOV60 MOV25 MOV25 INS41 INS65 INS42 INS83 INS43 INS42 INS83 INS43 INS42 INS42 INS6 INS25 INS60 INS60 INS21 INS25 INS21 INS60 INS21 INS41 INS65 INS43 INS43 INS83 INS43 INS42 INS42 INS6 INS25 INS60 INS60 INS21 INS21 INS21 INS41 INS65 INS43 INS43 INS83 INS39 INS42 INS42 INS6 INS25 INS60 INS25 INS60 INS60 INS60 INS60 INS70 INS60 INS41 INS65 INS83 INS43 INS42 INS83 INS43 INS42 INS42 INS6 INS25 INS25 INS25 INS41 INS65 INS65 INS65 INS83 INS43 INS42 INS83 INS43 INS42 INS42 INS25 INS42 INS42 INS74 INS14 INS9 INS32 INS32 INS32 INS32 INS32 INS43 INS59 INS32 INS8 INS8 INS32 INS32 INS42 INS83 INS43 INS59 INS83 INS43 INS59 INS32 INS32 INS8 INS8 INS42 INS27 INS8 INS7 INS32 INS7 INS32 INS27 INS8 INS32 INS7 INS32 INS32 INS27 INS8 INS32 INS8 INS8 INS27 INS8 MOV32 INS8 UPD66 INS42 MOV43 INS59 INS27 INS8 INS32 INS25 INS42 INS32 INS83 INS43 INS59 INS27 INS8 INS66 INS66 INS42 INS42 INS66 INS42 INS42 INS32 INS43 INS59 INS27 INS8 INS8 INS9 INS66 INS66 INS42 INS42 INS32 INS27 INS8 INS83 INS43 INS59 INS83 INS43 INS59 INS32 INS32 INS8 INS32 INS43 INS59 INS32 INS42 INS66 INS66 INS66 INS42 INS42 INS42 INS32 INS27 INS8 INS83 INS39 INS59 INS83 INS43 INS59 INS32 INS32 INS32 INS32 INS66 INS66 INS66 INS42 INS42 INS32 INS38 INS8 INS74 INS59 INS32 INS8 INS74 INS59 INS83 INS39 INS59 INS83 INS74 INS59 INS39 INS59 INS44 INS32 INS8 INS83 INS39 INS59 INS14 INS66 INS42 INS42 INS32 INS27 INS8 INS38 INS8 INS27 INS8 INS9 INS66 INS42 INS66 INS42 INS66 INS66 INS42 INS42 INS38 INS8 INS43 INS74 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS21 INS21 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS42 INS60 INS21 INS25 INS41 INS21 INS21 INS32 INS33 INS21 INS21 INS42 INS32 INS42 INS42 INS27 INS27 INS42 INS14 INS42 INS42 INS32 INS33 INS41 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS27 INS27 INS41 INS42 INS42 INS21 INS21 INS42 INS33 INS21 INS21 INS25 MOV25 INS42 INS32 INS42 INS33 INS41 INS42 INS42 INS21 INS42 INS8 INS42 INS42 INS42 INS42 INS32 INS27 INS27 INS60 INS21 INS21 INS21 INS53 INS25 INS42 INS42 INS42 INS42 INS32 INS42 INS33 INS41 INS41 INS42 INS42 INS42 INS33 INS53 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS42 INS32 INS42 INS32 INS53 INS42 INS42 INS45 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS33 INS53 INS42 INS32 INS42 INS42 INS32 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS45 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS32 INS41 INS43 INS43 INS43 INS42 INS32 INS42 INS42 INS41 INS43 INS43 INS43 INS42 INS32 INS42 INS32 INS43 INS43 INS42 INS32 INS42 INS34 UPD43 MOV43 UPD42 MOV42 INS42 INS42 INS60 INS25 INS21 INS21 INS21 INS25 INS42 INS36 INS74 INS42 INS42 INS42 INS42 INS42 INS33 INS53 INS32 INS41 INS38 INS38 INS41 INS32 INS53 INS42 INS43 INS43 INS7 INS32 INS32 INS42 INS42 INS42 INS42 INS42 INS83 INS43 INS59 INS7 INS27 INS8 INS32 INS32 INS32 INS42 INS7 INS7 INS42 INS42 INS42 INS42 INS42 INS34 INS42 INS45 INS43 INS42 INS42 INS42 INS42 INS32 INS33 INS42 INS33 INS32 INS32 INS32 INS7 INS27 INS8 INS27 INS42 INS42 INS42 INS33 INS32 INS21 INS42 INS42 INS42 INS42 INS33 INS32 INS40 INS83 INS43 INS59 INS32 INS32 INS32 INS14 INS83 INS43 INS38 MOV8 INS42 INS42 INS42 INS9 INS42 INS9 INS14 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS14 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS14 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS40 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS9 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS42 UPD42 INS83 INS43 INS59 INS27 INS8 INS32 INS32 INS38 INS27 INS8 INS27 INS43 INS14 INS42 INS42 INS9 INS32 INS32 INS9 INS42 INS42 INS42 INS14 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS32 INS42 INS33 INS41 INS32 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS14 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS33 INS27 INS38 INS41 INS42 INS33 INS42 INS32 INS32 INS32 INS42 INS42 INS42 INS42 INS14 INS42 INS42 INS45 INS42 INS42 INS32 INS42 INS42 INS45 INS43 INS32 INS42 UPD42 MOV32 MOV42 INS43 INS27 INS43 INS27 INS43 INS27 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS27 INS38 INS18 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS10 INS42 INS32 INS42 INS43 INS27 INS42 INS42 INS42 INS32 INS43 INS27 INS42 INS42 INS32 INS42 INS40 INS42 INS42 INS42 INS42 INS40 INS42 INS42 INS33 INS42 INS42 INS42 INS42 INS42 INS43 INS52 INS42 INS32 INS42 MOV32 INS33 INS32 INS32 MOV32 MOV43 INS43 INS42 INS42 INS42 INS42 INS42 INS32 INS32 INS43 INS42 INS42 INS42 INS42 INS42 INS42 UPD42 UPD42 UPD42 UPD42 INS42 INS45 INS45 INS42 INS45 INS42 INS45 INS42 INS45 INS45 MOV42 INS32 INS42 INS33 INS32 INS42 INS42 INS42 INS45 INS42 INS42 INS42 INS42 INS45 INS42 INS45 INS45 INS42 INS42 INS42 INS32 INS42 INS45 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS14 INS42 INS9 INS42 INS32 INS32 INS42 INS42 INS43 MOV42 INS42 MOV42 INS42 INS42 DEL8 DEL42 DEL44 DEL32 DEL41 DEL8 DEL31 DEL83 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42

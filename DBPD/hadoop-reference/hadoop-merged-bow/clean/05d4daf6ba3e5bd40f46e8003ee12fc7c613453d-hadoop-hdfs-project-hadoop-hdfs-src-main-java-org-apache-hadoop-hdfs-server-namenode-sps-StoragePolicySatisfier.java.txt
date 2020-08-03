@@ -1,0 +1,378 @@
+HDFS-12982 : [SPS]: Reduce the locking and cleanup the Namesystem access. Contributed by Rakesh R.
+
+-import org.apache.hadoop.conf.Configuration;
+-import org.apache.hadoop.hdfs.protocol.HdfsConstants.DatanodeReportType;
++import org.apache.hadoop.hdfs.protocol.DatanodeInfoWithStorage;
++import org.apache.hadoop.hdfs.protocol.ErasureCodingPolicy;
++import org.apache.hadoop.hdfs.protocol.ExtendedBlock;
++import org.apache.hadoop.hdfs.protocol.HdfsFileStatus;
++import org.apache.hadoop.hdfs.protocol.HdfsLocatedFileStatus;
++import org.apache.hadoop.hdfs.protocol.LocatedBlock;
++import org.apache.hadoop.hdfs.protocol.LocatedBlocks;
++import org.apache.hadoop.hdfs.protocol.LocatedStripedBlock;
+-import org.apache.hadoop.hdfs.server.blockmanagement.BlockCollection;
+-import org.apache.hadoop.hdfs.server.blockmanagement.BlockInfo;
+-import org.apache.hadoop.hdfs.server.blockmanagement.BlockInfoStriped;
+-import org.apache.hadoop.hdfs.server.blockmanagement.BlockInfoStriped.StorageAndBlockIndex;
+-import org.apache.hadoop.hdfs.server.blockmanagement.BlockManager;
+-import org.apache.hadoop.hdfs.server.blockmanagement.DatanodeDescriptor;
+-import org.apache.hadoop.hdfs.server.blockmanagement.DatanodeStorageInfo;
+-import org.apache.hadoop.hdfs.server.namenode.INode;
+-import org.apache.hadoop.hdfs.server.namenode.Namesystem;
++import org.apache.hadoop.hdfs.server.namenode.FSDirectory;
++import org.apache.hadoop.hdfs.server.protocol.DatanodeStorageReport;
+-  private final Namesystem namesystem;
+-  private final BlockManager blockManager;
+-   * An interface for analyzing and assigning the block storage movements to
+-   * worker nodes.
+-   */
+-  // TODO: Now, added one API which is required for sps package. Will refine
+-  // this interface via HDFS-12911.
+-  public interface Context {
+-    int getNumLiveDataNodes();
+-  }
+-
+-  /**
+-      FEW_LOW_REDUNDANCY_BLOCKS
++      FEW_LOW_REDUNDANCY_BLOCKS,
++      // Represents that, movement failures due to unexpected errors.
++      BLOCKS_FAILED_TO_MOVE
+-  public StoragePolicySatisfier(final Namesystem namesystem,
+-      final BlockManager blkManager, Configuration conf, Context ctxt) {
+-    this.namesystem = namesystem;
+-    this.storageMovementNeeded = new BlockStorageMovementNeeded(namesystem,
+-        this, conf.getInt(
+-            DFSConfigKeys.DFS_STORAGE_POLICY_SATISFIER_QUEUE_LIMIT_KEY,
+-            DFSConfigKeys.DFS_STORAGE_POLICY_SATISFIER_QUEUE_LIMIT_DEFAULT));
+-    this.blockManager = blkManager;
+-    this.storageMovementsMonitor = new BlockStorageMovementAttemptedItems(
+-        conf.getLong(
+-            DFSConfigKeys.DFS_STORAGE_POLICY_SATISFIER_RECHECK_TIMEOUT_MILLIS_KEY,
+-            DFSConfigKeys.DFS_STORAGE_POLICY_SATISFIER_RECHECK_TIMEOUT_MILLIS_DEFAULT),
+-        conf.getLong(
+-            DFSConfigKeys.DFS_STORAGE_POLICY_SATISFIER_SELF_RETRY_TIMEOUT_MILLIS_KEY,
+-            DFSConfigKeys.DFS_STORAGE_POLICY_SATISFIER_SELF_RETRY_TIMEOUT_MILLIS_DEFAULT),
++  public StoragePolicySatisfier(Context ctxt) {
++    this.ctxt = ctxt;
++    this.storageMovementNeeded = new BlockStorageMovementNeeded(ctxt);
++    this.storageMovementsMonitor = new BlockStorageMovementAttemptedItems(ctxt,
+-    this.spsWorkMultiplier = DFSUtil.getSPSWorkMultiplier(conf);
+-    this.blockMovementMaxRetry = conf.getInt(
++    this.spsWorkMultiplier = DFSUtil.getSPSWorkMultiplier(ctxt.getConf());
++    this.blockMovementMaxRetry = ctxt.getConf().getInt(
+-    this.ctxt = ctxt;
++   *
++   * // TODO: FSDirectory will get removed via HDFS-12911 modularization work.
+-  public synchronized void start(boolean reconfigStart) {
++  public synchronized void start(boolean reconfigStart, FSDirectory fsd) {
+-    if (checkIfMoverRunning()) {
++    ctxt.setSPSRunning(this::isRunning);
++    if (ctxt.isMoverRunning()) {
+-    storageMovementNeeded.init();
++    storageMovementNeeded.init(fsd);
+-
+-  // Return true if a Mover instance is running
+-  private boolean checkIfMoverRunning() {
+-    String moverId = HdfsServerConstants.MOVER_ID_PATH.toString();
+-    return namesystem.isFileOpenedForWrite(moverId);
+-  }
+-
+-    this.blockManager.getDatanodeManager().addDropSPSWorkCommandsToAllDNs();
++    ctxt.addDropPreviousSPSWorkAtDNs();
+-    while (namesystem.isRunning() && isRunning) {
++    while (ctxt.isRunning()) {
+-        if (!namesystem.isInSafeMode()) {
++        if (!ctxt.isInSafeMode()) {
+-            BlockCollection blockCollection;
+-            try {
+-              namesystem.readLock();
+-              blockCollection = namesystem.getBlockCollection(trackId);
+-              // Check blockCollectionId existence.
+-              if (blockCollection == null) {
+-                // File doesn't exists (maybe got deleted), remove trackId from
+-                // the queue
+-                storageMovementNeeded.removeItemTrackInfo(itemInfo, true);
+-              } else {
+-                status =
+-                    analyseBlocksStorageMovementsAndAssignToDN(
+-                        blockCollection);
+-              }
+-            } finally {
+-              namesystem.readUnlock();
+-            }
+-            if (blockCollection != null) {
++            DatanodeStorageReport[] liveDnReports;
++            BlockStoragePolicy existingStoragePolicy;
++            // TODO: presently, context internally acquire the lock
++            // and returns the result. Need to discuss to move the lock outside?
++            boolean hasLowRedundancyBlocks = ctxt
++                .hasLowRedundancyBlocks(trackId);
++            HdfsFileStatus fileStatus = ctxt.getFileInfo(trackId);
++            // Check path existence.
++            if (fileStatus == null || fileStatus.isDir()) {
++              // File doesn't exists (maybe got deleted) or its a directory,
++              // just remove trackId from the queue
++              storageMovementNeeded.removeItemTrackInfo(itemInfo, true);
++            } else {
++              liveDnReports = ctxt.getLiveDatanodeStorageReport();
++              byte existingStoragePolicyID = fileStatus.getStoragePolicy();
++              existingStoragePolicy = ctxt
++                  .getStoragePolicy(existingStoragePolicyID);
++
++              HdfsLocatedFileStatus file = (HdfsLocatedFileStatus) fileStatus;
++              status = analyseBlocksStorageMovementsAndAssignToDN(file,
++                  hasLowRedundancyBlocks, existingStoragePolicy, liveDnReports);
++              case BLOCKS_FAILED_TO_MOVE:
++                if (LOG.isDebugEnabled()) {
++                  LOG.debug("Adding trackID " + trackId
++                      + " back to retry queue as some of the blocks"
++                      + " movement failed.");
++                }
++                this.storageMovementNeeded.add(itemInfo);
++                break;
+-          if (!namesystem.isRunning()) {
+-            LOG.info("Stopping StoragePolicySatisfier.");
+-            if (!(t instanceof InterruptedException)) {
+-              LOG.info("StoragePolicySatisfier received an exception"
+-                  + " while shutting down.", t);
+-            }
+-            return;
++          if (!(t instanceof InterruptedException)) {
++            LOG.info("StoragePolicySatisfier received an exception"
++                + " while shutting down.", t);
++          LOG.info("Stopping StoragePolicySatisfier.");
+-      BlockCollection blockCollection) {
++      HdfsLocatedFileStatus fileInfo, boolean hasLowRedundancyBlocks,
++      BlockStoragePolicy existingStoragePolicy,
++      DatanodeStorageReport[] liveDns) {
+-    byte existingStoragePolicyID = blockCollection.getStoragePolicyID();
+-    BlockStoragePolicy existingStoragePolicy =
+-        blockManager.getStoragePolicy(existingStoragePolicyID);
+-    if (!blockCollection.getLastBlock().isComplete()) {
++    final ErasureCodingPolicy ecPolicy = fileInfo.getErasureCodingPolicy();
++    final LocatedBlocks locatedBlocks = fileInfo.getLocatedBlocks();
++    final boolean lastBlkComplete = locatedBlocks.isLastBlockComplete();
++    if (!lastBlkComplete) {
+-          + " this to the next retry iteration", blockCollection.getId());
++          + " this to the next retry iteration", fileInfo.getFileId());
+-    BlockInfo[] blocks = blockCollection.getBlocks();
+-    if (blocks.length == 0) {
++    List<LocatedBlock> blocks = locatedBlocks.getLocatedBlocks();
++    if (blocks.size() == 0) {
+-          + " So, skipping the analysis.", blockCollection.getId());
++          + " So, skipping the analysis.", fileInfo.getFileId());
+-    for (int i = 0; i < blocks.length; i++) {
+-      BlockInfo blockInfo = blocks[i];
++    for (int i = 0; i < blocks.size(); i++) {
++      LocatedBlock blockInfo = blocks.get(i);
+-                existingStoragePolicyID)) {
++                existingStoragePolicy.getId())) {
+-              .chooseStorageTypes((short) blockInfo.getCapacity());
++              .chooseStorageTypes((short) blockInfo.getLocations().length);
+-            .chooseStorageTypes(blockInfo.getReplication());
++            .chooseStorageTypes(fileInfo.getReplication());
+-      DatanodeStorageInfo[] storages = blockManager.getStorages(blockInfo);
+-      StorageType[] storageTypes = new StorageType[storages.length];
+-      for (int j = 0; j < storages.length; j++) {
+-        DatanodeStorageInfo datanodeStorageInfo = storages[j];
+-        StorageType storageType = datanodeStorageInfo.getStorageType();
+-        storageTypes[j] = storageType;
+-      }
+-      List<StorageType> existing =
+-          new LinkedList<StorageType>(Arrays.asList(storageTypes));
++      List<StorageType> existing = new LinkedList<StorageType>(
++          Arrays.asList(blockInfo.getStorageTypes()));
+-            blockInfo, expectedStorageTypes, existing, storages);
++            blockInfo, expectedStorageTypes, existing, blockInfo.getLocations(),
++            liveDns, ecPolicy);
+-        if (blockManager.hasLowRedundancyBlocks(blockCollection)) {
++        if (hasLowRedundancyBlocks) {
+-      if (blkMovingInfo.getTarget() != null) {
+-        // assign block storage movement task to the target node
+-        ((DatanodeDescriptor) blkMovingInfo.getTarget())
+-            .addBlocksToMoveStorage(blkMovingInfo);
++      try {
++        ctxt.assignBlockMoveTaskToTargetNode(blkMovingInfo);
++      } catch (IOException e) {
++        LOG.warn("Exception while scheduling movement task", e);
++        // failed to move the block.
++        status = BlocksMovingAnalysis.Status.BLOCKS_FAILED_TO_MOVE;
+-      List<BlockMovingInfo> blockMovingInfos, BlockInfo blockInfo,
++      List<BlockMovingInfo> blockMovingInfos, LocatedBlock blockInfo,
+-      DatanodeStorageInfo[] storages) {
++      DatanodeInfo[] storages, DatanodeStorageReport[] liveDns,
++      ErasureCodingPolicy ecPolicy) {
+-      List<DatanodeStorageInfo> existingBlockStorages =
+-          new ArrayList<DatanodeStorageInfo>(Arrays.asList(storages));
++      List<DatanodeInfo> existingBlockStorages = new ArrayList<DatanodeInfo>(
++          Arrays.asList(storages));
+-      Iterator<DatanodeStorageInfo> iterator = existingBlockStorages.iterator();
++      Iterator<DatanodeInfo> iterator = existingBlockStorages.iterator();
+-        DatanodeStorageInfo datanodeStorageInfo = iterator.next();
+-        if (checkSourceAndTargetTypeExists(
+-            datanodeStorageInfo.getDatanodeDescriptor(), existing,
+-            expectedStorageTypes)) {
++        DatanodeInfoWithStorage dnInfo = (DatanodeInfoWithStorage) iterator
++            .next();
++        if (checkSourceAndTargetTypeExists(dnInfo, existing,
++            expectedStorageTypes, liveDns)) {
+-              .add(new StorageTypeNodePair(datanodeStorageInfo.getStorageType(),
+-                  datanodeStorageInfo.getDatanodeDescriptor()));
++              .add(new StorageTypeNodePair(dnInfo.getStorageType(), dnInfo));
+-          existing.remove(datanodeStorageInfo.getStorageType());
++          existing.remove(dnInfo.getStorageType());
+-          DatanodeStorageInfo datanodeStorageInfo = iterator.next();
+-          StorageType storageType = datanodeStorageInfo.getStorageType();
++          DatanodeInfoWithStorage dnStorageInfo =
++              (DatanodeInfoWithStorage) iterator.next();
++          StorageType storageType = dnStorageInfo.getStorageType();
+-                datanodeStorageInfo.getDatanodeDescriptor()));
++                dnStorageInfo));
+-          findTargetsForExpectedStorageTypes(expectedStorageTypes);
++          findTargetsForExpectedStorageTypes(expectedStorageTypes, liveDns);
+-          expectedStorageTypes, locsForExpectedStorageTypes);
++          expectedStorageTypes, locsForExpectedStorageTypes,
++          ecPolicy);
+-      List<BlockMovingInfo> blockMovingInfos, BlockInfo blockInfo,
++      List<BlockMovingInfo> blockMovingInfos, LocatedBlock blockInfo,
+-      StorageTypeNodeMap locsForExpectedStorageTypes) {
++      StorageTypeNodeMap locsForExpectedStorageTypes,
++      ErasureCodingPolicy ecPolicy) {
+-    List<DatanodeDescriptor> excludeNodes = new ArrayList<>();
++    List<DatanodeInfo> excludeNodes = new ArrayList<>();
+-        StorageTypeNodePair chosenTarget = chooseTargetTypeInSameNode(
+-            blockInfo, existingTypeNodePair.dn, expected);
++        StorageTypeNodePair chosenTarget = chooseTargetTypeInSameNode(blockInfo,
++            existingTypeNodePair.dn, expected);
+-                chosenTarget.storageType, blockMovingInfos);
++                chosenTarget.storageType, blockMovingInfos,
++                ecPolicy);
+-      if (chosenTarget == null && blockManager.getDatanodeManager()
++      if (chosenTarget == null && ctxt
+-              chosenTarget.storageType, blockMovingInfos);
++              chosenTarget.storageType, blockMovingInfos, ecPolicy);
+-      DatanodeDescriptor dn) {
++      DatanodeInfo dn) {
+-  private void buildContinuousBlockMovingInfos(BlockInfo blockInfo,
++  private void buildContinuousBlockMovingInfos(LocatedBlock blockInfo,
+-    Block blk = new Block(blockInfo.getBlockId(), blockInfo.getNumBytes(),
+-        blockInfo.getGenerationStamp());
++    Block blk = ExtendedBlock.getLocalBlock(blockInfo.getBlock());
+-  private void buildStripedBlockMovingInfos(BlockInfo blockInfo,
++  private void buildStripedBlockMovingInfos(LocatedBlock blockInfo,
+-      List<BlockMovingInfo> blkMovingInfos) {
++      List<BlockMovingInfo> blkMovingInfos, ErasureCodingPolicy ecPolicy) {
+-    BlockInfoStriped sBlockInfo = (BlockInfoStriped) blockInfo;
+-    for (StorageAndBlockIndex si : sBlockInfo.getStorageAndIndexInfos()) {
+-      if (si.getBlockIndex() >= 0) {
+-        DatanodeDescriptor dn = si.getStorage().getDatanodeDescriptor();
+-        if (sourceNode.equals(dn)) {
++    LocatedStripedBlock sBlockInfo = (LocatedStripedBlock) blockInfo;
++    byte[] indices = sBlockInfo.getBlockIndices();
++    DatanodeInfo[] locations = sBlockInfo.getLocations();
++    for (int i = 0; i < indices.length; i++) {
++      byte blkIndex = indices[i];
++      if (blkIndex >= 0) {
++        // pick block movement only for the given source node.
++        if (sourceNode.equals(locations[i])) {
+-          long blockId = blockInfo.getBlockId() + si.getBlockIndex();
++          ExtendedBlock extBlock = sBlockInfo.getBlock();
+-              sBlockInfo.getNumBytes(), sBlockInfo.getCellSize(),
+-              sBlockInfo.getDataBlockNum(), si.getBlockIndex());
+-          Block blk = new Block(blockId, numBytes,
+-              blockInfo.getGenerationStamp());
++              extBlock.getNumBytes(), ecPolicy, blkIndex);
++          Block blk = new Block(ExtendedBlock.getLocalBlock(extBlock));
++          long blkId = blk.getBlockId() + blkIndex;
++          blk.setBlockId(blkId);
++          blk.setNumBytes(numBytes);
+-  private StorageTypeNodePair chooseTargetTypeInSameNode(Block block,
+-      DatanodeDescriptor source, List<StorageType> targetTypes) {
++  private StorageTypeNodePair chooseTargetTypeInSameNode(LocatedBlock blockInfo,
++      DatanodeInfo source, List<StorageType> targetTypes) {
+-      DatanodeStorageInfo chooseStorage4Block =
+-          source.chooseStorage4Block(t, block.getNumBytes());
+-      if (chooseStorage4Block != null) {
++      boolean goodTargetDn = ctxt.verifyTargetDatanodeHasSpaceForScheduling(
++          source, t, blockInfo.getBlockSize());
++      if (goodTargetDn) {
+-  private StorageTypeNodePair chooseTarget(Block block,
+-      DatanodeDescriptor source, List<StorageType> targetTypes, Matcher matcher,
++  private StorageTypeNodePair chooseTarget(LocatedBlock block,
++      DatanodeInfo source, List<StorageType> targetTypes, Matcher matcher,
+-      List<DatanodeDescriptor> excludeNodes) {
++      List<DatanodeInfo> excludeNodes) {
+-      List<DatanodeDescriptor> nodesWithStorages =
+-          locsForExpectedStorageTypes.getNodesWithStorages(t);
++      List<DatanodeInfo> nodesWithStorages = locsForExpectedStorageTypes
++          .getNodesWithStorages(t);
+-      for (DatanodeDescriptor target : nodesWithStorages) {
+-        if (!excludeNodes.contains(target) && matcher.match(
+-            blockManager.getDatanodeManager().getNetworkTopology(), source,
+-            target)) {
+-          if (null != target.chooseStorage4Block(t, block.getNumBytes())) {
++      for (DatanodeInfo target : nodesWithStorages) {
++        if (!excludeNodes.contains(target)
++            && matcher.match(ctxt.getNetworkTopology(), source, target)) {
++          boolean goodTargetDn = ctxt.verifyTargetDatanodeHasSpaceForScheduling(
++              target, t, block.getBlockSize());
++          if (goodTargetDn) {
+-    private DatanodeDescriptor dn = null;
++    private DatanodeInfo dn = null;
+-    StorageTypeNodePair(StorageType storageType, DatanodeDescriptor dn) {
++    StorageTypeNodePair(StorageType storageType, DatanodeInfo dn) {
+-      List<StorageType> expected) {
++      List<StorageType> expected, DatanodeStorageReport[] liveDns) {
+-    List<DatanodeDescriptor> reports = blockManager.getDatanodeManager()
+-        .getDatanodeListForReport(DatanodeReportType.LIVE);
+-    for (DatanodeDescriptor dn : reports) {
++    for (DatanodeStorageReport dn : liveDns) {
+-            targetMap.add(t, dn);
++            targetMap.add(t, dn.getDatanodeInfo());
+-  private boolean checkSourceAndTargetTypeExists(DatanodeDescriptor dn,
+-      List<StorageType> existing, List<StorageType> expectedStorageTypes) {
+-    DatanodeStorageInfo[] allDNStorageInfos = dn.getStorageInfos();
++  private boolean checkSourceAndTargetTypeExists(DatanodeInfo dn,
++      List<StorageType> existing, List<StorageType> expectedStorageTypes,
++      DatanodeStorageReport[] liveDns) {
+-    for (DatanodeStorageInfo dnInfo : allDNStorageInfos) {
+-      StorageType storageType = dnInfo.getStorageType();
+-      if (existing.contains(storageType)) {
+-        isExistingTypeAvailable = true;
+-      }
+-      if (expectedStorageTypes.contains(storageType)) {
+-        isExpectedTypeAvailable = true;
++    for (DatanodeStorageReport liveDn : liveDns) {
++      if (dn.equals(liveDn.getDatanodeInfo())) {
++        StorageReport[] storageReports = liveDn.getStorageReports();
++        for (StorageReport eachStorage : storageReports) {
++          StorageType storageType = eachStorage.getStorage().getStorageType();
++          if (existing.contains(storageType)) {
++            isExistingTypeAvailable = true;
++          }
++          if (expectedStorageTypes.contains(storageType)) {
++            isExpectedTypeAvailable = true;
++          }
++          if (isExistingTypeAvailable && isExpectedTypeAvailable) {
++            return true;
++          }
++        }
+-    private final EnumMap<StorageType, List<DatanodeDescriptor>> typeNodeMap =
+-        new EnumMap<StorageType, List<DatanodeDescriptor>>(StorageType.class);
++    private final EnumMap<StorageType, List<DatanodeInfo>> typeNodeMap =
++        new EnumMap<StorageType, List<DatanodeInfo>>(StorageType.class);
+-    private void add(StorageType t, DatanodeDescriptor dn) {
+-      List<DatanodeDescriptor> nodesWithStorages = getNodesWithStorages(t);
+-      LinkedList<DatanodeDescriptor> value = null;
++    private void add(StorageType t, DatanodeInfo dn) {
++      List<DatanodeInfo> nodesWithStorages = getNodesWithStorages(t);
++      LinkedList<DatanodeInfo> value = null;
+-        value = new LinkedList<DatanodeDescriptor>();
++        value = new LinkedList<DatanodeInfo>();
+-    private List<DatanodeDescriptor> getNodesWithStorages(StorageType type) {
++    private List<DatanodeInfo> getNodesWithStorages(StorageType type) {
+-    INode inode = namesystem.getFSDirectory().getINode(path);
+-    return storageMovementNeeded.getStatus(inode.getId());
++    return storageMovementNeeded.getStatus(ctxt.getFileID(path));
+
+MOV26 MOV26 MOV26 UPD40 UPD40 UPD40 UPD40 UPD40 UPD40 UPD40 UPD40 UPD40 UPD40 MOV21 INS44 MOV8 INS44 INS44 INS44 INS44 INS44 INS44 INS44 INS44 INS44 INS72 INS43 INS42 INS21 MOV21 INS41 UPD43 UPD42 INS39 INS42 MOV43 INS42 INS5 INS42 INS60 UPD43 UPD5 INS5 INS42 INS43 INS42 UPD43 INS43 INS42 UPD43 UPD43 UPD43 INS43 INS42 INS60 INS60 INS24 UPD43 UPD42 UPD43 UPD43 UPD43 UPD74 UPD43 INS5 INS42 UPD43 INS5 INS42 INS70 UPD74 MOV74 UPD74 INS42 INS66 INS42 INS32 INS32 INS8 UPD42 INS43 INS85 INS83 INS43 INS83 INS43 INS83 INS39 INS59 INS74 UPD42 UPD43 INS43 INS85 INS42 UPD42 INS42 UPD74 UPD42 UPD42 UPD42 INS42 UPD43 INS5 INS59 INS5 INS59 INS58 INS27 INS37 INS8 UPD42 UPD42 UPD42 UPD42 UPD43 UPD42 UPD43 INS43 INS85 UPD42 UPD42 INS43 INS85 INS44 INS42 INS8 UPD74 UPD43 UPD43 INS42 INS42 INS90 INS42 UPD42 INS42 INS42 UPD42 UPD42 MOV42 MOV42 INS51 INS42 INS42 UPD42 INS42 UPD42 INS42 INS32 INS42 MOV43 INS43 INS32 INS32 INS54 UPD42 INS42 UPD43 INS32 UPD42 INS39 INS85 INS42 INS32 INS43 INS85 INS42 INS32 INS39 INS59 INS42 INS40 INS42 MOV60 INS25 UPD42 UPD42 INS42 UPD43 INS42 INS43 INS42 INS25 UPD43 INS74 UPD42 UPD74 MOV74 UPD74 MOV74 UPD42 INS42 INS42 INS32 INS32 INS52 INS42 INS52 MOV8 UPD42 UPD42 UPD42 UPD42 INS42 INS42 UPD42 MOV42 UPD42 UPD42 INS42 INS42 INS42 INS42 UPD43 MOV8 INS12 UPD74 UPD74 UPD42 INS42 UPD42 MOV42 INS32 UPD43 MOV42 UPD42 MOV42 INS42 UPD42 MOV42 UPD42 MOV42 INS42 INS34 INS39 INS27 INS8 INS39 INS42 UPD74 UPD42 INS42 INS32 INS8 UPD42 MOV43 MOV43 INS74 UPD43 UPD43 UPD42 UPD42 INS42 INS42 UPD42 MOV42 INS42 UPD42 MOV42 UPD42 INS32 INS44 INS8 UPD43 UPD43 MOV42 UPD42 MOV42 UPD42 UPD42 INS2 INS42 INS34 MOV25 UPD42 UPD43 UPD43 INS42 INS42 INS32 MOV60 MOV70 MOV43 INS43 UPD42 UPD42 INS42 MOV21 UPD42 UPD42 UPD42 UPD42 INS42 INS42 INS42 INS42 INS43 INS42 INS21 INS21 UPD42 UPD74 UPD42 UPD43 INS42 INS42 INS42 INS42 INS42 INS42 UPD42 UPD42 INS42 INS42 UPD5 UPD42 INS42 MOV21 MOV21 MOV21 INS32 INS32 UPD42 MOV42 UPD42 INS42 INS32 INS7 UPD43 UPD42 INS42 INS11 UPD42 MOV42 INS42 UPD42 MOV42 INS2 INS60 INS60 INS60 INS21 INS21 UPD42 UPD42 INS60 UPD43 UPD42 UPD43 UPD42 INS25 UPD74 MOV74 UPD42 MOV60 UPD42 MOV42 INS42 INS42 UPD42 MOV42 INS32 UPD42 INS42 UPD42 MOV42 UPD42 MOV42 INS45 INS42 INS42 INS40 UPD42 INS43 MOV32 UPD43 INS42 INS42 INS43 MOV39 INS59 MOV43 INS59 INS39 INS59 INS32 INS32 INS39 INS59 INS42 UPD42 UPD42 UPD42 UPD42 INS27 INS8 UPD43 INS60 INS60 INS60 UPD42 INS42 INS42 INS42 UPD42 UPD42 INS11 INS42 INS42 UPD42 INS32 MOV42 INS32 INS42 INS14 INS42 INS27 INS42 INS42 INS42 UPD42 MOV42 UPD42 MOV42 INS42 UPD42 MOV42 INS42 INS32 INS42 INS42 INS41 UPD42 INS5 INS43 INS59 INS39 INS59 INS43 INS59 INS27 MOV8 INS42 UPD42 INS43 MOV32 UPD42 UPD42 MOV42 UPD42 MOV42 MOV42 MOV42 MOV32 INS42 UPD42 MOV42 MOV43 INS32 INS32 INS42 INS42 INS42 INS42 INS42 INS32 INS32 INS9 INS43 INS85 UPD42 INS42 INS42 INS42 INS32 INS42 INS42 INS32 INS27 INS32 INS21 INS60 INS21 INS60 INS21 MOV49 MOV10 INS22 UPD42 INS42 INS42 UPD42 UPD42 MOV42 UPD42 MOV42 INS42 UPD42 MOV42 UPD42 MOV42 INS42 INS42 INS32 UPD42 MOV42 INS42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 MOV42 UPD42 MOV42 UPD42 MOV42 INS42 UPD42 MOV42 MOV33 INS42 INS42 INS7 INS39 INS59 INS7 INS43 INS59 INS7 INS25 INS21 INS49 INS10 INS32 INS42 INS42 MOV42 INS42 INS42 INS32 INS42 INS32 INS42 INS32 INS42 INS42 INS11 INS42 INS32 INS42 INS32 INS8 INS32 MOV42 UPD42 MOV42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS43 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS21 INS22 INS42 INS42 INS42 INS32 INS52 INS42 INS42 INS42 INS27 INS45 INS42 INS45 INS45 DEL40 DEL26 DEL83 DEL83 DEL42 DEL43 DEL42 DEL59 DEL23 DEL83 DEL83 DEL42 DEL43 DEL42 DEL59 DEL23 DEL66 DEL66 DEL65 DEL29 DEL83 DEL42 DEL39 DEL42 DEL31 DEL55 DEL83 DEL42 DEL43 DEL42 DEL44 DEL83 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL44 DEL52 DEL42 DEL22 DEL42 DEL7 DEL21 DEL42 DEL52 DEL42 DEL42 DEL40 DEL40 DEL32 DEL52 DEL42 DEL22 DEL42 DEL7 DEL21 DEL42 DEL42 DEL40 DEL40 DEL32 DEL42 DEL42 DEL40 DEL40 DEL32 DEL83 DEL39 DEL42 DEL42 DEL43 DEL42 DEL40 DEL42 DEL32 DEL59 DEL60 DEL42 DEL42 DEL42 DEL32 DEL41 DEL8 DEL31 DEL52 DEL42 DEL22 DEL42 DEL32 DEL32 DEL42 DEL27 DEL43 DEL42 DEL42 DEL32 DEL21 DEL42 DEL32 DEL7 DEL21 DEL42 DEL33 DEL27 DEL42 DEL32 DEL7 DEL21 DEL8 DEL25 DEL8 DEL42 DEL42 DEL32 DEL21 DEL8 DEL54 DEL27 DEL42 DEL42 DEL32 DEL38 DEL41 DEL42 DEL52 DEL51 DEL8 DEL25 DEL41 DEL8 DEL39 DEL42 DEL42 DEL42 DEL32 DEL42 DEL32 DEL43 DEL85 DEL5 DEL40 DEL40 DEL42 DEL42 DEL2 DEL32 DEL42 DEL43 DEL85 DEL5 DEL42 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL43 DEL85 DEL5 DEL42 DEL42 DEL43 DEL85 DEL5 DEL40 DEL3 DEL59 DEL60 DEL39 DEL42 DEL34 DEL59 DEL58 DEL42 DEL40 DEL27 DEL42 DEL37 DEL42 DEL43 DEL42 DEL42 DEL42 DEL2 DEL59 DEL60 DEL42 DEL43 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL42 DEL2 DEL42 DEL7 DEL21 DEL8 DEL24 DEL42 DEL42 DEL42 DEL32 DEL42 DEL43 DEL42 DEL32 DEL11 DEL36 DEL32 DEL33 DEL27 DEL25 DEL42 DEL42 DEL32 DEL42 DEL42 DEL32 DEL42 DEL42 DEL32 DEL42 DEL32 DEL42 DEL43 DEL42 DEL32 DEL32 DEL42 DEL42 DEL32 DEL14 DEL42 DEL43 DEL42 DEL42 DEL32 DEL42 DEL32 DEL42 DEL39 DEL32 DEL42 DEL42 DEL32 DEL27 DEL42 DEL32 DEL32 DEL32 DEL32 DEL59 DEL60 DEL42 DEL42 DEL42 DEL32 DEL14 DEL59 DEL60 DEL42 DEL43 DEL42 DEL44 DEL32 DEL32 DEL34 DEL27 DEL8 DEL25 DEL8 DEL70 DEL42 DEL43 DEL42 DEL42 DEL33 DEL27 DEL42 DEL32 DEL33 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL32 DEL27 DEL42 DEL43 DEL74 DEL42 DEL42 DEL42 DEL32 DEL42 DEL40 DEL32 DEL59 DEL60 DEL74 DEL42 DEL43 DEL74 DEL42 DEL43 DEL42 DEL42 DEL42 DEL32 DEL42 DEL42 DEL32 DEL59 DEL60

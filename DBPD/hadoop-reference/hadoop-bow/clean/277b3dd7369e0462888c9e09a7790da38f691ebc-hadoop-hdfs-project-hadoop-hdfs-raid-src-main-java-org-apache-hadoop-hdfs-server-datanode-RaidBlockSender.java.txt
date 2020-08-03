@@ -1,0 +1,300 @@
+MAPREDUCE-3868. Make Raid Compile. (Weiyan Wang via schen)
+
+
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/trunk@1351548 13f79535-47bb-0310-9956-ffa450edef68
+
++import org.apache.hadoop.hdfs.util.DataTransferThrottler;
++import org.apache.hadoop.io.nativeio.NativeIO;
++  /** Initial position to read */
++  private long initialOffset;
+-  private int bytesPerChecksum; // chunk size
++  private int chunkSize; // chunk size
++  private static final int TRANSFERTO_BUFFER_SIZE = Math.max(
++      HdfsConstants.IO_FILE_BUFFER_SIZE, MIN_BUFFER_WITH_TRANSFERTO);
+-      bytesPerChecksum = checksum.getBytesPerChecksum();
+-      if (bytesPerChecksum > 10*1024*1024 && bytesPerChecksum > replicaVisibleLength) {
++      int size = checksum.getBytesPerChecksum();
++      if (size > 10*1024*1024 && size > replicaVisibleLength) {
+-        bytesPerChecksum = checksum.getBytesPerChecksum();        
++        size = checksum.getBytesPerChecksum();        
++      chunkSize = size;
+-      offset = (startOffset - (startOffset % bytesPerChecksum));
++      offset = (startOffset - (startOffset % chunkSize));
+-        if (tmpLen % bytesPerChecksum != 0) {
+-          tmpLen += (bytesPerChecksum - tmpLen % bytesPerChecksum);
++        if (tmpLen % chunkSize != 0) {
++          tmpLen += (chunkSize - tmpLen % chunkSize);
+-        long checksumSkip = (offset / bytesPerChecksum) * checksumSize;
++        long checksumSkip = (offset / chunkSize) * checksumSize;
+-
++  
+-
++  
+-   * Sends upto maxChunks chunks of data.
+-   * 
+-   * When blockInPosition is >= 0, assumes 'out' is a 
+-   * {@link SocketOutputStream} and tries 
+-   * {@link SocketOutputStream#transferToFully(FileChannel, long, int)} to
+-   * send data (and updates blockInPosition).
++   * @param datalen Length of data 
++   * @return number of chunks for data of given size
+-  private int sendChunks(ByteBuffer pkt, int maxChunks, OutputStream out) 
+-                         throws IOException {
+-    // Sends multiple chunks in one packet with a single write().
+-
+-    int len = (int) Math.min(endOffset - offset,
+-                             (((long) bytesPerChecksum) * ((long) maxChunks)));
+-    int numChunks = (len + bytesPerChecksum - 1)/bytesPerChecksum;
+-    int packetLen = len + numChunks*checksumSize + 4;
+-    boolean lastDataPacket = offset + len == endOffset && len > 0;
++  private int numberOfChunks(long datalen) {
++    return (int) ((datalen + chunkSize - 1)/chunkSize);
++  }
++  
++  /**
++   * Write packet header into {@code pkt}
++   */
++  private void writePacketHeader(ByteBuffer pkt, int dataLen, int packetLen) {
+-
+-
+-    PacketHeader header = new PacketHeader(
+-      packetLen, offset, seqno, (len == 0), len);
++    PacketHeader header = new PacketHeader(packetLen, offset, seqno,
++        (dataLen == 0), dataLen, false);
++  }
++  
++  /**
++   * Read checksum into given buffer
++   * @param buf buffer to read the checksum into
++   * @param checksumOffset offset at which to write the checksum into buf
++   * @param checksumLen length of checksum to write
++   * @throws IOException on error
++   */
++  private void readChecksum(byte[] buf, final int checksumOffset,
++      final int checksumLen) throws IOException {
++    if (checksumSize <= 0 && checksumIn == null) {
++      return;
++    }
++    try {
++      checksumIn.readFully(buf, checksumOffset, checksumLen);
++    } catch (IOException e) {
++      LOG.warn(" Could not read or failed to veirfy checksum for data"
++          + " at offset " + offset + " for block " + block, e);
++      IOUtils.closeStream(checksumIn);
++      checksumIn = null;
++      if (corruptChecksumOk) {
++        if (checksumOffset < checksumLen) {
++          // Just fill the array with zeros.
++          Arrays.fill(buf, checksumOffset, checksumLen, (byte) 0);
++        }
++      } else {
++        throw e;
++      }
++    }
++  }
++  
++  /**
++   * Sends a packet with up to maxChunks chunks of data.
++   * 
++   * @param pkt buffer used for writing packet data
++   * @param maxChunks maximum number of chunks to send
++   * @param out stream to send data to
++   * @param transferTo use transferTo to send data
++   * @param throttler used for throttling data transfer bandwidth
++   */
++  private int sendPacket(ByteBuffer pkt, int maxChunks, OutputStream out,
++      boolean transferTo, DataTransferThrottler throttler) throws IOException {
++    int dataLen = (int) Math.min(endOffset - offset,
++                             (chunkSize * (long) maxChunks));
++    
++    int numChunks = numberOfChunks(dataLen); // Number of chunks be sent in the packet
++    int checksumDataLen = numChunks * checksumSize;
++    int packetLen = dataLen + checksumDataLen + 4;
++    boolean lastDataPacket = offset + dataLen == endOffset && dataLen > 0;
++
++    writePacketHeader(pkt, dataLen, packetLen);
+-    int checksumLen = numChunks * checksumSize;
+-      try {
+-        checksumIn.readFully(buf, checksumOff, checksumLen);
+-      } catch (IOException e) {
+-        LOG.warn(" Could not read or failed to veirfy checksum for data" +
+-                 " at offset " + offset + " for block " + block + " got : "
+-                 + StringUtils.stringifyException(e));
+-        IOUtils.closeStream(checksumIn);
+-        checksumIn = null;
+-        if (corruptChecksumOk) {
+-          if (checksumOff < checksumLen) {
+-            // Just fill the array with zeros.
+-            Arrays.fill(buf, checksumOff, checksumLen, (byte) 0);
+-          }
+-        } else {
+-          throw e;
+-        }
+-      }
++      readChecksum(buf, checksumOff, checksumDataLen);
+-        int start = checksumOff + checksumLen - checksumSize;
++        int start = checksumOff + checksumDataLen - checksumSize;
+-    int dataOff = checksumOff + checksumLen;
+-    
+-    if (blockInPosition < 0) {
+-      //normal transfer
+-      IOUtils.readFully(blockIn, buf, dataOff, len);
++    int dataOff = checksumOff + checksumDataLen;
++    if (!transferTo) { // normal transfer
++      IOUtils.readFully(blockIn, buf, dataOff, dataLen);
+-        int dOff = dataOff;
+-        int cOff = checksumOff;
+-        int dLeft = len;
+-
+-        for (int i=0; i<numChunks; i++) {
+-          checksum.reset();
+-          int dLen = Math.min(dLeft, bytesPerChecksum);
+-          checksum.update(buf, dOff, dLen);
+-          if (!checksum.compare(buf, cOff)) {
+-            long failedPos = offset + len -dLeft;
+-            throw new ChecksumException("Checksum failed at " + 
+-                                        failedPos, failedPos);
+-          }
+-          dLeft -= dLen;
+-          dOff += dLen;
+-          cOff += checksumSize;
+-        }
++        verifyChecksum(buf, dataOff, dataLen, numChunks, checksumOff);
+-      //writing is done below (mainly to handle IOException)
+-      if (blockInPosition >= 0) {
+-        //use transferTo(). Checks on out and blockIn are already done. 
+-
++      if (transferTo) {
+-        //first write the packet
+-        sockOut.write(buf, 0, dataOff);
++        sockOut.write(buf, 0, dataOff); // First write checksum
++        
+-
+-                                blockInPosition, len);
+-
+-        blockInPosition += len;
+-      } else {
++                                blockInPosition, dataLen);
++        blockInPosition += dataLen;
++      } else { 
+-        out.write(buf, 0, dataOff + len);
++        out.write(buf, 0, dataOff + dataLen);
+-      
+-      /* exception while writing to the client (well, with transferTo(),
+-       * it could also be while reading from the local file).
++      /* Exception while writing to the client. Connection closure from
++       * the other end is mostly the case and we do not care much about
++       * it. But other things can go wrong, especially in transferTo(),
++       * which we do not want to ignore.
++       *
++       * The message parsing below should not be considered as a good
++       * coding example. NEVER do it to drive a program logic. NEVER.
++       * It was done here because the NIO throws an IOException for EPIPE.
++      String ioem = e.getMessage();
++      if (!ioem.startsWith("Broken pipe") && !ioem.startsWith("Connection reset")) {
++        LOG.error("BlockSender.sendChunks() exception: ", e);
++      }
+-    return len;
++    if (throttler != null) { // rebalancing so throttle
++      throttler.throttle(packetLen);
++    }
++
++    return dataLen;
++  
++  /**
++   * Compute checksum for chunks and verify the checksum that is read from
++   * the metadata file is correct.
++   * 
++   * @param buf buffer that has checksum and data
++   * @param dataOffset position where data is written in the buf
++   * @param datalen length of data
++   * @param numChunks number of chunks corresponding to data
++   * @param checksumOffset offset where checksum is written in the buf
++   * @throws ChecksumException on failed checksum verification
++   */
++  public void verifyChecksum(final byte[] buf, final int dataOffset,
++      final int datalen, final int numChunks, final int checksumOffset)
++      throws ChecksumException {
++    int dOff = dataOffset;
++    int cOff = checksumOffset;
++    int dLeft = datalen;
++
++    for (int i = 0; i < numChunks; i++) {
++      checksum.reset();
++      int dLen = Math.min(dLeft, chunkSize);
++      checksum.update(buf, dOff, dLen);
++      if (!checksum.compare(buf, cOff)) {
++        long failedPos = offset + datalen - dLeft;
++        throw new ChecksumException("Checksum failed at " + failedPos,
++            failedPos);
++      }
++      dLeft -= dLen;
++      dOff += dLen;
++      cOff += checksumSize;
++    }
++  }
++
+-    if( out == null ) {
++    if (out == null) {
+-
+-    long initialOffset = offset;
++    initialOffset = offset;
+-      try {
+-        checksum.writeHeader(out);
+-        if ( chunkOffsetOK ) {
+-          out.writeLong( offset );
+-        }
+-        out.flush();
+-      } catch (IOException e) { //socket error
+-        throw ioeToSocketException(e);
+-      }
+-      
+-      
+-      if (transferToAllowed && !verifyChecksum && 
+-          baseStream instanceof SocketOutputStream && 
+-          blockIn instanceof FileInputStream) {
+-        
++      boolean transferTo = transferToAllowed && !verifyChecksum
++          && baseStream instanceof SocketOutputStream
++          && blockIn instanceof FileInputStream;
++      if (transferTo) {
+-        
+-        // blockInPosition also indicates sendChunks() uses transferTo.
++        maxChunksPerPacket = numberOfChunks(TRANSFERTO_BUFFER_SIZE);
+-        // assure a mininum buffer size.
+-        maxChunksPerPacket = (Math.max(HdfsConstants.IO_FILE_BUFFER_SIZE, 
+-                                       MIN_BUFFER_WITH_TRANSFERTO)
+-                              + bytesPerChecksum - 1)/bytesPerChecksum;
+-        
+-        // allocate smaller buffer while using transferTo(). 
++        // Smaller packet size to only hold checksum when doing transferTo
+-            (HdfsConstants.IO_FILE_BUFFER_SIZE + bytesPerChecksum - 1)/bytesPerChecksum);
+-        pktSize += (bytesPerChecksum + checksumSize) * maxChunksPerPacket;
++            numberOfChunks(HdfsConstants.IO_FILE_BUFFER_SIZE));
++        // Packet size includes both checksum and data
++        pktSize += (chunkSize + checksumSize) * maxChunksPerPacket;
+-        long len = sendChunks(pktBuf, maxChunksPerPacket, 
+-                              streamForSendChunks);
++        long len = sendPacket(pktBuf, maxChunksPerPacket, streamForSendChunks,
++            transferTo, null);
+-        totalRead += len + ((len + bytesPerChecksum - 1)/bytesPerChecksum*
+-                            checksumSize);
++        totalRead += len + (numberOfChunks(len) * checksumSize);
+-        sendChunks(pktBuf, maxChunksPerPacket, streamForSendChunks);        
++        sendPacket(pktBuf, maxChunksPerPacket, streamForSendChunks, transferTo,
++            null);
++      blockReadFully = true;
+-        ClientTraceLog.info(String.format(clientTraceFmt, totalRead, initialOffset, endTime - startTime));
++        ClientTraceLog.info(String.format(clientTraceFmt, totalRead,
++            initialOffset, endTime - startTime));
+-
+-    blockReadFully = initialOffset == 0 && offset >= replicaVisibleLength;
+-
++  /**
++   * @return the checksum type that will be used with this block transfer.
++   */
++  public DataChecksum getChecksum() {
++    return checksum;
++  }
++  

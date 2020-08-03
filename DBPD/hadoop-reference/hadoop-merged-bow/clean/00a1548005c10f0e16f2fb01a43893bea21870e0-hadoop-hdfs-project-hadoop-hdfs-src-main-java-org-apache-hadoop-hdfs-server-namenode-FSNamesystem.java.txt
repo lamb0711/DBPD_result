@@ -1,0 +1,240 @@
+Merge trunk into auto-HA branch
+
+Resolved some trivial conflicts in NNHAServiceTarget
+
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/branches/HDFS-3042@1309576 13f79535-47bb-0310-9956-ffa450edef68
+
++import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_HA_STANDBY_CHECKPOINTS_DEFAULT;
++import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_HA_STANDBY_CHECKPOINTS_KEY;
++import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_NAMENODE_DELEGATION_TOKEN_ALWAYS_USE_DEFAULT;
++import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_NAMENODE_DELEGATION_TOKEN_ALWAYS_USE_KEY;
+-import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_NAMENODE_DELEGATION_TOKEN_ALWAYS_USE_KEY;
+-import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_NAMENODE_DELEGATION_TOKEN_ALWAYS_USE_DEFAULT;
+-import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_HA_STANDBY_CHECKPOINTS_DEFAULT;
+-import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_HA_STANDBY_CHECKPOINTS_KEY;
+-import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_PERSIST_BLOCKS_KEY;
+-import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_PERSIST_BLOCKS_DEFAULT;
++import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_PERSIST_BLOCKS_DEFAULT;
++import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_PERSIST_BLOCKS_KEY;
++import org.apache.hadoop.hdfs.server.common.Storage;
+-import org.apache.hadoop.hdfs.server.common.Storage;
+-  private boolean isPermissionEnabled;
+-  private boolean persistBlocks;
+-  private UserGroupInformation fsOwner;
+-  private String supergroup;
+-  private boolean standbyShouldCheckpoint;
++  private final boolean isPermissionEnabled;
++  private final boolean persistBlocks;
++  private final UserGroupInformation fsOwner;
++  private final String supergroup;
++  private final boolean standbyShouldCheckpoint;
+-  private DelegationTokenSecretManager dtSecretManager;
+-  private boolean alwaysUseDelegationTokensForTests;
++  private final DelegationTokenSecretManager dtSecretManager;
++  private final boolean alwaysUseDelegationTokensForTests;
+-  //
+-  // Stores the correct file name hierarchy
+-  //
++  /** The namespace tree. */
+-  private BlockManager blockManager;
+-  private DatanodeStatistics datanodeStatistics;
++  private final BlockManager blockManager;
++  private final DatanodeStatistics datanodeStatistics;
+-  LeaseManager leaseManager = new LeaseManager(this); 
++  final LeaseManager leaseManager = new LeaseManager(this); 
+-  long systemStart = 0;
++  
++  /** The start time of the namesystem. */
++  private final long startTime = now();
+-  //resourceRecheckInterval is how often namenode checks for the disk space availability
+-  private long resourceRecheckInterval;
++  /** The interval of namenode checking for the disk space availability */
++  private final long resourceRecheckInterval;
+-  private FsServerDefaults serverDefaults;
+-
+-  private boolean supportAppends;
+-  private ReplaceDatanodeOnFailure dtpReplaceDatanodeOnFailure = 
+-      ReplaceDatanodeOnFailure.DEFAULT;
++  private final FsServerDefaults serverDefaults;
++  private final boolean supportAppends;
++  private final ReplaceDatanodeOnFailure dtpReplaceDatanodeOnFailure;
+-  private long maxFsObjects = 0;          // maximum number of fs objects
++  private final long maxFsObjects;          // maximum number of fs objects
+-  private long accessTimePrecision = 0;
++  private final long accessTimePrecision;
+-  // lock to protect FSNamesystem.
+-  private ReentrantReadWriteLock fsLock;
++  /** Lock to protect FSNamesystem. */
++  private ReentrantReadWriteLock fsLock = new ReentrantReadWriteLock(true);
+-  private boolean haEnabled;
+-
+-  private final Configuration conf;
++  private final boolean haEnabled;
+-    this.conf = conf;
+-      initialize(conf, fsImage);
++      resourceRecheckInterval = conf.getLong(
++          DFS_NAMENODE_RESOURCE_CHECK_INTERVAL_KEY,
++          DFS_NAMENODE_RESOURCE_CHECK_INTERVAL_DEFAULT);
++
++      this.blockManager = new BlockManager(this, this, conf);
++      this.datanodeStatistics = blockManager.getDatanodeManager().getDatanodeStatistics();
++
++      this.fsOwner = UserGroupInformation.getCurrentUser();
++      this.supergroup = conf.get(DFS_PERMISSIONS_SUPERUSERGROUP_KEY, 
++                                 DFS_PERMISSIONS_SUPERUSERGROUP_DEFAULT);
++      this.isPermissionEnabled = conf.getBoolean(DFS_PERMISSIONS_ENABLED_KEY,
++                                                 DFS_PERMISSIONS_ENABLED_DEFAULT);
++      LOG.info("fsOwner             = " + fsOwner);
++      LOG.info("supergroup          = " + supergroup);
++      LOG.info("isPermissionEnabled = " + isPermissionEnabled);
++
++      final boolean persistBlocks = conf.getBoolean(DFS_PERSIST_BLOCKS_KEY,
++                                                    DFS_PERSIST_BLOCKS_DEFAULT);
++      // block allocation has to be persisted in HA using a shared edits directory
++      // so that the standby has up-to-date namespace information
++      String nameserviceId = DFSUtil.getNamenodeNameServiceId(conf);
++      this.haEnabled = HAUtil.isHAEnabled(conf, nameserviceId);  
++      this.persistBlocks = persistBlocks || (haEnabled && HAUtil.usesSharedEditsDir(conf));
++      
++      // Sanity check the HA-related config.
++      if (nameserviceId != null) {
++        LOG.info("Determined nameservice ID: " + nameserviceId);
++      }
++      LOG.info("HA Enabled: " + haEnabled);
++      if (!haEnabled && HAUtil.usesSharedEditsDir(conf)) {
++        LOG.warn("Configured NNs:\n" + DFSUtil.nnAddressesAsString(conf));
++        throw new IOException("Invalid configuration: a shared edits dir " +
++            "must not be specified if HA is not enabled.");
++      }
++
++      this.serverDefaults = new FsServerDefaults(
++          conf.getLongBytes(DFS_BLOCK_SIZE_KEY, DFS_BLOCK_SIZE_DEFAULT),
++          conf.getInt(DFS_BYTES_PER_CHECKSUM_KEY, DFS_BYTES_PER_CHECKSUM_DEFAULT),
++          conf.getInt(DFS_CLIENT_WRITE_PACKET_SIZE_KEY, DFS_CLIENT_WRITE_PACKET_SIZE_DEFAULT),
++          (short) conf.getInt(DFS_REPLICATION_KEY, DFS_REPLICATION_DEFAULT),
++          conf.getInt(IO_FILE_BUFFER_SIZE_KEY, IO_FILE_BUFFER_SIZE_DEFAULT));
++      
++      this.maxFsObjects = conf.getLong(DFS_NAMENODE_MAX_OBJECTS_KEY, 
++                                       DFS_NAMENODE_MAX_OBJECTS_DEFAULT);
++
++      this.accessTimePrecision = conf.getLong(DFS_NAMENODE_ACCESSTIME_PRECISION_KEY, 0);
++      this.supportAppends = conf.getBoolean(DFS_SUPPORT_APPEND_KEY, DFS_SUPPORT_APPEND_DEFAULT);
++      LOG.info("Append Enabled: " + haEnabled);
++
++      this.dtpReplaceDatanodeOnFailure = ReplaceDatanodeOnFailure.get(conf);
++      
++      this.standbyShouldCheckpoint = conf.getBoolean(
++          DFS_HA_STANDBY_CHECKPOINTS_KEY, DFS_HA_STANDBY_CHECKPOINTS_DEFAULT);
++      
++      // For testing purposes, allow the DT secret manager to be started regardless
++      // of whether security is enabled.
++      alwaysUseDelegationTokensForTests = conf.getBoolean(
++          DFS_NAMENODE_DELEGATION_TOKEN_ALWAYS_USE_KEY,
++          DFS_NAMENODE_DELEGATION_TOKEN_ALWAYS_USE_DEFAULT);
++
++      this.dtSecretManager = createDelegationTokenSecretManager(conf);
++      this.dir = new FSDirectory(fsImage, this, conf);
++      this.safeMode = new SafeModeInfo(conf);
++
+-  /**
+-   * Initialize FSNamesystem.
+-   */
+-  private void initialize(Configuration conf, FSImage fsImage)
+-      throws IOException {
+-    resourceRecheckInterval = conf.getLong(
+-        DFS_NAMENODE_RESOURCE_CHECK_INTERVAL_KEY,
+-        DFS_NAMENODE_RESOURCE_CHECK_INTERVAL_DEFAULT);
+-    this.systemStart = now();
+-    this.blockManager = new BlockManager(this, this, conf);
+-    this.datanodeStatistics = blockManager.getDatanodeManager().getDatanodeStatistics();
+-    this.fsLock = new ReentrantReadWriteLock(true); // fair locking
+-    setConfigurationParameters(conf);
+-    dtSecretManager = createDelegationTokenSecretManager(conf);
+-    this.dir = new FSDirectory(fsImage, this, conf);
+-    this.safeMode = new SafeModeInfo(conf);
+-  }
+-
+-  void startStandbyServices() {
++  void startStandbyServices(final Configuration conf) {
+-    editLogTailer = new EditLogTailer(this);
++    editLogTailer = new EditLogTailer(this, conf);
+-  
+-  public Configuration getConf() {
+-    return conf;
+-  }
+-
+-  /**
+-   * Initializes some of the members from configuration
+-   */
+-  private void setConfigurationParameters(Configuration conf) 
+-                                          throws IOException {
+-    fsOwner = UserGroupInformation.getCurrentUser();
+-    
+-    LOG.info("fsOwner=" + fsOwner);
+-
+-    this.supergroup = conf.get(DFS_PERMISSIONS_SUPERUSERGROUP_KEY, 
+-                               DFS_PERMISSIONS_SUPERUSERGROUP_DEFAULT);
+-    this.isPermissionEnabled = conf.getBoolean(DFS_PERMISSIONS_ENABLED_KEY,
+-                                               DFS_PERMISSIONS_ENABLED_DEFAULT);
+-    LOG.info("supergroup=" + supergroup);
+-    LOG.info("isPermissionEnabled=" + isPermissionEnabled);
+-
+-    this.persistBlocks = conf.getBoolean(DFS_PERSIST_BLOCKS_KEY,
+-                                         DFS_PERSIST_BLOCKS_DEFAULT);
+-    // block allocation has to be persisted in HA using a shared edits directory
+-    // so that the standby has up-to-date namespace information
+-    String nameserviceId = DFSUtil.getNamenodeNameServiceId(conf);
+-    this.haEnabled = HAUtil.isHAEnabled(conf, nameserviceId);  
+-    this.persistBlocks |= haEnabled && HAUtil.usesSharedEditsDir(conf);
+-    
+-    // Sanity check the HA-related config.
+-    if (nameserviceId != null) {
+-      LOG.info("Determined nameservice ID: " + nameserviceId);
+-    }
+-    LOG.info("HA Enabled: " + haEnabled);
+-    if (!haEnabled && HAUtil.usesSharedEditsDir(conf)) {
+-      LOG.warn("Configured NNs:\n" + DFSUtil.nnAddressesAsString(conf));
+-      throw new IOException("Invalid configuration: a shared edits dir " +
+-          "must not be specified if HA is not enabled.");
+-    }
+-
+-    this.serverDefaults = new FsServerDefaults(
+-        conf.getLongBytes(DFS_BLOCK_SIZE_KEY, DFS_BLOCK_SIZE_DEFAULT),
+-        conf.getInt(DFS_BYTES_PER_CHECKSUM_KEY, DFS_BYTES_PER_CHECKSUM_DEFAULT),
+-        conf.getInt(DFS_CLIENT_WRITE_PACKET_SIZE_KEY, DFS_CLIENT_WRITE_PACKET_SIZE_DEFAULT),
+-        (short) conf.getInt(DFS_REPLICATION_KEY, DFS_REPLICATION_DEFAULT),
+-        conf.getInt(IO_FILE_BUFFER_SIZE_KEY, IO_FILE_BUFFER_SIZE_DEFAULT));
+-    
+-    this.maxFsObjects = conf.getLong(DFS_NAMENODE_MAX_OBJECTS_KEY, 
+-                                     DFS_NAMENODE_MAX_OBJECTS_DEFAULT);
+-
+-    this.accessTimePrecision = conf.getLong(DFS_NAMENODE_ACCESSTIME_PRECISION_KEY, 0);
+-    this.supportAppends = conf.getBoolean(DFS_SUPPORT_APPEND_KEY,
+-        DFS_SUPPORT_APPEND_DEFAULT);
+-
+-    this.dtpReplaceDatanodeOnFailure = ReplaceDatanodeOnFailure.get(conf);
+-    
+-    this.standbyShouldCheckpoint = conf.getBoolean(
+-        DFS_HA_STANDBY_CHECKPOINTS_KEY,
+-        DFS_HA_STANDBY_CHECKPOINTS_DEFAULT);
+-    
+-    // For testing purposes, allow the DT secret manager to be started regardless
+-    // of whether security is enabled.
+-    alwaysUseDelegationTokensForTests = 
+-      conf.getBoolean(DFS_NAMENODE_DELEGATION_TOKEN_ALWAYS_USE_KEY,
+-          DFS_NAMENODE_DELEGATION_TOKEN_ALWAYS_USE_DEFAULT);
+-  }
+-
+-      INodeFileUnderConstruction pendingFile) throws IOException {
++      INodeFileUnderConstruction pendingFile) {
+-    return new Date(systemStart); 
++    return new Date(startTime); 
+-      long timeInSafemode = now() - systemStart;
++      long timeInSafemode = now() - startTime;
+-  public void logUpdateMasterKey(DelegationKey key) throws IOException {
++  public void logUpdateMasterKey(DelegationKey key) {
+-      String newHolder) throws IOException {
++      String newHolder) {
+
+MOV26 MOV26 MOV26 MOV26 MOV26 MOV26 MOV26 MOV31 INS83 INS83 INS83 INS83 INS83 INS83 INS83 INS29 INS83 INS83 INS83 INS29 INS83 INS83 INS29 INS83 INS83 INS83 INS83 INS83 INS83 INS29 INS83 MOV29 UPD42 MOV44 INS8 INS44 MOV43 INS65 INS65 UPD42 MOV32 INS65 INS65 MOV14 INS54 INS83 MOV43 INS42 INS66 INS66 INS66 INS66 MOV8 MOV21 MOV12 MOV21 MOV21 MOV21 INS60 INS21 MOV21 MOV21 MOV21 MOV43 UPD42 INS83 INS39 INS59 UPD7 INS32 INS42 INS22 INS42 MOV32 INS27 INS42 INS42 INS27 INS22 UPD42 INS52 INS42 UPD45 UPD45 UPD45 INS42 INS36 INS45 INS42 INS52 INS42 MOV27 DEL34 DEL40 DEL34 DEL34 DEL83 DEL83 DEL42 DEL43 DEL42 DEL59 DEL23 DEL66 DEL65 DEL29 DEL83 DEL39 DEL42 DEL52 DEL42 DEL22 DEL7 DEL21 DEL42 DEL42 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL52 DEL42 DEL22 DEL42 DEL7 DEL21 DEL42 DEL42 DEL42 DEL32 DEL21 DEL8 DEL54 DEL8 DEL31 DEL66 DEL65 DEL29 DEL83 DEL39 DEL42 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL52 DEL42 DEL22 DEL7 DEL21 DEL52 DEL42 DEL22 DEL7 DEL21 DEL42 DEL42 DEL32 DEL21 DEL8 DEL31 DEL83 DEL42 DEL42 DEL41 DEL8 DEL31 DEL42 DEL43 DEL42 DEL43 DEL42 DEL43

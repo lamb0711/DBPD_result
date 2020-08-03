@@ -1,0 +1,234 @@
+HDDS-1173. Fix a data corruption bug in BlockOutputStream. Contributed by Shashikant Banerjee.
+
+-import java.nio.Buffer;
+-  private List<ByteBuffer> bufferList;
++  private BufferPool bufferPool;
+-  private int currentBufferIndex;
+-
+-   * @param bufferList           list of byte buffers
++   * @param bufferPool           pool of buffers
+-      long streamBufferMaxSize, long watchTimeout, List<ByteBuffer> bufferList,
++      long streamBufferMaxSize, long watchTimeout, BufferPool bufferPool,
+-    this.bufferList = bufferList;
++    this.bufferPool = bufferPool;
+-    currentBufferIndex = 0;
+-  private long computeBufferData() {
+-    int dataLength =
+-        bufferList.stream().mapToInt(Buffer::position).sum();
+-    Preconditions.checkState(dataLength <= streamBufferMaxSize);
+-    return dataLength;
+-  }
+-
++    checkOpen();
+-      checkOpen();
+-      allocateBuffer();
+-      ByteBuffer currentBuffer = getCurrentBuffer();
++
++      // Allocate a buffer if needed. The buffer will be allocated only
++      // once as needed and will be reused again for mutiple blockOutputStream
++      // entries.
++      ByteBuffer  currentBuffer = bufferPool.allocateBufferIfNeeded();
++      int pos = currentBuffer.position();
+-          Math.min(chunkSize - currentBuffer.position() % chunkSize, len);
++          Math.min(chunkSize - pos % chunkSize, len);
+-      if (currentBuffer.position() % chunkSize == 0) {
+-        int pos = currentBuffer.position() - chunkSize;
+-        int limit = currentBuffer.position();
+-        writeChunk(pos, limit);
++      if (!currentBuffer.hasRemaining()) {
++        writeChunk(currentBuffer);
+-      if (currentBuffer.position() == streamBufferFlushSize) {
++      if (shouldFlush()) {
+-      long bufferedData = computeBufferData();
+-      // Data in the bufferList can not exceed streamBufferMaxSize
+-      if (bufferedData == streamBufferMaxSize) {
++      // Data in the bufferPool can not exceed streamBufferMaxSize
++      if (isBufferPoolFull()) {
+-  private ByteBuffer getCurrentBuffer() {
+-    ByteBuffer buffer = bufferList.get(currentBufferIndex);
+-    if (!buffer.hasRemaining()) {
+-      currentBufferIndex =
+-          currentBufferIndex < getMaxNumBuffers() - 1 ? ++currentBufferIndex :
+-              0;
+-    }
+-    return bufferList.get(currentBufferIndex);
++  private boolean shouldFlush() {
++    return writtenDataLength % streamBufferFlushSize == 0;
+-  private int getMaxNumBuffers() {
+-    return (int)(streamBufferMaxSize/streamBufferFlushSize);
++  private boolean isBufferPoolFull() {
++    return bufferPool.computeBufferData() == streamBufferMaxSize;
+-
+-  private void allocateBuffer() {
+-    for (int i = bufferList.size(); i < getMaxNumBuffers(); i++) {
+-      bufferList.add(ByteBuffer.allocate((int)streamBufferFlushSize));
+-    }
+-  }
+-
+-    int off = 0;
+-    int pos = off;
++    int count = 0;
++    Preconditions.checkArgument(len <= streamBufferMaxSize);
+-        int limit = pos + chunkSize;
+-        writeChunk(pos, limit);
++        writeChunk(bufferPool.getBuffer(count));
+-      off += writeLen;
++      count++;
+-      if (off % streamBufferFlushSize == 0) {
+-        // reset the position to zero as now we wll readng thhe next buffer in
+-        // the list
+-        pos = 0;
++      if (shouldFlush()) {
++        // reset the position to zero as now we will be reading the
++        // next buffer in the list
+-      if (computeBufferData() % streamBufferMaxSize == 0) {
++
++      // we should not call isBufferFull here. The buffer might already be full
++      // as whole data is already cached in the buffer. We should just validate
++      // if we wrote data of size streamBufferMaxSize to call for handling
++      // full buffer condition.
++      if (writtenDataLength == streamBufferMaxSize) {
+-   * just update the totalAckDataLength. Since we have allocated
+-   * the currentBuffer more than the streamBufferMaxSize, we can keep on writing
+-   * to the currentBuffer. In case of failure, we will read the data starting
+-   * from totalAckDataLength.
++   * just update the totalAckDataLength. In case of failure,
++   * we will read the data starting from totalAckDataLength.
+-      // just swap the bufferList head and tail after clearing.
+-      ByteBuffer currentBuffer = bufferList.remove(0);
+-      currentBuffer.clear();
+-      if (currentBufferIndex != 0) {
+-        currentBufferIndex--;
++      // just release the current buffer from the buffer pool.
++
++      // every entry removed from the putBlock future Map signifies
++      // streamBufferFlushSize/chunkSize no of chunks successfully committed.
++      // Release the buffers from the buffer pool to be reused again.
++      int chunkCount = (int) (streamBufferFlushSize / chunkSize);
++      for (int i = 0; i < chunkCount; i++) {
++        bufferPool.releaseBuffer();
+-      bufferList.add(currentBuffer);
+-        && bufferList != null) {
+-      checkOpen();
+-      int bufferSize = bufferList.size();
+-      if (bufferSize > 0) {
+-        try {
+-          // flush the last chunk data residing on the currentBuffer
+-          if (totalDataFlushedLength < writtenDataLength) {
+-            ByteBuffer currentBuffer = getCurrentBuffer();
+-            int pos = currentBuffer.position() - (currentBuffer.position()
+-                % chunkSize);
+-            int limit = currentBuffer.position() - pos;
+-            writeChunk(pos, currentBuffer.position());
+-            totalDataFlushedLength += limit;
+-            handlePartialFlush();
+-          }
+-          waitOnFlushFutures();
+-          // just check again if the exception is hit while waiting for the
+-          // futures to ensure flush has indeed succeeded
+-          checkOpen();
+-        } catch (InterruptedException | ExecutionException e) {
+-          adjustBuffersOnException();
+-          throw new IOException(
+-              "Unexpected Storage Container Exception: " + e.toString(), e);
+-        }
++        && bufferPool != null && bufferPool.getSize() > 0) {
++      try {
++        handleFlush();
++      } catch (InterruptedException | ExecutionException e) {
++        adjustBuffersOnException();
++        throw new IOException(
++            "Unexpected Storage Container Exception: " + e.toString(), e);
+-  private void writeChunk(int pos, int limit) throws IOException {
++
++  private void writeChunk(ByteBuffer buffer)
++      throws IOException {
+-    ByteBuffer chunk = bufferList.get(currentBufferIndex).duplicate();
+-    chunk.position(pos);
+-    chunk.limit(limit);
++    ByteBuffer chunk = buffer.duplicate();
++    chunk.position(0);
++    chunk.limit(buffer.position());
++  private void handleFlush()
++      throws IOException, InterruptedException, ExecutionException {
++    checkOpen();
++    // flush the last chunk data residing on the currentBuffer
++    if (totalDataFlushedLength < writtenDataLength) {
++      ByteBuffer currentBuffer = bufferPool.getBuffer();
++      int pos = currentBuffer.position();
++      writeChunk(currentBuffer);
++      totalDataFlushedLength += pos;
++      handlePartialFlush();
++    }
++    waitOnFlushFutures();
++    // just check again if the exception is hit while waiting for the
++    // futures to ensure flush has indeed succeeded
++
++    // irrespective of whether the commitIndex2flushedDataMap is empty
++    // or not, ensure there is no exception set
++    checkOpen();
++
++  }
++
+-        && bufferList != null) {
+-      int bufferSize = bufferList.size();
+-      if (bufferSize > 0) {
+-        try {
+-          // flush the last chunk data residing on the currentBuffer
+-          if (totalDataFlushedLength < writtenDataLength) {
+-            ByteBuffer currentBuffer = getCurrentBuffer();
+-            int pos = currentBuffer.position() - (currentBuffer.position()
+-                % chunkSize);
+-            int limit = currentBuffer.position() - pos;
+-            writeChunk(pos, currentBuffer.position());
+-            totalDataFlushedLength += limit;
+-            handlePartialFlush();
+-          }
+-          waitOnFlushFutures();
+-          // irrespective of whether the commitIndex2flushedDataMap is empty
+-          // or not, ensure there is no exception set
+-          checkOpen();
+-          if (!commitIndex2flushedDataMap.isEmpty()) {
+-            // wait for the last commit index in the commitIndex2flushedDataMap
+-            // to get committed to all or majority of nodes in case timeout
+-            // happens.
+-            long lastIndex =
+-                commitIndex2flushedDataMap.keySet().stream()
+-                    .mapToLong(v -> v).max().getAsLong();
+-            LOG.debug(
+-                "waiting for last flush Index " + lastIndex + " to catch up");
+-            watchForCommit(lastIndex);
+-          }
+-        } catch (InterruptedException | ExecutionException e) {
+-          adjustBuffersOnException();
+-          throw new IOException(
+-              "Unexpected Storage Container Exception: " + e.toString(), e);
+-        } finally {
+-          cleanup(false);
++        && bufferPool != null && bufferPool.getSize() > 0) {
++      try {
++        handleFlush();
++        if (!commitIndex2flushedDataMap.isEmpty()) {
++          // wait for the last commit index in the commitIndex2flushedDataMap
++          // to get committed to all or majority of nodes in case timeout
++          // happens.
++          long lastIndex =
++              commitIndex2flushedDataMap.keySet().stream().mapToLong(v -> v)
++                  .max().getAsLong();
++          LOG.debug(
++              "waiting for last flush Index " + lastIndex + " to catch up");
++          watchForCommit(lastIndex);
++      } catch (InterruptedException | ExecutionException e) {
++        adjustBuffersOnException();
++        throw new IOException(
++            "Unexpected Storage Container Exception: " + e.toString(), e);
++      } finally {
++        cleanup(false);
+-      // clear the currentBuffer
+-      bufferList.stream().forEach(ByteBuffer::clear);
++      // TODO: Turn the below buffer empty check on whne Standalone pipeline
++      // is removed in the write path in tests
++      // Preconditions.checkArgument(buffer.position() == 0);
++      // bufferPool.checkBufferPoolEmpty();
++
++

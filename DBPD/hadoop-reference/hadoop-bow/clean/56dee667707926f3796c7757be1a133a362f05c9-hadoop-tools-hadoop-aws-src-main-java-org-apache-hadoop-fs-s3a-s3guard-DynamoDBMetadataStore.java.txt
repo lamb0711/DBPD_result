@@ -1,0 +1,134 @@
+HADOOP-16823. Large DeleteObject requests are their own Thundering Herd.
+
+Contributed by Steve Loughran.
+
+During S3A rename() and delete() calls, the list of objects delete is
+built up into batches of a thousand and then POSTed in a single large
+DeleteObjects request.
+
+But as the IO capacity allowed on an S3 partition may only be 3500 writes
+per second *and* each entry in that POST counts as a single write, then
+one of those posts alone can trigger throttling on an already loaded
+S3 directory tree. Which can trigger backoff and retry, with the same
+thousand entry post, and so recreate the exact same problem.
+
+Fixes
+
+* Page size for delete object requests is set in
+  fs.s3a.bulk.delete.page.size; the default is 250.
+* The property fs.s3a.experimental.aws.s3.throttling (default=true)
+  can be set to false to disable throttle retry logic in the AWS
+  client SDK -it is all handled in the S3A client. This
+  gives more visibility in to when operations are being throttled
+* Bulk delete throttling events are logged to the log
+  org.apache.hadoop.fs.s3a.throttled log at INFO; if this appears
+  often then choose a smaller page size.
+* The metric "store_io_throttled" adds the entire count of delete
+  requests when a single DeleteObjects request is throttled.
+* A new quantile, "store_io_throttle_rate" can track throttling
+  load over time.
+* DynamoDB metastore throttle resilience issues have also been
+  identified and fixed. Note: the fs.s3a.experimental.aws.s3.throttling
+  flag does not apply to DDB IO precisely because there may still be
+  lurking issues there and it safest to rely on the DynamoDB client
+  SDK.
+
+Change-Id: I00f85cdd94fc008864d060533f6bd4870263fd84
+
++import org.apache.hadoop.fs.impl.WrappedIOException;
++  /** Invoker for scan operations. */
++  private Invoker scanOp;
++
++  private final AtomicLong scanThrottleEvents = new AtomicLong(0);
+-    // set up a full retry policy
+-    invoker = new Invoker(new S3GuardDataAccessRetryPolicy(conf),
+-        this::retryEvent
+-    );
+-
++    scanOp = new Invoker(throttledRetryRetryPolicy, this::scanRetryEvent);
++    final QuerySpec spec = new QuerySpec()
++        .withHashKey(pathToParentKeyAttribute(path))
++        .withConsistentRead(true); // strictly consistent read
++    final List<PathMetadata> metas = new ArrayList<>();
+-    return readOp.retry(
++    final ItemCollection<QueryOutcome> items = scanOp.retry(
+-        () -> {
+-          final QuerySpec spec = new QuerySpec()
+-              .withHashKey(pathToParentKeyAttribute(path))
+-              .withConsistentRead(true); // strictly consistent read
+-          final ItemCollection<QueryOutcome> items = table.query(spec);
++        () -> table.query(spec));
++    // now wrap the result with retry logic
++    try {
++      for (Item item : wrapWithRetries(items)) {
++        metas.add(itemToPathMetadata(item, username));
++      }
++    } catch (WrappedIOException e) {
++      // failure in the iterators; unwrap.
++      throw e.getCause();
++    }
+-          final List<PathMetadata> metas = new ArrayList<>();
+-          for (Item item : items) {
+-            DDBPathMetadata meta = itemToPathMetadata(item, username);
+-            metas.add(meta);
+-          }
+-
+-          // Minor race condition here - if the path is deleted between
+-          // getting the list of items and the directory metadata we might
+-          // get a null in DDBPathMetadata.
+-          DDBPathMetadata dirPathMeta = get(path);
+-
+-          final DirListingMetadata dirListing =
+-              getDirListingMetadataFromDirMetaAndList(path, metas,
+-                  dirPathMeta);
+-          return dirListing;
+-        });
++    // Minor race condition here - if the path is deleted between
++    // getting the list of items and the directory metadata we might
++    // get a null in DDBPathMetadata.
++    return getDirListingMetadataFromDirMetaAndList(path, metas,
++        get(path));
++   * Callback on a scan operation retried.
++   * @param text text of the operation
++   * @param ex exception
++   * @param attempts number of attempts
++   * @param idempotent is the method idempotent (this is assumed to be true)
++   */
++  void scanRetryEvent(
++      String text,
++      IOException ex,
++      int attempts,
++      boolean idempotent) {
++    scanThrottleEvents.incrementAndGet();
++    retryEvent(text, ex, attempts, idempotent);
++  }
++
++  /**
++  /**
++   * Get the count of scan throttle events.
++   * @return the current count of scan throttle events.
++   */
++  @VisibleForTesting
++  public long getScanThrottleEventCount() {
++    return scanThrottleEvents.get();
++  }
++
+-  @VisibleForTesting
++  /**
++   * Get the operation invoker for write operations.
++   * @return an invoker for retrying mutating operations on a store.
++   */
+-    return invoker;
++    return writeOp;
++  }
++
++  /**
++   * Wrap an iterator returned from any scan with a retrying one.
++   * This includes throttle handling.
++   * Retries will update the relevant counters/metrics for scan operations.
++   * @param source source iterator
++   * @return a retrying iterator.
++   */
++  public <T> Iterable<T> wrapWithRetries(
++      final Iterable<T> source) {
++    return new RetryingCollection<>("scan dynamoDB table", scanOp, source);

@@ -1,0 +1,357 @@
+JCR-3687 : Backport improvements made to token based auth in OAK
+
+git-svn-id: https://svn.apache.org/repos/asf/jackrabbit/trunk@1537027 13f79535-47bb-0310-9956-ffa450edef68
+
+-import org.apache.jackrabbit.api.security.authentication.token.TokenCredentials;
+-import org.apache.jackrabbit.api.security.principal.ItemBasedPrincipal;
+-import org.apache.jackrabbit.api.security.user.User;
+-import org.apache.jackrabbit.core.NodeImpl;
+-import org.apache.jackrabbit.core.SessionImpl;
+-import org.apache.jackrabbit.core.id.NodeId;
+-import org.apache.jackrabbit.core.id.NodeIdFactory;
+-import org.apache.jackrabbit.core.security.SecurityConstants;
+-import org.apache.jackrabbit.core.security.authentication.Authentication;
+-import org.apache.jackrabbit.spi.Name;
+-import org.apache.jackrabbit.util.ISO8601;
+-import org.apache.jackrabbit.util.Text;
+-import org.slf4j.Logger;
+-import org.slf4j.LoggerFactory;
+-
++import java.util.Date;
+-import javax.jcr.Property;
+-import javax.jcr.PropertyIterator;
+-import java.io.UnsupportedEncodingException;
+-import java.security.NoSuchAlgorithmException;
+-import java.security.Principal;
+-import java.security.SecureRandom;
+-import java.util.Arrays;
+-import java.util.Calendar;
+-import java.util.Collection;
+-import java.util.Collections;
+-import java.util.Date;
+-import java.util.GregorianCalendar;
+-import java.util.HashMap;
+-import java.util.Map;
++
++import org.apache.jackrabbit.api.JackrabbitSession;
++import org.apache.jackrabbit.api.security.authentication.token.TokenCredentials;
++import org.apache.jackrabbit.api.security.user.User;
++import org.apache.jackrabbit.core.NodeImpl;
++import org.apache.jackrabbit.core.SessionImpl;
++import org.apache.jackrabbit.core.security.authentication.Authentication;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
+-    private static final String TOKEN_ATTRIBUTE_EXPIRY = TOKEN_ATTRIBUTE + ".exp";
+-    private static final String TOKEN_ATTRIBUTE_KEY = TOKEN_ATTRIBUTE + ".key";
+-    private static final String TOKENS_NODE_NAME = ".tokens";
+-    private static final String TOKENS_NT_NAME = "nt:unstructured"; // TODO: configurable
++    /**
++     * @deprecated This system parameter allows to enable backwards compatible
++     * behavior of the {@code TokenBasedAuthentication}. Note that as of OAK 1.0
++     * this flag will no be supported.
++     */
++    public static final String PARAM_COMPAT = "TokenCompatMode";
+-    private static final char DELIM = '_';
+-
+-    private final String token;
+-    private final long tokenExpiration;
+-    private final Session session;
+-
+-    private final Map<String, String> attributes;
+-    private final Map<String, String> info;
+-    private final long expiry;
+-    private final String key;
++    private final TokenInfo tokenInfo;
+-        this.session = session;
+-        this.tokenExpiration = tokenExpiration;
+-        this.token = token;
+-        long expTime = Long.MAX_VALUE;
+-        String keyV = null;
+-        if (token != null) {
+-            attributes = new HashMap<String, String>();
+-            info = new HashMap<String, String>();
+-
+-            Node n = getTokenNode(token, session);
+-            PropertyIterator it = n.getProperties();
+-            while (it.hasNext()) {
+-                Property p = it.nextProperty();
+-                String name = p.getName();
+-                if (TOKEN_ATTRIBUTE_EXPIRY.equals(name)) {
+-                    expTime = p.getLong();
+-                } else if (TOKEN_ATTRIBUTE_KEY.equals(name)) {
+-                    keyV = p.getString();
+-                } else if (isMandatoryAttribute(name)) {
+-                    attributes.put(name, p.getString());
+-                } else if (isInfoAttribute(name)) {
+-                    info.put(name, p.getString());
+-                } // else: jcr property -> ignore
+-            }
++        if (compatMode()) {
++            this.tokenInfo = new CompatTokenProvider((SessionImpl) session, tokenExpiration).getTokenInfo(token);
+-            attributes = Collections.emptyMap();
+-            info = Collections.emptyMap();
++            this.tokenInfo = new TokenProvider((SessionImpl) session, tokenExpiration).getTokenInfo(token);
+-        expiry = expTime;
+-        key = keyV;
++
+-        return token != null && isTokenBasedLogin(credentials);
++        return tokenInfo != null && isTokenBasedLogin(credentials);
++        return validateCredentials(tokenCredentials);
++    }
+-        // credentials without userID -> check if attributes provide
+-        // sufficient information for successful authentication.
+-        if (token.equals(tokenCredentials.getToken())) {
+-            long loginTime = new Date().getTime();
+-            // test if the token has already expired
+-            if (expiry < loginTime) {
+-                // already expired -> login fails.
+-                // ... remove the expired token node before aborting the login
+-                removeToken();
+-                return false;
+-            }
++    private boolean validateCredentials(TokenCredentials tokenCredentials) throws RepositoryException {
++        if (tokenInfo == null) {
++            log.debug("No valid TokenInfo for token.");
++            return false;
++        }
+-            // test for matching key
+-            if (key != null && !key.equals(getDigestedKey(tokenCredentials))) {
+-                return false;
+-            }
++        long loginTime = new Date().getTime();
++        if (tokenInfo.isExpired(loginTime)) {
++            // token is expired
++            log.debug("Token is expired");
++            tokenInfo.remove();
++            return false;
++        }
+-            // check if all other required attributes match
+-            for (String name : attributes.keySet()) {
+-                if (!attributes.get(name).equals(tokenCredentials.getAttribute(name))) {
+-                    // no match -> login fails.
+-                    return false;
+-                }
+-            }
+-
+-            // update set of informative attributes on the credentials
+-            // based on the properties present on the token node.
+-            Collection<String> attrNames = Arrays.asList(tokenCredentials.getAttributeNames());
+-            for (String key : info.keySet()) {
+-                if (!attrNames.contains(key)) {
+-                    tokenCredentials.setAttribute(key, info.get(key));
+-                }
+-            }
+-
+-            // update token node if required: optionally resetting the expiration
+-            updateTokenNode(expiry, loginTime);
+-
++        if (tokenInfo.matches(tokenCredentials)) {
++            tokenInfo.resetExpiration(loginTime);
+-        // wrong credentials that cannot be compared by this authentication
+-    /**
+-     * Performs the following checks/updates:
+-     * <ol>
+-     * <li>Reset the expiration if half of the expiration has passed in order to
+-     * minimize write operations (avoid resetting upon each login).</li>
+-     * </ol>
+-     *
+-     * @param tokenExpiry
+-     * @param loginTime
+-     */
+-    private void updateTokenNode(long tokenExpiry, long loginTime) {
+-        Node tokenNode;
+-        Session s = null;
+-        try {
+-            // expiry...
+-            if (tokenExpiry - loginTime <= tokenExpiration/2) {
+-                long expirationTime = loginTime + tokenExpiration;
+-                Calendar cal = GregorianCalendar.getInstance();
+-                cal.setTimeInMillis(expirationTime);
+-
+-                s = ((SessionImpl) session).createSession(session.getWorkspace().getName());
+-                tokenNode = getTokenNode(token, s);
+-                tokenNode.setProperty(TOKEN_ATTRIBUTE_EXPIRY, s.getValueFactory().createValue(cal));
+-                s.save();
+-            }
+-        } catch (RepositoryException e) {
+-            log.warn("Failed to update expiry or informative attributes of token node.", e);
+-        } finally {
+-            if (s != null) {
+-                s.logout();
+-            }
+-        }
+-    }
+-
+-    /**
+-     * Remove the node associated with the expired token defined by this TokenBasedAuthentication.
+-     */
+-    private void removeToken() {
+-        Session s = null;
+-        try {
+-            s = ((SessionImpl) session).createSession(session.getWorkspace().getName());
+-            Node tokenNode = getTokenNode(token, s);
+-            
+-            tokenNode.remove();
+-            s.save();
+-        } catch (RepositoryException e) {
+-            log.warn("Internal error while removing token node.", e);
+-        } finally {
+-            if (s != null) {
+-                s.logout();
+-            }
+-        }
+-    }
+-
+-     *  
++     *
+-        return attributeName != null && attributeName.startsWith(TOKEN_ATTRIBUTE);
+-    }
+-
+-    /**
+-     * Returns <code>false</code> if the specified attribute name doesn't have
+-     * a 'jcr' or 'rep' namespace prefix; <code>true</code> otherwise. This is
+-     * a lazy evaluation in order to avoid testing the defining node type of
+-     * the associated jcr property.
+-     *
+-     * @param propertyName
+-     * @return <code>true</code> if the specified property name doesn't seem
+-     * to represent repository internal information.
+-     */
+-    private static boolean isInfoAttribute(String propertyName) {
+-        String prefix = Text.getNamespacePrefix(propertyName);
+-        return !Name.NS_JCR_PREFIX.equals(prefix) && !Name.NS_REP_PREFIX.equals(prefix);
++        if (compatMode()) {
++            return CompatTokenProvider.isMandatoryAttribute(attributeName);
++        } else {
++            return TokenProvider.isMandatoryAttribute(attributeName);
++        }
+-                                                       long tokenExpiration, Session session) throws RepositoryException {
++                                          long tokenExpiration, Session session) throws RepositoryException {
+-        String userPath = null;
+-        Principal pr = user.getPrincipal();
+-        if (pr instanceof ItemBasedPrincipal) {
+-            userPath = ((ItemBasedPrincipal) pr).getPath();
++
++        TokenInfo ti;
++        if (compatMode()) {
++            ti = new CompatTokenProvider((SessionImpl) session, tokenExpiration).createToken(user, credentials);
++        } else {
++            ti = new TokenProvider((SessionImpl) session, tokenExpiration).createToken(user, credentials);
+-        TokenCredentials tokenCredentials;
+-        if (userPath != null && session.nodeExists(userPath)) {
+-            Node userNode = session.getNode(userPath);
+-            Node tokenParent;
+-            if (!userNode.hasNode(TOKENS_NODE_NAME)) {
+-                userNode.addNode(TOKENS_NODE_NAME, TOKENS_NT_NAME);
+-                try {
+-                    session.save();
+-                } catch (RepositoryException e) {
+-                    // may happen when .tokens node is created concurrently
+-                    session.refresh(false);
+-                }
+-            }
+-            tokenParent = userNode.getNode(TOKENS_NODE_NAME);
+-
+-            long creationTime = new Date().getTime();
+-            long expirationTime = creationTime + tokenExpiration;
+-
+-            Calendar cal = GregorianCalendar.getInstance();
+-            cal.setTimeInMillis(creationTime);
+-
+-            // generate key part of the login token
+-            String key = generateKey(8);
+-
+-            // create the token node
+-            String tokenName = Text.replace(ISO8601.format(cal), ":", ".");
+-            Node tokenNode;
+-            // avoid usage of sequential nodeIDs
+-            if (System.getProperty(NodeIdFactory.SEQUENTIAL_NODE_ID) == null) {
+-                tokenNode = tokenParent.addNode(tokenName);
+-            } else {
+-                tokenNode = ((NodeImpl) tokenParent).addNodeWithUuid(tokenName, NodeId.randomId().toString());
+-            }
+-
+-            StringBuilder sb = new StringBuilder(tokenNode.getIdentifier());
+-            sb.append(DELIM).append(key);
+-
+-            String token = sb.toString();
+-            tokenCredentials = new TokenCredentials(token);
+-            credentials.setAttribute(TOKEN_ATTRIBUTE, token);
+-
+-            // add key property
+-            tokenNode.setProperty(TOKEN_ATTRIBUTE_KEY, getDigestedKey(key));
+-
+-            // add expiration time property
+-            cal.setTimeInMillis(expirationTime);
+-            tokenNode.setProperty(TOKEN_ATTRIBUTE_EXPIRY, session.getValueFactory().createValue(cal));
+-
+-            // add additional attributes passed in by the credentials.
+-            for (String name : credentials.getAttributeNames()) {
+-                if (!TOKEN_ATTRIBUTE.equals(name)) {
+-                    String value = credentials.getAttribute(name).toString();
+-                    tokenNode.setProperty(name, value);
+-                    tokenCredentials.setAttribute(name, value);
+-                }
+-            }
+-            session.save();
+-            return tokenCredentials;
++        if (ti != null) {
++            return ti.getCredentials();
+-            throw new RepositoryException("Cannot create login token: No corresponding node for User " + user.getID() +" in workspace '" + workspaceName + "'.");
++            throw new RepositoryException("Cannot create login token.");
+-        return getTokenNode(credentials.getToken(), session);
+-    }
+-
+-    private static Node getTokenNode(String token, Session session) throws RepositoryException {
+-        int pos = token.indexOf(DELIM);
+-        String id = (pos == -1) ? token : token.substring(0, pos);
+-        return session.getNodeByIdentifier(id);
+-    }
+-
+-    private static String generateKey(int size) {
+-        SecureRandom random = new SecureRandom();
+-        byte key[] = new byte[size];
+-        random.nextBytes(key);
+-
+-        StringBuffer res = new StringBuffer(key.length * 2);
+-        for (byte b : key) {
+-            res.append(Text.hexTable[(b >> 4) & 15]);
+-            res.append(Text.hexTable[b & 15]);
++        if (compatMode()) {
++            return CompatTokenProvider.getTokenNode(credentials.getToken(), session);
++        } else {
++            return TokenProvider.getTokenNode(credentials.getToken(), session);
+-        return res.toString();
+-    private static String getDigestedKey(TokenCredentials tc) throws RepositoryException {
+-        String tk = tc.getToken();
+-        int pos = tk.indexOf(DELIM);
+-        if (pos > -1) {
+-            return getDigestedKey(tk.substring(pos+1));
+-        }     
+-        return null;
+-    }
+-    private static String getDigestedKey(String key) throws RepositoryException {
+-        try {
+-            StringBuilder sb = new StringBuilder();
+-            sb.append("{").append(SecurityConstants.DEFAULT_DIGEST).append("}");
+-            sb.append(Text.digest(SecurityConstants.DEFAULT_DIGEST, key, "UTF-8"));
+-            return sb.toString();
+-        } catch (NoSuchAlgorithmException e) {
+-            throw new RepositoryException("Failed to generate login token.");
+-        } catch (UnsupportedEncodingException e) {
+-            throw new RepositoryException("Failed to generate login token.");
++    public static String getUserId(TokenCredentials tokenCredentials, Session session) throws RepositoryException {
++        if (compatMode()) {
++            return CompatTokenProvider.getUserId(tokenCredentials, session);
++        } else {
++            if (!(session instanceof JackrabbitSession)) {
++                throw new RepositoryException("JackrabbitSession expected");
++            }
++            NodeImpl n = (NodeImpl) getTokenNode(tokenCredentials, session);
++            return TokenProvider.getUserId(n, ((JackrabbitSession) session).getUserManager());
++
++    private static boolean compatMode() {
++        return Boolean.parseBoolean(System.getProperty(PARAM_COMPAT));
++    }
+
+MOV26 MOV26 MOV26 MOV26 MOV26 MOV26 MOV26 UPD40 INS31 INS31 INS29 UPD83 MOV43 UPD43 INS8 MOV83 UPD39 MOV39 UPD42 MOV42 MOV44 MOV43 INS8 INS8 UPD83 MOV83 MOV83 MOV43 UPD42 MOV42 MOV44 MOV44 MOV43 INS8 INS39 INS42 INS8 INS65 UPD42 UPD45 UPD42 UPD42 INS25 MOV25 MOV60 INS41 MOV43 UPD42 INS25 MOV60 INS25 INS25 MOV41 INS25 MOV60 MOV25 INS25 INS25 MOV43 UPD42 INS25 INS41 INS66 INS66 INS65 INS66 INS66 INS32 INS8 INS8 INS32 UPD27 MOV27 INS8 INS32 INS8 INS32 MOV8 INS32 INS8 INS8 UPD43 INS32 INS27 INS8 MOV8 INS32 INS8 MOV8 INS32 INS8 INS8 INS32 INS66 INS42 INS21 INS21 UPD42 MOV42 MOV42 UPD42 MOV42 INS33 MOV21 MOV41 INS42 UPD42 MOV42 UPD42 MOV42 MOV21 MOV21 MOV41 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 MOV41 INS42 INS41 INS41 UPD42 UPD42 UPD42 MOV42 INS42 INS33 INS41 INS42 INS41 UPD42 MOV42 INS41 INS25 MOV60 MOV41 UPD42 MOV42 UPD42 MOV42 MOV32 INS7 INS7 UPD42 INS32 INS32 INS32 INS32 INS32 INS32 INS38 INS8 UPD43 UPD42 UPD42 UPD42 MOV22 INS32 INS22 INS32 UPD42 UPD45 UPD42 MOV42 UPD42 MOV42 INS45 UPD42 UPD42 INS42 UPD42 INS42 INS42 INS42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 UPD42 UPD42 UPD42 MOV42 UPD42 MOV42 MOV43 INS45 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS42 UPD42 MOV42 INS36 INS53 UPD42 UPD42 INS11 INS42 UPD42 INS42 UPD42 INS14 UPD42 MOV42 MOV42 INS52 INS42 INS14 INS42 UPD42 MOV42 INS14 UPD42 INS42 INS42 INS14 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 INS42 INS42 INS62 INS14 MOV43 INS32 INS36 INS42 INS43 INS11 INS42 INS43 INS11 INS42 INS43 MOV11 INS42 INS43 MOV11 INS42 INS42 INS43 MOV43 INS45 INS42 UPD42 MOV42 UPD42 MOV42 INS11 UPD42 MOV42 INS43 INS42 UPD42 MOV42 INS43 INS42 INS42 INS42 UPD42 MOV42 INS43 INS42 UPD42 MOV42 UPD42 MOV42 INS42 DEL40 DEL26 DEL40 DEL26 DEL40 DEL26 DEL40 DEL26 DEL40 DEL26 DEL40 DEL26 DEL40 DEL26 DEL40 DEL26 DEL40 DEL26 DEL40 DEL26 DEL40 DEL26 DEL40 DEL26 DEL40 DEL26 DEL40 DEL26 DEL40 DEL26 DEL40 DEL26 DEL40 DEL26 DEL40 DEL26 DEL40 DEL26 DEL83 DEL83 DEL83 DEL42 DEL42 DEL45 DEL27 DEL59 DEL23 DEL83 DEL83 DEL83 DEL42 DEL43 DEL42 DEL42 DEL45 DEL27 DEL59 DEL23 DEL42 DEL43 DEL83 DEL83 DEL83 DEL42 DEL43 DEL42 DEL45 DEL59 DEL23 DEL83 DEL83 DEL83 DEL39 DEL42 DEL13 DEL59 DEL23 DEL83 DEL83 DEL39 DEL42 DEL59 DEL23 DEL83 DEL83 DEL42 DEL43 DEL42 DEL59 DEL23 DEL83 DEL83 DEL42 DEL43 DEL42 DEL43 DEL42 DEL43 DEL74 DEL42 DEL59 DEL23 DEL83 DEL83 DEL42 DEL43 DEL42 DEL43 DEL42 DEL43 DEL74 DEL42 DEL59 DEL23 DEL83 DEL83 DEL39 DEL42 DEL59 DEL23 DEL83 DEL83 DEL42 DEL43 DEL42 DEL59 DEL23 DEL52 DEL42 DEL22 DEL42 DEL7 DEL21 DEL52 DEL42 DEL22 DEL42 DEL7 DEL21 DEL42 DEL7 DEL21 DEL39 DEL42 DEL40 DEL59 DEL60 DEL43 DEL42 DEL33 DEL59 DEL60 DEL42 DEL33 DEL27 DEL42 DEL42 DEL43 DEL43 DEL42 DEL43 DEL74 DEL14 DEL7 DEL21 DEL42 DEL42 DEL43 DEL42 DEL43 DEL74 DEL14 DEL7 DEL21 DEL42 DEL43 DEL42 DEL42 DEL32 DEL59 DEL60 DEL43 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL42 DEL32 DEL42 DEL43 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL43 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL42 DEL42 DEL32 DEL42 DEL42 DEL42 DEL32 DEL7 DEL21 DEL8 DEL42 DEL42 DEL42 DEL32 DEL42 DEL42 DEL42 DEL32 DEL7 DEL21 DEL8 DEL42 DEL42 DEL32 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL32 DEL21 DEL8 DEL42 DEL42 DEL32 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL32 DEL21 DEL8 DEL25 DEL25 DEL25 DEL25 DEL8 DEL61 DEL8 DEL42 DEL42 DEL42 DEL32 DEL7 DEL21 DEL42 DEL42 DEL32 DEL7 DEL21 DEL8 DEL25 DEL42 DEL42 DEL7 DEL21 DEL42 DEL42 DEL7 DEL21 DEL42 DEL42 DEL42 DEL42 DEL32 DEL32 DEL42 DEL42 DEL27 DEL42 DEL32 DEL21 DEL8 DEL25 DEL42 DEL33 DEL27 DEL42 DEL42 DEL42 DEL42 DEL32 DEL32 DEL38 DEL27 DEL8 DEL25 DEL42 DEL43 DEL42 DEL44 DEL42 DEL42 DEL32 DEL42 DEL42 DEL42 DEL32 DEL42 DEL42 DEL32 DEL32 DEL38 DEL9 DEL41 DEL8 DEL25 DEL8 DEL70 DEL42 DEL43 DEL42 DEL43 DEL74 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL32 DEL59 DEL60 DEL42 DEL43 DEL42 DEL44 DEL42 DEL42 DEL32 DEL42 DEL42 DEL42 DEL32 DEL38 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL32 DEL21 DEL8 DEL25 DEL8 DEL70 DEL42 DEL42 DEL42 DEL32 DEL21 DEL8 DEL25 DEL8 DEL39 DEL42 DEL27 DEL42 DEL34 DEL27 DEL42 DEL42 DEL36 DEL42 DEL32 DEL42 DEL32 DEL32 DEL7 DEL66 DEL66 DEL66 DEL66 DEL66 DEL65 DEL42 DEL65 DEL42 DEL65 DEL29 DEL39 DEL42 DEL44 DEL42 DEL43 DEL42 DEL59 DEL60 DEL42 DEL43 DEL42 DEL33 DEL59 DEL60 DEL39 DEL42 DEL42 DEL42 DEL27 DEL59 DEL60 DEL42 DEL43 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL42 DEL42 DEL32 DEL21 DEL42 DEL36 DEL42 DEL42 DEL42 DEL32 DEL42 DEL32 DEL32 DEL7 DEL21 DEL42 DEL42 DEL42 DEL42 DEL32 DEL7 DEL21 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL42 DEL42 DEL32 DEL32 DEL21 DEL42 DEL42 DEL32 DEL21 DEL8 DEL25 DEL8 DEL42 DEL44 DEL8 DEL12 DEL42 DEL33 DEL27 DEL32 DEL21 DEL8 DEL25 DEL8 DEL54 DEL8 DEL31 DEL66 DEL65 DEL29 DEL83 DEL39 DEL42 DEL42 DEL43 DEL42 DEL33 DEL59 DEL60 DEL42 DEL43 DEL42 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL42 DEL32 DEL21 DEL8 DEL42 DEL44 DEL45 DEL32 DEL21 DEL8 DEL12 DEL42 DEL33 DEL27 DEL25 DEL8 DEL54 DEL8 DEL31 DEL42 DEL33 DEL27 DEL32 DEL27 DEL41 DEL66 DEL66 DEL66 DEL66 DEL65 DEL42 DEL65 DEL66 DEL66 DEL65 DEL29 DEL83 DEL83 DEL39 DEL42 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL40 DEL42 DEL42 DEL32 DEL38 DEL40 DEL42 DEL42 DEL32 DEL38 DEL27 DEL41 DEL8 DEL31 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL45 DEL45 DEL32 DEL42 DEL40 DEL32 DEL33 DEL27 DEL42 DEL42 DEL42 DEL11 DEL36 DEL42 DEL42 DEL32 DEL32 DEL42 DEL43 DEL45 DEL42 DEL42 DEL32 DEL45 DEL42 DEL45 DEL27 DEL42 DEL43 DEL42 DEL33 DEL59 DEL60 DEL42 DEL43 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL42 DEL43 DEL62 DEL42 DEL42 DEL43 DEL42 DEL11 DEL36 DEL42 DEL32 DEL7 DEL21 DEL8 DEL25 DEL42 DEL59 DEL60 DEL42 DEL33 DEL27 DEL42 DEL42 DEL42 DEL32 DEL27 DEL42 DEL43 DEL42 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL43 DEL42 DEL59 DEL60 DEL42 DEL42 DEL42 DEL32 DEL38 DEL42 DEL42 DEL42 DEL42 DEL32 DEL21 DEL42 DEL42 DEL32 DEL21 DEL8 DEL42 DEL43 DEL42 DEL44 DEL42 DEL42 DEL9 DEL32 DEL21 DEL8 DEL12 DEL54 DEL8 DEL25 DEL42 DEL42 DEL42 DEL42 DEL32 DEL7 DEL21 DEL39 DEL42 DEL42 DEL43 DEL14 DEL42 DEL32 DEL59 DEL60 DEL39 DEL42 DEL42 DEL42 DEL27 DEL59 DEL60 DEL42 DEL43 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL42 DEL42 DEL32 DEL21 DEL42 DEL43 DEL42 DEL42 DEL34 DEL32 DEL59 DEL60 DEL42 DEL43 DEL42 DEL59 DEL60 DEL42 DEL43 DEL42 DEL42 DEL43 DEL42 DEL42 DEL32 DEL14 DEL59 DEL60 DEL42 DEL42 DEL42 DEL32 DEL42 DEL42 DEL32 DEL21 DEL42 DEL43 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL42 DEL14 DEL7 DEL21 DEL42 DEL42 DEL42 DEL42 DEL32 DEL21 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL32 DEL21 DEL42 DEL42 DEL42 DEL32 DEL21 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL42 DEL42 DEL32 DEL32 DEL21 DEL42 DEL43 DEL42 DEL44 DEL42 DEL42 DEL32 DEL42 DEL32 DEL38 DEL42 DEL43 DEL42 DEL42 DEL42 DEL42 DEL32 DEL42 DEL32 DEL59 DEL60 DEL42 DEL42 DEL42 DEL42 DEL32 DEL21 DEL42 DEL42 DEL42 DEL42 DEL32 DEL21 DEL8 DEL25 DEL8 DEL70 DEL42 DEL42 DEL32 DEL21 DEL42 DEL41 DEL8 DEL25 DEL42 DEL43 DEL32 DEL42 DEL42 DEL42 DEL34 DEL27 DEL42 DEL43 DEL39 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL43 DEL42 DEL42 DEL34 DEL38 DEL27 DEL36 DEL42 DEL42 DEL34 DEL42 DEL32 DEL16 DEL59 DEL60 DEL42 DEL42 DEL42 DEL32 DEL41 DEL8 DEL31 DEL83 DEL83 DEL43 DEL42 DEL39 DEL42 DEL44 DEL42 DEL43 DEL42 DEL42 DEL43 DEL14 DEL59 DEL60 DEL39 DEL42 DEL85 DEL39 DEL85 DEL5 DEL42 DEL3 DEL59 DEL60 DEL42 DEL42 DEL42 DEL32 DEL21 DEL42 DEL43 DEL42 DEL42 DEL43 DEL40 DEL34 DEL27 DEL14 DEL59 DEL60 DEL39 DEL42 DEL44 DEL42 DEL42 DEL42 DEL40 DEL42 DEL34 DEL27 DEL36 DEL34 DEL27 DEL2 DEL32 DEL21 DEL42 DEL42 DEL40 DEL42 DEL34 DEL27 DEL2 DEL32 DEL21 DEL8 DEL70 DEL42 DEL42 DEL32 DEL41 DEL8 DEL31 DEL83 DEL83 DEL42 DEL43 DEL42 DEL42 DEL43 DEL42 DEL44 DEL39 DEL42 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL34 DEL38 DEL27 DEL8 DEL25 DEL33 DEL41 DEL8 DEL31 DEL40 DEL45 DEL42 DEL43 DEL42 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL43 DEL42 DEL42 DEL43 DEL14 DEL59 DEL60 DEL42 DEL42 DEL45 DEL32 DEL42 DEL40 DEL32 DEL42 DEL45 DEL32 DEL21 DEL32 DEL21 DEL42 DEL42 DEL32 DEL41 DEL8 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL45 DEL14 DEL53 DEL8 DEL12 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL45 DEL14 DEL53 DEL8 DEL12 DEL54 DEL8

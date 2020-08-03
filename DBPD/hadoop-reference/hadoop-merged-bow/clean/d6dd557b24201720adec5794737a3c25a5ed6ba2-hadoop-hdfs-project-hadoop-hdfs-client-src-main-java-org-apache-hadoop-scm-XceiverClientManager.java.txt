@@ -1,0 +1,154 @@
+HDFS-11887. Shared XceiverClient should be closed if there is no open clients to avoid resource leak. Contributed by Mukul Kumar Singh.
+
+-import java.util.concurrent.atomic.AtomicInteger;
++import java.util.concurrent.Callable;
++import com.google.common.annotations.VisibleForTesting;
+-import static org.apache.hadoop.scm.ScmConfigKeys.SCM_CONTAINER_CLIENT_STALE_THRESHOLD_DEFAULT;
+-import static org.apache.hadoop.scm.ScmConfigKeys.SCM_CONTAINER_CLIENT_STALE_THRESHOLD_KEY;
++import static org.apache.hadoop.scm.ScmConfigKeys
++    .SCM_CONTAINER_CLIENT_STALE_THRESHOLD_DEFAULT;
++import static org.apache.hadoop.scm.ScmConfigKeys
++    .SCM_CONTAINER_CLIENT_STALE_THRESHOLD_KEY;
++import static org.apache.hadoop.scm.ScmConfigKeys
++    .SCM_CONTAINER_CLIENT_MAX_SIZE_KEY;
++import static org.apache.hadoop.scm.ScmConfigKeys
++    .SCM_CONTAINER_CLIENT_MAX_SIZE_DEFAULT;
+-  private Cache<String, XceiverClientWithAccessInfo> openClient;
+-  private final long staleThresholdMs;
++  private final Cache<String, XceiverClientSpi> clientCache;
+-    this.staleThresholdMs = conf.getTimeDuration(
++    int maxSize = conf.getInt(SCM_CONTAINER_CLIENT_MAX_SIZE_KEY,
++        SCM_CONTAINER_CLIENT_MAX_SIZE_DEFAULT);
++    long staleThresholdMs = conf.getTimeDuration(
+-    this.openClient = CacheBuilder.newBuilder()
+-        .expireAfterAccess(this.staleThresholdMs, TimeUnit.MILLISECONDS)
++    this.clientCache = CacheBuilder.newBuilder()
++        .expireAfterAccess(staleThresholdMs, TimeUnit.MILLISECONDS)
++        .maximumSize(maxSize)
+-            new RemovalListener<String, XceiverClientWithAccessInfo>() {
++            new RemovalListener<String, XceiverClientSpi>() {
+-                RemovalNotification<String, XceiverClientWithAccessInfo>
++                RemovalNotification<String, XceiverClientSpi>
+-              // If the reference count is not 0, this xceiver client should not
+-              // be evicted, add it back to the cache.
+-              XceiverClientWithAccessInfo info = removalNotification.getValue();
+-              if (info.hasRefence()) {
+-                synchronized (XceiverClientManager.this.openClient) {
+-                  XceiverClientManager.this
+-                      .openClient.put(removalNotification.getKey(), info);
+-                }
++              synchronized (clientCache) {
++                // Mark the entry as evicted
++                XceiverClientSpi info = removalNotification.getValue();
++                info.setEvicted();
++  @VisibleForTesting
++  public Cache<String, XceiverClientSpi> getClientCache() {
++    return clientCache;
++  }
++
+-   * Acquires a XceiverClient connected to a container capable of storing the
+-   * specified key.
++   * Acquires a SharedXceiverClient connected to a container capable of
++   * storing the specified key.
+-   * If there is already a cached XceiverClient, simply return the cached
+-   * otherwise create a new one.
++   * If there is already a cached SharedXceiverClient, simply return
++   * the cached otherwise create a new one.
+-   * @return XceiverClient connected to a container
+-   * @throws IOException if an XceiverClient cannot be acquired
++   * @return SharedXceiverClient connected to a container
++   * @throws IOException if an SharedXceiverClient cannot be acquired
+-  public XceiverClientSpi acquireClient(Pipeline pipeline) throws IOException {
++  public XceiverClientSpi acquireClient(Pipeline pipeline)
++      throws IOException {
+-    String containerName = pipeline.getContainerName();
+-    synchronized(openClient) {
+-      XceiverClientWithAccessInfo info =
+-          openClient.getIfPresent(containerName);
+-      if (info != null) {
+-        // we do have this connection, add reference and return
+-        info.incrementReference();
+-        return info.getXceiverClient();
+-      } else {
+-        // connection not found, create new, add reference and return
+-        final XceiverClientSpi xceiverClient = useRatis ?
+-            XceiverClientRatis.newXceiverClientRatis(pipeline, conf)
+-            : new XceiverClient(pipeline, conf);
+-        try {
+-          xceiverClient.connect();
+-        } catch (Exception e) {
+-          throw new IOException("Exception connecting XceiverClient.", e);
+-        }
+-        info = new XceiverClientWithAccessInfo(xceiverClient);
+-        info.incrementReference();
+-        openClient.put(containerName, info);
+-        return xceiverClient;
+-      }
++    synchronized (clientCache) {
++      XceiverClientSpi info = getClient(pipeline);
++      info.incrementReference();
++      return info;
+-   * Releases an XceiverClient after use.
++   * Releases an SharedXceiverClient after use.
+-   * @param xceiverClient client to release
++   * @param client client to release
+-  public void releaseClient(XceiverClientSpi xceiverClient) {
+-    Preconditions.checkNotNull(xceiverClient);
+-    String containerName = xceiverClient.getPipeline().getContainerName();
+-    XceiverClientWithAccessInfo info;
+-    synchronized (openClient) {
+-      info = openClient.getIfPresent(containerName);
+-      Preconditions.checkNotNull(info);
+-      info.decrementReference();
++  public void releaseClient(XceiverClientSpi client) {
++    Preconditions.checkNotNull(client);
++    synchronized (clientCache) {
++      client.decrementReference();
+-  /**
+-   * A helper class for caching and cleaning XceiverClient. Three parameters:
+-   * - the actual XceiverClient object
+-   * - a time stamp representing the most recent access (acquire or release)
+-   * - a reference count, +1 when acquire, -1 when release
+-   */
+-  private static class XceiverClientWithAccessInfo {
+-    final private XceiverClientSpi xceiverClient;
+-    final private AtomicInteger referenceCount;
+-
+-    XceiverClientWithAccessInfo(XceiverClientSpi xceiverClient) {
+-      this.xceiverClient = xceiverClient;
+-      this.referenceCount = new AtomicInteger(0);
+-    }
+-
+-    void incrementReference() {
+-      this.referenceCount.incrementAndGet();
+-    }
+-
+-    void decrementReference() {
+-      this.referenceCount.decrementAndGet();
+-    }
+-
+-    boolean hasRefence() {
+-      return this.referenceCount.get() != 0;
+-    }
+-
+-    XceiverClientSpi getXceiverClient() {
+-      return xceiverClient;
++  private XceiverClientSpi getClient(Pipeline pipeline)
++      throws IOException {
++    String containerName = pipeline.getContainerName();
++    try {
++      return clientCache.get(containerName,
++          new Callable<XceiverClientSpi>() {
++          @Override
++          public XceiverClientSpi call() throws Exception {
++            XceiverClientSpi client = useRatis ?
++                    XceiverClientRatis.newXceiverClientRatis(pipeline, conf)
++                    : new XceiverClient(pipeline, conf);
++            client.connect();
++            return client;
++          }
++        });
++    } catch (Exception e) {
++      throw new IOException("Exception getting XceiverClient.", e);
+
+INS26 INS26 INS26 UPD40 INS40 INS40 INS40 INS31 INS31 INS83 UPD74 INS78 INS83 INS74 INS42 INS8 INS83 INS43 INS42 INS44 UPD43 MOV43 MOV8 UPD43 UPD42 INS60 INS60 INS42 INS43 MOV43 INS43 INS41 UPD42 MOV42 INS43 INS42 UPD42 MOV60 INS54 UPD42 INS39 INS59 INS39 INS59 INS42 INS42 INS42 UPD66 UPD66 UPD66 UPD66 UPD66 UPD66 UPD42 UPD66 UPD42 UPD42 UPD42 MOV42 INS8 MOV12 INS42 INS32 INS42 MOV32 MOV21 MOV41 UPD42 INS41 INS42 INS42 INS42 INS42 UPD42 MOV43 INS42 INS32 INS32 UPD42 UPD42 MOV42 INS42 UPD42 MOV42 INS14 MOV32 INS42 INS42 UPD74 UPD42 UPD42 INS74 INS1 UPD45 INS42 UPD43 INS43 INS43 INS31 UPD42 INS8 INS42 UPD42 MOV42 INS78 INS83 MOV43 INS42 INS43 INS8 UPD74 MOV51 INS42 INS42 INS42 MOV60 MOV21 MOV41 UPD43 INS42 UPD42 UPD42 MOV60 UPD42 UPD42 UPD42 UPD43 INS32 UPD42 UPD42 MOV42 UPD42 MOV42 DEL83 DEL83 DEL39 DEL42 DEL59 DEL23 DEL52 DEL42 DEL22 DEL7 DEL21 DEL52 DEL42 DEL22 DEL42 DEL52 DEL42 DEL22 DEL42 DEL52 DEL42 DEL22 DEL42 DEL32 DEL42 DEL32 DEL42 DEL42 DEL32 DEL8 DEL25 DEL8 DEL42 DEL43 DEL42 DEL42 DEL42 DEL32 DEL42 DEL33 DEL27 DEL8 DEL25 DEL42 DEL42 DEL42 DEL32 DEL42 DEL32 DEL59 DEL60 DEL42 DEL43 DEL42 DEL59 DEL60 DEL42 DEL42 DEL42 DEL42 DEL32 DEL7 DEL21 DEL42 DEL42 DEL42 DEL32 DEL21 DEL83 DEL42 DEL42 DEL32 DEL21 DEL8 DEL54 DEL42 DEL43 DEL42 DEL14 DEL7 DEL21 DEL42 DEL42 DEL32 DEL21 DEL66 DEL66 DEL66 DEL66 DEL65 DEL29 DEL83 DEL83 DEL42 DEL83 DEL83 DEL42 DEL59 DEL23 DEL83 DEL83 DEL43 DEL42 DEL59 DEL23 DEL42 DEL42 DEL44 DEL52 DEL42 DEL22 DEL42 DEL7 DEL21 DEL52 DEL42 DEL22 DEL42 DEL43 DEL34 DEL14 DEL7 DEL21 DEL8 DEL31 DEL39 DEL42 DEL52 DEL42 DEL22 DEL42 DEL32 DEL21 DEL8 DEL31 DEL39 DEL42 DEL52 DEL42 DEL22 DEL42 DEL32 DEL21 DEL8 DEL31 DEL39 DEL42 DEL52 DEL42 DEL22 DEL42 DEL32 DEL34 DEL27 DEL41 DEL8 DEL31 DEL42 DEL42 DEL41 DEL8 DEL31 DEL55

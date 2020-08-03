@@ -1,0 +1,190 @@
+HDDS-1368. Cleanup old ReplicationManager code from SCM.
+
+-import java.util.Set;
++import java.io.IOException;
++import java.util.Optional;
+-import org.apache.hadoop.hdds.scm.container.ContainerID;
+-import org.apache.hadoop.hdds.scm.container.ContainerReplica;
+-import org.apache.hadoop.hdds.scm.container.replication.ReplicationRequest;
+-import org.apache.hadoop.hdds.scm.events.SCMEvents;
++import org.apache.hadoop.hdds.scm.pipeline.PipelineManager;
++import org.apache.hadoop.hdds.scm.pipeline.PipelineNotFoundException;
++import static org.apache.hadoop.hdds.scm.events.SCMEvents.CLOSE_CONTAINER;
++
+-  private final ContainerManager containerManager;
+-
++  private final PipelineManager pipelineManager;
++  private final ContainerManager containerManager;
+-  public DeadNodeHandler(NodeManager nodeManager,
+-      ContainerManager containerManager) {
+-    this.containerManager = containerManager;
++  public DeadNodeHandler(final NodeManager nodeManager,
++                         final PipelineManager pipelineManager,
++                         final ContainerManager containerManager) {
++    this.pipelineManager = pipelineManager;
++    this.containerManager = containerManager;
+-  public void onMessage(DatanodeDetails datanodeDetails,
+-      EventPublisher publisher) {
++  public void onMessage(final DatanodeDetails datanodeDetails,
++                        final EventPublisher publisher) {
+-    // TODO: check if there are any pipeline on this node and fire close
+-    // pipeline event
+-    Set<ContainerID> ids =
+-        null;
+-      ids = nodeManager.getContainers(datanodeDetails);
+-    } catch (NodeNotFoundException e) {
++
++      /*
++       * We should have already destroyed all the pipelines on this datanode
++       * when it was marked as stale. Destroy pipeline should also have closed
++       * all the containers on this datanode.
++       *
++       * Ideally we should not have any pipeline or OPEN containers now.
++       *
++       * To be on a safer side, we double check here and take appropriate
++       * action.
++       */
++
++      destroyPipelines(datanodeDetails);
++      closeContainers(datanodeDetails, publisher);
++
++      // Remove the container replicas associated with the dead node.
++      removeContainerReplicas(datanodeDetails);
++
++    } catch (NodeNotFoundException ex) {
+-      // unregistered node!
++      // unregistered datanode!
+-    if (ids == null) {
+-      LOG.info("There's no containers in dead datanode {}, no replica will be"
+-          + " removed from the in-memory state.", datanodeDetails.getUuid());
+-      return;
+-    }
+-    LOG.info("Datanode {}  is dead. Removing replications from the in-memory" +
+-            " state.", datanodeDetails.getUuid());
+-    for (ContainerID id : ids) {
+-      try {
+-        final ContainerInfo container = containerManager.getContainer(id);
+-        // TODO: For open containers, trigger close on other nodes
+-        if (!container.isOpen()) {
+-          Set<ContainerReplica> replicas = containerManager
+-              .getContainerReplicas(id);
+-          replicas.stream()
+-              .filter(r -> r.getDatanodeDetails().equals(datanodeDetails))
+-              .findFirst()
+-              .ifPresent(replica -> {
+-                try {
+-                  containerManager.removeContainerReplica(id, replica);
+-                  ContainerInfo containerInfo =
+-                      containerManager.getContainer(id);
+-                  replicateIfNeeded(containerInfo, publisher);
+-                } catch (ContainerException ex) {
+-                  LOG.warn("Exception while removing container replica #{} " +
+-                      "for container #{}.", replica, container, ex);
+-                }
+-              });
+-        }
+-      } catch (ContainerNotFoundException cnfe) {
+-        LOG.warn("Container Not found!", cnfe);
+-      }
+-    }
+-   * Compare the existing replication number with the expected one.
++   * Destroys all the pipelines on the given datanode if there are any.
++   *
++   * @param datanodeDetails DatanodeDetails
+-  private void replicateIfNeeded(ContainerInfo container,
+-      EventPublisher publisher) throws ContainerNotFoundException {
+-    // Replicate only closed and Quasi closed containers
+-    if (container.getState() == HddsProtos.LifeCycleState.CLOSED ||
+-        container.getState() == HddsProtos.LifeCycleState.QUASI_CLOSED) {
+-      final int existingReplicas = containerManager
+-          .getContainerReplicas(container.containerID()).size();
+-      final int expectedReplicas = container.getReplicationFactor().getNumber();
+-      if (existingReplicas != expectedReplicas) {
+-        LOG.debug("Replicate Request fired for container {}, exisiting " +
+-                "replica count {}, expected replica count {}",
+-            container.getContainerID(), existingReplicas, expectedReplicas);
+-        publisher.fireEvent(SCMEvents.REPLICATE_CONTAINER,
+-            new ReplicationRequest(
+-                container.getContainerID(), existingReplicas,
+-                expectedReplicas));
+-      }
+-    }
++  private void destroyPipelines(final DatanodeDetails datanodeDetails) {
++    Optional.ofNullable(nodeManager.getPipelines(datanodeDetails))
++        .ifPresent(pipelines ->
++            pipelines.forEach(id -> {
++              try {
++                pipelineManager.finalizeAndDestroyPipeline(
++                    pipelineManager.getPipeline(id), false);
++              } catch (PipelineNotFoundException ignore) {
++                // Pipeline is not there in pipeline manager,
++                // should we care?
++              } catch (IOException ex) {
++                LOG.warn("Exception while finalizing pipeline {}",
++                    id, ex);
++              }
++            }));
+-   * Returns logger.
+-   * */
+-  // TODO: remove this.
+-  public static Logger getLogger() {
+-    return LOG;
++   * Sends CloseContainerCommand to all the open containers on the
++   * given datanode.
++   *
++   * @param datanodeDetails DatanodeDetails
++   * @param publisher EventPublisher
++   * @throws NodeNotFoundException
++   */
++  private void closeContainers(final DatanodeDetails datanodeDetails,
++                               final EventPublisher publisher)
++      throws NodeNotFoundException {
++    nodeManager.getContainers(datanodeDetails)
++        .forEach(id -> {
++          try {
++            final ContainerInfo container = containerManager.getContainer(id);
++            if (container.getState() == HddsProtos.LifeCycleState.OPEN) {
++              publisher.fireEvent(CLOSE_CONTAINER, id);
++            }
++          } catch (ContainerNotFoundException cnfe) {
++            LOG.warn("Container {} is not managed by ContainerManager.",
++                id, cnfe);
++          }
++        });
++
++  /**
++   * Removes the ContainerReplica of the dead datanode from the containers
++   * which are hosted by that datanode.
++   *
++   * @param datanodeDetails DatanodeDetails
++   * @throws NodeNotFoundException
++   */
++  private void removeContainerReplicas(final DatanodeDetails datanodeDetails)
++      throws NodeNotFoundException {
++    nodeManager.getContainers(datanodeDetails)
++        .forEach(id -> {
++          try {
++            final ContainerInfo container = containerManager.getContainer(id);
++            // Identify and remove the ContainerReplica of dead node
++            containerManager.getContainerReplicas(id)
++                .stream()
++                .filter(r -> r.getDatanodeDetails().equals(datanodeDetails))
++                .findFirst()
++                .ifPresent(replica -> {
++                  try {
++                    containerManager.removeContainerReplica(id, replica);
++                  } catch (ContainerException ex) {
++                    LOG.warn("Exception while removing container replica #{} " +
++                        "of container {}.", replica, container, ex);
++                  }
++                });
++          } catch (ContainerNotFoundException cnfe) {
++            LOG.warn("Container {} is not managed by ContainerManager.",
++                id, cnfe);
++          }
++        });
++  }
++
++
+
+MOV26 MOV26 MOV26 MOV23 MOV31 UPD40 UPD40 UPD40 UPD40 UPD40 INS23 INS31 INS83 INS83 INS43 INS59 INS44 MOV21 MOV78 INS83 INS39 INS42 MOV44 MOV44 INS8 UPD42 UPD83 INS39 INS42 INS44 MOV44 INS43 INS8 INS29 UPD83 INS42 INS44 INS43 MOV8 INS42 INS42 INS83 INS83 INS43 INS42 INS83 INS21 INS83 INS83 MOV54 INS65 INS83 UPD43 UPD42 INS21 INS65 INS65 INS65 INS83 INS43 INS42 INS83 INS42 INS21 INS65 INS65 INS65 INS83 INS43 INS42 UPD42 MOV42 MOV21 INS42 INS7 UPD66 INS42 INS66 UPD42 INS32 INS66 UPD66 INS42 INS66 INS42 INS66 INS42 UPD42 MOV42 INS32 INS66 INS66 INS42 INS66 INS42 INS42 INS32 INS22 INS42 INS21 INS21 INS32 UPD42 MOV42 INS86 MOV32 INS42 INS86 INS32 INS42 INS86 INS52 INS42 INS32 INS32 INS32 UPD42 UPD42 MOV42 UPD42 MOV42 MOV32 INS59 INS32 INS59 INS8 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 INS59 MOV8 INS42 INS42 INS42 INS42 INS42 INS42 INS42 UPD42 UPD42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 INS86 INS42 INS54 INS42 INS54 INS59 INS8 INS8 INS12 MOV8 INS12 INS42 INS54 INS60 INS25 MOV44 INS8 MOV60 INS44 INS8 INS8 INS12 INS12 INS83 INS43 INS59 MOV27 INS8 INS21 INS43 INS42 INS21 MOV21 INS44 INS8 INS44 INS8 INS42 INS42 INS32 UPD40 INS21 INS32 INS42 INS32 INS43 INS42 INS43 INS42 INS21 INS42 INS42 INS42 INS32 INS42 INS42 INS45 INS42 INS42 UPD42 MOV42 INS42 INS45 UPD42 MOV42 INS42 UPD42 UPD42 INS9 INS42 UPD42 MOV42 INS32 INS42 INS42 INS42 INS42 UPD42 UPD42 INS42 UPD42 MOV42 INS42 INS45 INS42 INS42 MOV32 UPD45 DEL42 DEL7 DEL42 DEL43 DEL42 DEL32 DEL45 DEL45 DEL27 DEL42 DEL42 DEL32 DEL40 DEL27 DEL27 DEL83 DEL39 DEL42 DEL32 DEL59 DEL60 DEL83 DEL39 DEL32 DEL42 DEL32 DEL59 DEL60 DEL42 DEL42 DEL27 DEL42 DEL42 DEL40 DEL43 DEL42 DEL32 DEL42 DEL42 DEL14 DEL32 DEL21 DEL8 DEL25 DEL8 DEL25 DEL83 DEL43 DEL42 DEL42 DEL41 DEL8 DEL42 DEL43 DEL42 DEL43 DEL74 DEL42 DEL59 DEL60 DEL42 DEL42 DEL43 DEL42 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL42 DEL42 DEL32 DEL21 DEL32 DEL38 DEL25 DEL45 DEL32 DEL8 DEL12 DEL54 DEL42 DEL42 DEL43 DEL42 DEL43 DEL74 DEL42 DEL33 DEL59 DEL60 DEL42 DEL33 DEL27 DEL42 DEL42 DEL45 DEL45 DEL27 DEL42 DEL42 DEL32 DEL32 DEL21 DEL41 DEL8 DEL25 DEL42 DEL42 DEL45 DEL45 DEL27 DEL42 DEL42 DEL32 DEL32 DEL21 DEL43 DEL42 DEL44 DEL42 DEL70 DEL8

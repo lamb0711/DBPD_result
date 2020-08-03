@@ -1,0 +1,398 @@
+HADOOP-16697. Tune/audit S3A authoritative mode.
+
+Contains:
+
+HADOOP-16474. S3Guard ProgressiveRenameTracker to mark destination
+              dirirectory as authoritative on success.
+HADOOP-16684. S3guard bucket info to list a bit more about
+              authoritative paths.
+HADOOP-16722. S3GuardTool to support FilterFileSystem.
+
+This patch improves the marking of newly created/import directory
+trees in S3Guard DynamoDB tables as authoritative.
+
+Specific changes:
+
+ * Renamed directories are marked as authoritative if the entire
+   operation succeeded (HADOOP-16474).
+ * When updating parent table entries as part of any table write,
+   there's no overwriting of their authoritative flag.
+
+s3guard import changes:
+
+* new -verbose flag to print out what is going on.
+
+* The "s3guard import" command lets you declare that a directory tree
+is to be marked as authoritative
+
+  hadoop s3guard import -authoritative -verbose s3a://bucket/path
+
+When importing a listing and a file is found, the import tool queries
+the metastore and only updates the entry if the file is different from
+before, where different == new timestamp, etag, or length. S3Guard can get
+timestamp differences due to clock skew in PUT operations.
+
+As the recursive list performed by the import command doesn't retrieve the
+versionID, the existing entry may in fact be more complete.
+When updating an existing due to clock skew the existing version ID
+is propagated to the new entry (note: the etags must match; this is needed
+to deal with inconsistent listings).
+
+There is a new s3guard command to audit a s3guard bucket/path's
+authoritative state:
+
+  hadoop s3guard authoritative -check-config s3a://bucket/path
+
+This is primarily for testing/auditing.
+
+The s3guard bucket-info command also provides some more details on the
+authoritative state of a store (HADOOP-16684).
+
+Change-Id: I58001341c04f6f3597fcb4fcb1581ccefeb77d91
+
+-import javax.annotation.Nullable;
++import java.io.Closeable;
++import java.util.Collection;
++import org.apache.hadoop.fs.FilterFileSystem;
+-import org.apache.hadoop.fs.RemoteIterator;
+-import org.apache.hadoop.fs.s3a.S3ALocatedFileStatus;
++import org.apache.hadoop.fs.s3a.commit.InternalCommitterConstants;
++import org.apache.hadoop.io.IOUtils;
++import org.apache.hadoop.util.ExitCodeProvider;
++import static org.apache.hadoop.fs.s3a.commit.CommitConstants.*;
++import static org.apache.hadoop.fs.s3a.commit.staging.StagingCommitterConstants.FILESYSTEM_TEMP_PATH;
+-public abstract class S3GuardTool extends Configured implements Tool {
++public abstract class S3GuardTool extends Configured implements Tool,
++    Closeable {
+-      "\t" + Fsck.NAME + " - " + Fsck.PURPOSE + "\n";
++      "\t" + Fsck.NAME + " - " + Fsck.PURPOSE + "\n" +
++      "\t" + Authoritative.NAME + " - " + Authoritative.PURPOSE + "\n";
++  /** Error String when the wrong FS is used for binding: {@value}. **/
++  @VisibleForTesting
++  public static final String WRONG_FILESYSTEM = "Wrong filesystem for ";
++
++  /**
++   * The FS we close when we are closed.
++   */
++  private FileSystem baseFS;
++  public static final String VERBOSE = "verbose";
++
+-   * @return sub-dommand name.
++   * @return sub-command name.
++   * Close the FS and metastore.
++   * @throws IOException on failure.
++   */
++  @Override
++  public void close() throws IOException {
++    IOUtils.cleanupWithLogger(LOG,
++        baseFS, store);
++    baseFS = null;
++    filesystem = null;
++    store = null;
++  }
++
++  /**
+-    FileSystem fs = FileSystem.newInstance(uri, conf);
+-    if (!(fs instanceof S3AFileSystem)) {
+-      throw invalidArgs("URI %s is not a S3A file system: %s",
+-          uri, fs.getClass().getName());
+-    }
+-    filesystem = (S3AFileSystem) fs;
++    bindFilesystem(FileSystem.newInstance(uri, conf));
+-  protected void setFilesystem(S3AFileSystem filesystem) {
+-    this.filesystem = filesystem;
++  /**
++   * Sets the filesystem; it must be an S3A FS instance, or a FilterFS
++   * around an S3A Filesystem.
++   * @param bindingFS filesystem to bind to
++   * @return the bound FS.
++   * @throws ExitUtil.ExitException if the FS is not an S3 FS
++   */
++  protected S3AFileSystem bindFilesystem(FileSystem bindingFS) {
++    FileSystem fs = bindingFS;
++    baseFS = bindingFS;
++    while (fs instanceof FilterFileSystem) {
++      fs = ((FilterFileSystem) fs).getRawFileSystem();
++    }
++    if (!(fs instanceof S3AFileSystem)) {
++      throw new ExitUtil.ExitException(EXIT_SERVICE_UNAVAILABLE,
++          WRONG_FILESYSTEM + "URI " + fs.getUri() + " : "
++          + fs.getClass().getName());
++    }
++    filesystem = (S3AFileSystem) fs;
++    return filesystem;
+-    private static final String USAGE = NAME + " [OPTIONS] [s3a://BUCKET]\n" +
++    public static final String AUTH_FLAG = "authoritative";
++    private static final String USAGE = NAME + " [OPTIONS] [s3a://PATH]\n" +
++        "  -" + AUTH_FLAG + " - Mark imported directory data as authoritative.\n" +
++        "  -" + VERBOSE + " - Verbose Output.\n" +
+-    private final Set<Path> dirCache = new HashSet<>();
+-
+-      super(conf);
++      super(conf, AUTH_FLAG, VERBOSE);
+-    /**
+-     * Put parents into MS and cache if the parents are not presented.
+-     *
+-     * @param f the file or an empty directory.
+-     * @param operationState store's bulk update state.
+-     * @throws IOException on I/O errors.
+-     */
+-    private void putParentsIfNotPresent(FileStatus f,
+-        @Nullable BulkOperationState operationState) throws IOException {
+-      Preconditions.checkNotNull(f);
+-      Path parent = f.getPath().getParent();
+-      while (parent != null) {
+-        if (dirCache.contains(parent)) {
+-          return;
+-        }
+-        S3AFileStatus dir = DynamoDBMetadataStore.makeDirStatus(parent,
+-            f.getOwner());
+-        S3Guard.putWithTtl(getStore(), new PathMetadata(dir),
+-            getFilesystem().getTtlTimeProvider(),
+-            operationState);
+-        dirCache.add(parent);
+-        parent = parent.getParent();
+-      }
+-    }
+-
+-    /**
+-     * Recursively import every path under path.
+-     * @return number of items inserted into MetadataStore
+-     * @throws IOException on I/O errors.
+-     */
+-    private long importDir(FileStatus status) throws IOException {
+-      Preconditions.checkArgument(status.isDirectory());
+-      BulkOperationState operationState = getStore().initiateBulkWrite(
+-          BulkOperationState.OperationType.Put,
+-          status.getPath());
+-      RemoteIterator<S3ALocatedFileStatus> it = getFilesystem()
+-          .listFilesAndEmptyDirectories(status.getPath(), true);
+-      long items = 0;
+-
+-      while (it.hasNext()) {
+-        S3ALocatedFileStatus located = it.next();
+-        S3AFileStatus child;
+-        if (located.isDirectory()) {
+-          child = DynamoDBMetadataStore.makeDirStatus(located.getPath(),
+-              located.getOwner());
+-          dirCache.add(child.getPath());
+-        } else {
+-          child = located.toS3AFileStatus();
+-        }
+-        putParentsIfNotPresent(child, operationState);
+-        S3Guard.putWithTtl(getStore(),
+-            new PathMetadata(child),
+-            getFilesystem().getTtlTimeProvider(),
+-            operationState);
+-        items++;
+-      }
+-      return items;
+-    }
+-
+-      long items = 1;
+-      if (status.isFile()) {
+-        PathMetadata meta = new PathMetadata(status);
+-        getStore().put(meta, null);
+-      } else {
+-        items = importDir(status);
+-      }
++      final CommandFormat commandFormat = getCommandFormat();
++      final ImportOperation importer = new ImportOperation(
++          getFilesystem(),
++          getStore(),
++          status,
++          commandFormat.getOpt(AUTH_FLAG),
++          commandFormat.getOpt(VERBOSE));
++      long items = importer.execute();
+-      S3AFileSystem fs = (S3AFileSystem) FileSystem.newInstance(
+-          fsURI, unguardedConf);
+-      setFilesystem(fs);
++      S3AFileSystem fs = bindFilesystem(
++          FileSystem.newInstance(fsURI, unguardedConf));
++        final Collection<String> authoritativePaths
++            = S3Guard.getAuthoritativePaths(fs);
++        if (!authoritativePaths.isEmpty()) {
++          println(out, "Qualified Authoritative Paths:");
++          for (String path : authoritativePaths) {
++            println(out, "\t%s", path);
++          }
++          println(out, "");
++        }
++        final long ttl = conf.getTimeDuration(METADATASTORE_METADATA_TTL,
++            DEFAULT_METADATASTORE_METADATA_TTL, TimeUnit.MILLISECONDS);
++        println(out, "\tMetadata time to live: %s=%s milliseconds",
++            METADATASTORE_METADATA_TTL, ttl);
+-      boolean magic = fs.hasPathCapability(
+-          new Path(s3Path),
+-          CommitConstants.STORE_CAPABILITY_MAGIC_COMMITTER);
+-      println(out, "The \"magic\" committer %s supported",
+-          magic ? "is" : "is not");
++      // committers
++      println(out, "%nS3A Committers");
++      boolean magic = fs.hasPathCapability(
++          new Path(s3Path),
++          CommitConstants.STORE_CAPABILITY_MAGIC_COMMITTER);
++      println(out, "\tThe \"magic\" committer %s supported in the filesystem",
++          magic ? "is" : "is not");
++
++      printOption(out, "\tS3A Committer factory class",
++          S3A_COMMITTER_FACTORY_KEY, "");
++      String committer = conf.getTrimmed(FS_S3A_COMMITTER_NAME,
++          COMMITTER_NAME_FILE);
++      printOption(out, "\tS3A Committer name",
++          FS_S3A_COMMITTER_NAME, COMMITTER_NAME_FILE);
++      switch (committer) {
++      case COMMITTER_NAME_FILE:
++        println(out, "The original 'file' commmitter is active"
++            + " -this is slow and potentially unsafe");
++        break;
++      case InternalCommitterConstants.COMMITTER_NAME_STAGING:
++        println(out, "The 'staging' committer is used "
++            + "-prefer the 'directory' committer");
++        // fall through
++      case COMMITTER_NAME_DIRECTORY:
++        // fall through
++      case COMMITTER_NAME_PARTITIONED:
++        // print all the staging options.
++        printOption(out, "\tCluster filesystem staging directory",
++            FS_S3A_COMMITTER_STAGING_TMP_PATH, FILESYSTEM_TEMP_PATH);
++        printOption(out, "\tLocal filesystem buffer directory",
++            BUFFER_DIR, "");
++        printOption(out, "\tFile conflict resolution",
++            FS_S3A_COMMITTER_STAGING_CONFLICT_MODE, DEFAULT_CONFLICT_MODE);
++        break;
++      case COMMITTER_NAME_MAGIC:
++        printOption(out, "\tStore magic committer integration",
++            MAGIC_COMMITTER_ENABLED,
++            Boolean.toString(DEFAULT_MAGIC_COMMITTER_ENABLED));
++        if (!magic) {
++          println(out, "Warning: although the magic committer is enabled, "
++              + "the store does not support it");
++        }
++        break;
++      default:
++        println(out, "\tWarning: committer '%s' is unknown", committer);
++      }
++      println(out, "%nSecurity");
+-        println(out, "Delegation Support enabled: token kind = %s",
++        println(out, "\tDelegation Support enabled: token kind = %s",
+-        println(out, "Hadoop security mode: %s", authenticationMethod);
++        println(out, "\tHadoop security mode: %s", authenticationMethod);
+-              "Warning: security is disabled; tokens will not be collected");
++              "\tWarning: security is disabled; tokens will not be collected");
+-        println(out, "Delegation token support is disabled");
++        println(out, "\tDelegation token support is disabled");
+-    public static final String VERBOSE = "verbose";
++  /**
++   * Audits a DynamoDB S3Guard repository for all the entries being
++   * 'authoritative'.
++   * Checks bucket settings if {@link #CHECK_FLAG} is set, then
++   * treewalk.
++   */
++  static class Authoritative extends S3GuardTool {
++
++    public static final String NAME = "authoritative";
++
++    public static final String CHECK_FLAG = "check-config";
++    public static final String REQUIRE_AUTH = "required";
++
++    public static final String PURPOSE = "Audits a DynamoDB S3Guard "
++        + "repository for all the entries being 'authoritative'";
++
++    private static final String USAGE = NAME + " [OPTIONS] [s3a://PATH]\n"
++        + "\t" + PURPOSE + "\n\n"
++        + "Options:\n"
++        + "  -" + REQUIRE_AUTH + " - Require directories under the path to"
++        + " be authoritative.\n"
++        + "  -" + CHECK_FLAG + " - Check the configuration for the path to"
++        + " be authoritative\n"
++        + "  -" + VERBOSE + " - Verbose Output.\n";
++
++    Authoritative(Configuration conf) {
++      super(conf, CHECK_FLAG, REQUIRE_AUTH, VERBOSE);
++    }
++
++    @Override
++    public String getName() {
++      return NAME;
++    }
++
++    @Override
++    public String getUsage() {
++      return USAGE;
++    }
++
++    public int run(String[] args, PrintStream out) throws
++        InterruptedException, IOException {
++      List<String> paths = parseArgs(args);
++      if (paths.isEmpty()) {
++        out.println(USAGE);
++        throw invalidArgs("no arguments");
++      }
++      maybeInitFilesystem(paths);
++      initMetadataStore(false);
++      String s3Path = paths.get(0);
++
++      URI uri = toUri(s3Path);
++      Path auditPath;
++      if (uri.getPath().isEmpty()) {
++        auditPath = new Path("/");
++      } else {
++        auditPath = new Path(uri.getPath());
++      }
++
++      final S3AFileSystem fs = getFilesystem();
++      final MetadataStore ms = getStore();
++
++      if (!(ms instanceof DynamoDBMetadataStore)) {
++        errorln(s3Path + " path uses MS: " + ms);
++        errorln(NAME + " can be only used with a DynamoDB-backed S3Guard table.");
++        errorln(USAGE);
++        return ERROR;
++      }
++
++      final CommandFormat commandFormat = getCommandFormat();
++      if (commandFormat.getOpt(CHECK_FLAG)) {
++        // check that the path is auth
++        if (!fs.allowAuthoritative(auditPath)) {
++          // path isn't considered auth in the S3A bucket info
++          errorln("Path " + auditPath
++              + " is not configured to be authoritative");
++          return AuthoritativeAuditOperation.ERROR_PATH_NOT_AUTH_IN_FS;
++        }
++      }
++
++      final AuthoritativeAuditOperation audit = new AuthoritativeAuditOperation(
++          fs.createStoreContext(),
++          (DynamoDBMetadataStore) ms,
++          commandFormat.getOpt(REQUIRE_AUTH),
++          commandFormat.getOpt(VERBOSE));
++      audit.audit(fs.qualify(auditPath));
++
++      out.flush();
++      return EXIT_SUCCESS;
++    }
++  }
++    case Authoritative.NAME:
++      command = new Authoritative(conf);
++      break;
+-    return ToolRunner.run(conf, command, otherArgs);
++    try {
++      return ToolRunner.run(conf, command, otherArgs);
++    } finally {
++      IOUtils.cleanupWithLogger(LOG, command);
++    }
++      LOG.debug("Exception raised", e);
+-      e.printStackTrace(System.err);
+-      exit(ERROR, e.toString());
++      if (e instanceof ExitCodeProvider) {
++        // this exception provides its own exit code
++        final ExitCodeProvider ec = (ExitCodeProvider) e;
++        LOG.debug("Exception raised", e);
++        exit(ec.getExitCode(), e.toString());
++      } else {
++        e.printStackTrace(System.err);
++        exit(ERROR, e.toString());
++      }
+
+MOV26 MOV26 INS26 INS26 INS26 INS26 INS26 UPD40 INS40 UPD40 INS40 INS40 INS40 UPD40 INS40 INS43 INS23 INS23 MOV23 INS31 INS31 INS55 INS42 INS29 INS78 INS83 INS83 INS83 INS43 INS59 INS29 INS83 INS43 INS59 INS29 INS78 INS83 MOV39 INS42 MOV43 INS8 INS29 INS83 MOV43 INS42 MOV44 INS8 INS23 INS29 INS83 INS42 INS43 INS23 INS23 INS23 INS23 INS23 INS31 INS31 INS31 INS31 INS65 INS42 INS42 INS42 INS45 INS65 INS42 INS42 INS65 INS65 INS42 INS21 INS21 INS21 INS21 INS21 INS65 INS65 INS65 INS65 MOV43 UPD42 INS60 INS21 INS61 MOV25 MOV21 INS41 INS83 INS83 INS83 MOV43 INS59 INS43 MOV60 MOV21 INS65 INS42 INS83 INS83 INS83 INS43 INS59 INS83 INS83 INS83 INS43 INS59 INS83 INS83 INS83 INS43 INS59 INS83 INS83 INS83 INS43 INS59 INS83 INS83 INS83 INS43 INS59 INS42 INS44 INS8 INS78 INS83 INS43 INS42 INS8 INS78 INS83 INS43 INS42 INS8 INS83 INS39 INS42 INS44 INS44 INS43 MOV43 INS8 INS54 INS45 INS40 INS45 INS40 INS45 INS66 INS65 INS66 INS66 UPD66 INS66 INS42 INS66 INS32 INS7 INS7 INS7 INS32 INS66 INS66 INS42 INS66 INS66 INS40 INS66 INS43 INS59 INS7 INS62 INS8 INS42 INS42 INS45 INS42 INS60 INS60 INS21 INS21 INS60 INS21 INS50 INS21 INS66 INS66 INS66 INS65 INS66 INS66 INS42 INS42 INS45 INS42 INS42 INS45 INS42 INS42 INS45 INS42 INS42 INS27 INS42 INS42 INS27 INS43 INS42 INS46 INS42 INS42 INS41 INS42 INS42 INS41 INS5 INS42 INS43 INS42 INS42 INS60 INS25 INS21 INS21 INS60 INS60 INS60 INS25 INS60 INS60 INS25 INS60 INS25 INS60 INS21 INS21 INS41 INS21 INS10 INS49 INS8 INS8 INS42 INS42 INS42 INS42 INS42 INS42 INS33 INS42 INS33 INS42 INS33 INS42 MOV32 INS42 INS42 INS42 INS42 INS42 INS42 INS43 MOV21 UPD45 INS42 INS45 INS45 INS42 INS45 INS45 INS42 INS42 INS83 INS43 INS83 UPD43 MOV43 INS59 INS39 INS59 MOV43 INS32 INS32 INS43 INS59 INS32 INS42 INS49 INS21 INS10 INS49 INS21 INS49 INS49 INS21 INS21 INS21 INS10 INS49 INS21 INS25 INS10 INS49 INS21 INS32 INS67 INS45 INS45 INS42 INS45 INS45 INS42 INS45 INS45 INS45 INS42 INS45 INS45 INS45 INS42 INS45 INS45 INS45 INS42 INS45 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS43 INS85 INS42 INS74 INS59 INS32 INS8 INS32 INS32 INS43 INS59 INS43 INS59 MOV43 INS59 INS32 INS8 INS8 INS83 MOV43 INS59 INS83 INS43 INS59 INS38 INS8 INS83 INS43 INS59 INS32 INS8 INS83 INS43 INS59 INS32 INS32 INS42 INS40 INS7 MOV41 INS21 INS8 INS42 INS14 INS42 UPD42 INS32 UPD42 UPD42 MOV42 INS14 INS42 INS32 INS32 INS60 INS25 INS60 INS21 INS42 INS42 INS45 UPD45 INS42 INS42 INS45 INS42 INS45 INS42 INS42 INS32 INS42 INS42 INS45 INS42 INS42 INS42 INS32 INS40 INS32 INS42 INS42 INS32 INS32 INS32 INS42 INS32 INS38 INS8 INS32 INS42 INS42 INS45 INS42 INS42 INS43 INS43 INS42 INS32 INS42 INS42 INS21 INS53 INS42 INS42 INS42 INS9 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS32 INS42 INS21 INS21 INS42 MOV32 INS42 INS42 MOV32 INS36 INS21 INS21 INS21 INS41 INS42 INS42 INS32 INS42 INS42 INS42 INS25 INS42 INS42 INS14 INS42 INS42 INS32 INS42 INS42 INS42 INS14 INS32 INS21 INS25 INS42 INS32 INS43 INS42 INS27 INS42 UPD43 MOV43 MOV32 MOV32 MOV42 INS32 INS32 UPD42 MOV42 UPD42 MOV42 INS42 MOV32 INS83 INS74 INS59 INS38 INS8 INS83 INS39 INS59 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS27 INS42 INS42 INS27 INS42 INS42 INS45 INS42 INS42 INS42 INS42 INS45 INS42 INS45 INS42 INS42 INS45 INS42 INS42 INS42 INS42 INS45 INS42 INS32 INS42 MOV21 INS42 INS42 INS45 INS42 INS42 INS42 INS42 INS42 INS32 INS32 INS42 INS42 INS34 INS42 INS42 INS42 INS42 INS7 INS7 INS62 INS32 INS32 INS32 INS42 INS42 INS38 INS8 INS43 INS32 INS11 INS32 INS32 INS42 INS42 INS42 INS43 INS42 INS42 INS42 INS42 INS42 INS32 INS62 INS8 MOV8 INS36 INS42 INS40 INS42 INS45 INS32 INS45 MOV32 UPD42 INS42 UPD42 MOV42 INS42 INS42 UPD42 MOV42 UPD42 MOV42 INS43 INS43 INS42 INS32 INS32 INS21 INS70 INS21 INS42 INS32 INS42 INS42 INS45 INS42 INS42 INS45 INS45 INS45 INS45 INS42 INS42 INS42 UPD45 UPD45 UPD45 INS42 INS42 INS42 INS42 INS45 INS42 INS14 INS42 INS14 INS42 INS43 INS42 INS27 INS42 INS27 INS42 INS42 INS32 INS21 INS41 INS42 INS42 INS42 INS43 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS45 INS42 INS42 INS43 INS60 INS21 INS21 INS11 INS42 UPD42 MOV42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS44 INS42 INS8 INS32 INS42 INS42 INS42 INS42 INS40 UPD42 UPD42 INS27 MOV43 INS45 INS43 INS32 INS42 INS42 INS45 INS42 INS42 INS45 INS42 INS42 INS42 INS32 INS40 INS42 INS42 INS83 INS43 INS59 INS32 INS32 INS43 INS42 INS42 INS42 INS45 INS43 INS42 INS21 INS42 INS42 INS45 INS45 INS45 UPD45 INS42 INS42 INS42 INS42 INS27 INS42 INS42 INS11 INS42 INS42 INS45 INS42 INS42 INS32 INS32 INS42 INS42 INS32 INS45 INS42 INS45 INS43 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS45 INS42 INS42 DEL42 DEL59 DEL60 DEL52 DEL42 DEL22 DEL42 DEL42 DEL45 DEL32 DEL83 DEL42 DEL8 DEL31 DEL83 DEL83 DEL42 DEL43 DEL74 DEL42 DEL42 DEL43 DEL74 DEL14 DEL59 DEL23 DEL66 DEL65 DEL42 DEL66 DEL65 DEL42 DEL66 DEL65 DEL42 DEL66 DEL65 DEL29 DEL83 DEL39 DEL42 DEL42 DEL43 DEL42 DEL44 DEL42 DEL78 DEL42 DEL43 DEL42 DEL44 DEL42 DEL42 DEL42 DEL32 DEL21 DEL42 DEL42 DEL42 DEL32 DEL42 DEL32 DEL59 DEL60 DEL42 DEL33 DEL27 DEL42 DEL42 DEL42 DEL32 DEL41 DEL8 DEL25 DEL42 DEL43 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL32 DEL59 DEL60 DEL42 DEL42 DEL42 DEL43 DEL42 DEL14 DEL42 DEL32 DEL42 DEL32 DEL42 DEL32 DEL21 DEL42 DEL42 DEL42 DEL32 DEL21 DEL42 DEL42 DEL42 DEL32 DEL7 DEL21 DEL8 DEL61 DEL8 DEL31 DEL66 DEL65 DEL66 DEL65 DEL42 DEL66 DEL65 DEL29 DEL83 DEL39 DEL42 DEL42 DEL43 DEL42 DEL44 DEL42 DEL42 DEL42 DEL42 DEL32 DEL32 DEL21 DEL42 DEL43 DEL42 DEL42 DEL32 DEL42 DEL40 DEL42 DEL42 DEL32 DEL32 DEL59 DEL60 DEL42 DEL43 DEL42 DEL43 DEL74 DEL42 DEL42 DEL42 DEL42 DEL32 DEL9 DEL32 DEL59 DEL60 DEL39 DEL42 DEL34 DEL59 DEL60 DEL42 DEL42 DEL32 DEL42 DEL43 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL43 DEL42 DEL59 DEL60 DEL42 DEL42 DEL32 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL42 DEL42 DEL32 DEL32 DEL7 DEL21 DEL42 DEL42 DEL42 DEL42 DEL32 DEL32 DEL21 DEL8 DEL42 DEL42 DEL42 DEL32 DEL7 DEL21 DEL8 DEL25 DEL42 DEL42 DEL42 DEL32 DEL21 DEL42 DEL42 DEL42 DEL43 DEL42 DEL14 DEL42 DEL32 DEL42 DEL32 DEL21 DEL42 DEL37 DEL21 DEL8 DEL61 DEL42 DEL41 DEL8 DEL31 DEL39 DEL34 DEL42 DEL42 DEL32 DEL14 DEL59 DEL60 DEL32 DEL33 DEL32 DEL21 DEL8 DEL42 DEL32 DEL7 DEL21 DEL8 DEL25 DEL11

@@ -1,0 +1,199 @@
+HADOOP-15079. ITestS3AFileOperationCost#testFakeDirectoryDeletion failing
+after OutputCommitter patch.
+Contributed by Steve Loughran
+
+-import com.amazonaws.event.ProgressEvent;
+-   * reported and downgraded to a failure. That is: if a rename
++   * reported and downgraded to a failure.
++   * Retries: retry translated, assuming all operations it is called do
++   * so. For safely, consider catch and handle AmazonClientException
++   * because this is such a complex method there's a risk it could surface.
++  @Retries.RetryMixed
+-        String newDstKey = dstKey;
+-        if (!newDstKey.endsWith("/")) {
+-          newDstKey = newDstKey + "/";
+-        }
++        String newDstKey = maybeAddTrailingSlash(dstKey);
+-      if (!dstKey.endsWith("/")) {
+-        dstKey = dstKey + "/";
+-      }
+-
+-      if (!srcKey.endsWith("/")) {
+-        srcKey = srcKey + "/";
+-      }
++      dstKey = maybeAddTrailingSlash(dstKey);
++      srcKey = maybeAddTrailingSlash(srcKey);
+-    if (src.getParent() != dst.getParent()) {
++    if (!src.getParent().equals(dst.getParent())) {
++      LOG.debug("source & dest parents are different; fix up dir markers");
++   * This call does <i>not</i> create any mock parent entries.
+-  @Retries.OnceRaw
++  @Retries.OnceRaw("For PUT; post-PUT actions are RetriesExceptionsSwallowed")
+-      return innerDelete(innerGetFileStatus(f, true), recursive);
++      boolean outcome = innerDelete(innerGetFileStatus(f, true), recursive);
++      if (outcome) {
++        maybeCreateFakeParentDirectory(f);
++      }
++      return outcome;
+-   *
++   * This call does not create any fake parent directory; that is
++   * left to the caller.
+-    maybeCreateFakeParentDirectory(f);
++      // this will create the marker file, delete the parent entries
++      // and update S3Guard
+-      S3Guard.makeDirsOrdered(metadataStore, metadataStoreDirs, username, true);
+-      // this is complicated because getParent(a/b/c/) returns a/b/c, but
+-      // we want a/b. See HADOOP-14428 for more details.
+-      deleteUnnecessaryFakeDirectories(new Path(f.toString()).getParent());
+-  @Retries.OnceRaw
++  @Retries.OnceRaw("For PUT; post-PUT actions are RetriesExceptionsSwallowed")
++   * There's no update of metadata, directory markers, etc.
++   * Callers must implement.
++  @Retries.RetryMixed
+-      throws IOException, InterruptedIOException, AmazonClientException {
++      throws IOException, InterruptedIOException  {
+-    try {
+-      ObjectMetadata srcom = getObjectMetadata(srcKey);
+-      ObjectMetadata dstom = cloneObjectMetadata(srcom);
+-      setOptionalObjectMetadata(dstom);
+-      CopyObjectRequest copyObjectRequest =
+-          new CopyObjectRequest(bucket, srcKey, bucket, dstKey);
+-      setOptionalCopyObjectRequestParameters(copyObjectRequest);
+-      copyObjectRequest.setCannedAccessControlList(cannedACL);
+-      copyObjectRequest.setNewObjectMetadata(dstom);
+-
+-      ProgressListener progressListener = new ProgressListener() {
+-        public void progressChanged(ProgressEvent progressEvent) {
+-          switch (progressEvent.getEventType()) {
+-            case TRANSFER_PART_COMPLETED_EVENT:
+-              incrementWriteOperations();
+-              break;
+-            default:
+-              break;
+-          }
+-        }
+-      };
+-
+-      Copy copy = transfers.copy(copyObjectRequest);
+-      copy.addProgressListener(progressListener);
+-      try {
+-        copy.waitForCopyResult();
++    ProgressListener progressListener = progressEvent -> {
++      switch (progressEvent.getEventType()) {
++      case TRANSFER_PART_COMPLETED_EVENT:
+-        instrumentation.filesCopied(1, size);
+-      } catch (InterruptedException e) {
+-        throw new InterruptedIOException("Interrupted copying " + srcKey
+-            + " to " + dstKey + ", cancelling");
++        break;
++      default:
++        break;
+-    } catch (AmazonClientException e) {
+-      throw translateException("copyFile("+ srcKey+ ", " + dstKey + ")",
+-          srcKey, e);
+-    }
++    };
++
++    once("copyFile(" + srcKey + ", " + dstKey + ")", srcKey,
++        () -> {
++          ObjectMetadata srcom = getObjectMetadata(srcKey);
++          ObjectMetadata dstom = cloneObjectMetadata(srcom);
++          setOptionalObjectMetadata(dstom);
++          CopyObjectRequest copyObjectRequest =
++              new CopyObjectRequest(bucket, srcKey, bucket, dstKey);
++          setOptionalCopyObjectRequestParameters(copyObjectRequest);
++          copyObjectRequest.setCannedAccessControlList(cannedACL);
++          copyObjectRequest.setNewObjectMetadata(dstom);
++          Copy copy = transfers.copy(copyObjectRequest);
++          copy.addProgressListener(progressListener);
++          try {
++            copy.waitForCopyResult();
++            incrementWriteOperations();
++            instrumentation.filesCopied(1, size);
++          } catch (InterruptedException e) {
++            throw new InterruptedIOException("Interrupted copying " + srcKey
++                + " to " + dstKey + ", cancelling");
++          }
++        });
++   * Calls {@link #deleteUnnecessaryFakeDirectories(Path)} and then
++   * {@link S3Guard#addAncestors(MetadataStore, Path, String)}}.
+-   * This includes
++   *
++   * The operations actions include
+-  @Retries.RetryTranslated("Exceptions are swallowed")
++  @Retries.RetryExceptionsSwallowed
+-    deleteUnnecessaryFakeDirectories(p.getParent());
++    deleteUnnecessaryFakeDirectories(p.getParent());
+-  @Retries.RetryRaw("Exceptions are swallowed")
++  @Retries.RetryExceptionsSwallowed
+-
++  @Override
++  @Retries.RetryTranslated
++  @Retries.OnceTranslated
++  @Retries.OnceTranslated
++  @Retries.OnceTranslated
+-  @Retries.OnceTranslated
++  @Retries.OnceTranslated("s3guard not retrying")
+-    try {
+-      // lookup dir triggers existence check
+-      final FileStatus fileStatus = getFileStatus(path);
+-      if (fileStatus.isFile()) {
+-        // simple case: File
+-        LOG.debug("Path is a file");
+-        return new Listing.SingleStatusRemoteIterator(
+-            filter.accept(path) ? toLocatedFileStatus(fileStatus) : null);
+-      } else {
+-        // directory: trigger a lookup
+-        final String key = maybeAddTrailingSlash(pathToKey(path));
+-        final Listing.FileStatusAcceptor acceptor =
+-            new Listing.AcceptAllButSelfAndS3nDirs(path);
+-        DirListingMetadata meta = metadataStore.listChildren(path);
+-        final RemoteIterator<FileStatus> cachedFileStatusIterator =
+-            listing.createProvidedFileStatusIterator(
+-                S3Guard.dirMetaToStatuses(meta), filter, acceptor);
+-        return (allowAuthoritative && meta != null && meta.isAuthoritative())
+-            ? listing.createLocatedFileStatusIterator(cachedFileStatusIterator)
+-            : listing.createLocatedFileStatusIterator(
+-                listing.createFileStatusListingIterator(path,
+-                    createListObjectsRequest(key, "/"),
+-                    filter,
+-                    acceptor,
+-                    cachedFileStatusIterator));
+-      }
+-    } catch (AmazonClientException e) {
+-      throw translateException("listLocatedStatus", path, e);
+-    }
++    return once("listLocatedStatus", path.toString(),
++        () -> {
++          // lookup dir triggers existence check
++          final FileStatus fileStatus = getFileStatus(path);
++          if (fileStatus.isFile()) {
++            // simple case: File
++            LOG.debug("Path is a file");
++            return new Listing.SingleStatusRemoteIterator(
++                filter.accept(path) ? toLocatedFileStatus(fileStatus) : null);
++          } else {
++            // directory: trigger a lookup
++            final String key = maybeAddTrailingSlash(pathToKey(path));
++            final Listing.FileStatusAcceptor acceptor =
++                new Listing.AcceptAllButSelfAndS3nDirs(path);
++            DirListingMetadata meta = metadataStore.listChildren(path);
++            final RemoteIterator<FileStatus> cachedFileStatusIterator =
++                listing.createProvidedFileStatusIterator(
++                    S3Guard.dirMetaToStatuses(meta), filter, acceptor);
++            return (allowAuthoritative && meta != null
++                && meta.isAuthoritative())
++                ? listing.createLocatedFileStatusIterator(
++                cachedFileStatusIterator)
++                : listing.createLocatedFileStatusIterator(
++                    listing.createFileStatusListingIterator(path,
++                        createListObjectsRequest(key, "/"),
++                        filter,
++                        acceptor,
++                        cachedFileStatusIterator));
++          }
++        });
++  @InterfaceAudience.Private
++  @Retries.RetryTranslated
+
+INS78 INS79 INS79 INS78 MOV8 INS78 MOV21 INS78 INS78 INS78 MOV78 INS78 INS78 INS79 INS78 INS78 INS40 INS40 INS45 INS40 INS45 INS40 MOV21 INS21 MOV65 INS40 INS40 INS42 INS40 INS40 INS40 INS40 INS45 INS41 INS40 INS40 UPD66 INS66 INS66 INS66 INS38 INS66 INS66 INS66 INS66 INS66 MOV43 INS32 INS66 INS66 INS65 INS66 UPD66 INS65 INS32 MOV21 MOV21 INS32 INS21 INS60 INS25 INS86 INS42 MOV27 INS42 INS86 INS68 INS68 UPD42 MOV42 MOV45 INS32 INS86 MOV32 INS42 MOV32 INS32 INS39 INS59 INS42 INS8 INS42 INS59 MOV8 INS8 INS42 INS42 INS69 INS69 INS69 INS42 INS69 MOV42 UPD42 MOV42 MOV8 INS32 INS32 INS42 INS42 INS45 INS42 MOV32 MOV21 INS42 MOV60 MOV60 MOV21 MOV60 MOV21 MOV21 MOV21 MOV60 MOV21 MOV54 INS43 MOV43 INS43 INS43 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS42 DEL40 DEL26 DEL42 DEL42 DEL42 DEL45 DEL32 DEL38 DEL42 DEL42 DEL45 DEL27 DEL7 DEL21 DEL8 DEL25 DEL42 DEL45 DEL27 DEL42 DEL45 DEL27 DEL42 DEL42 DEL45 DEL32 DEL38 DEL8 DEL25 DEL42 DEL42 DEL45 DEL32 DEL38 DEL8 DEL25 DEL27 DEL40 DEL78 DEL42 DEL42 DEL42 DEL42 DEL42 DEL9 DEL32 DEL21 DEL42 DEL42 DEL42 DEL32 DEL14 DEL42 DEL32 DEL32 DEL21 DEL40 DEL78 DEL42 DEL43 DEL83 DEL39 DEL42 DEL42 DEL43 DEL42 DEL44 DEL31 DEL1 DEL14 DEL42 DEL43 DEL42 DEL43 DEL42 DEL44 DEL42 DEL42 DEL42 DEL32 DEL53 DEL8 DEL12 DEL54 DEL8 DEL40 DEL45 DEL79 DEL40 DEL45 DEL79 DEL42 DEL43 DEL42 DEL44 DEL32 DEL53 DEL8 DEL12 DEL54

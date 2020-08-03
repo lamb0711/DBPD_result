@@ -1,0 +1,403 @@
+Merge trunk into HA branch.
+
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/branches/HDFS-1623@1230248 13f79535-47bb-0310-9956-ffa450edef68
+
++import java.util.concurrent.ConcurrentHashMap;
+-import org.apache.hadoop.mapreduce.v2.app.rm.ContainerAllocator;
+-import org.apache.hadoop.mapreduce.v2.app.rm.ContainerAllocatorEvent;
++  private ConcurrentHashMap<ContainerId, Container> containers = 
++    new ConcurrentHashMap<ContainerId, Container>(); 
+-  private ThreadPoolExecutor launcherPool;
+-  private static final int INITIAL_POOL_SIZE = 10;
++  protected ThreadPoolExecutor launcherPool;
++  protected static final int INITIAL_POOL_SIZE = 10;
+-  private BlockingQueue<ContainerLauncherEvent> eventQueue =
++  protected BlockingQueue<ContainerLauncherEvent> eventQueue =
++  private Container getContainer(ContainerId id) {
++    Container c = containers.get(id);
++    if(c == null) {
++      c = new Container();
++      Container old = containers.putIfAbsent(id, c);
++      if(old != null) {
++        c = old;
++      }
++    }
++    return c;
++  }
++  
++  private void removeContainerIfDone(ContainerId id) {
++    Container c = containers.get(id);
++    if(c != null && c.isCompletelyDone()) {
++      containers.remove(id);
++    }
++  }
++  
++  private static enum ContainerState {
++    PREP, FAILED, RUNNING, DONE, KILLED_BEFORE_LAUNCH
++  }
++
++  private class Container {
++    private ContainerState state;
++    
++    public Container() {
++      this.state = ContainerState.PREP;
++    }
++    
++    public synchronized boolean isCompletelyDone() {
++      return state == ContainerState.DONE || state == ContainerState.FAILED;
++    }
++    
++    @SuppressWarnings("unchecked")
++    public synchronized void launch(ContainerRemoteLaunchEvent event) {
++      TaskAttemptId taskAttemptID = event.getTaskAttemptID();
++      LOG.info("Launching " + taskAttemptID);
++      if(this.state == ContainerState.KILLED_BEFORE_LAUNCH) {
++        state = ContainerState.DONE;
++        sendContainerLaunchFailedMsg(taskAttemptID, 
++            "Container was killed before it was launched");
++        return;
++      }
++      CommandTimerTask timerTask = new CommandTimerTask(Thread
++          .currentThread(), event);
++      
++      final String containerManagerBindAddr = event.getContainerMgrAddress();
++      ContainerId containerID = event.getContainerID();
++      ContainerToken containerToken = event.getContainerToken();
++
++      ContainerManager proxy = null;
++      try {
++        commandTimer.schedule(timerTask, nmTimeOut);
++
++        proxy = getCMProxy(containerID, containerManagerBindAddr,
++            containerToken);
++
++        // Interrupted during getProxy, but that didn't throw exception
++        if (Thread.interrupted()) {
++          // The timer canceled the command in the mean while.
++          String message = "Container launch failed for " + containerID
++              + " : Start-container for " + event.getContainerID()
++              + " got interrupted. Returning.";
++          this.state = ContainerState.FAILED;
++          sendContainerLaunchFailedMsg(taskAttemptID, message);
++          return;
++        }
++        // Construct the actual Container
++        ContainerLaunchContext containerLaunchContext =
++          event.getContainer();
++
++        // Now launch the actual container
++        StartContainerRequest startRequest = Records
++          .newRecord(StartContainerRequest.class);
++        startRequest.setContainerLaunchContext(containerLaunchContext);
++        StartContainerResponse response = proxy.startContainer(startRequest);
++
++        // container started properly. Stop the timer
++        timerTask.cancel();
++        if (Thread.interrupted()) {
++          // The timer canceled the command in the mean while, but
++          // startContainer didn't throw exception
++          String message = "Container launch failed for " + containerID
++              + " : Start-container for " + event.getContainerID()
++              + " got interrupted. Returning.";
++          this.state = ContainerState.FAILED;
++          sendContainerLaunchFailedMsg(taskAttemptID, message);
++          return;
++        }
++
++        ByteBuffer portInfo = response
++          .getServiceResponse(ShuffleHandler.MAPREDUCE_SHUFFLE_SERVICEID);
++        int port = -1;
++        if(portInfo != null) {
++          port = ShuffleHandler.deserializeMetaData(portInfo);
++        }
++        LOG.info("Shuffle port returned by ContainerManager for "
++            + taskAttemptID + " : " + port);
++
++        if(port < 0) {
++          this.state = ContainerState.FAILED;
++          throw new IllegalStateException("Invalid shuffle port number "
++              + port + " returned for " + taskAttemptID);
++        }
++
++        // after launching, send launched event to task attempt to move
++        // it from ASSIGNED to RUNNING state
++        context.getEventHandler().handle(
++            new TaskAttemptContainerLaunchedEvent(taskAttemptID, port));
++        this.state = ContainerState.RUNNING;
++      } catch (Throwable t) {
++        if (Thread.interrupted()) {
++          // The timer canceled the command in the mean while.
++          LOG.info("Start-container for " + event.getContainerID()
++              + " got interrupted.");
++        }
++        String message = "Container launch failed for " + containerID + " : "
++            + StringUtils.stringifyException(t);
++        this.state = ContainerState.FAILED;
++        sendContainerLaunchFailedMsg(taskAttemptID, message);
++      } finally {
++        timerTask.cancel();
++        if (proxy != null) {
++          ContainerLauncherImpl.this.rpc.stopProxy(proxy, getConfig());
++        }
++      }
++    }
++    
++    @SuppressWarnings("unchecked")
++    public synchronized void kill(ContainerLauncherEvent event) {
++      if(this.state == ContainerState.PREP) {
++        this.state = ContainerState.KILLED_BEFORE_LAUNCH;
++      } else {
++        CommandTimerTask timerTask = new CommandTimerTask(Thread
++            .currentThread(), event);
++
++        final String containerManagerBindAddr = event.getContainerMgrAddress();
++        ContainerId containerID = event.getContainerID();
++        ContainerToken containerToken = event.getContainerToken();
++        TaskAttemptId taskAttemptID = event.getTaskAttemptID();
++        LOG.info("KILLING " + taskAttemptID);
++        commandTimer.schedule(timerTask, nmTimeOut);
++
++        ContainerManager proxy = null;
++        try {
++          proxy = getCMProxy(containerID, containerManagerBindAddr,
++              containerToken);
++
++          if (Thread.interrupted()) {
++            // The timer canceled the command in the mean while. No need to
++            // return, send cleaned up event anyways.
++            LOG.info("Stop-container for " + event.getContainerID()
++                + " got interrupted.");
++          } else {
++            // kill the remote container if already launched
++            StopContainerRequest stopRequest = Records
++              .newRecord(StopContainerRequest.class);
++            stopRequest.setContainerId(event.getContainerID());
++            proxy.stopContainer(stopRequest);
++          }
++        } catch (Throwable t) {
++
++          if (Thread.interrupted()) {
++            // The timer canceled the command in the mean while, clear the
++            // interrupt flag
++            LOG.info("Stop-container for " + event.getContainerID()
++                + " got interrupted.");
++          }
++
++          // ignore the cleanup failure
++          String message = "cleanup failed for container "
++            + event.getContainerID() + " : "
++            + StringUtils.stringifyException(t);
++          context.getEventHandler().handle(
++            new TaskAttemptDiagnosticsUpdateEvent(taskAttemptID, message));
++          LOG.warn(message);
++        } finally {
++          timerTask.cancel();
++          if (Thread.interrupted()) {
++            LOG.info("Stop-container for " + event.getContainerID()
++                + " got interrupted.");
++            // ignore the cleanup failure
++            context.getEventHandler().handle(
++              new TaskAttemptDiagnosticsUpdateEvent(taskAttemptID,
++                "cleanup failed for container " + event.getContainerID()));
++          }
++          if (proxy != null) {
++            ContainerLauncherImpl.this.rpc.stopProxy(proxy, getConfig());
++          }
++        }
++        this.state = ContainerState.DONE;
++      }
++      // after killing, send killed event to task attempt
++      context.getEventHandler().handle(
++          new TaskAttemptEvent(event.getTaskAttemptID(),
++              TaskAttemptEventType.TA_CONTAINER_CLEANED));
++    }
++  }
++    LOG.info("Upper limit on the thread pool size is " + this.limitOnPoolSize);
+-    this.rpc = YarnRPC.create(conf);
++    this.rpc = createYarnRPC(conf);
++  
++  protected YarnRPC createYarnRPC(Configuration conf) {
++    return YarnRPC.create(conf);
++  }
+-    eventHandlingThread = new Thread(new Runnable() {
++    eventHandlingThread = new Thread() {
+-            if (poolSize <= idealPoolSize) {
++            if (poolSize < idealPoolSize) {
+-              int newPoolSize = idealPoolSize + INITIAL_POOL_SIZE;
+-              LOG.info("Setting ContainerLauncher pool size to "
+-                  + newPoolSize);
++              int newPoolSize = Math.min(limitOnPoolSize, idealPoolSize
++                  + INITIAL_POOL_SIZE);
++              LOG.info("Setting ContainerLauncher pool size to " + newPoolSize
++                  + " as number-of-nodes to talk to is " + numNodes);
+-          launcherPool.execute(new EventProcessor(event));
++          launcherPool.execute(createEventProcessor(event));
+-    });
++    };
++  protected EventProcessor createEventProcessor(ContainerLauncherEvent event) {
++    return new EventProcessor(event);
++  }
++
+-    this.allNodes.add(containerManagerBindAddr);
+-
+-  private class EventProcessor implements Runnable {
++  class EventProcessor implements Runnable {
+-    @SuppressWarnings("unchecked")
+-      final String containerManagerBindAddr = event.getContainerMgrAddress();
+-      ContainerToken containerToken = event.getContainerToken();
+-      TaskAttemptId taskAttemptID = event.getTaskAttemptID();
+-      ContainerManager proxy = null;
+-
+-      CommandTimerTask timerTask = new CommandTimerTask(Thread
+-          .currentThread(), event);
+-
++      Container c = getContainer(containerID);
+-
+-        try {
+-          commandTimer.schedule(timerTask, nmTimeOut);
+-
+-          proxy = getCMProxy(containerID, containerManagerBindAddr,
+-              containerToken);
+-
+-          // Interruped during getProxy, but that didn't throw exception
+-          if (Thread.interrupted()) {
+-            // The timer cancelled the command in the mean while.
+-            String message = "Container launch failed for " + containerID
+-                + " : Start-container for " + event.getContainerID()
+-                + " got interrupted. Returning.";
+-            sendContainerLaunchFailedMsg(taskAttemptID, message);
+-            return;
+-          }
+-
+-          // Construct the actual Container
+-          ContainerLaunchContext containerLaunchContext =
+-              launchEvent.getContainer();
+-
+-          // Now launch the actual container
+-          StartContainerRequest startRequest = Records
+-              .newRecord(StartContainerRequest.class);
+-          startRequest.setContainerLaunchContext(containerLaunchContext);
+-          StartContainerResponse response = proxy.startContainer(startRequest);
+-
+-          // container started properly. Stop the timer
+-          timerTask.cancel();
+-          if (Thread.interrupted()) {
+-            // The timer cancelled the command in the mean while, but
+-            // startContainer didn't throw exception
+-            String message = "Container launch failed for " + containerID
+-                + " : Start-container for " + event.getContainerID()
+-                + " got interrupted. Returning.";
+-            sendContainerLaunchFailedMsg(taskAttemptID, message);
+-            return;
+-          }
+-
+-          ByteBuffer portInfo = response
+-              .getServiceResponse(ShuffleHandler.MAPREDUCE_SHUFFLE_SERVICEID);
+-          int port = -1;
+-          if(portInfo != null) {
+-            port = ShuffleHandler.deserializeMetaData(portInfo);
+-          }
+-          LOG.info("Shuffle port returned by ContainerManager for "
+-              + taskAttemptID + " : " + port);
+-          
+-          if(port < 0) {
+-            throw new IllegalStateException("Invalid shuffle port number "
+-                + port + " returned for " + taskAttemptID);
+-          }
+-
+-          // after launching, send launched event to task attempt to move
+-          // it from ASSIGNED to RUNNING state
+-          context.getEventHandler().handle(
+-              new TaskAttemptContainerLaunchedEvent(taskAttemptID, port));
+-        } catch (Throwable t) {
+-          if (Thread.interrupted()) {
+-            // The timer cancelled the command in the mean while.
+-            LOG.info("Start-container for " + event.getContainerID()
+-                + " got interrupted.");
+-          }
+-          String message = "Container launch failed for " + containerID
+-              + " : " + StringUtils.stringifyException(t);
+-          sendContainerLaunchFailedMsg(taskAttemptID, message);
+-        } finally {
+-          timerTask.cancel();
+-          if (proxy != null) {
+-            ContainerLauncherImpl.this.rpc.stopProxy(proxy, getConfig());
+-          }
+-        }
+-
++        c.launch(launchEvent);
+-        // We will have to remove the launch (meant "cleanup"? FIXME) event if it is still in eventQueue
+-        // and not yet processed
+-        if (eventQueue.contains(event)) {
+-          eventQueue.remove(event); // TODO: Any synchro needed?
+-          //deallocate the container
+-          context.getEventHandler().handle(
+-              new ContainerAllocatorEvent(taskAttemptID,
+-                  ContainerAllocator.EventType.CONTAINER_DEALLOCATE));
+-        } else {
+-
+-          try {
+-            commandTimer.schedule(timerTask, nmTimeOut);
+-
+-            proxy = getCMProxy(containerID, containerManagerBindAddr,
+-                containerToken);
+-
+-            if (Thread.interrupted()) {
+-              // The timer cancelled the command in the mean while. No need to
+-              // return, send cleanedup event anyways.
+-              LOG.info("Stop-container for " + event.getContainerID()
+-                  + " got interrupted.");
+-            } else {
+-
+-              // TODO:check whether container is launched
+-
+-              // kill the remote container if already launched
+-              StopContainerRequest stopRequest = Records
+-                  .newRecord(StopContainerRequest.class);
+-              stopRequest.setContainerId(event.getContainerID());
+-              proxy.stopContainer(stopRequest);
+-            }
+-          } catch (Throwable t) {
+-
+-            if (Thread.interrupted()) {
+-              // The timer cancelled the command in the mean while, clear the
+-              // interrupt flag
+-              LOG.info("Stop-container for " + event.getContainerID()
+-                  + " got interrupted.");
+-            }
+-
+-            // ignore the cleanup failure
+-            String message = "cleanup failed for container "
+-                + event.getContainerID() + " : "
+-                + StringUtils.stringifyException(t);
+-            context.getEventHandler()
+-                .handle(
+-                    new TaskAttemptDiagnosticsUpdateEvent(taskAttemptID,
+-                        message));
+-            LOG.warn(message);
+-          } finally {
+-            timerTask.cancel();
+-            if (Thread.interrupted()) {
+-              LOG.info("Stop-container for " + event.getContainerID()
+-                  + " got interrupted.");
+-              // ignore the cleanup failure
+-              context.getEventHandler()
+-                  .handle(new TaskAttemptDiagnosticsUpdateEvent(taskAttemptID,
+-                    "cleanup failed for container " + event.getContainerID()));
+-            }
+-            if (proxy != null) {
+-              ContainerLauncherImpl.this.rpc.stopProxy(proxy, getConfig());
+-            }
+-          }
+-
+-          // after killing, send killed event to taskattempt
+-          context.getEventHandler().handle(
+-              new TaskAttemptEvent(event.getTaskAttemptID(),
+-                  TaskAttemptEventType.TA_CONTAINER_CLEANED));
+-        }
++        c.kill(event);
++      removeContainerIfDone(containerID);
++      this.allNodes.add(event.getContainerMgrAddress());
+
+MOV26 MOV55 UPD40 INS23 INS31 INS31 INS71 INS31 INS31 INS55 INS83 INS74 INS59 UPD83 UPD83 UPD83 INS83 INS43 INS42 INS44 INS8 INS83 INS39 INS42 INS44 INS8 INS83 INS83 INS42 INS72 INS72 INS72 INS72 INS72 INS42 INS23 INS31 INS31 INS31 INS83 INS43 INS42 INS44 INS8 INS83 INS43 INS42 INS44 INS8 MOV29 INS42 MOV43 MOV23 MOV31 INS31 INS43 INS43 INS43 INS42 INS14 INS42 INS43 INS42 INS60 INS25 INS41 INS43 INS42 INS60 INS25 INS42 INS42 INS42 INS42 INS42 INS83 INS43 INS59 INS83 INS42 INS8 INS83 INS83 INS39 INS42 INS8 INS79 INS83 INS83 INS39 INS42 INS44 MOV8 INS83 UPD42 INS44 MOV8 INS21 INS42 INS43 INS42 INS41 INS42 INS43 INS42 INS41 MOV78 INS83 INS39 INS42 INS8 INS42 INS42 INS42 INS74 INS42 INS43 INS59 INS27 INS8 INS42 INS42 INS43 INS59 INS27 INS8 INS42 INS42 INS21 INS41 INS42 INS45 INS43 INS42 INS60 MOV21 INS25 INS60 INS60 INS60 INS60 INS60 MOV54 INS43 INS42 INS25 INS32 INS42 MOV32 INS42 MOV14 MOV21 INS60 INS60 INS50 INS21 INS43 INS43 INS43 INS42 INS42 INS32 INS42 INS33 INS21 INS60 INS25 INS42 INS42 INS32 INS27 INS32 INS21 INS7 INS27 INS42 INS43 INS59 INS27 INS8 INS43 INS59 INS83 INS43 INS59 INS43 INS59 INS43 INS59 INS43 INS59 MOV25 MOV25 INS42 INS27 INS8 INS8 INS42 INS42 INS27 INS32 MOV14 INS43 INS59 INS43 INS59 MOV32 MOV49 MOV60 INS21 INS10 MOV49 INS21 INS10 INS32 MOV21 INS42 INS42 INS42 INS42 INS42 INS42 INS7 INS43 INS59 INS27 INS8 INS42 INS42 INS42 INS42 INS33 INS42 INS42 INS32 INS22 INS40 INS27 INS27 INS42 INS42 INS32 UPD42 UPD42 INS27 INS22 INS40 INS21 INS21 INS41 INS42 INS42 INS14 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS33 INS21 INS22 INS40 INS21 MOV60 MOV60 MOV60 MOV60 MOV60 INS21 MOV21 MOV60 MOV54 INS21 INS45 INS22 INS42 INS42 MOV43 INS42 INS42 INS32 INS42 INS42 INS32 INS32 INS32 INS42 INS42 INS42 INS14 INS42 INS42 INS32 INS42 INS33 INS21 INS42 INS42 INS42 INS52 INS42 INS42 INS40 INS42 INS40 MOV42 INS42 INS45 INS42 INS52 INS42 INS7 INS32 UPD43 MOV43 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS7 INS21 INS52 INS42 INS7 INS32 INS7 INS52 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS43 INS42 INS42 INS42 INS42 INS7 INS42 INS40 UPD42 MOV42 UPD42 MOV42 INS45 UPD42 INS42 INS42 INS21 INS21 INS21 INS22 INS40 INS7 INS22 INS40 INS42 INS42 INS27 INS22 INS40 INS42 UPD42 MOV42 INS42 INS42 INS42 INS7 UPD42 INS7 INS7 INS52 INS42 INS22 INS40 INS52 INS42 INS45 INS42 INS52 INS42 INS22 INS40 INS22 INS40 INS22 INS40 INS52 INS42 INS52 INS42 INS52 INS42 INS52 INS42 INS32 UPD27 INS42 INS42 INS32 INS42 INS42 INS42 MOV27 INS45 INS42 DEL40 DEL26 DEL42 DEL10 DEL42 DEL42 DEL32 DEL32 DEL42 DEL42 DEL40 DEL14 DEL32 DEL21 DEL8 DEL25 DEL10 DEL50 DEL42 DEL42 DEL43 DEL14

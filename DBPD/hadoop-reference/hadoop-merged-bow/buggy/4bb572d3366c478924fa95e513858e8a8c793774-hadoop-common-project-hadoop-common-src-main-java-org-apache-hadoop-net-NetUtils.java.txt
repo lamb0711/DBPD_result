@@ -1,0 +1,316 @@
+HADOOP-7808. Port HADOOP-7510 - Add configurable option to use original hostname in token instead of IP to allow server IP change. Contributed by Daryn Sharp.
+
+
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/trunk@1227737 13f79535-47bb-0310-9956-ffa450edef68
+
++import java.util.concurrent.ConcurrentHashMap;
+-import org.apache.hadoop.fs.Path;
++import org.apache.hadoop.security.SecurityUtil;
++import com.google.common.annotations.VisibleForTesting;
++
++//this will need to be replaced someday when there is a suitable replacement
++import sun.net.dns.ResolverConfiguration;
++import sun.net.util.IPAddressUtil;
++
++  private static HostResolver hostResolver;
++  
++  static {
++    // SecurityUtils requires a more secure host resolver if tokens are
++    // using hostnames
++    setUseQualifiedHostResolver(!SecurityUtil.getTokenServiceUseIp());
++  }
++
++  /**
++   * This method is intended for use only by SecurityUtils!
++   * @param flag where the qualified or standard host resolver is used
++   *             to create socket addresses
++   */
++  @InterfaceAudience.Private
++  public static void setUseQualifiedHostResolver(boolean flag) {
++      hostResolver = flag
++          ? new QualifiedHostResolver()
++          : new StandardHostResolver();
++  }
++  
+-    int colonIndex = target.indexOf(':');
+-    if (colonIndex < 0 && defaultPort == -1) {
+-      throw new RuntimeException("Not a host:port pair: " + target +
+-          helpText);
+-    }
+-    String hostname;
+-    int port = -1;
+-    if (!target.contains("/")) {
+-      if (colonIndex == -1) {
+-        hostname = target;
+-      } else {
+-        // must be the old style <host>:<port>
+-        hostname = target.substring(0, colonIndex);
+-        String portStr = target.substring(colonIndex + 1);
+-        try {
+-          port = Integer.parseInt(portStr);
+-        } catch (NumberFormatException nfe) {
+-          throw new IllegalArgumentException(
+-              "Can't parse port '" + portStr + "'"
+-              + helpText);
+-        }
+-      }
+-    } else {
+-      // a new uri
+-      URI addr = new Path(target).toUri();
+-      hostname = addr.getHost();
+-      port = addr.getPort();
++    boolean hasScheme = target.contains("://");    
++    URI uri = null;
++    try {
++      uri = hasScheme ? URI.create(target) : URI.create("dummyscheme://"+target);
++    } catch (IllegalArgumentException e) {
++      throw new IllegalArgumentException(
++          "Does not contain a valid host:port authority: " + target + helpText
++      );
++    String host = uri.getHost();
++    int port = uri.getPort();
+-  
+-    if (getStaticResolution(hostname) != null) {
+-      hostname = getStaticResolution(hostname);
++    String path = uri.getPath();
++    
++    if ((host == null) || (port < 0) ||
++        (!hasScheme && path != null && !path.isEmpty()))
++    {
++      throw new IllegalArgumentException(
++          "Does not contain a valid host:port authority: " + target + helpText
++      );
+-    return new InetSocketAddress(hostname, port);
++    return createSocketAddrForHost(host, port);
++  }
++
++  /**
++   * Create a socket address with the given host and port.  The hostname
++   * might be replaced with another host that was set via
++   * {@link #addStaticResolution(String, String)}.  The value of
++   * hadoop.security.token.service.use_ip will determine whether the
++   * standard java host resolver is used, or if the fully qualified resolver
++   * is used.
++   * @param host the hostname or IP use to instantiate the object
++   * @param port the port number
++   * @return InetSocketAddress
++   */
++  public static InetSocketAddress createSocketAddrForHost(String host, int port) {
++    String staticHost = getStaticResolution(host);
++    String resolveHost = (staticHost != null) ? staticHost : host;
++    
++    InetSocketAddress addr;
++    try {
++      InetAddress iaddr = hostResolver.getByName(resolveHost);
++      // if there is a static entry for the host, make the returned
++      // address look like the original given host
++      if (staticHost != null) {
++        iaddr = InetAddress.getByAddress(host, iaddr.getAddress());
++      }
++      addr = new InetSocketAddress(iaddr, port);
++    } catch (UnknownHostException e) {
++      addr = InetSocketAddress.createUnresolved(host, port);
++    }
++    return addr;
++  }
++
++  interface HostResolver {
++    InetAddress getByName(String host) throws UnknownHostException;    
++  }
++  
++  /**
++   * Uses standard java host resolution
++   */
++  static class StandardHostResolver implements HostResolver {
++    public InetAddress getByName(String host) throws UnknownHostException {
++      return InetAddress.getByName(host);
++    }
++  }
++  
++  /**
++   * This an alternate resolver with important properties that the standard
++   * java resolver lacks:
++   * 1) The hostname is fully qualified.  This avoids security issues if not
++   *    all hosts in the cluster do not share the same search domains.  It
++   *    also prevents other hosts from performing unnecessary dns searches.
++   *    In contrast, InetAddress simply returns the host as given.
++   * 2) The InetAddress is instantiated with an exact host and IP to prevent
++   *    further unnecessary lookups.  InetAddress may perform an unnecessary
++   *    reverse lookup for an IP.
++   * 3) A call to getHostName() will always return the qualified hostname, or
++   *    more importantly, the IP if instantiated with an IP.  This avoids
++   *    unnecessary dns timeouts if the host is not resolvable.
++   * 4) Point 3 also ensures that if the host is re-resolved, ex. during a
++   *    connection re-attempt, that a reverse lookup to host and forward
++   *    lookup to IP is not performed since the reverse/forward mappings may
++   *    not always return the same IP.  If the client initiated a connection
++   *    with an IP, then that IP is all that should ever be contacted.
++   *    
++   * NOTE: this resolver is only used if:
++   *       hadoop.security.token.service.use_ip=false 
++   */
++  protected static class QualifiedHostResolver implements HostResolver {
++    @SuppressWarnings("unchecked")
++    private List<String> searchDomains =
++        ResolverConfiguration.open().searchlist();
++    
++    /**
++     * Create an InetAddress with a fully qualified hostname of the given
++     * hostname.  InetAddress does not qualify an incomplete hostname that
++     * is resolved via the domain search list.
++     * {@link InetAddress#getCanonicalHostName()} will fully qualify the
++     * hostname, but it always return the A record whereas the given hostname
++     * may be a CNAME.
++     * 
++     * @param host a hostname or ip address
++     * @return InetAddress with the fully qualified hostname or ip
++     * @throws UnknownHostException if host does not exist
++     */
++    public InetAddress getByName(String host) throws UnknownHostException {
++      InetAddress addr = null;
++
++      if (IPAddressUtil.isIPv4LiteralAddress(host)) {
++        // use ipv4 address as-is
++        byte[] ip = IPAddressUtil.textToNumericFormatV4(host);
++        addr = InetAddress.getByAddress(host, ip);
++      } else if (IPAddressUtil.isIPv6LiteralAddress(host)) {
++        // use ipv6 address as-is
++        byte[] ip = IPAddressUtil.textToNumericFormatV6(host);
++        addr = InetAddress.getByAddress(host, ip);
++      } else if (host.endsWith(".")) {
++        // a rooted host ends with a dot, ex. "host."
++        // rooted hosts never use the search path, so only try an exact lookup
++        addr = getByExactName(host);
++      } else if (host.contains(".")) {
++        // the host contains a dot (domain), ex. "host.domain"
++        // try an exact host lookup, then fallback to search list
++        addr = getByExactName(host);
++        if (addr == null) {
++          addr = getByNameWithSearch(host);
++        }
++      } else {
++        // it's a simple host with no dots, ex. "host"
++        // try the search list, then fallback to exact host
++        InetAddress loopback = InetAddress.getByName(null);
++        if (host.equalsIgnoreCase(loopback.getHostName())) {
++          addr = InetAddress.getByAddress(host, loopback.getAddress());
++        } else {
++          addr = getByNameWithSearch(host);
++          if (addr == null) {
++            addr = getByExactName(host);
++          }
++        }
++      }
++      // unresolvable!
++      if (addr == null) {
++        throw new UnknownHostException(host);
++      }
++      return addr;
++    }
++
++    InetAddress getByExactName(String host) {
++      InetAddress addr = null;
++      // InetAddress will use the search list unless the host is rooted
++      // with a trailing dot.  The trailing dot will disable any use of the
++      // search path in a lower level resolver.  See RFC 1535.
++      String fqHost = host;
++      if (!fqHost.endsWith(".")) fqHost += ".";
++      try {
++        addr = getInetAddressByName(fqHost);
++        // can't leave the hostname as rooted or other parts of the system
++        // malfunction, ex. kerberos principals are lacking proper host
++        // equivalence for rooted/non-rooted hostnames
++        addr = InetAddress.getByAddress(host, addr.getAddress());
++      } catch (UnknownHostException e) {
++        // ignore, caller will throw if necessary
++      }
++      return addr;
++    }
++
++    InetAddress getByNameWithSearch(String host) {
++      InetAddress addr = null;
++      if (host.endsWith(".")) { // already qualified?
++        addr = getByExactName(host); 
++      } else {
++        for (String domain : searchDomains) {
++          String dot = !domain.startsWith(".") ? "." : "";
++          addr = getByExactName(host + dot + domain);
++          if (addr != null) break;
++        }
++      }
++      return addr;
++    }
++
++    // implemented as a separate method to facilitate unit testing
++    InetAddress getInetAddressByName(String host) throws UnknownHostException {
++      return InetAddress.getByName(host);
++    }
++
++    void setSearchDomains(String ... domains) {
++      searchDomains = Arrays.asList(domains);
++    }
++  }
++  
++  /**
++   * This is for testing only!
++   */
++  @VisibleForTesting
++  static void setHostResolver(HostResolver newResolver) {
++    hostResolver = newResolver;
++  }
++  
++  /**
++   * Resolve the uri's hostname and add the default port if not in the uri
++   * @param uri to resolve
++   * @param defaultPort if none is given
++   * @return URI
++   */
++  public static URI getCanonicalUri(URI uri, int defaultPort) {
++    // skip if there is no authority, ie. "file" scheme or relative uri
++    String host = uri.getHost();
++    if (host == null) {
++      return uri;
++    }
++    String fqHost = canonicalizeHost(host);
++    int port = uri.getPort();
++    // short out if already canonical with a port
++    if (host.equals(fqHost) && port != -1) {
++      return uri;
++    }
++    // reconstruct the uri with the canonical host and port
++    try {
++      uri = new URI(uri.getScheme(), uri.getUserInfo(),
++          fqHost, (port == -1) ? defaultPort : port,
++          uri.getPath(), uri.getQuery(), uri.getFragment());
++    } catch (URISyntaxException e) {
++      throw new IllegalArgumentException(e);
++    }
++    return uri;
++  }  
++
++  // cache the canonicalized hostnames;  the cache currently isn't expired,
++  // but the canonicals will only change if the host's resolver configuration
++  // changes
++  private static final ConcurrentHashMap<String, String> canonicalizedHostCache =
++      new ConcurrentHashMap<String, String>();
++
++  private static String canonicalizeHost(String host) {
++    // check if the host has already been canonicalized
++    String fqHost = canonicalizedHostCache.get(host);
++    if (fqHost == null) {
++      try {
++        fqHost = hostResolver.getByName(host).getHostName();
++        // slight race condition, but won't hurt 
++        canonicalizedHostCache.put(host, fqHost);
++      } catch (UnknownHostException e) {
++        fqHost = host;
++      }
++    }
++    return fqHost;
+-    if (addr.getAddress().getHostAddress().equals("0.0.0.0")) {
+-      addr = new InetSocketAddress("127.0.0.1", addr.getPort());
++    if (addr.getAddress().isAnyLocalAddress()) {
++      addr = createSocketAddrForHost("127.0.0.1", addr.getPort());
+
+MOV26 INS26 INS26 INS26 INS26 INS40 UPD40 INS40 INS40 INS40 INS23 INS28 INS31 INS31 INS31 INS55 INS55 INS55 INS31 INS31 INS23 INS31 INS83 INS83 INS43 INS59 INS83 INS8 INS29 INS78 MOV83 MOV83 INS39 INS42 INS44 INS8 MOV29 INS83 INS83 MOV43 MOV42 MOV44 MOV44 MOV44 INS8 INS29 INS83 INS83 INS43 INS42 INS44 INS44 INS8 INS42 INS31 INS29 INS83 INS42 INS43 INS31 INS29 INS83 INS83 INS42 INS43 INS23 INS31 INS31 INS31 INS31 INS31 INS29 INS78 INS83 INS39 INS42 INS44 INS8 INS29 INS83 INS83 INS43 INS42 INS44 INS44 INS8 INS83 INS83 INS83 INS74 INS59 INS83 INS83 INS43 INS42 INS44 INS8 INS42 INS42 INS21 INS65 INS65 INS40 INS39 INS42 INS21 MOV60 MOV25 MOV25 MOV60 INS60 INS54 INS60 INS60 MOV25 INS60 MOV25 INS41 INS65 INS65 INS65 INS65 INS42 INS43 INS42 INS39 INS42 MOV60 INS60 INS60 INS54 INS41 INS43 INS42 INS44 INS43 INS65 INS42 INS83 INS43 INS42 INS44 INS43 INS8 INS65 INS42 INS79 INS83 INS74 INS59 INS29 INS83 INS43 INS42 INS44 INS43 INS8 INS43 INS42 INS44 INS8 INS43 INS42 INS44 INS8 INS43 INS42 INS44 INS43 INS8 INS39 INS42 INS44 INS8 INS65 INS42 INS43 INS42 INS21 INS65 INS65 INS65 INS65 INS42 INS43 INS42 INS39 INS42 INS60 INS25 INS60 INS60 INS25 INS54 INS41 INS43 INS43 INS43 INS42 INS14 INS42 INS43 INS42 INS60 INS25 INS41 INS32 INS66 INS42 INS66 INS66 INS7 UPD39 MOV43 INS59 INS8 INS12 MOV43 INS59 INS39 INS59 MOV43 INS59 UPD27 INS32 INS66 INS66 INS65 INS66 INS66 INS66 INS66 INS42 INS66 INS42 INS66 INS66 INS42 INS43 INS43 INS59 MOV43 INS59 INS8 INS12 INS42 INS42 INS43 INS42 INS42 INS66 INS42 INS43 INS42 INS42 INS41 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS42 INS45 INS43 INS43 INS42 INS32 INS65 INS65 INS65 INS65 INS42 INS43 INS42 INS42 INS60 INS25 INS25 INS41 INS42 INS43 INS42 INS60 INS60 INS25 INS54 INS41 INS42 INS43 INS42 INS60 INS25 INS41 UPD42 MOV42 INS43 INS42 INS42 INS41 INS43 INS42 MOV21 INS66 INS42 INS7 INS66 INS42 INS66 INS42 INS66 INS66 INS42 INS43 INS59 INS27 INS8 INS43 INS59 INS39 INS59 INS27 INS8 INS8 INS12 INS42 INS42 INS42 INS42 INS74 INS42 INS43 INS59 INS27 INS8 INS42 MOV32 INS42 INS38 INS42 INS16 UPD42 INS42 INS33 INS21 INS44 INS8 INS42 INS32 INS42 INS32 INS42 INS32 INS36 INS36 INS36 INS42 INS42 INS42 INS68 INS42 INS42 INS32 INS42 INS42 INS16 INS42 INS60 INS25 INS21 INS44 INS8 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS66 INS66 INS66 INS65 INS66 INS66 INS66 INS42 INS66 INS66 INS42 INS66 INS42 INS43 INS59 INS32 INS8 INS25 INS27 INS8 INS42 INS42 INS43 INS59 INS43 INS59 INS38 INS21 MOV8 INS12 INS42 INS42 INS43 INS59 INS32 INS8 INS8 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS33 INS41 INS42 INS42 INS32 INS42 INS32 INS32 UPD27 MOV27 INS41 MOV21 INS44 INS8 INS43 INS43 INS43 INS42 INS42 INS32 INS42 MOV33 INS54 UPD42 INS32 INS42 INS14 INS14 UPD42 INS45 INS7 MOV43 INS42 INS53 INS42 INS42 INS42 INS42 INS42 INS42 INS27 INS27 INS27 INS42 INS69 INS69 INS42 INS42 INS36 INS42 INS42 INS43 INS59 INS27 INS8 INS7 INS43 INS42 INS21 INS42 INS42 INS42 INS42 INS42 INS68 INS42 INS42 INS33 INS42 INS42 INS42 MOV60 INS21 INS32 INS8 INS25 UPD42 MOV42 INS33 INS53 INS42 INS42 INS33 INS42 INS42 INS42 INS32 INS7 INS21 MOV44 INS8 INS42 INS42 INS33 INS42 INS42 INS45 INS21 INS70 INS42 INS42 INS42 UPD42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 UPD42 INS42 INS43 INS42 INS53 INS42 INS42 INS42 INS42 UPD42 MOV42 UPD42 MOV42 INS8 INS12 INS42 INS42 INS43 INS43 INS42 INS16 INS14 INS42 INS33 UPD42 MOV42 MOV34 INS27 UPD38 MOV38 UPD43 INS43 INS43 INS27 INS42 INS42 INS32 INS42 INS33 INS21 INS42 INS14 INS42 INS7 INS42 INS42 INS5 INS7 INS42 INS42 INS42 INS60 INS21 INS32 INS8 INS25 INS14 INS42 INS42 INS45 INS42 INS45 INS7 UPD43 UPD42 INS7 INS44 INS42 INS8 UPD42 UPD42 INS42 INS42 INS14 INS42 INS14 MOV21 INS21 INS44 INS8 INS32 INS42 INS42 INS42 INS32 INS32 INS43 INS27 INS38 INS27 INS32 UPD42 UPD45 INS42 INS42 INS42 INS33 INS42 INS42 INS42 INS7 MOV43 INS42 INS42 INS42 INS32 INS39 INS85 INS42 INS32 INS42 INS32 INS5 INS59 INS7 INS42 INS42 INS45 INS21 INS32 MOV8 INS8 INS43 INS42 INS42 INS32 UPD42 UPD42 INS42 INS32 INS43 INS42 INS60 INS21 INS25 INS43 INS32 INS32 INS42 INS16 INS32 INS32 INS32 INS43 INS42 INS32 INS43 INS42 INS21 INS42 INS45 MOV32 INS42 INS42 INS42 INS42 INS42 INS27 INS42 INS45 INS42 INS42 INS42 INS42 INS33 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS39 INS85 INS42 INS32 INS42 INS32 INS7 UPD42 MOV42 MOV42 UPD45 MOV45 INS25 INS60 INS25 INS42 INS42 INS42 UPD42 INS42 UPD42 INS32 INS42 INS42 INS42 INS43 INS59 INS7 INS27 INS10 INS42 INS42 INS42 INS42 INS42 INS36 INS42 INS42 UPD42 MOV42 UPD42 MOV42 INS42 INS42 INS42 INS42 INS42 UPD42 INS32 INS42 INS42 INS42 INS42 INS42 INS7 INS45 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS27 INS8 INS43 INS59 INS32 INS8 INS8 UPD42 MOV42 INS42 INS42 INS42 INS16 INS42 INS32 INS42 INS33 INS27 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS33 INS21 INS42 INS42 INS32 INS42 INS42 INS32 MOV21 INS21 INS25 INS38 INS45 INS45 INS42 INS27 INS42 MOV38 INS42 UPD42 MOV42 UPD42 MOV42 INS42 INS42 INS7 INS42 INS42 INS33 INS42 INS42 INS7 INS27 INS8 INS32 UPD42 MOV42 UPD42 MOV42 INS42 INS42 INS32 UPD42 INS42 INS32 INS42 INS33 INS21 INS42 INS42 INS45 INS42 INS42 INS42 INS42 UPD42 INS32 INS42 UPD42 MOV42 INS7 UPD42 MOV42 UPD42 MOV42 INS42 INS32 INS42 INS42 DEL13 DEL34 DEL27 DEL42 DEL27 DEL42 DEL39 DEL42 DEL42 DEL42 DEL34 DEL42 DEL32 DEL32 DEL32 DEL38 DEL42 DEL42 DEL34 DEL27 DEL32 DEL59 DEL60 DEL45 DEL45 DEL27 DEL14 DEL53 DEL8 DEL12 DEL54 DEL8 DEL25 DEL8 DEL42 DEL43 DEL42 DEL14 DEL42 DEL32 DEL59 DEL60 DEL8 DEL25 DEL32 DEL27 DEL8 DEL25 DEL42 DEL42 DEL14 DEL41 DEL8 DEL31 DEL42 DEL45 DEL32 DEL45 DEL14

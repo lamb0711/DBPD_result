@@ -1,0 +1,150 @@
+YARN-2888. Corrective mechanisms for rebalancing NM container queues. (asuresh)
+
+-import java.util.HashMap;
++import java.util.Map;
++import java.util.concurrent.ConcurrentHashMap;
+-public class TopKNodeSelector implements ClusterMonitor {
++/**
++ * The NodeQueueLoadMonitor keeps track of load metrics (such as queue length
++ * and total wait time) associated with Container Queues on the Node Manager.
++ * It uses this information to periodically sort the Nodes from least to most
++ * loaded.
++ */
++public class NodeQueueLoadMonitor implements ClusterMonitor {
+-  final static Log LOG = LogFactory.getLog(TopKNodeSelector.class);
++  final static Log LOG = LogFactory.getLog(NodeQueueLoadMonitor.class);
+-  public enum TopKComparator implements Comparator<ClusterNode> {
+-    WAIT_TIME,
+-    QUEUE_LENGTH;
++  /**
++   * The comparator used to specify the metric against which the load
++   * of two Nodes are compared.
++   */
++  public enum LoadComparator implements Comparator<ClusterNode> {
++    QUEUE_LENGTH,
++    QUEUE_WAIT_TIME;
+-      if (getQuant(o1) == getQuant(o2)) {
++      if (getMetric(o1) == getMetric(o2)) {
+-      return getQuant(o1) > getQuant(o2) ? +1 : -1;
++      return getMetric(o1) > getMetric(o2) ? +1 : -1;
+-    private int getQuant(ClusterNode c) {
+-      return (this == WAIT_TIME) ? c.queueTime : c.waitQueueLength;
++    public int getMetric(ClusterNode c) {
++      return (this == QUEUE_LENGTH) ? c.queueLength : c.queueWaitTime;
+-    int queueTime = -1;
+-    int waitQueueLength = 0;
++    int queueLength = 0;
++    int queueWaitTime = -1;
+-    public ClusterNode setQueueTime(int queueTime) {
+-      this.queueTime = queueTime;
++    public ClusterNode setQueueLength(int qLength) {
++      this.queueLength = qLength;
+-    public ClusterNode setWaitQueueLength(int queueLength) {
+-      this.waitQueueLength = queueLength;
++    public ClusterNode setQueueWaitTime(int wTime) {
++      this.queueWaitTime = wTime;
+-  private final int k;
+-  private final List<NodeId> topKNodes;
+-  private final HashMap<NodeId, ClusterNode> clusterNodes = new HashMap<>();
+-  private final Comparator<ClusterNode> comparator;
++
++  private final List<NodeId> sortedNodes;
++  private final Map<NodeId, ClusterNode> clusterNodes =
++      new ConcurrentHashMap<>();
++  private final LoadComparator comparator;
++  private QueueLimitCalculator thresholdCalculator;
+-      synchronized (topKNodes) {
+-        topKNodes.clear();
+-        topKNodes.addAll(computeTopKNodes());
++      synchronized (sortedNodes) {
++        sortedNodes.clear();
++        sortedNodes.addAll(sortNodes());
++        if (thresholdCalculator != null) {
++          thresholdCalculator.update();
++        }
+-  TopKNodeSelector(int k, TopKComparator comparator) {
+-    this.k = k;
+-    this.topKNodes = new ArrayList<>();
++  NodeQueueLoadMonitor(LoadComparator comparator) {
++    this.sortedNodes = new ArrayList<>();
+-  public TopKNodeSelector(int k, long nodeComputationInterval,
+-      TopKComparator comparator) {
+-    this.k = k;
+-    this.topKNodes = new ArrayList<>();
++  public NodeQueueLoadMonitor(long nodeComputationInterval,
++      LoadComparator comparator) {
++    this.sortedNodes = new ArrayList<>();
++  List<NodeId> getSortedNodes() {
++    return sortedNodes;
++  }
++
++  public QueueLimitCalculator getThresholdCalculator() {
++    return thresholdCalculator;
++  }
++
++  Map<NodeId, ClusterNode> getClusterNodes() {
++    return clusterNodes;
++  }
++
++  Comparator<ClusterNode> getComparator() {
++    return comparator;
++  }
++
++  public void initThresholdCalculator(float sigma, int limitMin, int limitMax) {
++    this.thresholdCalculator =
++        new QueueLimitCalculator(this, sigma, limitMin, limitMax);
++  }
+-    // Ignoring this currently : atleast one NODE_UPDATE heartbeat is
++    // Ignoring this currently : at least one NODE_UPDATE heartbeat is
+-  public void nodeUpdate(RMNode rmNode) {
++  public void updateNode(RMNode rmNode) {
+-    // Add nodes to clusterNodes.. if estimatedQueueTime is -1, Ignore node
+-    // UNLESS comparator is based on queue length, in which case, we should add
++    // Add nodes to clusterNodes. If estimatedQueueTime is -1, ignore node
++    // UNLESS comparator is based on queue length.
+-            || comparator == TopKComparator.QUEUE_LENGTH) {
++            || comparator == LoadComparator.QUEUE_LENGTH) {
+-                  .setQueueTime(estimatedQueueWaitTime)
+-                  .setWaitQueueLength(waitQueueLength));
++                  .setQueueWaitTime(estimatedQueueWaitTime)
++                  .setQueueLength(waitQueueLength));
+-            || comparator == TopKComparator.QUEUE_LENGTH) {
++            || comparator == LoadComparator.QUEUE_LENGTH) {
+-              .setQueueTime(estimatedQueueWaitTime)
+-              .setWaitQueueLength(waitQueueLength)
++              .setQueueWaitTime(estimatedQueueWaitTime)
++              .setQueueLength(waitQueueLength)
+-              "with queue wait time [" + currentNode.queueTime + "] and " +
+-              "wait queue length [" + currentNode.waitQueueLength + "]");
++              "with queue wait time [" + currentNode.queueWaitTime + "] and " +
++              "wait queue length [" + currentNode.queueLength + "]");
+-    // Ignoring this currently...
++    // Ignoring this currently.
++  /**
++   * Returns all Node Ids as ordered list from Least to Most Loaded.
++   * @return ordered list of nodes
++   */
+-    synchronized (this.topKNodes) {
+-      return this.k < this.topKNodes.size() ?
+-          new ArrayList<>(this.topKNodes).subList(0, this.k) :
+-          new ArrayList<>(this.topKNodes);
++    return selectLeastLoadedNodes(-1);
++  }
++
++  /**
++   * Returns 'K' of the least Loaded Node Ids as ordered list.
++   * @param k max number of nodes to return
++   * @return ordered list of nodes
++   */
++  public List<NodeId> selectLeastLoadedNodes(int k) {
++    synchronized (this.sortedNodes) {
++      return ((k < this.sortedNodes.size()) && (k >= 0)) ?
++          new ArrayList<>(this.sortedNodes).subList(0, k) :
++          new ArrayList<>(this.sortedNodes);
+-  private List<NodeId> computeTopKNodes() {
++  private List<NodeId> sortNodes() {
+-      // to reset the value of each element.. Since we don't really care about
++      // to reset the value of each element. Since we don't really care about
++
+
+MOV26 INS26 MOV23 MOV23 UPD40 INS40 INS29 UPD42 MOV72 MOV23 INS31 INS31 INS31 INS31 INS31 INS31 INS65 INS29 UPD42 UPD74 INS43 MOV59 INS43 INS59 MOV43 UPD42 UPD42 INS74 INS42 INS8 INS83 INS43 INS42 INS8 INS74 INS42 INS8 MOV74 INS42 INS8 INS83 INS39 INS42 INS44 INS44 INS44 INS8 UPD42 INS29 INS83 INS74 INS42 INS8 INS29 UPD42 MOV44 UPD42 INS66 INS66 INS66 INS66 INS65 UPD42 UPD83 UPD42 MOV43 UPD42 MOV43 UPD42 UPD42 UPD43 INS42 INS42 INS42 UPD43 UPD43 INS43 INS43 INS41 INS42 INS41 INS43 INS43 INS43 INS41 INS41 INS39 INS42 INS39 INS42 INS39 INS42 INS21 INS65 INS65 INS43 INS43 INS41 INS65 INS65 INS65 INS66 INS66 UPD42 UPD42 UPD42 MOV41 UPD42 MOV41 UPD42 UPD74 MOV43 UPD42 UPD42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS7 INS66 INS66 INS42 INS42 INS32 INS66 INS42 INS66 INS66 UPD43 UPD43 INS22 INS14 INS42 INS38 UPD42 UPD42 UPD40 UPD40 UPD42 UPD42 UPD42 UPD42 UPD42 INS52 INS42 INS43 INS52 INS42 INS42 INS42 INS34 UPD42 UPD42 UPD42 UPD42 INS42 INS36 MOV14 UPD42 UPD42 UPD42 UPD42 INS27 MOV27 INS27 MOV14 INS42 INS25 MOV27 INS27 INS36 INS36 UPD42 INS27 INS8 INS42 INS40 UPD40 INS27 INS27 UPD42 UPD42 UPD42 INS42 INS33 INS21 INS42 MOV32 INS42 INS34 UPD42 INS32 UPD42 UPD42 UPD40 UPD40 INS42 INS42 UPD42 UPD42 UPD42 DEL39 DEL42 DEL59 DEL83 DEL39 DEL42 DEL44 DEL52 DEL42 DEL22 DEL42 DEL7 DEL21 DEL52 DEL42 DEL22 DEL42 DEL7 DEL21 DEL42 DEL40 DEL27 DEL27 DEL52 DEL42 DEL22 DEL27 DEL52 DEL42 DEL22

@@ -1,0 +1,216 @@
+HADOOP-14445. Delegation tokens are not shared between KMS instances. Contributed by Xiao Chen and Rushabh S Shah.
+
+-import org.apache.hadoop.security.token.TokenRenewer;
++import org.apache.hadoop.security.token.TokenSelector;
++import org.apache.hadoop.security.token.delegation.AbstractDelegationTokenSelector;
++import static org.apache.hadoop.fs.CommonConfigurationKeysPublic.KMS_CLIENT_COPY_LEGACY_TOKEN_KEY;
++import static org.apache.hadoop.fs.CommonConfigurationKeysPublic.KMS_CLIENT_COPY_LEGACY_TOKEN_DEFAULT;
+-  private static final Logger LOG =
++  public static final Logger LOG =
+-  public static final String TOKEN_KIND_STR = KMSDelegationToken.TOKEN_KIND_STR;
+-  public static final Text TOKEN_KIND = KMSDelegationToken.TOKEN_KIND;
+-
++  /* dtService defines the token service value for the kms token.
++   * The value can be legacy format which is ip:port format or it can be uri.
++   * If it's uri format, then the value is read from
++   * CommonConfigurationKeysPublic.HADOOP_SECURITY_KEY_PROVIDER_PATH at key
++   * provider creation time, and set to token's Service field.
++   * When a token is renewed / canceled, its Service field will be used to
++   * instantiate a KeyProvider, eliminating the need to read configs
++    * at that time.
++   */
+-
+-  // Allow fallback to default kms server port 9600 for certain tests that do
+-  // not specify the port explicitly in the kms provider url.
+-  @VisibleForTesting
+-  public static volatile boolean fallbackDefaultPortForTesting = false;
++  private final boolean copyLegacyToken;
+-  /**
+-   * The KMS implementation of {@link TokenRenewer}.
+-   */
+-  public static class KMSTokenRenewer extends TokenRenewer {
+-    private static final Logger LOG =
+-        LoggerFactory.getLogger(KMSTokenRenewer.class);
+-
+-    @Override
+-    public boolean handleKind(Text kind) {
+-      return kind.equals(TOKEN_KIND);
+-    }
+-
+-    @Override
+-    public boolean isManaged(Token<?> token) throws IOException {
+-      return true;
+-    }
+-
+-    @Override
+-    public long renew(Token<?> token, Configuration conf) throws IOException {
+-      LOG.debug("Renewing delegation token {}", token);
+-      KeyProvider keyProvider = KMSUtil.createKeyProvider(conf,
+-          KeyProviderFactory.KEY_PROVIDER_PATH);
+-      try {
+-        if (!(keyProvider instanceof
+-            KeyProviderDelegationTokenExtension.DelegationTokenExtension)) {
+-          LOG.warn("keyProvider {} cannot renew dt.", keyProvider == null ?
+-              "null" : keyProvider.getClass());
+-          return 0;
+-        }
+-        return ((KeyProviderDelegationTokenExtension.DelegationTokenExtension)
+-            keyProvider).renewDelegationToken(token);
+-      } finally {
+-        if (keyProvider != null) {
+-          keyProvider.close();
+-        }
+-      }
+-    }
+-
+-    @Override
+-    public void cancel(Token<?> token, Configuration conf) throws IOException {
+-      LOG.debug("Canceling delegation token {}", token);
+-      KeyProvider keyProvider = KMSUtil.createKeyProvider(conf,
+-          KeyProviderFactory.KEY_PROVIDER_PATH);
+-      try {
+-        if (!(keyProvider instanceof
+-            KeyProviderDelegationTokenExtension.DelegationTokenExtension)) {
+-          LOG.warn("keyProvider {} cannot cancel dt.", keyProvider == null ?
+-              "null" : keyProvider.getClass());
+-          return;
+-        }
+-        ((KeyProviderDelegationTokenExtension.DelegationTokenExtension)
+-            keyProvider).cancelDelegationToken(token);
+-      } finally {
+-        if (keyProvider != null) {
+-          keyProvider.close();
+-        }
+-      }
+-    }
+-  }
+-
+-        return createProvider(conf, origUrl, port, hostsPart);
++        return createProvider(conf, origUrl, port, hostsPart, providerUri);
+-    private KeyProvider createProvider(Configuration conf,
+-        URL origUrl, int port, String hostsPart) throws IOException {
++    private KeyProvider createProvider(Configuration conf, URL origUrl,
++        int port, String hostsPart, URI providerUri) throws IOException {
+-                      origUrl.getPath(), null, null), conf);
++                      origUrl.getPath(), null, null), conf, providerUri);
+-  public KMSClientProvider(URI uri, Configuration conf) throws IOException {
++  public KMSClientProvider(URI uri, Configuration conf, URI providerUri) throws
++      IOException {
+-    int kmsPort = kmsUrl.getPort();
+-    if ((kmsPort == -1) && fallbackDefaultPortForTesting) {
+-      kmsPort = 9600;
+-    }
+-
+-    InetSocketAddress addr = new InetSocketAddress(kmsUrl.getHost(), kmsPort);
+-    dtService = SecurityUtil.buildTokenService(addr);
+-
++    copyLegacyToken = conf.getBoolean(KMS_CLIENT_COPY_LEGACY_TOKEN_KEY,
++        KMS_CLIENT_COPY_LEGACY_TOKEN_DEFAULT);
++
++    dtService = new Text(providerUri.toString());
+-              new DelegationTokenAuthenticatedURL(configurator);
++              createKMSAuthenticatedURL();
+-          new DelegationTokenAuthenticatedURL(configurator);
++          createKMSAuthenticatedURL();
+-                  new DelegationTokenAuthenticatedURL(configurator);
++                  createKMSAuthenticatedURL();
++  @VisibleForTesting
++  DelegationTokenAuthenticatedURL createKMSAuthenticatedURL() {
++    return new DelegationTokenAuthenticatedURL(configurator) {
++      @Override
++      public org.apache.hadoop.security.token.Token<? extends TokenIdentifier>
++          getDelegationToken(URL url, Credentials creds) {
++        return selectKMSDelegationToken(creds);
++      }
++    };
++  }
++
+-          new DelegationTokenAuthenticatedURL(configurator);
++          createKMSAuthenticatedURL();
+-          LOG.debug("New token received: ({})", token);
++          if (KMSDelegationToken.TOKEN_KIND.equals(token.getKind())) {
++            // do not set service for legacy kind, for compatibility.
++            token.setService(dtService);
++          }
++          LOG.info("New token created: ({})", token);
+-          tokens = new Token<?>[] { token };
++          Token<?> legacyToken = createAndAddLegacyToken(credentials, token);
++          tokens = legacyToken == null ?
++              new Token<?>[] {token} :
++              new Token<?>[] {token, legacyToken};
+-  private boolean containsKmsDt(UserGroupInformation ugi) throws IOException {
+-    // Add existing credentials from the UGI, since provider is cached.
+-    Credentials creds = ugi.getCredentials();
++  /**
++   * If {@link CommonConfigurationKeysPublic#KMS_CLIENT_COPY_LEGACY_TOKEN_KEY}
++   * is true when creating the provider, then copy the passed-in token of
++   * {@link KMSDelegationToken#TOKEN_KIND} and create a new token of
++   * {@link KMSDelegationToken#TOKEN_LEGACY_KIND}, and add it to credentials.
++   *
++   * @return The legacy token, or null if one should not be created.
++   */
++  private Token<?> createAndAddLegacyToken(Credentials credentials,
++      Token<?> token) {
++    if (!copyLegacyToken || !KMSDelegationToken.TOKEN_KIND
++        .equals(token.getKind())) {
++      LOG.debug("Not creating legacy token because copyLegacyToken={}, "
++          + "token={}", copyLegacyToken, token);
++      return null;
++    }
++    // copy a KMS_DELEGATION_TOKEN and create a new kms-dt with the same
++    // underlying token for backwards-compatibility. Old clients/renewers
++    // does not parse the new token and can only work with kms-dt.
++    final Token<?> legacyToken = token.copyToken();
++    legacyToken.setKind(KMSDelegationToken.TOKEN_LEGACY_KIND);
++    final InetSocketAddress addr =
++        new InetSocketAddress(kmsUrl.getHost(), kmsUrl.getPort());
++    final Text fallBackServiceText = SecurityUtil.buildTokenService(addr);
++    legacyToken.setService(fallBackServiceText);
++    LOG.info("Copied token to legacy kind: {}", legacyToken);
++    credentials.addToken(legacyToken.getService(), legacyToken);
++    return legacyToken;
++  }
++
++  @VisibleForTesting
++  public Text getDelegationTokenService() {
++    return dtService;
++  }
++
++  /**
++   * Given a list of tokens, return the token that should be used for KMS
++   * authentication.
++   */
++  @VisibleForTesting
++  Token selectKMSDelegationToken(Credentials creds) {
++    // always look for TOKEN_KIND first
++    final TokenSelector<AbstractDelegationTokenIdentifier> tokenSelector =
++        new AbstractDelegationTokenSelector<AbstractDelegationTokenIdentifier>(
++            KMSDelegationToken.TOKEN_KIND) {
++        };
++    Token token = tokenSelector.selectToken(dtService, creds.getAllTokens());
++    LOG.debug("Searching service {} found token {}", dtService, token);
++    if (token != null) {
++      return token;
++    }
++
++    // fall back to look for token by service, regardless of kind.
++    // this is old behavior, keeping for compatibility reasons (for example,
++    // even if KMS server is new, if the job is submitted with an old kms
++    // client, job runners on new version should be able to find the token).
++    final InetSocketAddress addr =
++        new InetSocketAddress(kmsUrl.getHost(), kmsUrl.getPort());
++    final Text fallBackServiceText = SecurityUtil.buildTokenService(addr);
++    token = creds.getToken(fallBackServiceText);
++    LOG.debug("Selected delegation token {} using service:{}", token,
++        fallBackServiceText);
++    return token;
++  }
++
++  private boolean containsKmsDt(UserGroupInformation ugi) {
++    final Credentials creds = ugi.getCredentials();
+-      LOG.debug("Searching for token that matches service: {}", dtService);
+-      org.apache.hadoop.security.token.Token<? extends TokenIdentifier>
+-          dToken = creds.getToken(dtService);
++      final Token dToken = selectKMSDelegationToken(creds);
+
+INS26 INS26 INS26 MOV23 UPD40 INS40 INS40 INS40 INS31 INS31 INS31 INS31 UPD83 UPD83 INS39 INS44 MOV21 MOV78 MOV43 INS42 INS8 INS29 INS83 INS74 INS42 INS44 MOV44 INS8 MOV78 MOV83 MOV43 UPD42 MOV42 INS8 INS29 INS78 INS43 INS42 MOV44 INS8 UPD42 INS44 INS43 INS42 INS21 INS41 INS65 INS65 INS43 INS76 INS43 INS42 INS25 INS60 INS21 MOV60 INS60 INS21 INS21 INS21 MOV41 UPD42 INS41 INS65 INS42 MOV42 UPD43 UPD42 INS60 INS60 INS21 MOV25 INS60 MOV60 MOV21 MOV21 INS41 INS43 INS42 INS42 INS7 INS14 UPD66 MOV66 INS65 INS66 MOV65 UPD66 MOV66 INS65 INS66 INS66 UPD42 MOV42 INS42 INS27 INS8 INS83 INS74 INS59 INS32 INS83 INS43 INS83 INS43 INS59 INS32 INS32 INS32 INS42 INS42 INS66 INS66 UPD42 INS83 INS74 MOV59 INS43 INS59 INS32 INS83 INS43 INS59 INS83 UPD43 INS7 INS42 INS83 INS42 INS42 INS32 INS14 MOV43 INS42 INS1 INS67 INS67 INS67 INS38 INS38 INS21 INS41 MOV43 MOV76 INS42 INS32 INS42 INS42 INS40 INS42 UPD42 MOV42 INS42 MOV32 INS42 INS42 INS42 INS42 INS42 INS45 INS42 INS42 INS42 INS32 INS42 INS43 INS43 UPD42 INS14 INS42 INS42 INS32 INS42 UPD42 MOV42 INS45 INS42 MOV42 UPD42 INS41 UPD42 MOV42 INS42 INS14 UPD42 UPD42 INS42 INS32 INS42 UPD42 INS45 INS42 INS60 INS42 INS42 INS42 INS42 MOV43 INS32 MOV43 INS31 MOV43 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS32 INS33 INS42 INS42 MOV32 INS42 INS42 UPD42 MOV42 UPD42 MOV42 INS74 INS40 INS1 UPD42 MOV42 UPD42 MOV42 INS42 INS32 INS42 MOV43 INS32 INS32 UPD42 UPD42 UPD42 UPD42 MOV42 UPD42 MOV42 INS42 INS83 INS43 MOV59 INS42 INS42 INS42 INS32 MOV78 INS83 MOV74 INS42 INS44 INS44 INS8 INS32 INS40 INS42 INS32 UPD42 MOV42 UPD42 MOV42 INS27 UPD42 MOV42 INS42 INS43 INS43 UPD42 MOV42 UPD42 MOV42 INS42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 INS42 INS42 INS42 INS43 INS42 INS43 INS42 INS41 INS42 INS42 INS42 INS45 INS45 INS42 INS42 UPD42 UPD42 INS42 INS42 INS32 INS25 INS60 INS42 INS42 INS32 INS8 INS74 INS59 INS42 INS40 INS42 INS32 INS21 UPD42 UPD45 INS43 INS76 INS42 INS32 INS16 MOV43 INS59 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS27 MOV3 INS3 MOV42 INS42 INS32 INS42 INS42 INS42 INS42 INS33 INS5 INS4 INS32 INS42 INS74 INS85 INS42 INS42 INS42 INS43 INS76 INS42 DEL83 DEL83 DEL83 DEL42 DEL40 DEL59 DEL23 DEL83 DEL42 DEL43 DEL40 DEL83 DEL83 DEL83 DEL39 DEL42 DEL9 DEL59 DEL23 DEL65 DEL29 DEL83 DEL83 DEL42 DEL42 DEL43 DEL83 DEL83 DEL83 DEL43 DEL42 DEL42 DEL42 DEL42 DEL43 DEL57 DEL32 DEL59 DEL23 DEL42 DEL78 DEL83 DEL39 DEL42 DEL42 DEL44 DEL32 DEL41 DEL8 DEL31 DEL42 DEL78 DEL83 DEL39 DEL42 DEL74 DEL42 DEL44 DEL43 DEL8 DEL31 DEL39 DEL43 DEL76 DEL74 DEL42 DEL44 DEL43 DEL42 DEL42 DEL45 DEL42 DEL32 DEL21 DEL43 DEL60 DEL42 DEL40 DEL43 DEL62 DEL36 DEL38 DEL45 DEL42 DEL33 DEL27 DEL45 DEL32 DEL16 DEL32 DEL21 DEL34 DEL41 DEL8 DEL25 DEL40 DEL43 DEL42 DEL11 DEL36 DEL32 DEL41 DEL8 DEL8 DEL54 DEL8 DEL31 DEL83 DEL39 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL45 DEL32 DEL21 DEL42 DEL40 DEL43 DEL62 DEL36 DEL38 DEL41 DEL8 DEL25 DEL8 DEL42 DEL33 DEL27 DEL42 DEL42 DEL32 DEL21 DEL8 DEL25 DEL8 DEL54 DEL8 DEL31 DEL55 DEL39 DEL42 DEL59 DEL60 DEL42 DEL34 DEL38 DEL27 DEL36 DEL42 DEL27 DEL42 DEL34 DEL7 DEL21 DEL8 DEL25 DEL42 DEL43 DEL42 DEL14 DEL42 DEL14 DEL42 DEL42 DEL14 DEL59 DEL42 DEL43 DEL42 DEL14 DEL42 DEL42 DEL9 DEL42 DEL42 DEL42 DEL40 DEL32 DEL42 DEL42 DEL32 DEL21 DEL40 DEL42 DEL42 DEL45 DEL42 DEL33 DEL27 DEL45 DEL32 DEL16 DEL32 DEL40 DEL43 DEL42 DEL11 DEL36 DEL42 DEL43 DEL42 DEL42 DEL42 DEL45 DEL42 DEL32 DEL21 DEL60

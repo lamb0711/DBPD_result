@@ -1,0 +1,121 @@
+HADOOP-16823. Large DeleteObject requests are their own Thundering Herd.
+
+Contributed by Steve Loughran.
+
+During S3A rename() and delete() calls, the list of objects delete is
+built up into batches of a thousand and then POSTed in a single large
+DeleteObjects request.
+
+But as the IO capacity allowed on an S3 partition may only be 3500 writes
+per second *and* each entry in that POST counts as a single write, then
+one of those posts alone can trigger throttling on an already loaded
+S3 directory tree. Which can trigger backoff and retry, with the same
+thousand entry post, and so recreate the exact same problem.
+
+Fixes
+
+* Page size for delete object requests is set in
+  fs.s3a.bulk.delete.page.size; the default is 250.
+* The property fs.s3a.experimental.aws.s3.throttling (default=true)
+  can be set to false to disable throttle retry logic in the AWS
+  client SDK -it is all handled in the S3A client. This
+  gives more visibility in to when operations are being throttled
+* Bulk delete throttling events are logged to the log
+  org.apache.hadoop.fs.s3a.throttled log at INFO; if this appears
+  often then choose a smaller page size.
+* The metric "store_io_throttled" adds the entire count of delete
+  requests when a single DeleteObjects request is throttled.
+* A new quantile, "store_io_throttle_rate" can track throttling
+  load over time.
+* DynamoDB metastore throttle resilience issues have also been
+  identified and fixed. Note: the fs.s3a.experimental.aws.s3.throttling
+  flag does not apply to DDB IO precisely because there may still be
+  lurking issues there and it safest to rely on the DynamoDB client
+  SDK.
+
+Change-Id: I00f85cdd94fc008864d060533f6bd4870263fd84
+
++import org.apache.hadoop.fs.s3a.impl.BulkDeleteRetryHandler;
++import static org.apache.hadoop.fs.s3a.impl.CallableSupplier.submit;
++import static org.apache.hadoop.fs.s3a.impl.CallableSupplier.waitForCompletionIgnoringExceptions;
++   * Page size for deletions.
++   */
++  private int pageSize;
++
++  /**
++
++      pageSize = intOption(getConf(), BULK_DELETE_PAGE_SIZE,
++          BULK_DELETE_PAGE_SIZE_DEFAULT, 0);
+-        operationCallbacks);
++        operationCallbacks,
++        pageSize);
+-    Statistic stat = isThrottleException(ex)
+-        ? STORE_IO_THROTTLED
+-        : IGNORED_ERRORS;
+-    incrementStatistic(stat);
++    if (isThrottleException(ex)) {
++      operationThrottled(false);
++    } else {
++      incrementStatistic(IGNORED_ERRORS);
++    }
+-    operationRetried(ex);
++      operationThrottled(true);
++    } else {
++      incrementStatistic(IGNORED_ERRORS);
++    }
++  }
++
++  /**
++   * Note that an operation was throttled -this will update
++   * specific counters/metrics.
++   * @param metastore was the throttling observed in the S3Guard metastore?
++   */
++  private void operationThrottled(boolean metastore) {
++    LOG.debug("Request throttled on {}", metastore ? "S3": "DynamoDB");
++    if (metastore) {
+-      instrumentation.addValueToQuantiles(S3GUARD_METADATASTORE_THROTTLE_RATE, 1);
++      instrumentation.addValueToQuantiles(S3GUARD_METADATASTORE_THROTTLE_RATE,
++          1);
++    } else {
++      incrementStatistic(STORE_IO_THROTTLED);
++      instrumentation.addValueToQuantiles(STORE_IO_THROTTLE_RATE, 1);
++   * If the request is throttled, this is logged in the throttle statistics,
++   * with the counter set to the number of keys, rather than the number
++   * of invocations of the delete operation.
++   * This is because S3 considers each key as one mutating operation on
++   * the store when updating its load counters on a specific partition
++   * of an S3 bucket.
++   * If only the request was measured, this operation would under-report.
++    BulkDeleteRetryHandler retryHandler =
++        new BulkDeleteRetryHandler(createStoreContext());
++          (text, e, r, i) -> {
++            // handle the failure
++            retryHandler.bulkDeleteRetried(deleteRequest, e);
++          },
+-      // one or more of the operations failed.
++      // one or more of the keys could not be deleted.
++      // log and rethrow
+-  void removeKeys(
++  public void removeKeys(
+-          InternalConstants.MAX_ENTRIES_TO_DELETE);
++          pageSize);
+-      final Set<Path> tombstones) throws IOException {
++      @Nullable Set<Path> tombstones) throws IOException {
+-    deleteUnnecessaryFakeDirectories(p.getParent());
++    final boolean isDir = objectRepresentsDirectory(key, length);
++    // kick off an async delete
++    final CompletableFuture<?> deletion = submit(
++        unboundedThreadPool,
++        () -> {
++          deleteUnnecessaryFakeDirectories(p.getParent());
++          return null;
++        });
+-              BulkOperationState.OperationType.Mkdir,
++              isDir
++                  ? BulkOperationState.OperationType.Mkdir
++                  : BulkOperationState.OperationType.Put,
+-        final boolean isDir = objectRepresentsDirectory(key, length);
++      // and catch up with any delete operation.
++      waitForCompletionIgnoringExceptions(deletion);
+
+INS26 INS26 INS26 INS40 INS40 INS40 INS23 INS31 INS29 INS83 INS39 INS59 INS8 INS29 INS83 INS39 INS42 INS44 INS8 INS83 INS65 INS42 INS25 MOV21 INS25 INS65 INS65 INS39 INS42 INS21 MOV25 INS60 INS78 MOV60 INS60 INS66 MOV32 INS8 INS8 MOV32 INS8 INS8 INS66 INS66 INS42 INS66 INS32 INS42 INS8 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS43 INS59 INS42 INS83 INS74 INS59 INS21 INS21 MOV21 INS21 MOV21 INS42 INS42 INS45 INS16 INS21 INS21 INS42 INS42 INS14 INS43 INS76 INS42 INS32 INS21 INS7 INS42 INS32 INS32 INS42 INS45 INS45 INS32 INS32 INS43 INS32 INS42 INS42 INS42 INS86 INS32 INS42 INS32 INS42 INS9 UPD42 INS42 INS9 UPD42 UPD42 INS42 INS42 INS42 INS42 INS42 INS34 INS42 INS42 INS86 INS8 INS42 INS42 INS42 INS32 INS42 INS42 INS34 INS59 INS59 INS59 INS59 INS8 INS42 MOV21 INS41 INS42 INS42 INS42 INS42 INS42 INS21 INS33 INS32 INS42 INS42 INS42 INS42 INS16 INS42 INS40 INS40 DEL42 DEL43 DEL42 DEL42 DEL42 DEL16 DEL59 DEL60 DEL8 DEL40 DEL83 DEL40

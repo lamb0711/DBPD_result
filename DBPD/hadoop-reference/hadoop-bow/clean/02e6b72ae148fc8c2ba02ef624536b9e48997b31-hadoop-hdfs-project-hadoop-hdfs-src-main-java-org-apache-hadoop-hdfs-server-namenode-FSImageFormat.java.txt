@@ -1,0 +1,275 @@
+HDFS-4481. Change fsimage to support snapshot file diffs.
+
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/branches/HDFS-2802@1446000 13f79535-47bb-0310-9956-ffa450edef68
+
++import org.apache.hadoop.hdfs.server.namenode.snapshot.FileWithSnapshot.FileDiffList;
++import org.apache.hadoop.hdfs.server.namenode.snapshot.INodeFileUnderConstructionWithSnapshot;
++import org.apache.hadoop.hdfs.server.namenode.snapshot.INodeFileWithSnapshot;
+- *     containsBlock: byte (when {@link Feature#SNAPSHOT} is supported),
+- *     [list of BlockInfo] (when {@link Feature#SNAPSHOT} is not supported or 
+- *     containsBlock is true),
++ *     [list of BlockInfo]
++ *     [list of FileDiff]
+- *       snapshotFileSize: long (negative is the file is not a snapshot copy),
+- *       isINodeFileUnderConstructionSnapshot: byte (if snapshotFileSize 
+- *       is positive), 
++ *       isINodeFileUnderConstructionSnapshot: byte, 
+- *       isINodeFileWithSnapshot: byte (if snapshotFileSize is negative),
+- *     } (when {@link Feature#SNAPSHOT} is supported), 
++ *     } (when {@link Feature#SNAPSHOT} is supported and writing snapshotINode), 
+- *     numberOfSnapshotDiffs: int,
+- *     [list of SnapshotDiff] (NumberOfSnapshotDiffs is positive),
++ *     numberOfDirectoryDiffs: int,
++ *     [list of DirectoryDiff] (NumberOfDirectoryDiffs is positive),
+- * SnapshotDiff {
+- *   childrenSize: int, 
++ * DirectoryDiff {
++ *   childrenSize: int, 
++ *
++ * FileDiff {
++ *   full path of the root of the associated Snapshot: short + byte[], 
++ *   fileSize: long, 
++ *   snapshotINodeIsNotNull: byte,
++ *   snapshotINode: INodeFile (when SnapshotINodeIsNotNull is true), Diff 
++ * }
+-      INode root = loadINode(in);
++      final INode root = loadINode(null, false, in);
+-    private void loadChildren(INodeDirectory parent, DataInputStream in)
++    private int loadChildren(INodeDirectory parent, DataInputStream in)
+-        byte[] localName = new byte[in.readShort()];
+-        in.readFully(localName); // read local name
+-        INode newNode = loadINode(in); // read rest of inode
+-        newNode.setLocalName(localName);
++        INode newNode = loadINodeWithLocalName(false, in);
++      return numChildren;
+-      // Step 2. Load children nodes under parent
+-      loadChildren(parent, in);
+-      
+-      // Step 3. Load snapshots if parent is snapshottable
++      // Step 2. Load snapshots if parent is snapshottable
+-      INodeDirectorySnapshottable snapshottableParent = null;
+-        snapshottableParent = (INodeDirectorySnapshottable) parent;
++        final INodeDirectorySnapshottable snapshottableParent
++            = INodeDirectorySnapshottable.valueOf(parent, parentPath);
++
++      // Step 3. Load children nodes under parent
++      loadChildren(parent, in);
+-      // Step 4. load SnapshotDiff list
+-      int numSnapshotDiffs = in.readInt();
+-      if (numSnapshotDiffs >= 0) {
+-        INodeDirectoryWithSnapshot parentWithSnapshot = 
+-            (INodeDirectoryWithSnapshot) parent;
+-        // load SnapshotDiff list
+-        SnapshotFSImageFormat.loadSnapshotDiffList(parentWithSnapshot,
+-            numSnapshotDiffs, in, this);
+-      }
++      // Step 4. load Directory Diff List
++      SnapshotFSImageFormat.loadDirectoryDiffList(parent, in, this);
+-     FSDirectory fsDir = namesystem.dir;
+-         fsDir.rootDir.getNode(parentPath, true), parentPath);
+-
+-     int numChildren = in.readInt();
+-     for(int i=0; i<numChildren; i++) {
+-       // load single inode
+-       byte[] localName = new byte[in.readShort()];
+-       in.readFully(localName); // read local name
+-       INode newNode = loadINode(in); // read rest of inode
+-
+-       // add to parent
+-       newNode.setLocalName(localName);
+-       addToParent(parent, newNode);
+-     }
+-     return numChildren;
++         namesystem.dir.rootDir.getNode(parentPath, true), parentPath);
++     return loadChildren(parent, in);
+-      INode newNode = loadINode(in);
++      final INode newNode = loadINode(pathComponents[pathComponents.length-1],
++          false, in);
+-      newNode.setLocalName(pathComponents[pathComponents.length-1]);
+-      final BlockManager bm = namesystem.getBlockManager();
+-      for (int i = 0; i < blocks.length; i++) {
+-        file.setBlock(i, bm.addBlockCollection(blocks[i], file));
++      if (blocks != null) {
++        final BlockManager bm = namesystem.getBlockManager();
++        for (int i = 0; i < blocks.length; i++) {
++          file.setBlock(i, bm.addBlockCollection(blocks[i], file));
++        } 
++
++    public INode loadINodeWithLocalName(boolean isSnapshotINode,
++        DataInputStream in) throws IOException {
++      final byte[] localName = new byte[in.readShort()];
++      in.readFully(localName);
++      final INode inode = loadINode(localName, isSnapshotINode, in);
++      inode.setLocalName(localName);
++      return inode;
++    }
+-  public INode loadINode(DataInputStream in) throws IOException {
+-    long modificationTime = 0;
++  INode loadINode(final byte[] localName, boolean isSnapshotINode,
++      DataInputStream in) throws IOException {
++    final int imgVersion = getLayoutVersion();
++    final long inodeId = namesystem.allocateNewInodeId();
++    
++    final short replication = namesystem.getBlockManager().adjustReplication(
++        in.readShort());
++    final long modificationTime = in.readLong();
+-    long blockSize = 0;
+-    long computeFileSize = -1;
+-    boolean snapshottable = false;
+-    boolean withSnapshot = false;
+-    
+-    int imgVersion = getLayoutVersion();
+-    long inodeId = namesystem.allocateNewInodeId();
+-    
+-    short replication = in.readShort();
+-    replication = namesystem.getBlockManager().adjustReplication(replication);
+-    modificationTime = in.readLong();
+-    blockSize = in.readLong();
+-    int numBlocks = in.readInt();
+-    BlockInfo blocks[] = null;
++    final long blockSize = in.readLong();
++    final int numBlocks = in.readInt();
+-    String clientName = "";
+-    String clientMachine = "";
+-    boolean underConstruction = false;
+-      // to indicate INodeFileWithSnapshot, blocks may be set as null while
+-      // numBlocks is set to 0
+-      blocks = LayoutVersion.supports(Feature.SNAPSHOT, imgVersion) ? (in
+-            .readBoolean() ? new BlockInfo[numBlocks] : null)
+-            : new BlockInfo[numBlocks];
++      // file
+-      for (int j = 0; j < numBlocks; j++) {
+-        blocks[j] = new BlockInfo(replication);
+-        blocks[j].readFields(in);
++      // read blocks
++      BlockInfo[] blocks = null;
++      if (numBlocks > 0) {
++        blocks = new BlockInfo[numBlocks];
++        for (int j = 0; j < numBlocks; j++) {
++          blocks[j] = new BlockInfo(replication);
++          blocks[j].readFields(in);
++        }
++
++      String clientName = "";
++      String clientMachine = "";
++      boolean underConstruction = false;
++      FileDiffList fileDiffs = null;
+-        computeFileSize = in.readLong();
+-        if (computeFileSize < 0) {
+-        } else {
++        // read diffs
++        fileDiffs = SnapshotFSImageFormat.loadFileDiffList(in, this);
++
++        if (isSnapshotINode) {
+-    }
+-    
+-    // get quota only when the node is a directory
+-    long nsQuota = -1L;
+-    if (blocks == null && numBlocks == -1) {
+-      nsQuota = in.readLong();
+-    }
+-    long dsQuota = -1L;
+-    if (LayoutVersion.supports(Feature.DISKSPACE_QUOTA, imgVersion)
+-        && blocks == null && numBlocks == -1) {
+-      dsQuota = in.readLong();
+-    }
+-    if (LayoutVersion.supports(Feature.SNAPSHOT, imgVersion)
+-        && blocks == null && numBlocks == -1) {
+-      snapshottable = in.readBoolean();
+-      if (!snapshottable) {
+-        withSnapshot = in.readBoolean();
+-      }
+-    }
+-    
+-    // Read the symlink only when the node is a symlink
+-    String symlink = "";
+-    if (numBlocks == -2) {
+-      symlink = Text.readString(in);
+-    }
+-    
+-    PermissionStatus permissions = PermissionStatus.read(in);
+-      return INode.newINode(inodeId, permissions, blocks, symlink, replication,
+-          modificationTime, atime, nsQuota, dsQuota, blockSize, numBlocks,
+-          computeFileSize, snapshottable, withSnapshot,
+-          underConstruction, clientName, clientMachine);
++      final PermissionStatus permissions = PermissionStatus.read(in);
++
++      // return
++      final INodeFile file = new INodeFile(inodeId, localName, permissions,
++          modificationTime, atime, blocks, replication, blockSize);
++      return fileDiffs != null? new INodeFileWithSnapshot(file, fileDiffs)
++          : underConstruction? new INodeFileUnderConstruction(
++              file, clientName, clientMachine, null)
++          : file;
++    } else if (numBlocks == -1) {
++      //directory
++      
++      //read quotas
++      final long nsQuota = in.readLong();
++      long dsQuota = -1L;
++      if (LayoutVersion.supports(Feature.DISKSPACE_QUOTA, imgVersion)) {
++        dsQuota = in.readLong();
++      }
++
++      //read snapshot info
++      boolean snapshottable = false;
++      boolean withSnapshot = false;
++      if (LayoutVersion.supports(Feature.SNAPSHOT, imgVersion)) {
++        snapshottable = in.readBoolean();
++        if (!snapshottable) {
++          withSnapshot = in.readBoolean();
++        }
++      }
++
++      final PermissionStatus permissions = PermissionStatus.read(in);
++
++      //return
++      final INodeDirectory dir = nsQuota >= 0 || dsQuota >= 0?
++          new INodeDirectoryWithQuota(inodeId, localName, permissions,
++              modificationTime, nsQuota, dsQuota)
++          : new INodeDirectory(inodeId, localName, permissions, modificationTime);
++      return snapshottable ? new INodeDirectorySnapshottable(dir)
++          : withSnapshot ? new INodeDirectoryWithSnapshot(dir)
++          : dir;
++    } else if (numBlocks == -2) {
++      //symlink
++
++      final String symlink = Text.readString(in);
++      final PermissionStatus permissions = PermissionStatus.read(in);
++      return new INodeSymlink(inodeId, localName, permissions,
++          modificationTime, atime, symlink);
++    }
++    
++    throw new IOException("Unknown inode type: numBlocks=" + numBlocks);
+-        INodeFileUnderConstruction cons =
+-          FSImageSerialization.readINodeUnderConstruction(in, supportSnapshot);
++        INodeFileUnderConstruction cons
++            = FSImageSerialization.readINodeUnderConstruction(in);
+-        fsDir.unprotectedReplaceINodeFile(path, oldnode, cons,
+-            iip.getLatestSnapshot());
++        cons.setParent(oldnode.getParent());
++
++        if (oldnode instanceof INodeFileWithSnapshot) {
++          cons = new INodeFileUnderConstructionWithSnapshot(cons,
++              ((INodeFileWithSnapshot)oldnode).getDiffs());
++        }
++
++        fsDir.unprotectedReplaceINodeFile(path, oldnode, cons);
+-      // 2. Write children INode 
+-      dirNum += saveChildren(children, out);
+-      
+-      // 3. Write INodeDirectorySnapshottable#snapshotsByNames to record all
++      // 2. Write INodeDirectorySnapshottable#snapshotsByNames to record all
++
++      // 3. Write children INode 
++      dirNum += saveChildren(children, out);
+-      // 4. Write SnapshotDiff lists.
+-      if (current instanceof INodeDirectoryWithSnapshot) {
+-        INodeDirectoryWithSnapshot sNode = (INodeDirectoryWithSnapshot) current;
+-        SnapshotFSImageFormat.saveSnapshotDiffs(sNode, out);
+-      } else {
+-        out.writeInt(-1); // # of SnapshotDiffs
+-      }
++      // 4. Write DirectoryDiff lists, if there is any.
++      SnapshotFSImageFormat.saveDirectoryDiffList(current, out);

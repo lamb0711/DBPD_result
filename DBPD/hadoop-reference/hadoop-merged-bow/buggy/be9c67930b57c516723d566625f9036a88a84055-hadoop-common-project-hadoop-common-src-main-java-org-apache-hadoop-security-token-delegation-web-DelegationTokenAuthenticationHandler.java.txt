@@ -1,0 +1,351 @@
+HADOOP-10771. Refactor HTTP delegation support out of httpfs to common, PART 2. (tucu)
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/trunk@1616672 13f79535-47bb-0310-9956-ffa450edef68
+
+-package org.apache.hadoop.fs.http.server;
++package org.apache.hadoop.security.token.delegation.web;
++import com.google.common.annotations.VisibleForTesting;
+-import org.apache.hadoop.fs.http.client.HttpFSFileSystem;
+-import org.apache.hadoop.fs.http.client.HttpFSKerberosAuthenticator;
+-import org.apache.hadoop.fs.http.client.HttpFSKerberosAuthenticator.DelegationTokenOperation;
+-import org.apache.hadoop.lib.service.DelegationTokenIdentifier;
+-import org.apache.hadoop.lib.service.DelegationTokenManager;
+-import org.apache.hadoop.lib.service.DelegationTokenManagerException;
++import org.apache.hadoop.classification.InterfaceStability;
++import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.io.Text;
++import org.apache.hadoop.security.authentication.server.AuthenticationHandler;
+-import org.json.simple.JSONObject;
++import org.apache.hadoop.security.token.delegation.AbstractDelegationTokenSecretManager;
++import org.codehaus.jackson.map.ObjectMapper;
++import javax.servlet.ServletException;
++import java.util.Properties;
+- * Server side <code>AuthenticationHandler</code> that authenticates requests
+- * using the incoming delegation token as a 'delegation' query string parameter.
++ * An {@link AuthenticationHandler} that implements Kerberos SPNEGO mechanism
++ * for HTTP and supports Delegation Token functionality.
+- * If not delegation token is present in the request it delegates to the
+- * {@link KerberosAuthenticationHandler}
++ * In addition to the wrapped {@link AuthenticationHandler} configuration
++ * properties, this handler supports the following properties prefixed
++ * with the type of the wrapped <code>AuthenticationHandler</code>:
++ * <ul>
++ * <li>delegation-token.token-kind: the token kind for generated tokens
++ * (no default, required property).</li>
++ * <li>delegation-token.update-interval.sec: secret manager master key
++ * update interval in seconds (default 1 day).</li>
++ * <li>delegation-token.max-lifetime.sec: maximum life of a delegation
++ * token in seconds (default 7 days).</li>
++ * <li>delegation-token.renewal-interval.sec: renewal interval for
++ * delegation tokens in seconds (default 1 day).</li>
++ * <li>delegation-token.removal-scan-interval.sec: delegation tokens
++ * removal scan interval in seconds (default 1 hour).</li>
++ * </ul>
++ *
+-public class HttpFSKerberosAuthenticationHandler
+-  extends KerberosAuthenticationHandler {
++@InterfaceStability.Evolving
++public abstract class DelegationTokenAuthenticationHandler
++    implements AuthenticationHandler {
+-  static final Set<String> DELEGATION_TOKEN_OPS =
+-    new HashSet<String>();
++  protected static final String TYPE_POSTFIX = "-dt";
++
++  public static final String PREFIX = "delegation-token.";
++
++  public static final String TOKEN_KIND = PREFIX + "token-kind.sec";
++
++  public static final String UPDATE_INTERVAL = PREFIX + "update-interval.sec";
++  public static final long UPDATE_INTERVAL_DEFAULT = 24 * 60 * 60;
++
++  public static final String MAX_LIFETIME = PREFIX + "max-lifetime.sec";
++  public static final long MAX_LIFETIME_DEFAULT = 7 * 24 * 60 * 60;
++
++  public static final String RENEW_INTERVAL = PREFIX + "renew-interval.sec";
++  public static final long RENEW_INTERVAL_DEFAULT = 24 * 60 * 60;
++
++  public static final String REMOVAL_SCAN_INTERVAL = PREFIX +
++      "removal-scan-interval.sec";
++  public static final long REMOVAL_SCAN_INTERVAL_DEFAULT = 60 * 60;
++
++  private static final Set<String> DELEGATION_TOKEN_OPS = new HashSet<String>();
+-    DELEGATION_TOKEN_OPS.add(
+-      DelegationTokenOperation.GETDELEGATIONTOKEN.toString());
+-    DELEGATION_TOKEN_OPS.add(
+-      DelegationTokenOperation.RENEWDELEGATIONTOKEN.toString());
+-    DELEGATION_TOKEN_OPS.add(
+-      DelegationTokenOperation.CANCELDELEGATIONTOKEN.toString());
++    DELEGATION_TOKEN_OPS.add(KerberosDelegationTokenAuthenticator.
++        DelegationTokenOperation.GETDELEGATIONTOKEN.toString());
++    DELEGATION_TOKEN_OPS.add(KerberosDelegationTokenAuthenticator.
++        DelegationTokenOperation.RENEWDELEGATIONTOKEN.toString());
++    DELEGATION_TOKEN_OPS.add(KerberosDelegationTokenAuthenticator.
++        DelegationTokenOperation.CANCELDELEGATIONTOKEN.toString());
+-  public static final String TYPE = "kerberos-dt";
++  private AuthenticationHandler authHandler;
++  private DelegationTokenManager tokenManager;
++  private String authType;
++
++  public DelegationTokenAuthenticationHandler(AuthenticationHandler handler) {
++    authHandler = handler;
++    authType = handler.getType();
++  }
++
++  @VisibleForTesting
++  DelegationTokenManager getTokenManager() {
++    return tokenManager;
++  }
++
++  @Override
++  public void init(Properties config) throws ServletException {
++    authHandler.init(config);
++    initTokenManager(config);
++  }
+-   * Returns authentication type of the handler.
++   * Sets an external <code>DelegationTokenSecretManager</code> instance to
++   * manage creation and verification of Delegation Tokens.
++   * <p/>
++   * This is useful for use cases where secrets must be shared across multiple
++   * services.
+-   * @return <code>delegationtoken-kerberos</code>
++   * @param secretManager a <code>DelegationTokenSecretManager</code> instance
++  public void setExternalDelegationTokenSecretManager(
++      AbstractDelegationTokenSecretManager secretManager) {
++    tokenManager.setExternalDelegationTokenSecretManager(secretManager);
++  }
++
++  @VisibleForTesting
++  @SuppressWarnings("unchecked")
++  public void initTokenManager(Properties config) {
++    String configPrefix = authHandler.getType() + ".";
++    Configuration conf = new Configuration(false);
++    for (Map.Entry entry : config.entrySet()) {
++      conf.set((String) entry.getKey(), (String) entry.getValue());
++    }
++    String tokenKind = conf.get(TOKEN_KIND);
++    if (tokenKind == null) {
++      throw new IllegalArgumentException(
++          "The configuration does not define the token kind");
++    }
++    tokenKind = tokenKind.trim();
++    long updateInterval = conf.getLong(configPrefix + UPDATE_INTERVAL,
++        UPDATE_INTERVAL_DEFAULT);
++    long maxLifeTime = conf.getLong(configPrefix + MAX_LIFETIME,
++        MAX_LIFETIME_DEFAULT);
++    long renewInterval = conf.getLong(configPrefix + RENEW_INTERVAL,
++        RENEW_INTERVAL_DEFAULT);
++    long removalScanInterval = conf.getLong(
++        configPrefix + REMOVAL_SCAN_INTERVAL, REMOVAL_SCAN_INTERVAL_DEFAULT);
++    tokenManager = new DelegationTokenManager(new Text(tokenKind),
++        updateInterval * 1000, maxLifeTime * 1000, renewInterval * 1000,
++        removalScanInterval * 1000);
++    tokenManager.init();
++  }
++
++  @Override
++  public void destroy() {
++    tokenManager.destroy();
++    authHandler.destroy();
++  }
++
+-    return TYPE;
++    return authType;
+-    throws IOException, AuthenticationException {
++      throws IOException, AuthenticationException {
+-    String op = request.getParameter(HttpFSFileSystem.OP_PARAM);
++    String op = ServletUtils.getParameter(request,
++        KerberosDelegationTokenAuthenticator.OP_PARAM);
+-      DelegationTokenOperation dtOp =
+-        DelegationTokenOperation.valueOf(op);
++      KerberosDelegationTokenAuthenticator.DelegationTokenOperation dtOp =
++          KerberosDelegationTokenAuthenticator.
++              DelegationTokenOperation.valueOf(op);
++        boolean doManagement;
+-          response.sendError(HttpServletResponse.SC_UNAUTHORIZED,
+-            MessageFormat.format(
+-              "Operation [{0}] requires SPNEGO authentication established",
+-              dtOp));
+-          requestContinues = false;
++          token = authenticate(request, response);
++          if (token == null) {
++            requestContinues = false;
++            doManagement = false;
++          } else {
++            doManagement = true;
++          }
+-          DelegationTokenManager tokenManager =
+-            HttpFSServerWebApp.get().get(DelegationTokenManager.class);
+-          try {
+-            Map map = null;
+-            switch (dtOp) {
+-              case GETDELEGATIONTOKEN:
+-                String renewerParam =
+-                  request.getParameter(HttpFSKerberosAuthenticator.RENEWER_PARAM);
+-                if (renewerParam == null) {
+-                  renewerParam = token.getUserName();
+-                }
+-                Token<?> dToken = tokenManager.createToken(
+-                  UserGroupInformation.getCurrentUser(), renewerParam);
+-                map = delegationTokenToJSON(dToken);
+-                break;
+-              case RENEWDELEGATIONTOKEN:
+-              case CANCELDELEGATIONTOKEN:
+-                String tokenParam =
+-                  request.getParameter(HttpFSKerberosAuthenticator.TOKEN_PARAM);
+-                if (tokenParam == null) {
+-                  response.sendError(HttpServletResponse.SC_BAD_REQUEST,
+-                    MessageFormat.format(
+-                      "Operation [{0}] requires the parameter [{1}]",
+-                      dtOp, HttpFSKerberosAuthenticator.TOKEN_PARAM));
+-                  requestContinues = false;
+-                } else {
+-                  if (dtOp == DelegationTokenOperation.CANCELDELEGATIONTOKEN) {
+-                    Token<DelegationTokenIdentifier> dt =
+-                      new Token<DelegationTokenIdentifier>();
+-                    dt.decodeFromUrlString(tokenParam);
+-                    tokenManager.cancelToken(dt,
+-                      UserGroupInformation.getCurrentUser().getUserName());
+-                  } else {
+-                    Token<DelegationTokenIdentifier> dt =
+-                      new Token<DelegationTokenIdentifier>();
+-                    dt.decodeFromUrlString(tokenParam);
+-                    long expirationTime =
+-                      tokenManager.renewToken(dt, token.getUserName());
+-                    map = new HashMap();
+-                    map.put("long", expirationTime);
+-                  }
+-                }
+-                break;
+-            }
+-            if (requestContinues) {
+-              response.setStatus(HttpServletResponse.SC_OK);
+-              if (map != null) {
+-                response.setContentType(MediaType.APPLICATION_JSON);
+-                Writer writer = response.getWriter();
+-                JSONObject.writeJSONString(map, writer);
+-                writer.write(ENTER);
+-                writer.flush();
+-
++          doManagement = true;
++        }
++        if (doManagement) {
++          UserGroupInformation requestUgi = (token != null)
++              ? UserGroupInformation.createRemoteUser(token.getUserName())
++              : null;
++          Map map = null;
++          switch (dtOp) {
++            case GETDELEGATIONTOKEN:
++              if (requestUgi == null) {
++                throw new IllegalStateException("request UGI cannot be NULL");
+-              requestContinues = false;
++              String renewer = ServletUtils.getParameter(request,
++                  KerberosDelegationTokenAuthenticator.RENEWER_PARAM);
++              try {
++                Token<?> dToken = tokenManager.createToken(requestUgi, renewer);
++                map = delegationTokenToJSON(dToken);
++              } catch (IOException ex) {
++                throw new AuthenticationException(ex.toString(), ex);
++              }
++              break;
++            case RENEWDELEGATIONTOKEN:
++              if (requestUgi == null) {
++                throw new IllegalStateException("request UGI cannot be NULL");
++              }
++              String tokenToRenew = ServletUtils.getParameter(request,
++                  KerberosDelegationTokenAuthenticator.TOKEN_PARAM);
++              if (tokenToRenew == null) {
++                response.sendError(HttpServletResponse.SC_BAD_REQUEST,
++                    MessageFormat.format(
++                        "Operation [{0}] requires the parameter [{1}]", dtOp,
++                        KerberosDelegationTokenAuthenticator.TOKEN_PARAM)
++                );
++                requestContinues = false;
++              } else {
++                Token<DelegationTokenIdentifier> dt =
++                    new Token<DelegationTokenIdentifier>();
++                try {
++                  dt.decodeFromUrlString(tokenToRenew);
++                  long expirationTime = tokenManager.renewToken(dt,
++                      requestUgi.getShortUserName());
++                  map = new HashMap();
++                  map.put("long", expirationTime);
++                } catch (IOException ex) {
++                  throw new AuthenticationException(ex.toString(), ex);
++                }
++              }
++              break;
++            case CANCELDELEGATIONTOKEN:
++              String tokenToCancel = ServletUtils.getParameter(request,
++                  KerberosDelegationTokenAuthenticator.TOKEN_PARAM);
++              if (tokenToCancel == null) {
++                response.sendError(HttpServletResponse.SC_BAD_REQUEST,
++                    MessageFormat.format(
++                        "Operation [{0}] requires the parameter [{1}]", dtOp,
++                        KerberosDelegationTokenAuthenticator.TOKEN_PARAM)
++                );
++                requestContinues = false;
++              } else {
++                Token<DelegationTokenIdentifier> dt =
++                    new Token<DelegationTokenIdentifier>();
++                try {
++                  dt.decodeFromUrlString(tokenToCancel);
++                  tokenManager.cancelToken(dt, (requestUgi != null)
++                      ? requestUgi.getShortUserName() : null);
++                } catch (IOException ex) {
++                  response.sendError(HttpServletResponse.SC_NOT_FOUND,
++                      "Invalid delegation token, cannot cancel");
++                  requestContinues = false;
++                }
++              }
++              break;
++          }
++          if (requestContinues) {
++            response.setStatus(HttpServletResponse.SC_OK);
++            if (map != null) {
++              response.setContentType(MediaType.APPLICATION_JSON);
++              Writer writer = response.getWriter();
++              ObjectMapper jsonMapper = new ObjectMapper();
++              jsonMapper.writeValue(writer, map);
++              writer.write(ENTER);
++              writer.flush();
+-          } catch (DelegationTokenManagerException ex) {
+-            throw new AuthenticationException(ex.toString(), ex);
++            requestContinues = false;
+-          MessageFormat.format(
+-            "Wrong HTTP method [{0}] for operation [{1}], it should be [{2}]",
+-            request.getMethod(), dtOp, dtOp.getHttpMethod()));
++            MessageFormat.format(
++                "Wrong HTTP method [{0}] for operation [{1}], it should be " +
++                    "[{2}]", request.getMethod(), dtOp, dtOp.getHttpMethod()));
+-    json.put(HttpFSKerberosAuthenticator.DELEGATION_TOKEN_URL_STRING_JSON,
+-             token.encodeToUrlString());
++    json.put(
++        KerberosDelegationTokenAuthenticator.DELEGATION_TOKEN_URL_STRING_JSON,
++        token.encodeToUrlString());
+-    response.put(HttpFSKerberosAuthenticator.DELEGATION_TOKEN_JSON, json);
++    response.put(KerberosDelegationTokenAuthenticator.DELEGATION_TOKEN_JSON,
++        json);
+-  
++
+-   *
+-                                          HttpServletResponse response)
+-    throws IOException, AuthenticationException {
++      HttpServletResponse response)
++      throws IOException, AuthenticationException {
+-    String delegationParam =
+-      request.getParameter(HttpFSKerberosAuthenticator.DELEGATION_PARAM);
++    String delegationParam = ServletUtils.getParameter(request,
++        KerberosDelegationTokenAuthenticator.DELEGATION_PARAM);
+-          new Token<DelegationTokenIdentifier>();
++            new Token<DelegationTokenIdentifier>();
+-        DelegationTokenManager tokenManager =
+-          HttpFSServerWebApp.get().get(DelegationTokenManager.class);
+-                                        getType());
++            getType());
+-                                          ex.toString(), ex);
++            ex.toString(), ex);
+-      token = super.authenticate(request, response);
++      token = authHandler.authenticate(request, response);
+-
+
+MOV26 MOV26 MOV26 INS26 INS26 UPD40 UPD40 UPD40 UPD40 UPD40 UPD40 UPD40 UPD40 INS40 INS40 INS78 INS83 UPD42 UPD43 INS23 INS23 INS23 INS23 INS23 INS23 INS23 INS23 INS23 INS23 INS23 INS23 INS23 INS23 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS40 UPD42 INS83 INS83 INS83 INS43 INS59 INS83 INS83 INS83 INS43 INS59 INS83 INS83 INS83 MOV43 INS59 INS83 INS83 INS83 MOV43 INS59 INS83 INS83 INS83 INS39 INS59 INS83 INS83 INS83 INS43 INS59 INS83 INS83 INS83 INS39 INS59 INS83 INS83 INS83 INS43 INS59 INS83 INS83 INS83 INS39 INS59 INS83 INS83 INS83 INS43 INS59 INS83 INS83 INS83 INS39 INS59 INS83 UPD83 MOV83 INS43 INS59 UPD83 MOV83 MOV43 INS59 UPD83 MOV83 INS43 MOV59 INS83 INS42 INS44 INS8 INS78 MOV43 INS42 INS8 MOV78 INS83 INS39 INS42 INS44 INS43 INS8 MOV29 MOV83 INS39 INS42 INS44 INS8 INS78 INS79 INS83 INS39 INS42 INS44 INS8 INS78 INS83 INS39 INS42 INS8 INS78 INS83 INS43 INS42 MOV8 MOV8 INS66 INS65 UPD66 UPD66 UPD66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS42 INS42 INS45 INS42 INS42 INS45 INS42 INS27 INS42 INS27 INS42 INS27 INS42 INS42 INS27 INS42 INS27 INS42 INS42 INS27 INS42 INS27 INS42 INS42 INS27 INS42 INS27 INS42 INS42 INS42 INS42 UPD42 INS43 INS42 INS21 INS21 INS42 INS41 INS43 INS42 INS42 INS21 INS21 UPD65 INS43 INS42 INS21 INS42 INS42 INS45 INS43 INS42 INS60 INS60 INS70 INS60 INS25 INS21 INS60 INS60 INS60 INS60 INS21 INS21 INS42 INS21 INS21 INS42 INS42 MOV60 MOV21 MOV41 INS42 UPD42 INS42 INS45 INS42 INS45 INS34 INS34 INS34 INS42 INS45 INS34 INS34 INS34 INS34 INS42 INS45 INS34 INS34 INS34 INS42 INS45 INS34 INS34 INS42 INS7 INS7 INS42 INS42 INS32 INS32 INS66 UPD66 INS66 INS66 INS66 INS42 UPD66 INS42 INS32 INS42 MOV43 INS59 INS43 INS59 INS44 INS32 INS8 INS43 INS59 INS27 INS8 INS7 INS39 INS59 INS39 INS59 INS39 INS59 INS39 INS59 INS7 INS32 INS32 INS32 UPD42 UPD43 MOV27 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS27 INS42 INS42 INS14 INS43 INS42 INS42 INS42 INS21 INS42 INS42 INS32 INS42 INS33 INS53 INS42 INS32 INS42 INS32 INS42 INS32 INS42 INS32 INS42 INS32 INS42 INS14 INS42 INS42 INS42 INS42 INS42 INS42 UPD42 UPD42 INS60 MOV8 UPD40 UPD40 UPD40 UPD40 UPD40 INS42 INS42 INS32 INS45 INS43 INS9 INS40 INS32 INS42 INS42 INS42 INS14 INS42 INS42 INS42 INS42 INS27 INS42 INS42 INS42 INS27 INS42 INS42 INS42 INS27 INS42 INS42 INS42 INS27 INS42 MOV43 INS14 INS27 INS27 INS27 INS27 UPD42 UPD42 UPD42 INS40 INS43 INS59 MOV32 UPD42 INS42 UPD40 INS42 INS42 INS42 INS42 INS42 INS11 INS11 INS43 INS45 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS43 INS42 INS42 INS34 INS42 INS34 INS42 INS34 INS42 INS34 INS40 INS42 INS32 INS60 INS25 INS25 MOV21 INS32 MOV43 INS32 MOV43 INS32 INS42 INS42 INS40 INS42 INS42 INS39 INS59 MOV27 INS8 INS8 INS42 MOV8 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS21 INS25 INS21 MOV60 MOV10 UPD40 INS7 INS27 INS8 INS8 INS7 INS43 INS25 INS54 INS10 INS25 INS60 INS25 INS27 MOV32 MOV32 INS42 INS32 INS42 INS33 INS21 INS21 INS21 INS42 INS9 INS42 UPD42 INS16 INS27 INS8 INS43 INS8 INS12 MOV27 INS8 INS43 INS59 INS27 INS8 MOV8 INS43 INS45 INS45 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 INS7 INS7 INS7 INS36 MOV32 INS33 INS42 INS33 INS53 INS42 UPD42 INS60 MOV21 INS44 MOV8 UPD42 INS53 INS42 INS42 INS32 INS42 INS33 INS21 MOV21 INS54 INS42 UPD42 UPD42 MOV21 MOV60 INS54 INS42 INS9 INS42 INS9 INS42 INS9 INS27 UPD42 UPD42 INS14 UPD42 INS42 UPD40 MOV74 INS59 INS43 INS42 INS14 UPD42 MOV42 UPD42 MOV42 INS42 INS40 INS32 INS8 INS12 UPD42 INS42 UPD40 INS8 INS12 INS60 INS42 INS33 INS43 INS45 INS42 INS32 INS42 INS43 INS45 UPD42 MOV42 UPD42 MOV42 INS40 MOV32 MOV21 INS60 MOV21 MOV21 INS44 INS8 MOV21 MOV21 INS44 INS8 INS43 INS59 INS42 INS42 INS42 INS42 INS42 INS42 INS42 UPD42 INS45 UPD42 INS40 INS39 INS59 INS43 INS42 INS53 UPD40 INS43 INS42 INS21 INS21 INS42 INS42 INS14 UPD42 INS42 UPD42 UPD42 INS42 INS32 INS42 INS14 UPD42 INS16 INS42 INS32 INS7 INS43 INS42 INS42 INS42 INS32 INS43 INS32 INS42 INS36 INS32 INS33 INS42 INS42 INS40 INS45 INS42 INS9 INS42 INS42 INS42 INS42 INS42 INS42 INS27 UPD42 MOV42 UPD42 MOV42 INS42 INS33 DEL45 DEL23 DEL42 DEL31 DEL39 DEL42 DEL42 DEL32 DEL7 DEL21 DEL8 DEL25 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL32 DEL32 DEL42 DEL40 DEL27 DEL8 DEL25 DEL42 DEL42 DEL32 DEL57 DEL32 DEL59 DEL60 DEL42 DEL43 DEL42 DEL44 DEL12 DEL54 DEL45 DEL42 DEL42 DEL40 DEL42 DEL42 DEL45 DEL42 DEL32 DEL32 DEL21 DEL8 DEL42 DEL42 DEL42 DEL40 DEL32 DEL59 DEL60 DEL25 DEL8 DEL42 DEL42 DEL42 DEL32 DEL42 DEL42 DEL43 DEL57 DEL32 DEL59 DEL60 DEL42 DEL42 DEL42 DEL48

@@ -1,0 +1,335 @@
+YARN-8925. Updating distributed node attributes only when necessary. Contributed by Tao Yang.
+
++import java.util.Objects;
++    Set<NodeAttribute> nodeAttributes =
++        nodeAttributesHandler.getNodeAttributesForRegistration();
+-              nodeLabels, physicalResource);
++              nodeLabels, physicalResource, nodeAttributes);
++    successfullRegistrationMsg.append(nodeAttributesHandler
++        .verifyRMRegistrationResponseForNodeAttributes(regNMResponse));
+-    return provider == null ? null :
+-        new NMDistributedNodeAttributesHandler(nodeAttributesProvider);
++    if (provider == null) {
++      return new NMCentralizedNodeAttributesHandler();
++    } else {
++      return new NMDistributedNodeAttributesHandler(provider, this.getConfig());
++    }
++  }
++
++  private static abstract class CachedNodeDescriptorHandler<T> {
++    private final long resyncInterval;
++    private final T defaultValue;
++    private T previousValue;
++    private long lastSendMills = 0L;
++    private boolean isValueSented;
++
++    CachedNodeDescriptorHandler(T defaultValue,
++        long resyncInterval) {
++      this.defaultValue = defaultValue;
++      this.resyncInterval = resyncInterval;
++    }
++
++    public abstract T getValueFromProvider();
++
++    public T getValueForRegistration() {
++      T value = getValueFromProvider();
++      if (defaultValue != null) {
++        value = (null == value) ? defaultValue : value;
++      }
++      previousValue = value;
++      try {
++        validate(value);
++      } catch (IOException e) {
++        value = null;
++      }
++      return value;
++    }
++
++    public T getValueForHeartbeat() {
++      T value = getValueFromProvider();
++      // if the provider returns null then consider default value are set
++      if (defaultValue != null) {
++        value = (null == value) ? defaultValue : value;
++      }
++      // take some action only on modification of value
++      boolean isValueUpdated = isValueUpdated(value);
++
++      isValueSented = false;
++      // When value updated or resync time is elapsed will send again in
++      // heartbeat.
++      if (isValueUpdated || isResyncIntervalElapsed()) {
++        previousValue = value;
++        try {
++          validate(value);
++          isValueSented = true;
++        } catch (IOException e) {
++          // take previous value to replace invalid value, so that invalid
++          // value are not verified for every HB, and send empty set
++          // to RM to have same value which was earlier set.
++          value = null;
++        } finally {
++          // Set last send time in heartbeat
++          lastSendMills = System.currentTimeMillis();
++        }
++      } else {
++        // if value have not changed then no need to send
++        value = null;
++      }
++      return value;
++    }
++
++    /**
++     * This method checks resync interval is elapsed or not.
++     */
++    public boolean isResyncIntervalElapsed() {
++      long elapsedTimeSinceLastSync =
++          System.currentTimeMillis() - lastSendMills;
++      if (elapsedTimeSinceLastSync > resyncInterval) {
++        return true;
++      }
++      return false;
++    }
++
++    protected abstract void validate(T value) throws IOException;
++
++    protected abstract boolean isValueUpdated(T value);
++
++    public long getResyncInterval() {
++      return resyncInterval;
++    }
++
++    public T getDefaultValue() {
++      return defaultValue;
++    }
++
++    public T getPreviousValue() {
++      return previousValue;
++    }
++
++    public long getLastSendMills() {
++      return lastSendMills;
++    }
++
++    public boolean isValueSented() {
++      return isValueSented;
++    }
++     * validates nodeAttributes From Provider and returns it to the caller. Also
++     * ensures that if provider returns null then empty set is considered
++     */
++    Set<NodeAttribute> getNodeAttributesForRegistration();
++
++    /**
++
++    /**
++     * @return RMRegistration Success message and on failure will log
++     *         independently and returns empty string
++     */
++    String verifyRMRegistrationResponseForNodeAttributes(
++        RegisterNodeManagerResponse regNMResponse);
++
++    /**
++     * check whether if updated attributes sent to RM was accepted or not.
++     * @param response
++     */
++    void verifyRMHeartbeatResponseForNodeAttributes(
++        NodeHeartbeatResponse response);
++  }
++
++
++  /**
++   * In centralized configuration, NM need not send Node attributes or process
++   * the response.
++   */
++  private static class NMCentralizedNodeAttributesHandler
++      implements NMNodeAttributesHandler {
++    @Override
++    public Set<NodeAttribute> getNodeAttributesForHeartbeat() {
++      return null;
++    }
++
++    @Override
++    public Set<NodeAttribute> getNodeAttributesForRegistration() {
++      return null;
++    }
++
++    @Override
++    public void verifyRMHeartbeatResponseForNodeAttributes(
++        NodeHeartbeatResponse response) {
++    }
++
++    @Override
++    public String verifyRMRegistrationResponseForNodeAttributes(
++        RegisterNodeManagerResponse regNMResponse) {
++      return "";
++    }
++      extends CachedNodeDescriptorHandler<Set<NodeAttribute>>
+-        NodeAttributesProvider provider) {
++        NodeAttributesProvider provider, Configuration conf) {
++      super(Collections.unmodifiableSet(new HashSet<>(0)),
++          conf.getLong(YarnConfiguration.NM_NODE_ATTRIBUTES_RESYNC_INTERVAL,
++              YarnConfiguration.DEFAULT_NM_NODE_ATTRIBUTES_RESYNC_INTERVAL));
++    public Set<NodeAttribute> getNodeAttributesForRegistration() {
++      return getValueForRegistration();
++    }
++
++    @Override
++      return getValueForHeartbeat();
++    }
++
++    @Override
++    public Set<NodeAttribute> getValueFromProvider() {
+-  }
++    @Override
++    protected void validate(Set<NodeAttribute> nodeAttributes)
++        throws IOException {
++      try {
++        NodeLabelUtil.validateNodeAttributes(nodeAttributes);
++      } catch (IOException e) {
++        LOG.error(
++            "Invalid node attribute(s) from Provider : " + e.getMessage());
++        throw e;
++      }
++    }
++
++    @Override
++    protected boolean isValueUpdated(Set<NodeAttribute> value) {
++      return !NodeLabelUtil.isNodeAttributesEquals(getPreviousValue(), value);
++    }
++
++    @Override
++    public String verifyRMRegistrationResponseForNodeAttributes(
++        RegisterNodeManagerResponse regNMResponse) {
++      StringBuilder successfulNodeAttributesRegistrationMsg =
++          new StringBuilder();
++      if (regNMResponse.getAreNodeAttributesAcceptedByRM()) {
++        successfulNodeAttributesRegistrationMsg
++            .append(" and with following Node attribute(s) : {")
++            .append(getPreviousValue()).append("}");
++      } else {
++        // case where provider is set but RM did not accept the node attributes
++        String errorMsgFromRM = regNMResponse.getDiagnosticsMessage();
++        LOG.error("Node attributes sent from NM while registration were"
++            + " rejected by RM. " + ((errorMsgFromRM == null) ?
++            "Seems like RM is configured with Centralized Attributes." :
++            "And with message " + regNMResponse.getDiagnosticsMessage()));
++      }
++      return successfulNodeAttributesRegistrationMsg.toString();
++    }
++
++    @Override
++    public void verifyRMHeartbeatResponseForNodeAttributes(
++        NodeHeartbeatResponse response) {
++      if (isValueSented()) {
++        if (response.getAreNodeAttributesAcceptedByRM()) {
++          if(LOG.isDebugEnabled()){
++            LOG.debug("Node attributes {" + getPreviousValue()
++                + "} were Accepted by RM ");
++          }
++        } else {
++          // case where updated node attributes from NodeAttributesProvider
++          // is sent to RM and RM rejected the attributes
++          LOG.error("NM node attributes {" + getPreviousValue()
++              + "} were not accepted by RM and message from RM : " + response
++              .getDiagnosticsMessage());
++        }
++      }
++    }
++  }
++      extends CachedNodeDescriptorHandler<Set<NodeLabel>>
++
+-      this.nodeLabelsProvider = nodeLabelsProvider;
+-      this.resyncInterval =
++      super(CommonNodeLabelsManager.EMPTY_NODELABEL_SET,
+-              YarnConfiguration.DEFAULT_NM_NODE_LABELS_RESYNC_INTERVAL);
++              YarnConfiguration.DEFAULT_NM_NODE_LABELS_RESYNC_INTERVAL));
++      this.nodeLabelsProvider = nodeLabelsProvider;
+-    private Set<NodeLabel> previousNodeLabels;
+-    private boolean areLabelsSentToRM;
+-    private long lastNodeLabelSendMills = 0L;
+-    private final long resyncInterval;
+-      Set<NodeLabel> nodeLabels = nodeLabelsProvider.getDescriptors();
+-      nodeLabels = (null == nodeLabels)
+-          ? CommonNodeLabelsManager.EMPTY_NODELABEL_SET : nodeLabels;
+-      previousNodeLabels = nodeLabels;
+-      try {
+-        validateNodeLabels(nodeLabels);
+-      } catch (IOException e) {
+-        nodeLabels = null;
+-      }
+-      return nodeLabels;
++      return getValueForRegistration();
+-            .append(StringUtils.join(",", previousNodeLabels)).append("}");
++            .append(StringUtils.join(",", getPreviousValue())).append("}");
+-      Set<NodeLabel> nodeLabelsForHeartbeat =
+-          nodeLabelsProvider.getDescriptors();
+-      // if the provider returns null then consider empty labels are set
+-      nodeLabelsForHeartbeat = (nodeLabelsForHeartbeat == null)
+-          ? CommonNodeLabelsManager.EMPTY_NODELABEL_SET
+-          : nodeLabelsForHeartbeat;
+-      // take some action only on modification of labels
+-      boolean areNodeLabelsUpdated =
+-          nodeLabelsForHeartbeat.size() != previousNodeLabels.size()
+-              || !previousNodeLabels.containsAll(nodeLabelsForHeartbeat);
+-
+-      areLabelsSentToRM = false;
+-      // When nodelabels elapsed or resync time is elapsed will send again in
+-      // heartbeat.
+-      if (areNodeLabelsUpdated || isResyncIntervalElapsed()) {
+-        previousNodeLabels = nodeLabelsForHeartbeat;
+-        try {
+-          if (LOG.isDebugEnabled()) {
+-            LOG.debug("Labels from provider: "
+-                + StringUtils.join(",", previousNodeLabels));
+-          }
+-          validateNodeLabels(nodeLabelsForHeartbeat);
+-          areLabelsSentToRM = true;
+-        } catch (IOException e) {
+-          // set previous node labels to invalid set, so that invalid
+-          // labels are not verified for every HB, and send empty set
+-          // to RM to have same nodeLabels which was earlier set.
+-          nodeLabelsForHeartbeat = null;
+-        } finally {
+-          // Set last send time in heartbeat
+-          lastNodeLabelSendMills = System.currentTimeMillis();
+-        }
+-      } else {
+-        // if nodelabels have not changed then no need to send
+-        nodeLabelsForHeartbeat = null;
+-      }
+-      return nodeLabelsForHeartbeat;
++      return getValueForHeartbeat();
+-    private void validateNodeLabels(Set<NodeLabel> nodeLabelsForHeartbeat)
++    protected void validate(Set<NodeLabel> nodeLabels)
+-      Iterator<NodeLabel> iterator = nodeLabelsForHeartbeat.iterator();
++      Iterator<NodeLabel> iterator = nodeLabels.iterator();
+-      StringBuilder errorMsg = new StringBuilder("");
++      StringBuilder errorMsg = new StringBuilder();
+-    /*
+-     * This method checks resync interval is elapsed or not.
+-     */
+-    public boolean isResyncIntervalElapsed() {
+-      long elapsedTimeSinceLastSync =
+-          System.currentTimeMillis() - lastNodeLabelSendMills;
+-      if (elapsedTimeSinceLastSync > resyncInterval) {
+-        return true;
+-      }
+-      return false;
++    @Override
++    public Set<NodeLabel> getValueFromProvider() {
++      return this.nodeLabelsProvider.getDescriptors();
++    }
++
++    @Override
++    protected boolean isValueUpdated(Set<NodeLabel> value) {
++      return !Objects.equals(value, getPreviousValue());
+-      if (areLabelsSentToRM) {
++      if (isValueSented()) {
+-                "Node Labels {" + StringUtils.join(",", previousNodeLabels)
++                "Node Labels {" + StringUtils.join(",", getPreviousValue())
+-              "NM node labels {" + StringUtils.join(",", previousNodeLabels)
++              "NM node labels {" + StringUtils.join(",", getPreviousValue())
+-              nodeAttributesHandler == null ? null :
++            nodeAttributesHandler
++                .verifyRMHeartbeatResponseForNodeAttributes(response);
+
+INS26 INS40 INS55 INS55 INS8 INS83 INS83 INS83 INS42 INS73 MOV23 INS23 INS23 INS23 INS23 INS31 INS31 INS31 INS31 MOV31 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS29 INS83 INS83 INS42 INS43 INS31 INS31 INS31 INS31 INS74 INS31 INS31 INS31 INS31 INS31 INS31 INS74 INS31 INS31 INS31 INS31 INS60 INS21 INS25 INS42 INS83 INS83 INS43 INS59 INS83 INS43 INS59 INS83 INS39 INS59 INS83 INS39 INS59 INS42 INS44 INS44 INS8 INS83 INS83 INS43 INS42 INS83 INS43 INS42 INS8 INS83 INS43 INS42 INS8 INS29 INS83 INS83 INS39 INS42 INS44 INS43 INS83 INS83 INS39 INS42 INS44 INS83 INS39 INS42 INS8 INS83 INS43 INS42 INS8 INS83 INS43 INS42 INS8 INS83 INS39 INS42 INS8 INS83 INS39 INS42 INS8 INS29 INS74 INS42 INS29 INS43 INS42 INS44 INS29 INS39 INS42 INS44 INS65 INS42 MOV78 INS83 INS74 INS42 INS8 MOV78 INS83 INS74 INS42 INS8 INS78 INS83 INS39 INS42 INS44 INS8 INS78 INS83 INS43 INS42 INS44 INS8 INS43 INS74 INS44 INS78 INS83 INS74 INS42 INS8 INS78 INS83 INS74 INS42 INS8 UPD42 INS78 INS83 INS39 INS42 INS44 INS43 INS8 INS78 INS83 INS39 INS42 INS44 INS8 INS78 INS83 INS43 INS42 INS44 INS8 INS78 INS83 INS39 INS42 INS44 INS8 INS43 MOV74 INS78 MOV83 MOV74 MOV42 INS8 INS78 INS83 MOV74 INS42 INS8 UPD83 UPD42 INS78 MOV83 MOV74 UPD42 MOV42 INS8 INS78 INS83 INS39 INS42 INS44 INS8 INS74 INS59 INS32 MOV27 INS8 INS8 INS42 INS42 INS42 INS42 INS42 INS34 INS42 INS43 INS42 INS39 INS42 INS21 MOV21 INS42 INS42 INS60 INS25 INS21 INS54 INS41 INS42 INS60 INS25 INS60 INS21 INS25 INS41 INS65 INS43 INS42 INS42 INS43 INS42 INS41 INS42 INS41 INS42 INS41 INS41 INS41 INS65 INS43 INS43 INS65 INS42 INS43 INS42 INS65 INS65 INS43 INS42 INS66 INS66 INS43 INS43 INS41 INS43 INS43 INS41 INS42 INS43 INS42 INS42 INS42 INS43 INS42 INS41 INS42 INS43 INS43 INS43 INS42 INS46 INS42 INS43 INS43 INS41 INS42 INS43 INS43 INS41 INS42 INS74 INS42 INS42 INS54 INS42 INS74 INS42 INS41 INS42 INS42 INS43 INS42 MOV60 INS25 INS41 INS42 INS43 INS42 INS25 INS42 INS46 INS42 INS41 INS42 INS41 UPD42 INS60 INS42 INS41 INS42 MOV74 INS42 INS41 INS43 INS43 INS42 INS32 INS42 INS42 INS32 MOV41 INS41 INS42 INS7 INS43 INS59 INS27 INS8 INS7 INS8 INS12 INS42 INS43 INS59 INS27 INS8 INS39 INS59 INS7 MOV27 INS8 INS8 INS42 INS66 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS66 INS66 INS42 INS42 INS66 INS66 INS42 INS66 INS42 INS42 INS42 INS42 INS33 INS42 INS42 INS33 INS42 INS42 INS45 INS42 INS42 INS42 INS32 INS32 INS42 INS42 INS32 INS42 INS42 INS32 INS43 INS43 INS8 INS12 INS43 INS43 INS38 INS42 MOV43 INS32 INS8 INS8 INS32 INS42 INS32 INS8 INS40 MOV32 INS32 INS32 INS43 INS59 INS32 INS38 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS14 INS14 INS22 INS42 INS42 INS42 INS42 INS32 INS42 INS33 INS21 INS42 INS42 INS21 INS44 INS8 INS42 INS42 INS32 INS42 INS33 INS21 INS42 INS32 INS42 INS9 UPD42 INS21 INS54 INS21 INS42 INS42 INS14 INS42 INS42 INS40 INS40 INS42 INS42 INS42 INS42 INS21 MOV44 INS8 INS42 INS42 INS32 UPD42 INS42 INS42 INS21 INS60 INS21 INS42 INS42 INS42 INS25 UPD42 MOV42 UPD42 MOV42 INS42 INS42 INS14 INS22 MOV42 INS32 INS42 INS43 MOV43 INS42 INS32 INS52 INS42 INS42 INS7 INS32 INS43 INS42 INS21 INS42 INS7 INS42 INS42 INS7 INS8 INS12 MOV8 INS7 UPD42 INS74 INS34 INS32 INS21 INS53 INS42 INS42 INS32 INS42 MOV43 INS32 INS43 INS59 INS32 INS32 INS8 INS8 UPD42 INS43 INS52 INS42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 INS32 INS42 INS42 INS52 INS42 INS42 INS16 INS42 INS42 INS42 INS7 INS42 INS16 INS42 INS42 INS21 INS21 MOV44 INS8 INS42 INS33 INS43 INS42 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS45 INS42 INS42 INS32 INS42 INS42 INS27 INS42 INS42 INS25 INS21 INS42 UPD42 MOV42 INS36 INS42 INS42 INS42 INS33 INS36 INS42 INS42 INS32 INS7 INS21 INS42 INS42 INS42 INS27 INS32 INS42 INS32 INS42 INS42 INS45 INS45 INS36 MOV32 INS8 INS32 MOV32 INS27 INS27 INS42 INS42 INS42 INS9 INS7 UPD42 INS45 INS32 INS42 INS42 INS45 INS42 INS16 INS21 INS42 INS42 INS27 INS32 MOV32 INS21 INS33 INS42 INS33 INS42 INS42 INS33 INS42 INS42 INS36 INS45 INS27 INS32 INS45 INS32 INS45 MOV32 UPD42 MOV42 INS32 INS32 INS27 INS45 INS32 INS42 INS42 INS27 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS33 INS42 INS42 INS45 INS32 INS45 UPD42 MOV42 INS42 INS32 UPD42 MOV42 DEL33 DEL42 DEL14 DEL16 DEL8 DEL45 DEL83 DEL42 DEL59 DEL23 DEL83 DEL39 DEL42 DEL59 DEL23 DEL83 DEL39 DEL42 DEL34 DEL59 DEL23 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL33 DEL42 DEL27 DEL36 DEL40 DEL42 DEL16 DEL7 DEL21 DEL42 DEL42 DEL7 DEL21 DEL42 DEL32 DEL21 DEL8 DEL42 DEL33 DEL7 DEL21 DEL8 DEL12 DEL54 DEL42 DEL41 DEL8 DEL31 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL42 DEL33 DEL27 DEL36 DEL40 DEL42 DEL16 DEL7 DEL21 DEL39 DEL42 DEL42 DEL42 DEL32 DEL42 DEL42 DEL32 DEL27 DEL42 DEL42 DEL42 DEL32 DEL38 DEL27 DEL59 DEL60 DEL42 DEL9 DEL7 DEL21 DEL42 DEL42 DEL7 DEL21 DEL42 DEL45 DEL45 DEL32 DEL27 DEL32 DEL21 DEL8 DEL25 DEL42 DEL42 DEL32 DEL21 DEL42 DEL9 DEL7 DEL21 DEL8 DEL42 DEL33 DEL7 DEL21 DEL8 DEL12 DEL54 DEL8 DEL42 DEL33 DEL7 DEL21 DEL8 DEL25 DEL42 DEL41 DEL8 DEL31 DEL42 DEL42 DEL33 DEL27 DEL33 DEL16

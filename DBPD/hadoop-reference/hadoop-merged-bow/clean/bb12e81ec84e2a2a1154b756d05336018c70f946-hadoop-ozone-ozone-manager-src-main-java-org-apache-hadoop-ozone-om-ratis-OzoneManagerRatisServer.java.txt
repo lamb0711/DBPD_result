@@ -1,0 +1,163 @@
+HDDS-1175. Serve read requests directly from RocksDB. (#557)
+
+HDDS-1175. Serve read requests directly from RocksDB.
+
++import java.util.Optional;
++import java.util.concurrent.Executors;
++import java.util.concurrent.ScheduledExecutorService;
++import java.util.concurrent.atomic.AtomicLong;
++import java.util.concurrent.locks.ReentrantReadWriteLock;
++import org.apache.ratis.proto.RaftProtos.RoleInfoProto;
++import org.apache.ratis.proto.RaftProtos.RaftPeerRole;
++import org.apache.ratis.protocol.ClientId;
++import org.apache.ratis.protocol.GroupInfoReply;
++import org.apache.ratis.protocol.GroupInfoRequest;
++import org.apache.ratis.thirdparty.com.google.protobuf.ByteString;
++
++  private final ClientId clientId = ClientId.randomId();
++
++  private final ScheduledExecutorService scheduledRoleChecker;
++  private long roleCheckInitialDelayMs = 1000; // 1 second default
++  private long roleCheckIntervalMs;
++  private ReentrantReadWriteLock roleCheckLock = new ReentrantReadWriteLock();
++  private Optional<RaftPeerRole> cachedPeerRole = Optional.empty();
++  private Optional<RaftPeerId> cachedLeaderPeerId = Optional.empty();
++
++  private static final AtomicLong CALL_ID_COUNTER = new AtomicLong();
++
++  private static long nextCallId() {
++    return CALL_ID_COUNTER.getAndIncrement() & Long.MAX_VALUE;
++  }
++
++    // Run a scheduler to check and update the server role on the leader
++    // periodically
++    this.scheduledRoleChecker = Executors.newSingleThreadScheduledExecutor();
++    this.scheduledRoleChecker.scheduleWithFixedDelay(new Runnable() {
++      @Override
++      public void run() {
++        // Run this check only on the leader OM
++        if (cachedPeerRole.isPresent() &&
++            cachedPeerRole.get() == RaftPeerRole.LEADER) {
++          updateServerRole();
++        }
++      }
++    }, roleCheckInitialDelayMs, roleCheckIntervalMs, TimeUnit.MILLISECONDS);
+-    return  new OzoneManagerStateMachine(ozoneManager);
++    return  new OzoneManagerStateMachine(this);
++  }
++
++  public OzoneManagerProtocol getOzoneManager() {
++    return ozoneManager;
++    TimeUnit roleCheckIntervalUnit =
++        OMConfigKeys.OZONE_OM_RATIS_SERVER_ROLE_CHECK_INTERVAL_DEFAULT
++            .getUnit();
++    long roleCheckIntervalDuration = conf.getTimeDuration(
++        OMConfigKeys.OZONE_OM_RATIS_SERVER_ROLE_CHECK_INTERVAL_KEY,
++        OMConfigKeys.OZONE_OM_RATIS_SERVER_ROLE_CHECK_INTERVAL_DEFAULT
++            .getDuration(), nodeFailureTimeoutUnit);
++    this.roleCheckIntervalMs = TimeDuration.valueOf(
++        roleCheckIntervalDuration, roleCheckIntervalUnit)
++        .toLong(TimeUnit.MILLISECONDS);
++    this.roleCheckInitialDelayMs = leaderElectionMinTimeout
++        .toLong(TimeUnit.MILLISECONDS);
++
++  /**
++   * Check the cached leader status.
++   * @return true if cached role is Leader, false otherwise.
++   */
++  private boolean checkCachedPeerRoleIsLeader() {
++    this.roleCheckLock.readLock().lock();
++    try {
++      if (cachedPeerRole.isPresent() &&
++          cachedPeerRole.get() == RaftPeerRole.LEADER) {
++        return true;
++      }
++      return false;
++    } finally {
++      this.roleCheckLock.readLock().unlock();
++    }
++  }
++
++  /**
++   * Check if the current OM node is the leader node.
++   * @return true if Leader, false otherwise.
++   */
++  public boolean isLeader() {
++    if (checkCachedPeerRoleIsLeader()) {
++      return true;
++    }
++
++    // Get the server role from ratis server and update the cached values.
++    updateServerRole();
++
++    // After updating the server role, check and return if leader or not.
++    return checkCachedPeerRoleIsLeader();
++  }
++
++  /**
++   * Get the suggested leader peer id.
++   * @return RaftPeerId of the suggested leader node.
++   */
++  public Optional<RaftPeerId> getCachedLeaderPeerId() {
++    this.roleCheckLock.readLock().lock();
++    try {
++      return cachedLeaderPeerId;
++    } finally {
++      this.roleCheckLock.readLock().unlock();
++    }
++  }
++
++  /**
++   * Get the gorup info (peer role and leader peer id) from Ratis server and
++   * update the OM server role.
++   */
++  public void updateServerRole() {
++    try {
++      GroupInfoReply groupInfo = getGroupInfo();
++      RoleInfoProto roleInfoProto = groupInfo.getRoleInfoProto();
++      RaftPeerRole thisNodeRole = roleInfoProto.getRole();
++
++      if (thisNodeRole.equals(RaftPeerRole.LEADER)) {
++        setServerRole(thisNodeRole, raftPeerId);
++
++      } else if (thisNodeRole.equals(RaftPeerRole.FOLLOWER)) {
++        ByteString leaderNodeId = roleInfoProto.getFollowerInfo()
++            .getLeaderInfo().getId().getId();
++        RaftPeerId leaderPeerId = RaftPeerId.valueOf(leaderNodeId);
++
++        setServerRole(thisNodeRole, leaderPeerId);
++
++      } else {
++        setServerRole(thisNodeRole, null);
++
++      }
++    } catch (IOException e) {
++      LOG.error("Failed to retrieve RaftPeerRole. Setting cached role to " +
++          "{} and resetting leader info.", RaftPeerRole.UNRECOGNIZED, e);
++      setServerRole(null, null);
++    }
++  }
++
++  /**
++   * Set the current server role and the leader peer id.
++   */
++  private void setServerRole(RaftPeerRole currentRole,
++      RaftPeerId leaderPeerId) {
++    this.roleCheckLock.writeLock().lock();
++    try {
++      this.cachedPeerRole = Optional.ofNullable(currentRole);
++      this.cachedLeaderPeerId = Optional.ofNullable(leaderPeerId);
++    } finally {
++      this.roleCheckLock.writeLock().unlock();
++    }
++  }
++
++  private GroupInfoReply getGroupInfo() throws IOException {
++    GroupInfoRequest groupInfoRequest = new GroupInfoRequest(clientId,
++        raftPeerId, raftGroupId, nextCallId());
++    GroupInfoReply groupInfo = server.getGroupInfo(groupInfoRequest);
++    return groupInfo;
++  }
++
+
+INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS23 INS23 INS23 INS23 INS23 INS23 INS23 INS23 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS83 INS83 INS43 INS59 INS83 INS83 INS43 INS59 INS83 INS39 INS59 INS83 INS39 INS59 INS83 INS43 INS59 INS83 INS74 INS59 INS83 INS74 INS59 INS83 INS83 INS83 INS43 INS59 INS83 INS83 INS39 INS42 INS8 INS83 INS43 INS42 INS8 INS29 INS83 INS39 INS42 INS8 INS29 INS83 INS39 INS42 INS8 INS29 INS83 INS74 INS42 INS8 INS29 INS83 INS39 INS42 INS8 INS29 INS83 INS39 INS42 INS44 INS44 INS8 INS83 INS43 INS42 INS43 INS8 INS42 INS42 INS32 INS42 INS42 INS42 INS34 INS42 INS42 INS42 INS14 INS43 INS43 INS42 INS32 INS43 INS43 INS42 INS32 INS42 INS42 INS14 INS41 INS21 INS21 INS42 INS41 INS60 INS60 INS21 INS21 INS65 INS65 INS21 INS54 INS65 INS65 INS25 INS21 INS41 INS65 INS65 INS43 INS43 INS21 INS54 INS65 INS54 INS65 INS43 INS42 INS43 INS42 INS21 INS54 INS42 INS42 INS60 INS60 INS41 INS42 INS42 INS43 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS43 INS27 INS7 INS32 INS42 INS43 INS59 INS39 INS59 INS7 INS7 INS66 INS66 INS32 INS8 INS8 INS66 INS66 INS32 INS8 INS32 INS32 INS66 INS66 INS42 INS42 INS32 INS8 INS8 INS66 INS66 INS8 INS12 INS66 INS42 INS42 INS32 INS8 INS8 INS43 INS59 INS43 INS59 INS42 INS42 INS42 INS32 INS40 INS22 INS32 INS22 INS42 INS14 INS42 INS42 INS40 INS52 INS42 INS42 INS32 INS42 INS32 INS22 INS32 INS22 INS32 INS32 INS42 INS25 INS41 INS21 INS42 INS41 INS42 INS42 INS32 INS42 INS41 INS21 INS60 INS60 INS60 INS25 INS44 INS8 INS32 INS42 INS21 INS21 INS21 INS42 INS42 INS14 INS42 INS42 INS32 INS42 INS42 INS52 INS42 INS42 INS42 INS52 INS42 INS43 INS1 INS40 INS42 INS42 INS42 INS40 INS32 INS42 INS52 INS42 INS32 INS42 INS40 INS52 INS42 INS42 INS42 INS40 INS22 INS42 INS27 INS8 INS9 INS32 INS9 INS22 INS42 INS42 INS32 INS43 INS59 INS43 INS59 INS43 INS59 INS32 INS8 INS25 INS43 INS42 INS21 INS21 INS22 INS42 INS7 INS7 INS32 INS43 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS31 INS40 INS42 INS42 INS42 INS42 INS42 INS52 INS42 INS32 INS27 INS41 INS32 INS42 INS52 INS42 INS32 INS42 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS40 INS21 INS32 INS8 INS8 INS42 INS32 INS32 INS52 INS42 INS22 INS32 INS22 INS32 INS32 INS42 INS42 INS42 INS78 INS83 INS39 INS42 INS8 INS42 INS42 INS32 INS40 INS9 INS22 INS42 INS22 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS40 INS60 INS60 INS21 INS21 INS42 INS42 INS27 INS40 INS42 INS42 INS33 INS33 INS52 INS42 INS42 INS42 INS42 INS52 INS42 INS42 INS42 INS42 INS22 INS42 INS42 INS25 INS42 INS42 INS52 INS42 INS52 INS42 INS42 INS42 INS42 INS43 INS59 INS43 INS59 INS32 INS32 INS45 INS45 INS52 INS42 INS27 INS8 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS33 INS32 INS27 INS21 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS40 INS32 INS32 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS42 DEL42

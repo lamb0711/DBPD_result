@@ -1,0 +1,146 @@
+HDFS-9390. Block management for maintenance states.
+
+-        node.decommissioningStatus.setStartTime(monotonicNow());
++        node.getLeavingServiceStatus().setStartTime(monotonicNow());
+-        blockManager.processExtraRedundancyBlocksOnReCommission(node);
++        blockManager.processExtraRedundancyBlocksOnInService(node);
++      // hbManager.startMaintenance will set dead node to IN_MAINTENANCE.
++      if (node.isEnteringMaintenance()) {
++        for (DatanodeStorageInfo storage : node.getStorageInfos()) {
++          LOG.info("Starting maintenance of {} {} with {} blocks",
++              node, storage, storage.numBlocks());
++        }
++        node.getLeavingServiceStatus().setStartTime(monotonicNow());
++      }
++      // Track the node regardless whether it is ENTERING_MAINTENANCE or
++      // IN_MAINTENANCE to support maintenance expiration.
+-      // TODO HDFS-9390 remove replicas from block maps
+-      // or handle over replicated blocks.
++      // extra redundancy blocks will be detected and processed when
++      // the dead node comes back and send in its full block report.
++      if (!node.isAlive()) {
++        // The node became dead when it was in maintenance, at which point
++        // the replicas weren't removed from block maps.
++        // When the node leaves maintenance, the replicas should be removed
++        // from the block maps to trigger the necessary replication to
++        // maintain the safety property of "# of live replicas + maintenance
++        // replicas" >= the expected redundancy.
++        blockManager.removeBlocksAssociatedTo(node);
++      } else {
++        // Even though putting nodes in maintenance node doesn't cause live
++        // replicas to match expected replication factor, it is still possible
++        // to have over replicated when the node leaves maintenance node.
++        // First scenario:
++        // a. Node became dead when it is at AdminStates.NORMAL, thus
++        //    block is replicated so that 3 replicas exist on other nodes.
++        // b. Admins put the dead node into maintenance mode and then
++        //    have the node rejoin the cluster.
++        // c. Take the node out of maintenance mode.
++        // Second scenario:
++        // a. With replication factor 3, set one replica to maintenance node,
++        //    thus block has 1 maintenance replica and 2 live replicas.
++        // b. Change the replication factor to 2. The block will still have
++        //    1 maintenance replica and 2 live replicas.
++        // c. Take the node out of maintenance mode.
++        blockManager.processExtraRedundancyBlocksOnInService(node);
++      }
++  private void setInMaintenance(DatanodeDescriptor dn) {
++    dn.setInMaintenance();
++    LOG.info("Node {} has entered maintenance mode.", dn);
++  }
++
+-      NumberReplicas numberReplicas) {
+-    final int numExpected = blockManager.getExpectedRedundancyNum(block);
+-    final int numLive = numberReplicas.liveReplicas();
+-    if (numLive >= numExpected
+-        && blockManager.isPlacementPolicySatisfied(block)) {
++      NumberReplicas numberReplicas, boolean isDecommission) {
++    if (blockManager.hasEnoughEffectiveReplicas(block, numberReplicas, 0)) {
++    final int numExpected = blockManager.getExpectedLiveRedundancyNum(block,
++        numberReplicas);
++    final int numLive = numberReplicas.liveReplicas();
++
+-    LOG.trace("Block {} numExpected={}, numLive={}", block, numExpected, 
++    LOG.trace("Block {} numExpected={}, numLive={}", block, numExpected,
+-    if (numExpected > numLive) {
++    if (isDecommission && numExpected > numLive) {
++        + ", maintenance replicas: " + num.maintenanceReplicas()
++        + ", live entering maintenance replicas: "
++        + num.liveEnteringMaintenanceReplicas()
+-        + srcNode.isDecommissionInProgress());
++        + srcNode.isDecommissionInProgress() +
++        ", Is current datanode entering maintenance: "
++        + srcNode.isEnteringMaintenance());
+-      // Check decom progress
++      // Check decommission or maintenance progress.
+-        if (dn.isMaintenance()) {
+-          // TODO HDFS-9390 make sure blocks are minimally replicated
+-          // before transitioning the node to IN_MAINTENANCE state.
+-
++        if (dn.isMaintenance() && dn.maintenanceExpired()) {
+-          if (dn.maintenanceExpired()) {
+-            stopMaintenance(dn);
+-            toRemove.add(dn);
+-          }
++          stopMaintenance(dn);
++          toRemove.add(dn);
++          continue;
++        }
++        if (dn.isInMaintenance()) {
++          // The dn is IN_MAINTENANCE and the maintenance hasn't expired yet.
+-          LOG.debug("Processing decommission-in-progress node {}", dn);
++          LOG.debug("Processing {} node {}", dn.getAdminState(), dn);
+-              blockManager.isNodeHealthyForDecommission(dn);
++              blockManager.isNodeHealthyForDecommissionOrMaintenance(dn);
+-            setDecommissioned(dn);
+-            toRemove.add(dn);
++            if (dn.isDecommissionInProgress()) {
++              setDecommissioned(dn);
++              toRemove.add(dn);
++            } else if (dn.isEnteringMaintenance()) {
++              // IN_MAINTENANCE node remains in the outOfServiceNodeBlocks to
++              // to track maintenance expiration.
++              setInMaintenance(dn);
++            } else {
++              Preconditions.checkState(false,
++                  "A node is in an invalid state!");
++            }
+-                + "marked as decommissioned.", dn);
++                + "marked as {}.", dn.getAdminState());
+-                + " Decommissioning is still in progress.",
+-                dn, isHealthy? "is": "isn't", blocks.size());
++                + " {} is still in progress.", dn,
++                isHealthy? "is": "isn't", blocks.size(), dn.getAdminState());
+-                  + "before it is a candidate to finish decommissioning.",
+-              dn, blocks.size());
++              + "before it is a candidate to finish {}.",
++              dn, blocks.size(), dn.getAdminState());
+-      processBlocksForDecomInternal(datanode, blocks.iterator(), null, true);
++      processBlocksInternal(datanode, blocks.iterator(), null, true);
+-      processBlocksForDecomInternal(datanode, datanode.getBlockIterator(),
++      processBlocksInternal(datanode, datanode.getBlockIterator(),
+-    private void processBlocksForDecomInternal(
++    private void processBlocksInternal(
+-      int decommissionOnlyReplicas = 0;
++      int outOfServiceOnlyReplicas = 0;
+-        if (blockManager.isNeededReconstruction(block, liveReplicas)) {
++        boolean isDecommission = datanode.isDecommissionInProgress();
++        boolean neededReconstruction = isDecommission ?
++            blockManager.isNeededReconstruction(block, num) :
++            blockManager.isNeededReconstructionForMaintenance(block, num);
++        if (neededReconstruction) {
+-                num.decommissionedAndDecommissioning(),
++                num.outOfServiceReplicas(),
+-        if (isSufficient(block, bc, num)) {
++        if (isSufficient(block, bc, num, isDecommission)) {
+-        if ((liveReplicas == 0) && (num.decommissionedAndDecommissioning() > 0)) {
+-          decommissionOnlyReplicas++;
++        if ((liveReplicas == 0) && (num.outOfServiceReplicas() > 0)) {
++          outOfServiceOnlyReplicas++;
+-      datanode.decommissioningStatus.set(lowRedundancyBlocks,
+-          decommissionOnlyReplicas,
+-          lowRedundancyInOpenFiles);
++      datanode.getLeavingServiceStatus().set(lowRedundancyBlocks,
++          outOfServiceOnlyReplicas, lowRedundancyInOpenFiles);
+
+INS31 INS83 INS39 INS42 INS44 INS8 INS44 MOV25 INS43 INS42 INS21 INS21 INS39 INS42 UPD42 INS8 INS42 INS32 INS32 INS32 INS27 MOV21 INS25 MOV21 INS25 INS42 INS42 INS42 INS42 INS45 INS42 MOV42 UPD42 MOV42 MOV42 INS42 INS34 INS42 MOV27 INS32 INS8 INS38 INS8 INS8 UPD42 INS42 INS45 INS32 INS45 INS32 INS45 INS32 MOV25 UPD42 UPD42 UPD42 INS60 INS60 INS32 UPD42 INS42 INS42 INS70 INS21 INS32 INS21 INS21 INS42 INS42 INS42 INS42 INS42 INS42 INS27 INS32 INS39 INS59 INS39 INS59 INS42 INS42 INS42 INS44 INS32 INS8 INS32 INS42 INS42 INS32 INS32 MOV32 MOV32 INS18 INS42 INS42 INS42 INS32 INS42 INS16 INS42 INS32 UPD42 INS43 INS42 INS42 INS42 INS21 INS32 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS8 INS42 INS42 INS42 INS32 INS32 INS42 INS42 INS42 INS32 INS42 INS42 INS42 UPD45 INS32 INS42 INS25 INS21 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 UPD42 INS42 INS42 INS45 INS42 INS42 INS32 MOV42 INS42 UPD42 INS32 MOV8 INS25 INS32 UPD45 INS42 INS42 UPD42 INS42 INS42 INS42 INS42 INS32 INS8 INS8 INS42 INS42 INS27 INS32 INS32 INS42 INS42 INS21 INS21 INS45 INS45 INS42 INS42 UPD45 INS42 INS42 UPD42 INS32 INS32 INS42 INS42 INS42 INS42 INS9 INS45 DEL40 DEL8 DEL42 DEL42 DEL27 DEL32 DEL27 DEL42 DEL42 DEL45 DEL45 DEL27 DEL42 DEL32 DEL21 DEL42 DEL42 DEL42 DEL42 DEL32 DEL40

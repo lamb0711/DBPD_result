@@ -1,0 +1,171 @@
+Merge r1432789 through r1437840 from trunk.
+
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/branches/HDFS-2802@1437843 13f79535-47bb-0310-9956-ffa450edef68
+
++import org.apache.hadoop.util.DataChecksum.Type;
+-    return getFileChecksum(src, namenode, socketFactory,
++    return getFileChecksum(src, clientName, namenode, socketFactory,
++   * @param clientName the name of the client requesting the checksum.
++   * @param namenode the RPC proxy for the namenode
++   * @param socketFactory to create sockets to connect to DNs
++   * @param socketTimeout timeout to use when connecting and waiting for a response
++   * @param encryptionKey the key needed to communicate with DNs in this cluster
++   * @param connectToDnViaHostname {@see #connectToDnViaHostname()}
+-  public static MD5MD5CRC32FileChecksum getFileChecksum(String src,
++  static MD5MD5CRC32FileChecksum getFileChecksum(String src,
++      String clientName,
+-        Socket sock = null;
+-          sock = socketFactory.createSocket();
+-          String dnAddr = datanodes[j].getXferAddr(connectToDnViaHostname);
+-          if (LOG.isDebugEnabled()) {
+-            LOG.debug("Connecting to datanode " + dnAddr);
+-          }
+-          NetUtils.connect(sock, NetUtils.createSocketAddr(dnAddr), timeout);
+-          sock.setSoTimeout(timeout);
+-
+-          OutputStream unbufOut = NetUtils.getOutputStream(sock);
+-          InputStream unbufIn = NetUtils.getInputStream(sock);
+-          if (encryptionKey != null) {
+-            IOStreamPair encryptedStreams =
+-                DataTransferEncryptor.getEncryptedStreams(
+-                    unbufOut, unbufIn, encryptionKey);
+-            unbufOut = encryptedStreams.out;
+-            unbufIn = encryptedStreams.in;
+-          }
+-          out = new DataOutputStream(new BufferedOutputStream(unbufOut,
++          IOStreamPair pair = connectToDN(socketFactory, connectToDnViaHostname,
++              encryptionKey, datanodes[j], timeout);
++          out = new DataOutputStream(new BufferedOutputStream(pair.out,
+-          in = new DataInputStream(unbufIn);
++          in = new DataInputStream(pair.in);
+-            if (reply.getStatus() == Status.ERROR_ACCESS_TOKEN
+-                && i > lastRetriedIndex) {
+-              if (LOG.isDebugEnabled()) {
+-                LOG.debug("Got access token error in response to OP_BLOCK_CHECKSUM "
+-                    + "for file " + src + " for block " + block
+-                    + " from datanode " + datanodes[j]
+-                    + ". Will retry the block once.");
+-              }
+-              lastRetriedIndex = i;
+-              done = true; // actually it's not done; but we'll retry
+-              i--; // repeat at i-th block
+-              refetchBlocks = true;
+-              break;
++            if (reply.getStatus() == Status.ERROR_ACCESS_TOKEN) {
++              throw new InvalidBlockTokenException();
+-          final DataChecksum.Type ct = PBHelper.convert(checksumData
+-              .getCrcType());
++          final DataChecksum.Type ct;
++          if (checksumData.hasCrcType()) {
++            ct = PBHelper.convert(checksumData
++                .getCrcType());
++          } else {
++            LOG.debug("Retrieving checksum from an earlier-version DataNode: " +
++                      "inferring checksum by reading first byte");
++            ct = inferChecksumTypeByReading(
++                clientName, socketFactory, socketTimeout, lb, datanodes[j],
++                encryptionKey, connectToDnViaHostname);
++          }
++
++        } catch (InvalidBlockTokenException ibte) {
++          if (i > lastRetriedIndex) {
++            if (LOG.isDebugEnabled()) {
++              LOG.debug("Got access token error in response to OP_BLOCK_CHECKSUM "
++                  + "for file " + src + " for block " + block
++                  + " from datanode " + datanodes[j]
++                  + ". Will retry the block once.");
++            }
++            lastRetriedIndex = i;
++            done = true; // actually it's not done; but we'll retry
++            i--; // repeat at i-th block
++            refetchBlocks = true;
++            break;
++          }
+-          IOUtils.closeSocket(sock);        
++   * Connect to the given datanode's datantrasfer port, and return
++   * the resulting IOStreamPair. This includes encryption wrapping, etc.
++   */
++  private static IOStreamPair connectToDN(
++      SocketFactory socketFactory, boolean connectToDnViaHostname,
++      DataEncryptionKey encryptionKey, DatanodeInfo dn, int timeout)
++      throws IOException
++  {
++    boolean success = false;
++    Socket sock = null;
++    try {
++      sock = socketFactory.createSocket();
++      String dnAddr = dn.getXferAddr(connectToDnViaHostname);
++      if (LOG.isDebugEnabled()) {
++        LOG.debug("Connecting to datanode " + dnAddr);
++      }
++      NetUtils.connect(sock, NetUtils.createSocketAddr(dnAddr), timeout);
++      sock.setSoTimeout(timeout);
++  
++      OutputStream unbufOut = NetUtils.getOutputStream(sock);
++      InputStream unbufIn = NetUtils.getInputStream(sock);
++      IOStreamPair ret;
++      if (encryptionKey != null) {
++        ret = DataTransferEncryptor.getEncryptedStreams(
++                unbufOut, unbufIn, encryptionKey);
++      } else {
++        ret = new IOStreamPair(unbufIn, unbufOut);        
++      }
++      success = true;
++      return ret;
++    } finally {
++      if (!success) {
++        IOUtils.closeSocket(sock);
++      }
++    }
++  }
++  
++  /**
++   * Infer the checksum type for a replica by sending an OP_READ_BLOCK
++   * for the first byte of that replica. This is used for compatibility
++   * with older HDFS versions which did not include the checksum type in
++   * OpBlockChecksumResponseProto.
++   *
++   * @param in input stream from datanode
++   * @param out output stream to datanode
++   * @param lb the located block
++   * @param clientName the name of the DFSClient requesting the checksum
++   * @param dn the connected datanode
++   * @return the inferred checksum type
++   * @throws IOException if an error occurs
++   */
++  private static Type inferChecksumTypeByReading(
++      String clientName, SocketFactory socketFactory, int socketTimeout,
++      LocatedBlock lb, DatanodeInfo dn,
++      DataEncryptionKey encryptionKey, boolean connectToDnViaHostname)
++      throws IOException {
++    IOStreamPair pair = connectToDN(socketFactory, connectToDnViaHostname,
++        encryptionKey, dn, socketTimeout);
++
++    try {
++      DataOutputStream out = new DataOutputStream(new BufferedOutputStream(pair.out,
++          HdfsConstants.SMALL_BUFFER_SIZE));
++      DataInputStream in = new DataInputStream(pair.in);
++  
++      new Sender(out).readBlock(lb.getBlock(), lb.getBlockToken(), clientName, 0, 1, true);
++      final BlockOpResponseProto reply =
++          BlockOpResponseProto.parseFrom(PBHelper.vintPrefixed(in));
++      
++      if (reply.getStatus() != Status.SUCCESS) {
++        if (reply.getStatus() == Status.ERROR_ACCESS_TOKEN) {
++          throw new InvalidBlockTokenException();
++        } else {
++          throw new IOException("Bad response " + reply + " trying to read "
++              + lb.getBlock() + " from datanode " + dn);
++        }
++      }
++      
++      return PBHelper.convert(reply.getReadOpChecksumInfo().getChecksum().getType());
++    } finally {
++      IOUtils.cleanup(null, pair.in, pair.out);
++    }
++  }
++
++  /**
+
+INS26 INS40 INS31 INS31 INS29 INS83 INS42 INS44 MOV8 INS29 INS83 INS83 MOV43 INS42 INS44 INS44 INS44 INS44 INS44 INS43 INS8 INS29 INS83 INS83 INS43 INS42 INS44 INS44 INS44 INS44 INS44 INS44 INS44 INS43 INS8 MOV65 MOV65 INS65 INS65 INS65 INS65 INS65 INS65 MOV65 MOV43 INS42 MOV60 MOV25 MOV60 MOV60 MOV60 MOV60 MOV60 MOV60 MOV60 MOV60 MOV50 INS65 INS43 INS42 INS39 INS42 INS43 INS42 INS43 INS42 INS39 INS42 INS42 INS60 MOV60 INS54 INS65 INS65 INS65 INS65 INS65 INS65 INS65 INS65 INS42 INS43 INS42 INS43 INS42 INS39 INS42 INS43 INS42 INS43 INS42 INS43 INS42 INS39 INS42 INS42 INS60 INS54 INS42 INS66 INS42 INS66 INS42 INS66 INS42 INS66 INS42 INS66 INS42 INS66 INS65 MOV58 MOV27 MOV37 INS66 INS66 INS42 INS42 INS42 INS39 INS59 INS8 INS8 INS66 INS66 INS66 INS66 INS42 INS66 INS42 INS66 INS42 INS66 INS42 INS66 INS42 INS66 INS66 INS42 INS66 INS42 INS42 INS42 INS42 INS42 INS43 INS59 INS8 INS8 INS42 INS66 MOV25 MOV60 MOV60 MOV60 MOV60 MOV60 INS24 MOV25 INS42 INS9 MOV21 INS60 MOV25 MOV21 MOV21 MOV60 MOV60 INS60 INS25 INS21 INS41 INS25 INS42 INS42 INS32 INS60 INS60 INS21 INS60 INS25 INS41 INS21 MOV58 MOV27 MOV37 MOV8 INS8 INS43 INS59 INS43 INS59 MOV27 INS8 INS8 INS7 INS42 INS38 MOV8 INS42 INS42 INS42 INS42 INS42 INS42 INS43 INS59 INS43 INS59 INS32 INS83 INS43 INS59 INS27 INS8 INS32 INS32 MOV60 MOV60 INS54 MOV53 INS42 INS42 INS32 INS42 INS42 INS21 INS21 INS42 INS9 INS42 INS42 INS42 INS14 INS42 INS42 INS14 INS14 INS42 INS32 INS32 INS42 INS34 INS34 INS9 INS42 INS42 INS32 INS32 INS40 INS25 INS42 INS42 INS32 INS42 INS42 INS33 INS40 INS40 INS8 INS12 MOV12 INS8 UPD43 MOV43 INS42 INS42 INS42 INS7 INS7 INS43 INS14 INS43 INS40 INS43 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS27 INS8 INS8 INS32 INS42 MOV60 MOV21 MOV21 MOV25 MOV21 MOV60 MOV25 MOV60 MOV60 MOV25 MOV60 MOV25 MOV60 MOV21 MOV60 INS25 MOV25 MOV21 MOV25 INS44 MOV8 MOV21 MOV21 INS43 MOV42 INS42 MOV32 INS42 INS14 INS42 INS43 INS40 INS40 INS42 INS42 INS42 INS42 INS42 INS32 INS40 INS53 INS53 INS32 INS42 INS43 INS8 INS83 MOV43 INS32 INS8 INS8 INS43 INS42 MOV42 UPD45 MOV45 INS43 INS42 INS42 INS42 INS42 INS42 INS14 INS14 INS42 INS42 INS42 UPD42 INS25 UPD42 INS42 INS42 MOV21 INS21 MOV21 INS42 MOV27 INS42 INS42 INS43 INS43 INS27 UPD42 INS42 INS42 INS2 INS42 INS40 MOV27 INS8 MOV8 INS32 INS42 INS42 INS45 INS42 INS45 INS32 INS45 INS42 INS42 INS42 INS40 INS53 UPD42 MOV32 INS42 INS42 INS27 UPD42 INS32 INS45 INS42 INS42 INS14 INS45 INS45 INS42 INS42 INS42 INS42 INS42 MOV2 INS42 INS42 INS43 INS42 DEL29 DEL83 DEL83 DEL42 DEL42 DEL42 DEL40 DEL40 DEL27 DEL8 DEL25 DEL83 DEL42 DEL59 DEL60 DEL54 DEL24 DEL8

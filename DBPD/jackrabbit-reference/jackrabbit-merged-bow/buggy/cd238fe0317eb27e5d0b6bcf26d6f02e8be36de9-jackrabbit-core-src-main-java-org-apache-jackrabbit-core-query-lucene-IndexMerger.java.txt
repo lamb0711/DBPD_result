@@ -1,0 +1,251 @@
+JCR-2387: Use executor service from repository for index merging
+
+git-svn-id: https://svn.apache.org/repos/asf/jackrabbit/trunk@834039 13f79535-47bb-0310-9956-ffa450edef68
+
+-import org.apache.lucene.index.Term;
++import java.io.IOException;
++import java.util.ArrayList;
++import java.util.Collections;
++import java.util.Iterator;
++import java.util.List;
++import java.util.concurrent.CountDownLatch;
++import java.util.concurrent.Executor;
++import java.util.concurrent.atomic.AtomicBoolean;
++import java.util.concurrent.locks.Lock;
++import java.util.concurrent.locks.ReadWriteLock;
++import java.util.concurrent.locks.ReentrantReadWriteLock;
++
++import org.apache.lucene.index.Term;
+-import java.util.List;
+-import java.util.Collections;
+-import java.util.ArrayList;
+-import java.util.Iterator;
+-import java.util.concurrent.LinkedBlockingQueue;
+-import java.util.concurrent.BlockingQueue;
+-import java.util.concurrent.Semaphore;
+-import java.io.IOException;
+-
+-     * Marker task to signal the background thread to quit.
+-     */
+-    private static final Merge QUIT = new Merge(new Index[0]);
+-
+-    /**
+-     * Queue of merge Tasks
+-     */
+-    private final BlockingQueue<Merge> mergeTasks = new LinkedBlockingQueue<Merge>();
+-
+-    /**
++     * The executor of the repository.
++     */
++    private final Executor executor;
++
++    /**
++     * Flag that indicates that this index merger is shuting down and should
++     * quit. 
++     */
++    private final AtomicBoolean quit = new AtomicBoolean(false);
++
++    /**
++     * Flag that indicates if this index merger has already been started.
++     * @see #start()
++     */
++    private final AtomicBoolean isStarted = new AtomicBoolean(false);
++
++    /**
+-     * Mutex that is acquired when replacing indexes on MultiIndex.
++     * Read/write lock for index segment replacement. A shared read lock is
++     * aquired for an index replacement. An exclusive write lock is acquired
++     * when this index merger is shuting down, to prevent further index
++     * replacements.
+-    private final Semaphore indexReplacement;
++    private final ReadWriteLock indexReplacement = new ReentrantReadWriteLock();
+-     * List of merger threads.
+-     */
+-    private final List<Worker> workers = new ArrayList<Worker>();
+-
+-    /**
+-     * @param numWorkers the number of worker threads to use.
++     * @param executor   the executor of the repository.
+-    IndexMerger(MultiIndex multiIndex, int numWorkers) {
++    IndexMerger(MultiIndex multiIndex, Executor executor) {
+-        for (int i = 0; i < numWorkers; i++) {
+-            Worker w = new Worker();
+-            workers.add(w);
+-            busyMergers.add(w);
+-        }
+-        this.indexReplacement = new Semaphore(workers.size());
++        this.executor = executor;
+-        for (Thread t : workers) {
+-            t.start();
++        isStarted.set(true);
++        for (Worker worker : busyMergers) {
++            worker.unblock();
+-                        log.debug("merge queue now contains " + mergeTasks.size() + " tasks.");
+-        // get all permits for index replacements
++        // get exclusive lock on index replacements
+-            indexReplacement.acquire(workers.size());
++            indexReplacement.writeLock().lockInterruptibly();
+-            log.warn("Interrupted while acquiring index replacement permits: " + e);
++            log.warn("Interrupted while acquiring index replacement exclusive lock: " + e);
+-        log.debug("merge queue size: " + mergeTasks.size());
+-        // clear task queue
+-        mergeTasks.clear();
+-
+-        // send quit
+-        addMergeTask(QUIT);
+-        log.debug("quit sent");
++        // set quit
++        quit.set(true);
++        log.debug("quit flag set");
+-            for (Thread t : workers) {
+-                t.join(500);
+-                if (t.isAlive()) {
++            Worker[] workers;
++            synchronized (busyMergers) {
++                workers = busyMergers.toArray(new Worker[busyMergers.size()]);
++            }
++            for (Worker w : workers) {
++                w.join(500);
++                if (w.isAlive()) {
+-        for (;;) {
+-            try {
+-                mergeTasks.put(task);
+-                break;
+-            } catch (InterruptedException e) {
+-                // try again
+-                Thread.interrupted();
++        // only enqueue if still running
++        if (!quit.get()) {
++            Worker worker = new Worker(task);
++            if (isStarted.get()) {
++                // immediately unblock if this index merger is already started
++                worker.unblock();
++            synchronized (busyMergers) {
++                busyMergers.add(worker);
++            }
++            executor.execute(worker);
+-    private class Worker extends Thread implements IndexListener {
++    private class Worker implements Runnable, IndexListener {
+-        public Worker() {
+-            setName("IndexMerger.Worker");
+-            setDaemon(true);
++        /**
++         * A latch that is set to zero when this worker is unblocked.
++         */
++        private final CountDownLatch start = new CountDownLatch(1);
++
++        /**
++         * Flat that indicates whether this woker has finished its work.
++         */
++        private final AtomicBoolean terminated = new AtomicBoolean(true);
++
++        /**
++         * The merge task.
++         */
++        private final Merge task;
++
++        /**
++         * Creates a new worker which is initially blocked. Call
++         * {@link #unblock()} to unblock it.
++         *
++         * @param task the merge task.
++         */
++        private Worker(Merge task) {
++            this.task = task;
+-            for (;;) {
+-                boolean isIdle = false;
+-                if (mergeTasks.size() == 0) {
+-                    synchronized (busyMergers) {
+-                        busyMergers.remove(this);
+-                        busyMergers.notifyAll();
++            // worker is initially suspended
++            try {
++                try {
++                    start.await();
++                } catch (InterruptedException e) {
++                    // check if we should quit
++                    if (!quit.get()) {
++                        // enqueue task again and retry with another thread
++                        addMergeTask(task);
+-                    isIdle = true;
+-                }
+-                Merge task;
+-                for (;;) {
+-                    try {
+-                        task = mergeTasks.take();
+-                        break;
+-                    } catch (InterruptedException e) {
+-                        // try again
+-                        Thread.interrupted();
+-                    }
+-                }
+-                if (task == QUIT) {
+-                    synchronized (busyMergers) {
+-                        busyMergers.remove(this);
+-                    }
+-                    // put back QUIT to signal other workers
+-                    addMergeTask(task);
+-                    break;
+-                }
+-                if (isIdle) {
+-                    synchronized (busyMergers) {
+-                        busyMergers.add(this);
+-                    }
++                    return;
+-                // reset deleted documents
+-                deletedDocuments.clear();
+-
+-                        if (!indexReplacement.tryAcquire()) {
++                        Lock shared = indexReplacement.readLock();
++                        if (!shared.tryLock()) {
+-                            break;
++                            return;
+-                            indexReplacement.release();
++                            shared.unlock();
++                            // add task again and retry
++                            addMergeTask(task);
++            } finally {
++                synchronized (terminated) {
++                    terminated.set(true);
++                    terminated.notifyAll();
++                }
++                synchronized (busyMergers) {
++                    busyMergers.remove(this);
++                    busyMergers.notifyAll();
++                }
++                log.debug("Worker finished");
+-            log.info("IndexMerger.Worker terminated");
++
++        /**
++         * Unblocks this worker and allows it to start with the index merging.
++         */
++        void unblock() {
++            start.countDown();
++        }
++
++        /**
++         * Waits until this worker is finished or the specified amount of time
++         * has elapsed.
++         *
++         * @param timeout the timeout in milliseconds.
++         * @throws InterruptedException if the current thread is interrupted
++         *                              while waiting for this worker to
++         *                              terminate.
++         */
++        void join(long timeout) throws InterruptedException {
++            synchronized (terminated) {
++                while (!terminated.get()) {
++                    terminated.wait(timeout);
++                }
++            }
++        }
++
++        /**
++         * @return <code>true</code> if this worker is still alive and not yet
++         *         terminated.
++         */
++        boolean isAlive() {
++            return !terminated.get();
++        }
+
+MOV26 MOV26 MOV26 MOV26 MOV26 MOV26 MOV26 INS26 INS26 INS26 MOV23 MOV23 MOV23 MOV23 INS40 UPD40 INS40 UPD40 UPD40 INS40 UPD43 INS43 UPD43 INS43 UPD43 INS23 INS23 INS23 INS31 INS31 INS31 INS31 UPD42 UPD42 UPD42 MOV42 UPD42 INS65 UPD42 UPD42 INS14 UPD42 MOV42 UPD42 INS43 INS42 INS21 INS25 UPD42 INS29 INS83 INS83 INS43 INS59 INS29 INS83 INS83 INS43 INS59 INS29 INS83 INS83 MOV43 MOV59 INS29 INS83 MOV42 INS44 INS8 MOV8 INS29 INS39 INS42 INS8 INS29 INS39 INS42 INS44 INS43 INS8 INS29 INS39 INS42 INS8 UPD66 UPD66 INS66 INS43 INS9 UPD66 INS68 INS43 INS9 INS66 INS66 UPD66 INS66 INS43 UPD42 UPD66 INS42 INS32 UPD42 INS32 INS38 INS8 INS65 INS42 INS42 INS14 INS65 INS42 INS42 INS14 INS65 INS65 INS65 INS43 INS42 INS21 INS54 INS65 MOV21 INS65 INS65 INS65 INS39 INS42 INS42 INS51 INS65 INS41 UPD42 MOV42 INS42 INS42 UPD42 MOV42 INS42 INS42 INS42 INS9 MOV43 INS42 UPD42 MOV42 UPD42 MOV42 INS9 UPD45 INS60 INS51 INS32 INS60 INS25 INS51 INS21 INS66 INS43 INS34 INS66 INS43 INS9 INS66 INS66 INS65 INS66 INS42 INS66 INS42 INS7 INS8 MOV8 INS66 INS66 INS66 INS42 INS66 INS42 INS66 INS66 INS66 INS42 INS8 INS66 INS66 INS38 UPD42 INS5 INS59 INS42 INS8 INS42 INS42 INS43 INS59 INS32 INS8 INS42 INS8 INS32 INS42 INS42 INS68 INS22 INS42 MOV54 MOV21 MOV60 MOV24 MOV54 INS51 INS21 UPD42 INS42 INS61 INS32 UPD42 UPD42 INS32 UPD42 MOV42 MOV43 INS85 INS42 INS21 MOV43 INS42 INS42 INS42 INS14 INS42 INS42 MOV21 MOV21 INS42 INS42 INS42 INS42 INS52 INS42 INS42 INS8 INS32 INS38 INS8 INS42 INS42 MOV42 UPD42 MOV42 INS7 INS43 INS42 MOV21 INS21 INS42 INS42 INS45 INS32 MOV21 UPD45 INS42 INS32 UPD42 UPD42 INS42 UPD42 UPD42 INS42 UPD42 UPD42 INS32 INS25 INS41 INS32 INS32 INS42 INS42 INS42 INS42 INS3 UPD42 MOV42 UPD42 MOV42 INS38 MOV8 INS60 INS42 INS42 INS9 INS42 INS42 UPD42 INS42 INS42 INS5 INS32 INS32 INS43 INS59 MOV43 INS85 INS42 INS42 UPD42 MOV42 UPD42 MOV42 INS42 INS42 INS32 INS41 INS21 INS42 INS42 UPD42 UPD42 INS32 UPD42 UPD42 INS42 INS42 DEL83 DEL42 DEL43 DEL42 DEL43 DEL85 DEL5 DEL34 DEL3 DEL14 DEL43 DEL42 DEL43 DEL74 DEL43 DEL42 DEL43 DEL74 DEL43 DEL74 DEL43 DEL74 DEL39 DEL42 DEL39 DEL42 DEL34 DEL59 DEL58 DEL42 DEL42 DEL27 DEL42 DEL37 DEL42 DEL14 DEL59 DEL60 DEL42 DEL42 DEL42 DEL32 DEL21 DEL42 DEL42 DEL42 DEL32 DEL21 DEL8 DEL24 DEL42 DEL43 DEL42 DEL42 DEL32 DEL14 DEL42 DEL43 DEL42 DEL42 DEL42 DEL45 DEL42 DEL42 DEL32 DEL45 DEL27 DEL32 DEL21 DEL42 DEL32 DEL42 DEL42 DEL45 DEL32 DEL27 DEL32 DEL42 DEL42 DEL32 DEL21 DEL42 DEL42 DEL32 DEL21 DEL42 DEL43 DEL42 DEL42 DEL10 DEL8 DEL42 DEL43 DEL42 DEL44 DEL8 DEL12 DEL54 DEL8 DEL24 DEL83 DEL8 DEL31 DEL42 DEL32 DEL7 DEL10 DEL42 DEL42 DEL42 DEL52 DEL32 DEL21 DEL8 DEL51 DEL10 DEL32 DEL21 DEL10 DEL42 DEL9 DEL7 DEL39 DEL42 DEL9 DEL59 DEL60 DEL42 DEL42 DEL32 DEL34 DEL27 DEL25 DEL60 DEL8 DEL24 DEL42 DEL42 DEL27 DEL25 DEL42 DEL42 DEL42 DEL42 DEL52 DEL32 DEL21 DEL8 DEL51 DEL8 DEL25 DEL42 DEL42 DEL32 DEL21 DEL24 DEL42 DEL42 DEL45 DEL32 DEL21 DEL8 DEL45 DEL9

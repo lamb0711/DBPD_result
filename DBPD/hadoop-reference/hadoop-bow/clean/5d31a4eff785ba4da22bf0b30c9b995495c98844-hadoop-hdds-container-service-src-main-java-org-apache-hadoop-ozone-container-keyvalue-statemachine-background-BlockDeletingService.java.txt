@@ -1,0 +1,95 @@
+HDDS-1753. Datanode unable to find chunk while replication data using ratis. (#1318)
+
+
++import org.apache.hadoop.hdds.scm.pipeline.PipelineID;
+-import org.apache.hadoop.ozone.container.common.impl.ContainerSet;
++import org.apache.hadoop.ozone.container.common.transport.server.ratis.XceiverServerRatis;
++import org.apache.hadoop.ozone.container.ozoneimpl.OzoneContainer;
++import java.io.IOException;
++import java.util.UUID;
++import java.util.stream.Collectors;
+-public class BlockDeletingService extends BackgroundService{
++public class BlockDeletingService extends BackgroundService {
+-  private ContainerSet containerSet;
++  private OzoneContainer ozoneContainer;
+-  public BlockDeletingService(ContainerSet containerSet, long serviceInterval,
+-      long serviceTimeout, TimeUnit timeUnit, Configuration conf) {
++  public BlockDeletingService(OzoneContainer ozoneContainer,
++      long serviceInterval, long serviceTimeout, TimeUnit timeUnit,
++      Configuration conf) {
+-    this.containerSet = containerSet;
++    this.ozoneContainer = ozoneContainer;
+-    this.blockLimitPerTask = conf.getInt(
+-        OZONE_BLOCK_DELETING_LIMIT_PER_CONTAINER,
+-        OZONE_BLOCK_DELETING_LIMIT_PER_CONTAINER_DEFAULT);
+-    this.containerLimitPerInterval = conf.getInt(
+-        OZONE_BLOCK_DELETING_CONTAINER_LIMIT_PER_INTERVAL,
+-        OZONE_BLOCK_DELETING_CONTAINER_LIMIT_PER_INTERVAL_DEFAULT);
++    this.blockLimitPerTask =
++        conf.getInt(OZONE_BLOCK_DELETING_LIMIT_PER_CONTAINER,
++            OZONE_BLOCK_DELETING_LIMIT_PER_CONTAINER_DEFAULT);
++    this.containerLimitPerInterval =
++        conf.getInt(OZONE_BLOCK_DELETING_CONTAINER_LIMIT_PER_INTERVAL,
++            OZONE_BLOCK_DELETING_CONTAINER_LIMIT_PER_INTERVAL_DEFAULT);
+-      containers = containerSet.chooseContainerForBlockDeletion(
+-          containerLimitPerInterval, containerDeletionPolicy);
++      containers = chooseContainerForBlockDeletion(containerLimitPerInterval,
++              containerDeletionPolicy);
++  public List<ContainerData> chooseContainerForBlockDeletion(int count,
++      ContainerDeletionChoosingPolicy deletionPolicy)
++      throws StorageContainerException {
++    Map<Long, ContainerData> containerDataMap =
++        ozoneContainer.getContainerSet().getContainerMap().entrySet().stream()
++            .filter(e -> isDeletionAllowed(e.getValue().getContainerData(),
++                deletionPolicy)).collect(Collectors
++            .toMap(Map.Entry::getKey, e -> e.getValue().getContainerData()));
++    return deletionPolicy
++        .chooseContainerForBlockDeletion(count, containerDataMap);
++  }
++
++  private boolean isDeletionAllowed(ContainerData containerData,
++      ContainerDeletionChoosingPolicy deletionPolicy) {
++    if (!deletionPolicy
++        .isValidContainerType(containerData.getContainerType())) {
++      return false;
++    } else if (!containerData.isClosed()) {
++      return false;
++    } else {
++      if (ozoneContainer.getWriteChannel() instanceof XceiverServerRatis) {
++        XceiverServerRatis ratisServer =
++            (XceiverServerRatis) ozoneContainer.getWriteChannel();
++        PipelineID pipelineID = PipelineID
++            .valueOf(UUID.fromString(containerData.getOriginPipelineId()));
++        // in case te ratis group does not exist, just mark it for deletion.
++        if (!ratisServer.isExist(pipelineID.getProtobuf())) {
++          return true;
++        }
++        try {
++          long minReplicatedIndex =
++              ratisServer.getMinReplicatedIndex(pipelineID);
++          long containerBCSID = containerData.getBlockCommitSequenceId();
++          if (minReplicatedIndex >= 0 && minReplicatedIndex < containerBCSID) {
++            LOG.warn("Close Container log Index {} is not replicated across all"
++                    + "the servers in the pipeline {} as the min replicated "
++                    + "index is {}. Deletion is not allowed in this container "
++                    + "yet.", containerBCSID,
++                containerData.getOriginPipelineId(), minReplicatedIndex);
++            return false;
++          } else {
++            return true;
++          }
++        } catch (IOException ioe) {
++          // in case of any exception check again whether the pipeline exist
++          // and in case the pipeline got destroyed, just mark it for deletion
++          if (!ratisServer.isExist(pipelineID.getProtobuf())) {
++            return true;
++          } else {
++            LOG.info(ioe.getMessage());
++            return false;
++          }
++        }
++      }
++      return true;
++    }
++  }
++

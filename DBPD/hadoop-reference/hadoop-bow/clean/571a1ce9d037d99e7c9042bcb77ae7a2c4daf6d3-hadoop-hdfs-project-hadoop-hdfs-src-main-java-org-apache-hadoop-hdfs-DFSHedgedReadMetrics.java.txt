@@ -1,0 +1,5 @@
+HDFS-8049. Add @InterfaceAudience.Private annotation to hdfs client implementation. Contributed by Takuya Fukudome
+
++import org.apache.hadoop.classification.InterfaceAudience;
++
++@InterfaceAudience.Private

@@ -1,0 +1,128 @@
+HADOOP-16570. S3A committers encounter scale issues.
+
+Contributed by Steve Loughran.
+
+This addresses two scale issues which has surfaced in large scale benchmarks
+of the S3A Committers.
+
+* Thread pools are not cleaned up.
+  This now happens, with tests.
+
+* OOM on job commit for jobs with many thousands of tasks,
+  each generating tens of (very large) files.
+
+Instead of loading all pending commits into memory as a single list, the list
+of files to load is the sole list which is passed around; .pendingset files are
+loaded and processed in isolation -and reloaded if necessary for any
+abort/rollback operation.
+
+The parallel commit/abort/revert operations now work at the .pendingset level,
+rather than that of individual pending commit files. The existing parallelized
+Tasks API is still used to commit those files, but with a null thread pool, so
+as to serialize the operations.
+
+Change-Id: I5c8240cd31800eaa83d112358770ca0eb2bca797
+
++import java.util.Map;
+-import java.util.stream.Collectors;
++import java.util.concurrent.ConcurrentHashMap;
++import java.util.concurrent.ExecutorService;
+-import com.google.common.collect.Sets;
++import org.apache.hadoop.fs.s3a.commit.Tasks;
++import org.apache.hadoop.fs.s3a.commit.files.PendingSet;
++import org.apache.hadoop.util.DurationInfo;
+-import static org.apache.hadoop.fs.s3a.commit.CommitConstants.*;
++import static org.apache.hadoop.fs.s3a.commit.CommitConstants.COMMITTER_NAME_PARTITIONED;
++ * To determine the paths, the precommit process actually has to read
++ * in all source files, independently of the final commit phase.
++ * This is inefficient, though some parallelization here helps.
++   * All
+-  protected void preCommitJob(JobContext context,
+-      List<SinglePendingCommit> pending) throws IOException {
++  public void preCommitJob(
++      final JobContext context,
++      final ActiveCommit pending) throws IOException {
++    boolean shouldPrecheckPendingFiles = true;
+-      Set<Path> partitions = pending.stream()
+-          .map(SinglePendingCommit::destinationPath)
+-          .map(Path::getParent)
+-          .collect(Collectors.toCollection(Sets::newLinkedHashSet));
+-      for (Path partitionPath : partitions) {
+-        LOG.debug("{}: removing partition path to be replaced: " +
+-            getRole(), partitionPath);
+-        fs.delete(partitionPath, true);
+-      }
++      // identify and replace the destination partitions
++      replacePartitions(context, pending);
++      // and so there is no need to do another check.
++      shouldPrecheckPendingFiles = false;
++    if (shouldPrecheckPendingFiles) {
++      precommitCheckPendingFiles(context, pending);
++    }
++  }
++
++  /**
++   * Identify all partitions which need to be replaced and then delete them.
++   * The original implementation relied on all the pending commits to be
++   * loaded so could simply enumerate them.
++   * This iteration does not do that; it has to reload all the files
++   * to build the set, after which it initiates the delete process.
++   * This is done in parallel.
++   * <pre>
++   *   Set<Path> partitions = pending.stream()
++   *     .map(Path::getParent)
++   *     .collect(Collectors.toCollection(Sets::newLinkedHashSet));
++   *   for (Path partitionPath : partitions) {
++   *     LOG.debug("{}: removing partition path to be replaced: " +
++   *     getRole(), partitionPath);
++   *     fs.delete(partitionPath, true);
++   *   }
++   * </pre>
++   *
++   * @param context job context
++   * @param pending the pending operations
++   * @throws IOException any failure
++   */
++  private void replacePartitions(
++      final JobContext context,
++      final ActiveCommit pending) throws IOException {
++
++    Map<Path, String> partitions = new ConcurrentHashMap<>();
++    FileSystem sourceFS = pending.getSourceFS();
++    ExecutorService pool = buildThreadPool(context);
++    try (DurationInfo ignored =
++             new DurationInfo(LOG, "Replacing partitions")) {
++
++      // the parent directories are saved to a concurrent hash map.
++      // for a marginal optimisation, the previous parent is tracked, so
++      // if a task writes many files to the same dir, the synchronized map
++      // is updated only once.
++      Tasks.foreach(pending.getSourceFiles())
++          .stopOnFailure()
++          .suppressExceptions(false)
++          .executeWith(pool)
++          .run(path -> {
++            PendingSet pendingSet = PendingSet.load(sourceFS, path);
++            Path lastParent = null;
++            for (SinglePendingCommit commit : pendingSet.getCommits()) {
++              Path parent = commit.destinationPath().getParent();
++              if (parent != null && !parent.equals(lastParent)) {
++                partitions.put(parent, "");
++                lastParent = parent;
++              }
++            }
++          });
++    }
++    // now do the deletes
++    FileSystem fs = getDestFS();
++    Tasks.foreach(partitions.keySet())
++        .stopOnFailure()
++        .suppressExceptions(false)
++        .executeWith(pool)
++        .run(partitionPath -> {
++          LOG.debug("{}: removing partition path to be replaced: " +
++              getRole(), partitionPath);
++          fs.delete(partitionPath, true);
++        });
+
+MOV26 MOV26 INS26 INS26 INS26 INS26 UPD40 INS40 INS40 UPD40 INS40 INS40 UPD40 INS31 UPD83 INS29 INS83 INS39 INS42 INS44 INS44 INS43 INS8 INS66 INS66 INS66 INS83 INS83 INS43 INS60 INS50 INS25 INS65 INS65 INS65 INS65 INS83 INS43 INS42 INS83 INS43 INS42 INS42 INS60 INS60 INS60 INS54 INS60 INS21 INS66 UPD42 MOV42 INS39 INS59 MOV32 MOV49 MOV10 MOV49 MOV10 MOV49 INS21 INS21 INS10 INS49 MOV53 INS42 INS8 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS42 INS66 INS42 INS66 INS42 INS66 INS42 INS42 INS74 INS59 INS43 INS59 INS43 INS59 INS58 INS8 INS43 INS59 INS32 INS42 INS9 INS32 INS7 INS21 INS43 MOV43 INS43 INS42 INS14 INS42 INS42 INS32 INS42 INS42 INS32 INS43 INS59 INS21 INS42 INS42 INS32 INS32 INS42 INS86 UPD42 MOV42 UPD42 MOV42 INS42 INS42 INS9 INS32 INS42 INS42 INS74 INS42 INS42 INS42 INS42 INS42 INS42 INS14 INS32 INS42 INS32 INS42 INS42 INS59 MOV8 UPD42 MOV42 UPD42 MOV42 INS42 INS43 INS43 INS42 INS45 INS32 INS42 INS86 INS32 INS42 INS9 INS42 INS42 INS42 INS32 INS42 INS42 INS59 INS8 INS32 INS42 INS32 INS42 INS9 INS42 INS60 INS60 INS70 INS42 INS42 INS32 INS32 INS42 INS43 INS59 MOV43 INS59 INS44 INS32 INS8 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS33 MOV43 INS42 INS42 INS42 INS60 INS25 INS42 INS42 INS42 INS42 INS42 INS42 INS43 INS59 INS27 INS8 INS42 INS42 INS32 INS27 INS38 INS21 INS21 INS32 INS42 INS42 INS33 INS32 INS32 INS7 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS45 INS42 INS42 DEL43 DEL74 DEL42 DEL43 DEL74 DEL42 DEL32 DEL42 DEL42 DEL42 DEL90 DEL32 DEL42 DEL42 DEL42 DEL90 DEL32 DEL42 DEL42 DEL42 DEL90 DEL32 DEL32 DEL59 DEL60 DEL42 DEL44 DEL42 DEL70 DEL10 DEL49 DEL50

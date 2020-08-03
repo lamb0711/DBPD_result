@@ -1,0 +1,244 @@
+HDFS-14617. Improve fsimage load time by writing sub-sections to the fsimage index (#1028). Contributed by  Stephen O'Donnell.
+
+Reviewed-by: He Xiaoqiao <hexiaoqiao@apache.org>
++import java.util.concurrent.CopyOnWriteArrayList;
++import java.util.concurrent.CountDownLatch;
++import java.util.concurrent.ExecutorService;
++import java.util.concurrent.atomic.AtomicInteger;
++import java.util.concurrent.locks.ReentrantLock;
++  private static final int DIRECTORY_ENTRY_BATCH_SIZE = 1000;
++
++    private ReentrantLock cacheNameMapLock;
++    private ReentrantLock blockMapLock;
++      cacheNameMapLock = new ReentrantLock(true);
++      blockMapLock = new ReentrantLock(true);
++    }
++
++    void loadINodeDirectorySectionInParallel(ExecutorService service,
++        ArrayList<FileSummary.Section> sections, String compressionCodec)
++        throws IOException {
++      LOG.info("Loading the INodeDirectory section in parallel with {} sub-" +
++              "sections", sections.size());
++      CountDownLatch latch = new CountDownLatch(sections.size());
++      final CopyOnWriteArrayList<IOException> exceptions =
++          new CopyOnWriteArrayList<>();
++      for (FileSummary.Section s : sections) {
++        service.submit(() -> {
++          InputStream ins = null;
++          try {
++            ins = parent.getInputStreamForSection(s,
++                compressionCodec);
++            loadINodeDirectorySection(ins);
++          } catch (Exception e) {
++            LOG.error("An exception occurred loading INodeDirectories in " +
++                "parallel", e);
++            exceptions.add(new IOException(e));
++          } finally {
++            latch.countDown();
++            try {
++              if (ins != null) {
++                ins.close();
++              }
++            } catch (IOException ioe) {
++              LOG.warn("Failed to close the input stream, ignoring", ioe);
++            }
++          }
++        });
++      }
++      try {
++        latch.await();
++      } catch (InterruptedException e) {
++        LOG.error("Interrupted waiting for countdown latch", e);
++        throw new IOException(e);
++      }
++      if (exceptions.size() != 0) {
++        LOG.error("{} exceptions occurred loading INodeDirectories",
++            exceptions.size());
++        throw exceptions.get(0);
++      }
++      LOG.info("Completed loading all INodeDirectory sub-sections");
++      ArrayList<INode> inodeList = new ArrayList<>();
+-          addToParent(p, child);
++          if (addToParent(p, child)) {
++            if (child.isFile()) {
++              inodeList.add(child);
++            }
++            if (inodeList.size() >= DIRECTORY_ENTRY_BATCH_SIZE) {
++              addToCacheAndBlockMap(inodeList);
++              inodeList.clear();
++            }
++          } else {
++            LOG.warn("Failed to add the inode {} to the directory {}",
++                child.getId(), p.getId());
++          }
++
+-          addToParent(p, ref);
++          if (addToParent(p, ref)) {
++            if (ref.isFile()) {
++              inodeList.add(ref);
++            }
++            if (inodeList.size() >= DIRECTORY_ENTRY_BATCH_SIZE) {
++              addToCacheAndBlockMap(inodeList);
++              inodeList.clear();
++            }
++          } else {
++            LOG.warn("Failed to add the inode reference {} to the directory {}",
++                ref.getId(), p.getId());
++          }
++      addToCacheAndBlockMap(inodeList);
++    }
++
++    private void addToCacheAndBlockMap(ArrayList<INode> inodeList) {
++      try {
++        cacheNameMapLock.lock();
++        for (INode i : inodeList) {
++          dir.cacheName(i);
++        }
++      } finally {
++        cacheNameMapLock.unlock();
++      }
++
++      try {
++        blockMapLock.lock();
++        for (INode i : inodeList) {
++          updateBlocksMap(i.asFile(), fsn.getBlockManager());
++        }
++      } finally {
++        blockMapLock.unlock();
++      }
++      loadINodeSectionHeader(in, prog, currentStep);
++      Counter counter = prog.getCounter(Phase.LOADING_FSIMAGE, currentStep);
++      int totalLoaded = loadINodesInSection(in, counter);
++      LOG.info("Successfully loaded {} inodes", totalLoaded);
++    }
++
++    private int loadINodesInSection(InputStream in, Counter counter)
++        throws IOException {
++      // As the input stream is a LimitInputStream, the reading will stop when
++      // EOF is encountered at the end of the stream.
++      int cntr = 0;
++      while (true) {
++        INodeSection.INode p = INodeSection.INode.parseDelimitedFrom(in);
++        if (p == null) {
++          break;
++        }
++        if (p.getId() == INodeId.ROOT_INODE_ID) {
++          synchronized(this) {
++            loadRootINode(p);
++          }
++        } else {
++          INode n = loadINode(p);
++          synchronized(this) {
++            dir.addToInodeMap(n);
++          }
++        }
++        cntr++;
++        if (counter != null) {
++          counter.increment();
++        }
++      }
++      return cntr;
++    }
++
++
++    private long loadINodeSectionHeader(InputStream in, StartupProgress prog,
++        Step currentStep) throws IOException {
+-      Counter counter = prog.getCounter(Phase.LOADING_FSIMAGE, currentStep);
+-      for (int i = 0; i < numInodes; ++i) {
+-        INodeSection.INode p = INodeSection.INode.parseDelimitedFrom(in);
+-        if (p.getId() == INodeId.ROOT_INODE_ID) {
+-          loadRootINode(p);
+-        } else {
+-          INode n = loadINode(p);
+-          dir.addToInodeMap(n);
++      return numInodes;
++    }
++
++    void loadINodeSectionInParallel(ExecutorService service,
++        ArrayList<FileSummary.Section> sections,
++        String compressionCodec, StartupProgress prog,
++        Step currentStep) throws IOException {
++      LOG.info("Loading the INode section in parallel with {} sub-sections",
++          sections.size());
++      long expectedInodes = 0;
++      CountDownLatch latch = new CountDownLatch(sections.size());
++      AtomicInteger totalLoaded = new AtomicInteger(0);
++      final CopyOnWriteArrayList<IOException> exceptions =
++          new CopyOnWriteArrayList<>();
++
++      for (int i=0; i < sections.size(); i++) {
++        FileSummary.Section s = sections.get(i);
++        InputStream ins = parent.getInputStreamForSection(s, compressionCodec);
++        if (i == 0) {
++          // The first inode section has a header which must be processed first
++          expectedInodes = loadINodeSectionHeader(ins, prog, currentStep);
+-        counter.increment();
++        service.submit(() -> {
++          try {
++            totalLoaded.addAndGet(loadINodesInSection(ins, null));
++            prog.setCount(Phase.LOADING_FSIMAGE, currentStep,
++                totalLoaded.get());
++          } catch (Exception e) {
++            LOG.error("An exception occurred loading INodes in parallel", e);
++            exceptions.add(new IOException(e));
++          } finally {
++            latch.countDown();
++            try {
++              ins.close();
++            } catch (IOException ioe) {
++              LOG.warn("Failed to close the input stream, ignoring", ioe);
++            }
++          }
++        });
++      try {
++        latch.await();
++      } catch (InterruptedException e) {
++        LOG.info("Interrupted waiting for countdown latch");
++      }
++      if (exceptions.size() != 0) {
++        LOG.error("{} exceptions occurred loading INodes", exceptions.size());
++        throw exceptions.get(0);
++      }
++      if (totalLoaded.get() != expectedInodes) {
++        throw new IOException("Expected to load "+expectedInodes+" in " +
++            "parallel, but loaded "+totalLoaded.get()+". The image may " +
++            "be corrupt.");
++      }
++      LOG.info("Completed loading all INode sections. Loaded {} inodes.",
++          totalLoaded.get());
+-    private void addToParent(INodeDirectory parent, INode child) {
+-      if (parent == dir.rootDir && FSDirectory.isReservedName(child)) {
++    private boolean addToParent(INodeDirectory parentDir, INode child) {
++      if (parentDir == dir.rootDir && FSDirectory.isReservedName(child)) {
+-      if (!parent.addChildAtLoading(child)) {
+-        return;
++      if (!parentDir.addChildAtLoading(child)) {
++        return false;
+-      dir.cacheName(child);
+-
+-      if (child.isFile()) {
+-        updateBlocksMap(child.asFile(), fsn.getBlockManager());
+-      }
++      return true;
++      int outputInodes = 0;
++            outputInodes++;
++        if (outputInodes >= parent.getInodesPerSubSection()) {
++          outputInodes = 0;
++          parent.commitSubSection(summary,
++              FSImageFormatProtobuf.SectionName.INODE_DIR_SUB);
++        }
+-      parent.commitSection(summary,
+-          FSImageFormatProtobuf.SectionName.INODE_DIR);
++      parent.commitSectionAndSubSection(summary,
++          FSImageFormatProtobuf.SectionName.INODE_DIR,
++          FSImageFormatProtobuf.SectionName.INODE_DIR_SUB);
++        if (i % parent.getInodesPerSubSection() == 0) {
++          parent.commitSubSection(summary,
++              FSImageFormatProtobuf.SectionName.INODE_SUB);
++        }
+-      parent.commitSection(summary, FSImageFormatProtobuf.SectionName.INODE);
++      parent.commitSectionAndSubSection(summary,
++          FSImageFormatProtobuf.SectionName.INODE,
++          FSImageFormatProtobuf.SectionName.INODE_SUB);
+
+INS26 INS26 INS26 INS26 INS26 INS40 INS40 INS40 INS40 INS40 INS23 INS83 INS83 INS83 INS39 INS59 INS23 INS23 INS31 INS31 INS31 INS31 INS31 INS42 INS34 INS83 INS43 INS59 INS83 INS43 INS59 INS39 INS42 INS44 INS44 INS44 INS43 INS8 INS83 INS39 INS42 INS44 INS8 INS39 INS42 INS44 INS44 INS44 INS43 INS8 INS83 INS39 INS42 INS44 INS44 INS43 INS8 INS83 UPD39 UPD42 INS39 INS42 INS44 INS44 INS44 INS44 INS44 INS43 INS8 UPD39 INS42 INS42 INS42 INS42 INS21 INS21 INS43 INS42 INS74 INS42 INS43 INS42 INS42 INS21 INS60 INS60 INS70 INS54 INS25 INS21 INS60 INS21 INS74 INS42 INS54 INS54 INS43 INS42 INS43 INS42 INS43 INS42 INS42 INS21 MOV60 INS60 INS21 INS43 INS42 INS43 INS42 INS42 INS60 INS61 INS41 INS41 INS43 INS42 INS74 INS42 INS43 INS42 INS43 INS42 INS43 INS42 INS42 INS21 INS60 INS60 INS60 INS60 INS24 INS54 INS25 INS25 INS21 UPD42 INS41 INS60 INS7 INS7 INS42 INS43 INS43 INS42 INS32 INS43 INS59 INS83 INS74 INS59 INS44 INS42 INS8 INS8 INS12 INS27 INS8 INS32 INS74 INS59 INS32 INS43 INS43 INS8 INS8 INS8 INS8 INS42 INS42 INS42 INS32 INS39 INS59 INS32 INS42 INS42 INS39 INS59 INS9 MOV8 INS42 INS42 INS42 INS43 INS43 INS42 INS42 INS42 INS32 INS39 INS59 INS43 INS59 INS43 INS59 INS83 INS74 INS59 MOV58 INS27 INS37 INS8 INS8 INS12 INS27 INS8 INS27 INS8 INS32 INS9 INS39 INS59 INS42 INS14 INS42 INS14 INS42 INS40 INS42 INS42 INS27 INS32 INS42 INS42 INS14 INS43 INS43 INS42 INS14 INS43 INS42 INS21 INS21 INS44 INS8 INS32 INS34 INS21 INS53 INS42 INS42 INS45 INS43 INS43 INS42 INS14 INS42 INS42 INS42 INS42 INS21 INS70 INS21 INS21 INS70 INS21 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS45 INS42 INS42 INS34 INS25 INS21 INS25 INS42 INS40 INS42 INS42 INS45 INS32 INS42 INS34 INS42 INS42 INS14 INS42 INS42 INS14 INS43 INS43 INS42 INS14 INS42 INS32 INS42 INS60 INS60 INS25 INS21 INS21 INS44 INS8 INS32 INS34 INS21 INS53 INS32 INS42 INS53 INS42 INS42 INS45 INS32 INS42 INS34 INS25 UPD42 INS40 INS25 UPD42 INS40 INS43 INS9 INS43 INS9 INS45 INS45 INS42 INS42 INS43 INS32 INS42 INS42 INS74 INS40 INS32 INS32 INS43 INS42 INS21 INS53 INS42 INS42 INS32 INS32 INS42 INS42 INS74 INS8 INS8 INS32 INS44 INS42 INS8 INS32 INS32 INS44 INS42 INS8 INS32 INS42 INS42 INS42 INS27 INS8 INS8 INS37 INS27 INS8 INS42 INS42 INS43 INS32 INS43 INS34 INS42 INS42 INS74 INS42 INS42 INS43 INS59 INS43 INS59 INS27 INS8 INS32 INS32 INS43 INS42 INS21 INS42 INS42 INS32 INS32 INS42 INS42 INS14 INS42 INS42 UPD42 UPD42 INS9 INS27 INS8 INS27 INS8 INS42 INS42 INS42 INS42 INS42 INS43 INS42 INS42 INS86 INS42 INS42 INS42 INS32 INS14 INS42 INS42 INS45 INS32 INS42 INS42 INS34 INS43 MOV60 INS25 MOV60 INS25 INS42 INS42 INS43 INS42 INS21 INS42 INS42 INS42 INS42 INS43 INS42 INS21 INS42 INS42 INS42 INS33 INS10 INS51 INS51 INS42 INS42 INS33 MOV21 INS42 INS42 INS42 INS42 INS43 INS40 INS42 INS32 INS42 INS42 INS32 INS42 INS34 INS21 INS42 INS42 INS86 INS42 INS42 INS42 INS32 INS42 INS42 INS45 INS32 INS42 INS42 INS34 INS43 INS27 INS42 INS32 INS21 INS21 INS27 INS34 INS21 INS42 INS8 INS42 INS42 INS45 INS42 INS43 INS42 INS42 INS42 INS42 MOV32 INS8 INS8 MOV32 INS8 INS8 INS42 INS32 INS42 INS32 INS52 MOV8 INS52 INS8 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS7 INS8 INS42 INS42 INS45 INS42 INS42 INS42 INS45 INS42 INS45 INS45 INS32 INS45 INS45 INS42 INS42 INS7 INS32 INS42 INS32 INS32 INS60 INS54 INS42 INS25 INS25 INS21 INS25 INS25 INS21 INS42 INS42 INS42 INS42 INS32 MOV32 MOV21 INS42 INS32 INS54 INS42 INS42 INS21 INS42 INS34 INS42 INS42 INS42 INS40 INS42 INS42 INS42 INS42 INS42 INS40 INS43 INS59 INS8 INS12 INS8 MOV32 INS8 INS27 INS8 INS32 INS32 INS8 INS27 INS8 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS8 INS12 INS8 INS37 INS42 INS42 INS33 INS21 INS21 INS44 INS8 INS21 INS54 MOV21 INS32 INS42 INS21 INS21 INS42 INS42 INS45 INS32 INS32 INS42 INS42 MOV21 INS32 INS42 INS21 INS21 INS42 INS42 INS45 INS32 INS32 INS21 INS21 INS44 INS8 INS21 INS54 INS42 INS7 INS32 INS43 INS42 INS21 INS21 INS32 INS8 INS12 INS32 INS42 INS42 INS32 INS32 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS32 INS32 INS42 INS42 INS42 INS42 INS32 INS32 INS43 INS42 INS21 INS21 INS32 INS8 INS12 INS42 INS32 INS42 INS42 INS42 INS32 INS32 INS42 INS42 INS25 INS44 INS8 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS40 INS42 INS32 INS42 INS32 INS32 INS42 INS42 INS21 INS44 INS8 INS42 INS42 INS42 INS42 INS42 INS42 INS27 INS42 INS42 INS42 INS14 INS27 INS8 INS43 INS42 INS21 INS42 INS42 INS33 INS42 INS42 INS42 INS42 INS45 INS42 INS42 INS42 INS14 INS32 INS43 INS42 INS21 INS45 INS45 INS43 INS42 INS42 INS33 INS21 INS42 INS32 INS43 INS42 INS42 INS42 INS42 INS32 INS42 INS32 INS42 INS42 INS45 INS42 INS42 INS42 INS42 INS45 INS42 INS42 INS42 DEL8 DEL8 DEL42 DEL42 DEL27 DEL42 DEL38 DEL24 DEL42 DEL42 DEL42 DEL32 DEL21 DEL42 DEL42 DEL42 DEL32 DEL32 DEL21 DEL8 DEL25

@@ -1,0 +1,201 @@
+HADOOP-11552. Allow handoff on the server side for RPC requests. Contributed by Siddharth Seth
+
+-  void updateMetrics(String name, int queueTime, int processingTime) {
++  void updateMetrics(String name, int queueTime, int processingTime,
++                     boolean deferredCall) {
+-    rpcMetrics.addRpcProcessingTime(processingTime);
+-    rpcDetailedMetrics.addProcessingTime(name, processingTime);
+-    callQueue.addResponseTime(name, getPriorityLevel(), queueTime,
+-        processingTime);
+-
+-    if (isLogSlowRPC()) {
+-      logSlowRpcCalls(name, processingTime);
++    if (!deferredCall) {
++      rpcMetrics.addRpcProcessingTime(processingTime);
++      rpcDetailedMetrics.addProcessingTime(name, processingTime);
++      callQueue.addResponseTime(name, getPriorityLevel(), queueTime,
++          processingTime);
++      if (isLogSlowRPC()) {
++        logSlowRpcCalls(name, processingTime);
++      }
++  void updateDeferredMetrics(String name, long processingTime) {
++    rpcMetrics.addDeferredRpcProcessingTime(processingTime);
++    rpcDetailedMetrics.addDeferredProcessingTime(name, processingTime);
++  }
++
++    private boolean deferredResponse = false;
++
++    @InterfaceStability.Unstable
++    public void deferResponse() {
++      this.deferredResponse = true;
++    }
++
++    @InterfaceStability.Unstable
++    public boolean isResponseDeferred() {
++      return this.deferredResponse;
++    }
++
++    public void setDeferredResponse(Writable response) {
++    }
++
++    public void setDeferredError(Throwable t) {
++    }
+-      String errorClass = null;
+-      String error = null;
+-      RpcStatusProto returnStatus = RpcStatusProto.SUCCESS;
+-      RpcErrorCodeProto detailedErr = null;
++      ResponseParams responseParams = new ResponseParams();
+-        if (e instanceof UndeclaredThrowableException) {
+-          e = e.getCause();
+-        }
+-        logException(Server.LOG, e, this);
+-        if (e instanceof RpcServerException) {
+-          RpcServerException rse = ((RpcServerException)e);
+-          returnStatus = rse.getRpcStatusProto();
+-          detailedErr = rse.getRpcErrorCodeProto();
+-        } else {
+-          returnStatus = RpcStatusProto.ERROR;
+-          detailedErr = RpcErrorCodeProto.ERROR_APPLICATION;
+-        }
+-        errorClass = e.getClass().getName();
+-        error = StringUtils.stringifyException(e);
+-        // Remove redundant error class name from the beginning of the
+-        // stack trace
+-        String exceptionHdr = errorClass + ": ";
+-        if (error.startsWith(exceptionHdr)) {
+-          error = error.substring(exceptionHdr.length());
++        populateResponseParamsOnError(e, responseParams);
++      }
++      if (!isResponseDeferred()) {
++        setupResponse(this, responseParams.returnStatus,
++            responseParams.detailedErr,
++            value, responseParams.errorClass, responseParams.error);
++        sendResponse();
++      } else {
++        if (LOG.isDebugEnabled()) {
++          LOG.debug("Deferring response for callId: " + this.callId);
+-      setupResponse(this, returnStatus, detailedErr,
+-          value, errorClass, error);
+-      sendResponse();
++    /**
++     * @param t              the {@link java.lang.Throwable} to use to set
++     *                       errorInfo
++     * @param responseParams the {@link ResponseParams} instance to populate
++     */
++    private void populateResponseParamsOnError(Throwable t,
++                                               ResponseParams responseParams) {
++      if (t instanceof UndeclaredThrowableException) {
++        t = t.getCause();
++      }
++      logException(Server.LOG, t, this);
++      if (t instanceof RpcServerException) {
++        RpcServerException rse = ((RpcServerException) t);
++        responseParams.returnStatus = rse.getRpcStatusProto();
++        responseParams.detailedErr = rse.getRpcErrorCodeProto();
++      } else {
++        responseParams.returnStatus = RpcStatusProto.ERROR;
++        responseParams.detailedErr = RpcErrorCodeProto.ERROR_APPLICATION;
++      }
++      responseParams.errorClass = t.getClass().getName();
++      responseParams.error = StringUtils.stringifyException(t);
++      // Remove redundant error class name from the beginning of the
++      // stack trace
++      String exceptionHdr = responseParams.errorClass + ": ";
++      if (responseParams.error.startsWith(exceptionHdr)) {
++        responseParams.error =
++            responseParams.error.substring(exceptionHdr.length());
++      }
++    }
++
++    /**
++     * Send a deferred response, ignoring errors.
++     */
++    private void sendDeferedResponse() {
++      try {
++        connection.sendResponse(this);
++      } catch (Exception e) {
++        // For synchronous calls, application code is done once it's returned
++        // from a method. It does not expect to receive an error.
++        // This is equivalent to what happens in synchronous calls when the
++        // Responder is not able to send out the response.
++        LOG.error("Failed to send deferred response. ThreadName=" + Thread
++            .currentThread().getName() + ", CallId="
++            + callId + ", hostname=" + getHostAddress());
++      }
++    }
++
++    @Override
++    public void setDeferredResponse(Writable response) {
++      if (this.connection.getServer().running) {
++        try {
++          setupResponse(this, RpcStatusProto.SUCCESS, null, response,
++              null, null);
++        } catch (IOException e) {
++          // For synchronous calls, application code is done once it has
++          // returned from a method. It does not expect to receive an error.
++          // This is equivalent to what happens in synchronous calls when the
++          // response cannot be sent.
++          LOG.error(
++              "Failed to setup deferred successful response. ThreadName=" +
++                  Thread.currentThread().getName() + ", Call=" + this);
++          return;
++        }
++        sendDeferedResponse();
++      }
++    }
++
++    @Override
++    public void setDeferredError(Throwable t) {
++      if (this.connection.getServer().running) {
++        if (t == null) {
++          t = new IOException(
++              "User code indicated an error without an exception");
++        }
++        try {
++          ResponseParams responseParams = new ResponseParams();
++          populateResponseParamsOnError(t, responseParams);
++          setupResponse(this, responseParams.returnStatus,
++              responseParams.detailedErr,
++              null, responseParams.errorClass, responseParams.error);
++        } catch (IOException e) {
++          // For synchronous calls, application code is done once it has
++          // returned from a method. It does not expect to receive an error.
++          // This is equivalent to what happens in synchronous calls when the
++          // response cannot be sent.
++          LOG.error(
++              "Failed to setup deferred error response. ThreadName=" +
++                  Thread.currentThread().getName() + ", Call=" + this);
++        }
++        sendDeferedResponse();
++      }
++    }
++
++    /**
++     * Holds response parameters. Defaults set to work for successful
++     * invocations
++     */
++    private class ResponseParams {
++      String errorClass = null;
++      String error = null;
++      RpcErrorCodeProto detailedErr = null;
++      RpcStatusProto returnStatus = RpcStatusProto.SUCCESS;
++    }
++
++    public Server getServer() {
++      return Server.this;
++    }
++
+-     * @param dis - DataInputStream from which to read the header 
+-     * @param buf - contains the RPC request header and the rpc request
++     * @param bb - contains the RPC request header and the rpc request
+-     * @param dis - stream to request payload
++     * @param buffer - stream to request payload
+-     * @param dis - stream to request payload
++     * @param buffer - stream to request payload
+-     * @param builder - Builder of the protobuf to decode
+-     * @param dis - DataInputStream to read the protobuf
+-  
++
+-   * @param responseBuf buffer to serialize the response into
+
+INS31 INS44 INS39 INS42 INS44 INS44 INS8 INS23 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS55 INS31 INS39 INS42 INS25 INS43 INS42 INS39 INS42 INS21 INS21 INS83 INS39 INS59 INS78 INS83 INS39 INS42 INS8 INS78 INS83 INS39 INS42 INS8 INS83 INS39 INS42 INS44 INS8 INS83 INS39 INS42 INS44 INS8 MOV78 INS83 MOV43 INS42 MOV43 INS8 INS29 INS83 INS39 INS42 INS44 INS44 MOV8 INS29 INS83 INS39 INS42 INS8 INS78 INS83 INS39 INS42 INS44 INS8 INS78 INS83 INS39 INS42 INS44 INS8 INS29 INS83 INS42 INS23 INS23 INS23 INS23 INS83 INS43 INS42 INS8 INS38 INS8 INS42 INS32 INS32 INS42 INS9 INS40 INS21 INS40 INS41 INS43 INS42 INS43 INS42 MOV25 MOV60 INS60 INS54 INS25 MOV41 INS65 INS65 INS43 INS42 INS43 INS42 INS65 INS54 INS42 INS43 INS42 INS25 INS42 INS43 INS42 INS25 INS65 MOV43 MOV59 MOV43 MOV59 MOV43 MOV59 MOV43 MOV59 INS42 INS41 INS42 MOV21 MOV21 MOV21 MOV25 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS7 INS22 INS42 INS42 INS43 INS59 MOV8 INS12 INS38 INS8 INS8 INS42 INS66 INS65 INS66 INS66 INS42 INS66 INS65 INS66 INS42 INS42 INS66 INS8 INS12 INS42 INS22 INS8 INS42 INS22 INS8 INS66 INS66 INS52 UPD42 UPD42 UPD42 INS22 INS9 INS52 INS42 INS42 INS42 INS14 MOV44 INS8 INS32 INS21 MOV21 INS25 INS40 INS42 UPD42 UPD42 UPD42 INS40 INS40 INS40 INS21 INS44 INS8 INS32 INS42 INS54 INS21 INS32 INS42 INS25 INS54 INS21 INS42 INS52 INS42 INS43 INS21 INS42 INS32 INS32 INS8 MOV43 UPD42 INS40 INS32 INS43 INS42 INS21 INS22 INS42 INS8 INS12 INS32 INS22 INS42 INS27 INS8 INS8 INS12 INS32 INS42 INS32 INS42 INS52 INS40 INS40 INS42 INS40 INS40 INS42 INS42 INS21 UPD42 INS40 INS40 INS40 INS40 UPD42 INS40 INS42 INS42 INS52 INS42 INS32 INS52 INS42 INS21 INS44 INS8 INS42 INS52 INS42 INS42 INS33 INS21 INS60 INS21 INS21 INS44 INS8 INS42 INS42 INS42 INS42 INS32 UPD42 INS40 INS42 INS42 INS27 INS32 INS43 INS42 INS21 INS41 INS7 INS43 INS59 INS32 INS32 INS43 INS42 INS21 INS42 INS42 INS27 MOV43 UPD42 INS45 INS32 INS45 INS42 INS45 INS32 INS42 INS52 INS40 INS33 INS42 INS33 INS33 INS42 INS32 INS42 INS14 INS42 INS42 INS14 INS42 INS42 INS42 INS42 INS52 INS40 INS40 INS33 INS40 INS40 INS42 INS32 INS45 INS22 INS32 INS42 INS42 INS42 INS42 INS27 INS43 INS45 INS43 INS42 INS42 INS27 INS52 INS42 INS42 INS42 INS45 INS32 INS45 INS52 INS42 INS42 INS45 INS32 INS45 INS52 INS32 INS42 INS32 INS42 INS42 INS42 INS42 INS42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL83 DEL42 DEL60 DEL60 DEL60 DEL60 DEL12 DEL54 DEL42 DEL52 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL21 DEL8 DEL42 DEL66 DEL65 DEL42 DEL66 DEL65 DEL42 DEL66 DEL65 DEL42 DEL66 DEL65

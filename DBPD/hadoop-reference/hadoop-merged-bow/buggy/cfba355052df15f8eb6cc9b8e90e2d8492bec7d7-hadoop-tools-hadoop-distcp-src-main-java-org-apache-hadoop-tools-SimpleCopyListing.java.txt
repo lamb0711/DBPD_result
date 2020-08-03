@@ -1,0 +1,173 @@
+HADOOP-11827. Speed-up distcp buildListing() using threadpool (Zoran Dimitrijevic via raviprak)
+
++import org.apache.hadoop.tools.util.ProducerConsumer;
++import org.apache.hadoop.tools.util.WorkReport;
++import org.apache.hadoop.tools.util.WorkRequest;
++import org.apache.hadoop.tools.util.WorkRequestProcessor;
+-import java.util.Stack;
++import java.util.ArrayList;
++  private long totalDirs = 0;
++  private int numListstatusThreads = 1;
++  private final int maxRetries = 3;
++    numListstatusThreads = getConf().getInt(
++        DistCpConstants.CONF_LABEL_LISTSTATUS_THREADS,
++        DistCpConstants.DEFAULT_LISTSTATUS_THREADS);
++  }
++
++  @VisibleForTesting
++  protected SimpleCopyListing(Configuration configuration, Credentials credentials,
++                              int numListstatusThreads) {
++    super(configuration, credentials);
++    this.numListstatusThreads = numListstatusThreads;
++    if (options.getNumListstatusThreads() > 0) {
++      numListstatusThreads = options.getNumListstatusThreads();
++    }
++
++          ArrayList<FileStatus> sourceDirs = new ArrayList<FileStatus>();
+-                LOG.debug("Traversing source dir: " + sourceStatus.getPath());
++                LOG.debug("Adding source dir for traverse: " + sourceStatus.getPath());
+-              traverseDirectory(fileListWriter, sourceFS, sourceStatus,
+-                                sourcePathRoot, options);
++              sourceDirs.add(sourceStatus);
++          traverseDirectory(fileListWriter, sourceFS, sourceDirs,
++                            sourcePathRoot, options);
++      printStats();
++      LOG.info("Build file listing completed.");
+-  private static FileStatus[] getChildren(FileSystem fileSystem,
+-                                         FileStatus parent) throws IOException {
+-    return fileSystem.listStatus(parent.getPath());
++  /*
++   *  Private class to implement WorkRequestProcessor interface. It processes
++   *  each directory (represented by FileStatus item) and returns a list of all
++   *  file-system objects in that directory (files and directories). In case of
++   *  retriable exceptions it increments retry counter and returns the same
++   *  directory for later retry.
++   */
++  private static class FileStatusProcessor
++      implements WorkRequestProcessor<FileStatus, FileStatus[]> {
++    private FileSystem fileSystem;
++
++    public FileStatusProcessor(FileSystem fileSystem) {
++      this.fileSystem = fileSystem;
++    }
++
++    /*
++     *  Processor for FileSystem.listStatus().
++     *
++     *  @param workRequest  Input work item that contains FileStatus item which
++     *                      is a parent directory we want to list.
++     *  @return Outputs WorkReport<FileStatus[]> with a list of objects in the
++     *          directory (array of objects, empty if parent directory is
++     *          empty). In case of intermittent exception we increment retry
++     *          counter and return the list containing the parent directory).
++     */
++    public WorkReport<FileStatus[]> processItem(
++        WorkRequest<FileStatus> workRequest) {
++      FileStatus parent = workRequest.getItem();
++      int retry = workRequest.getRetry();
++      WorkReport<FileStatus[]> result = null;
++      try {
++        if (retry > 0) {
++          int sleepSeconds = 2;
++          for (int i = 1; i < retry; i++) {
++            sleepSeconds *= 2;
++          }
++          try {
++            Thread.sleep(1000 * sleepSeconds);
++          } catch (InterruptedException ie) {
++            LOG.debug("Interrupted while sleeping in exponential backoff.");
++          }
++        }
++        result = new WorkReport<FileStatus[]>(
++            fileSystem.listStatus(parent.getPath()), 0, true);
++      } catch (FileNotFoundException fnf) {
++        LOG.error("FileNotFoundException exception in listStatus: " +
++                  fnf.getMessage());
++        result = new WorkReport<FileStatus[]>(new FileStatus[0], 0, true, fnf);
++      } catch (Exception e) {
++        LOG.error("Exception in listStatus. Will send for retry.");
++        FileStatus[] parentList = new FileStatus[1];
++        parentList[0] = parent;
++        result = new WorkReport<FileStatus[]>(parentList, retry + 1, false, e);
++      }
++      return result;
++    }
++  }
++
++  private void printStats() {
++    LOG.info("Paths (files+dirs) cnt = " + totalPaths +
++             "; dirCnt = " + totalDirs);
++  }
++
++  private void maybePrintStats() {
++    if (totalPaths % 100000 == 0) {
++      printStats();
++    }
+-                                 FileStatus sourceStatus,
++                                 ArrayList<FileStatus> sourceDirs,
+-    Stack<FileStatus> pathStack = new Stack<FileStatus>();
+-    pathStack.push(sourceStatus);
+-    while (!pathStack.isEmpty()) {
+-      for (FileStatus child: getChildren(sourceFS, pathStack.pop())) {
+-        if (LOG.isDebugEnabled()) {
+-          LOG.debug("Recording source-path: " + child.getPath() + " for copy.");
+-        }
+-        CopyListingFileStatus childCopyListingStatus =
+-          DistCpUtils.toCopyListingFileStatus(sourceFS, child,
+-            preserveAcls && child.isDirectory(),
+-            preserveXAttrs && child.isDirectory(),
+-            preserveRawXattrs && child.isDirectory());
+-        writeToFileListing(fileListWriter, childCopyListingStatus,
+-             sourcePathRoot, options);
+-        if (child.isDirectory()) {
++    assert numListstatusThreads > 0;
++    LOG.debug("Starting thread pool of " + numListstatusThreads +
++              " listStatus workers.");
++    ProducerConsumer<FileStatus, FileStatus[]> workers =
++        new ProducerConsumer<FileStatus, FileStatus[]>(numListstatusThreads);
++    for (int i = 0; i < numListstatusThreads; i++) {
++      workers.addWorker(
++          new FileStatusProcessor(sourcePathRoot.getFileSystem(getConf())));
++    }
++
++    for (FileStatus status : sourceDirs) {
++      workers.put(new WorkRequest<FileStatus>(status, 0));
++      maybePrintStats();
++    }
++
++    while (workers.hasWork()) {
++      try {
++        WorkReport<FileStatus[]> workResult = workers.take();
++        int retry = workResult.getRetry();
++        for (FileStatus child: workResult.getItem()) {
+-            LOG.debug("Traversing into source dir: " + child.getPath());
++            LOG.debug("Recording source-path: " + child.getPath() + " for copy.");
+-          pathStack.push(child);
++          if (retry == 0) {
++            CopyListingFileStatus childCopyListingStatus =
++              DistCpUtils.toCopyListingFileStatus(sourceFS, child,
++                preserveAcls && child.isDirectory(),
++                preserveXAttrs && child.isDirectory(),
++                preserveRawXattrs && child.isDirectory());
++            writeToFileListing(fileListWriter, childCopyListingStatus,
++                 sourcePathRoot, options);
++          }
++          if (retry < maxRetries) {
++            if (child.isDirectory()) {
++              if (LOG.isDebugEnabled()) {
++                LOG.debug("Traversing into source dir: " + child.getPath());
++              }
++              workers.put(new WorkRequest<FileStatus>(child, retry));
++              maybePrintStats();
++            }
++          } else {
++            LOG.error("Giving up on " + child.getPath() +
++                      " after " + retry + " retries.");
++          }
++      } catch (InterruptedException ie) {
++        LOG.error("Could not get item from childQueue. Retrying...");
++    workers.shutdown();
++    } else {
++      totalDirs++;
+
+INS26 INS26 INS26 INS26 INS40 INS40 INS40 INS40 UPD40 INS23 INS23 INS23 INS31 INS55 INS31 INS31 INS83 INS39 INS59 INS83 INS39 INS59 INS83 INS83 INS39 INS59 INS78 INS83 INS42 INS44 INS44 INS44 INS8 INS83 INS83 INS42 INS74 INS23 INS31 INS31 INS83 INS39 INS42 INS8 INS83 INS39 INS42 INS8 INS42 INS34 INS42 INS34 INS42 INS34 INS21 INS42 INS43 INS42 INS43 INS42 INS39 INS42 INS46 INS21 INS25 INS43 MOV43 MOV5 INS83 INS43 INS59 INS83 INS42 MOV44 INS8 INS83 INS74 INS42 INS44 INS8 INS21 INS25 INS74 UPD42 INS6 INS21 INS24 INS70 INS21 INS7 INS42 INS42 INS42 INS42 INS7 INS27 INS8 INS42 INS42 INS42 INS21 INS43 INS5 UPD74 MOV74 INS42 INS60 INS60 INS60 INS54 MOV41 INS32 INS27 INS8 INS43 INS43 INS27 INS32 INS74 INS58 INS27 INS37 INS8 INS44 INS42 INS8 INS32 INS8 INS32 INS8 INS42 INS32 INS22 INS42 INS32 INS34 INS21 INS21 INS21 INS7 INS42 INS43 INS85 UPD43 MOV43 INS59 INS39 INS59 INS74 INS59 INS8 INS12 INS12 INS42 INS42 INS42 INS27 INS27 INS34 INS21 INS42 MOV42 INS42 INS34 INS42 INS42 INS27 INS43 INS43 INS5 UPD42 INS39 INS59 INS42 INS42 INS42 INS21 INS43 INS42 MOV21 INS21 UPD42 MOV42 UPD42 MOV42 INS54 INS42 INS42 INS21 INS32 INS42 INS40 INS40 INS52 INS42 INS42 INS42 INS7 INS32 INS32 INS22 INS42 INS42 UPD42 INS42 INS32 INS42 INS32 INS43 INS5 INS42 INS33 INS25 INS21 INS44 INS8 INS44 INS8 INS45 INS42 INS45 INS42 INS42 INS34 INS32 INS45 INS42 INS45 INS42 INS42 INS43 INS85 UPD74 INS42 INS42 INS34 INS32 INS42 INS32 MOV8 INS12 INS37 INS42 INS42 INS32 INS42 INS42 INS42 INS45 INS52 INS42 INS42 INS42 INS42 INS42 INS42 INS43 INS85 INS27 INS8 INS7 INS43 INS42 INS21 INS21 INS43 INS42 INS21 INS60 INS21 INS21 INS42 INS42 INS43 UPD43 INS5 INS42 INS42 INS14 UPD42 UPD42 INS14 INS42 INS60 INS60 INS44 INS8 INS42 INS42 INS42 INS42 INS42 INS34 INS60 INS24 INS54 INS42 INS14 INS42 INS32 INS7 UPD42 MOV42 INS32 INS5 INS59 INS7 INS7 INS42 UPD42 INS43 INS85 INS43 INS32 INS74 INS42 INS34 INS74 INS59 INS39 INS59 INS32 INS43 INS42 INS21 INS60 INS21 INS39 INS59 INS58 INS27 INS37 INS8 INS8 INS12 INS74 MOV32 INS34 INS9 INS42 INS42 INS27 INS42 INS14 INS42 INS42 INS45 INS43 INS85 INS42 INS3 INS2 INS42 INS42 INS14 INS42 INS42 INS42 INS42 INS32 INS43 INS43 INS43 INS5 INS42 INS32 INS42 INS32 UPD42 MOV42 UPD42 MOV42 INS25 INS25 INS42 INS32 INS74 INS59 INS32 INS42 INS34 INS39 INS59 INS42 INS42 INS42 INS21 INS21 INS44 INS8 INS43 INS5 INS45 INS32 INS74 INS3 INS34 INS9 INS42 INS42 INS5 INS34 INS42 INS34 INS74 INS42 INS27 INS9 INS42 INS42 INS42 INS42 INS42 INS43 INS85 INS42 INS42 INS42 INS42 INS27 INS8 INS27 INS8 INS8 INS42 INS42 INS45 INS43 INS43 INS42 INS14 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS34 INS7 INS32 INS43 INS42 INS21 INS42 INS43 INS85 INS42 INS42 INS43 INS5 INS5 INS34 INS43 INS85 INS43 INS5 INS42 INS34 INS42 INS42 INS34 MOV60 MOV21 INS42 INS42 MOV25 INS21 INS42 INS42 INS74 INS42 INS34 INS42 INS42 INS27 INS42 INS32 INS42 INS42 INS43 INS85 INS43 INS85 INS42 INS42 INS43 INS85 INS32 INS43 INS43 INS34 INS42 INS42 INS42 INS45 INS42 INS42 INS42 INS21 INS42 INS42 INS27 INS42 INS42 INS32 INS45 INS32 INS45 INS42 INS45 UPD42 UPD42 UPD42 UPD42 INS14 INS42 INS42 INS42 INS74 INS42 INS42 INS43 INS43 UPD45 INS42 INS42 DEL42 DEL42 DEL42 DEL83 DEL83 DEL42 DEL42 DEL44 DEL43 DEL8 DEL31 DEL43 DEL42 DEL42 DEL42 DEL32 DEL32 DEL42 DEL32 DEL38

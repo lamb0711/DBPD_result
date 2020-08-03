@@ -1,0 +1,99 @@
+svn merge -c -1430507 . for reverting HDFS-4353. Encapsulate connections to peers in Peer and PeerServer classes
+
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/trunk@1430662 13f79535-47bb-0310-9956-ffa450edef68
+
+-import org.apache.commons.io.IOUtils;
+-import org.apache.hadoop.hdfs.net.EncryptedPeer;
+-import org.apache.hadoop.hdfs.net.Peer;
+-import org.apache.hadoop.hdfs.net.TcpPeerServer;
++import org.apache.hadoop.hdfs.SocketCache.SocketAndStreams;
+-import org.apache.hadoop.hdfs.security.token.block.DataEncryptionKey;
+-  private final PeerCache peerCache;
++  private final SocketCache socketCache;
+-    this.peerCache = dfsClient.peerCache;
++    this.socketCache = dfsClient.socketCache;
+-      blockReader.close(peerCache);
++      closeBlockReader(blockReader);
+-      blockReader.close(peerCache);
++      closeBlockReader(blockReader);
+-          reader.close(peerCache);
++          closeBlockReader(reader);
+-  private Peer newPeer(InetSocketAddress addr) throws IOException {
+-    Peer peer = null;
+-    boolean success = false;
+-    Socket sock = null;
+-    try {
+-      sock = dfsClient.socketFactory.createSocket();
+-      NetUtils.connect(sock, addr,
+-        dfsClient.getRandomLocalInterfaceAddr(),
+-        dfsClient.getConf().socketTimeout);
+-      peer = TcpPeerServer.peerFromSocket(sock);
+-      
+-      // Add encryption if configured.
+-      DataEncryptionKey key = dfsClient.getDataEncryptionKey();
+-      if (key != null) {
+-        peer = new EncryptedPeer(peer, key);
+-      }
+-      success = true;
+-      return peer;
+-    } finally {
+-      if (!success) {
+-        IOUtils.closeQuietly(peer);
+-        IOUtils.closeQuietly(sock);
+-      }
++  /**
++   * Close the given BlockReader and cache its socket.
++   */
++  private void closeBlockReader(BlockReader reader) throws IOException {
++    if (reader.hasSentStatusCode()) {
++      IOStreamPair ioStreams = reader.getStreams();
++      Socket oldSock = reader.takeSocket();
++      socketCache.put(oldSock, ioStreams);
++    reader.close();
+-      Peer peer = null;
++      SocketAndStreams sockAndStreams = null;
+-        peer = peerCache.get(chosenNode);
++        sockAndStreams = socketCache.get(dnAddr);
+-      if (peer == null) {
+-        peer = newPeer(dnAddr);
++      Socket sock;
++      if (sockAndStreams == null) {
++
++        sock = dfsClient.socketFactory.createSocket();
++        
++        // TCP_NODELAY is crucial here because of bad interactions between
++        // Nagle's Algorithm and Delayed ACKs. With connection keepalive
++        // between the client and DN, the conversation looks like:
++        //   1. Client -> DN: Read block X
++        //   2. DN -> Client: data for block X
++        //   3. Client -> DN: Status OK (successful read)
++        //   4. Client -> DN: Read block Y
++        // The fact that step #3 and #4 are both in the client->DN direction
++        // triggers Nagling. If the DN is using delayed ACKs, this results
++        // in a delay of 40ms or more.
++        //
++        // TCP_NODELAY disables nagling and thus avoids this performance
++        // disaster.
++        sock.setTcpNoDelay(true);
++
++        NetUtils.connect(sock, dnAddr,
++            dfsClient.getRandomLocalInterfaceAddr(),
++            dfsClient.getConf().socketTimeout);
++        sock.setSoTimeout(dfsClient.getConf().socketTimeout);
++      } else {
++        sock = sockAndStreams.sock;
+-                setClientName(clientName).setDatanodeID(chosenNode).
+-                setPeer(peer));
++                setClientName(clientName).
++                setEncryptionKey(dfsClient.getDataEncryptionKey()).
++                setIoStreamPair(sockAndStreams == null ? null : sockAndStreams.ioStreams).
++                setSocket(sock));
+-        DFSClient.LOG.debug("Error making BlockReader. Closing stale " + peer, ex);
+-        IOUtils.closeQuietly(peer);
++        DFSClient.LOG.debug("Error making BlockReader. Closing stale " + sock, ex);
++        if (sockAndStreams != null) {
++          sockAndStreams.close();
++        } else {
++          sock.close();
++        }

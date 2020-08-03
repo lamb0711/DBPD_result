@@ -1,0 +1,244 @@
+YARN-7095. Federation: routing getNode/getNodes/getMetrics REST invocations transparently to multiple RMs. (Giovanni Matteo Fumarola via Subru).
+
+-import java.util.concurrent.Executors;
++import org.apache.hadoop.util.concurrent.HadoopExecutors;
++import org.apache.hadoop.yarn.webapp.NotFoundException;
++import com.google.common.util.concurrent.ThreadFactoryBuilder;
+-    threadpool = Executors.newCachedThreadPool();
++    threadpool = HadoopExecutors.newCachedThreadPool(new ThreadFactoryBuilder()
++        .setNameFormat("FederationInterceptorREST #%d").build());
++  /**
++   * The Yarn Router will forward to the request to all the SubClusters to find
++   * where the node is running.
++   * <p>
++   * Possible failure:
++   * <p>
++   * Client: identical behavior as {@code RMWebServices}.
++   * <p>
++   * Router: the Client will timeout and resubmit the request.
++   * <p>
++   * ResourceManager: the Router will timeout and the call will fail.
++   * <p>
++   * State Store: the Router will timeout and it will retry depending on the
++   * FederationFacade settings - if the failure happened before the select
++   * operation.
++   */
++  @Override
++  public NodeInfo getNode(String nodeId) {
++    Map<SubClusterId, SubClusterInfo> subClustersActive = null;
++    try {
++      subClustersActive = federationFacade.getSubClusters(true);
++    } catch (YarnException e) {
++      throw new NotFoundException(e.getMessage());
++    }
++
++    if (subClustersActive.isEmpty()) {
++      throw new NotFoundException(
++          FederationPolicyUtils.NO_ACTIVE_SUBCLUSTER_AVAILABLE);
++    }
++
++    // Send the requests in parallel
++
++    ExecutorCompletionService<NodeInfo> compSvc =
++        new ExecutorCompletionService<NodeInfo>(this.threadpool);
++
++    for (final SubClusterInfo info : subClustersActive.values()) {
++      compSvc.submit(new Callable<NodeInfo>() {
++        @Override
++        public NodeInfo call() {
++          DefaultRequestInterceptorREST interceptor =
++              getOrCreateInterceptorForSubCluster(info.getSubClusterId(),
++                  info.getClientRMServiceAddress());
++          try {
++            NodeInfo nodeInfo = interceptor.getNode(nodeId);
++            return nodeInfo;
++          } catch (Exception e) {
++            LOG.error("Subcluster " + info.getSubClusterId()
++                + " failed to return nodeInfo.");
++            return null;
++          }
++        }
++      });
++    }
++
++    // Collect all the responses in parallel
++    NodeInfo nodeInfo = null;
++    for (int i = 0; i < subClustersActive.values().size(); i++) {
++      try {
++        Future<NodeInfo> future = compSvc.take();
++        NodeInfo nodeResponse = future.get();
++
++        // Check if the node was found in this SubCluster
++        if (nodeResponse != null) {
++          // Check if the node was already found in a different SubCluster and
++          // it has an old health report
++          if (nodeInfo == null || nodeInfo.getLastHealthUpdate() < nodeResponse
++              .getLastHealthUpdate()) {
++            nodeInfo = nodeResponse;
++          }
++        }
++      } catch (Throwable e) {
++        LOG.warn("Failed to get node report ", e);
++      }
++    }
++    if (nodeInfo == null) {
++      throw new NotFoundException("nodeId, " + nodeId + ", is not found");
++    }
++    return nodeInfo;
++  }
++
++  /**
++   * The Yarn Router will forward the request to all the Yarn RMs in parallel,
++   * after that it will remove all the duplicated NodeInfo by using the NodeId.
++   * <p>
++   * Possible failure:
++   * <p>
++   * Client: identical behavior as {@code RMWebServices}.
++   * <p>
++   * Router: the Client will timeout and resubmit the request.
++   * <p>
++   * ResourceManager: the Router calls each Yarn RM in parallel by using one
++   * thread for each Yarn RM. In case a Yarn RM fails, a single call will
++   * timeout. However the Router will use the NodesInfo it got, and provides a
++   * partial list to the client.
++   * <p>
++   * State Store: the Router will timeout and it will retry depending on the
++   * FederationFacade settings - if the failure happened before the select
++   * operation.
++   */
++  @Override
++  public NodesInfo getNodes(String states) {
++
++    NodesInfo nodes = new NodesInfo();
++
++    Map<SubClusterId, SubClusterInfo> subClustersActive = null;
++    try {
++      subClustersActive = federationFacade.getSubClusters(true);
++    } catch (YarnException e) {
++      LOG.error(e.getMessage());
++      return new NodesInfo();
++    }
++
++    // Send the requests in parallel
++
++    ExecutorCompletionService<NodesInfo> compSvc =
++        new ExecutorCompletionService<NodesInfo>(this.threadpool);
++
++    for (final SubClusterInfo info : subClustersActive.values()) {
++      compSvc.submit(new Callable<NodesInfo>() {
++        @Override
++        public NodesInfo call() {
++          DefaultRequestInterceptorREST interceptor =
++              getOrCreateInterceptorForSubCluster(info.getSubClusterId(),
++                  info.getClientRMServiceAddress());
++          try {
++            NodesInfo nodesInfo = interceptor.getNodes(states);
++            return nodesInfo;
++          } catch (Exception e) {
++            LOG.error("Subcluster " + info.getSubClusterId()
++                + " failed to return nodesInfo.");
++            return null;
++          }
++        }
++      });
++    }
++
++    // Collect all the responses in parallel
++
++    for (int i = 0; i < subClustersActive.values().size(); i++) {
++      try {
++        Future<NodesInfo> future = compSvc.take();
++        NodesInfo nodesResponse = future.get();
++
++        if (nodesResponse != null) {
++          nodes.addAll(nodesResponse.getNodes());
++        }
++      } catch (Throwable e) {
++        LOG.warn("Failed to get nodes report ", e);
++      }
++    }
++
++    // Delete duplicate from all the node reports got from all the available
++    // Yarn RMs. Nodes can be moved from one subclusters to another. In this
++    // operation they result LOST/RUNNING in the previous SubCluster and
++    // NEW/RUNNING in the new one.
++
++    return RouterWebServiceUtil.deleteDuplicateNodesInfo(nodes.getNodes());
++  }
++
++  @Override
++  public ClusterMetricsInfo getClusterMetricsInfo() {
++    ClusterMetricsInfo metrics = new ClusterMetricsInfo();
++
++    Map<SubClusterId, SubClusterInfo> subClustersActive = null;
++    try {
++      subClustersActive = federationFacade.getSubClusters(true);
++    } catch (YarnException e) {
++      LOG.error(e.getLocalizedMessage());
++      return metrics;
++    }
++
++    // Send the requests in parallel
++
++    ExecutorCompletionService<ClusterMetricsInfo> compSvc =
++        new ExecutorCompletionService<ClusterMetricsInfo>(this.threadpool);
++
++    for (final SubClusterInfo info : subClustersActive.values()) {
++      compSvc.submit(new Callable<ClusterMetricsInfo>() {
++        @Override
++        public ClusterMetricsInfo call() {
++          DefaultRequestInterceptorREST interceptor =
++              getOrCreateInterceptorForSubCluster(info.getSubClusterId(),
++                  info.getClientRMServiceAddress());
++          try {
++            ClusterMetricsInfo metrics = interceptor.getClusterMetricsInfo();
++            return metrics;
++          } catch (Exception e) {
++            LOG.error("Subcluster " + info.getSubClusterId()
++                + " failed to return Cluster Metrics.");
++            return null;
++          }
++        }
++      });
++    }
++
++    // Collect all the responses in parallel
++
++    for (int i = 0; i < subClustersActive.values().size(); i++) {
++      try {
++        Future<ClusterMetricsInfo> future = compSvc.take();
++        ClusterMetricsInfo metricsResponse = future.get();
++
++        if (metricsResponse != null) {
++          RouterWebServiceUtil.mergeMetrics(metrics, metricsResponse);
++        }
++      } catch (Throwable e) {
++        LOG.warn("Failed to get nodes report ", e);
++      }
++    }
++
++    return metrics;
++  }
++
+-  public ClusterMetricsInfo getClusterMetricsInfo() {
+-    throw new NotImplementedException();
+-  }
+-
+-  @Override
+-  public NodesInfo getNodes(String states) {
+-    throw new NotImplementedException();
+-  }
+-
+-  @Override
+-  public NodeInfo getNode(String nodeId) {
+-    throw new NotImplementedException();
+-  }
+-
+-  @Override
++
++  @Override
++  public void shutdown() {
++    if (threadpool != null) {
++      threadpool.shutdown();
++    }
++  }

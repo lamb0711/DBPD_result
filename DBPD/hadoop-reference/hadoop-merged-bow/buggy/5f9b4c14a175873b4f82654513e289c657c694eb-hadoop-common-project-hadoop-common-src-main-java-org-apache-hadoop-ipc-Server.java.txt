@@ -1,0 +1,392 @@
+HADOOP-9421. [RPC v9] Convert SASL to use ProtoBuf and provide negotiation capabilities (daryn)
+
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/trunk@1495577 13f79535-47bb-0310-9956-ffa450edef68
+
+-import java.io.DataOutput;
+-import java.util.EnumSet;
+-import javax.security.auth.callback.CallbackHandler;
+-import org.apache.hadoop.io.BytesWritable;
+-import org.apache.hadoop.io.IntWritable;
++import org.apache.hadoop.ipc.ProtobufRpcEngine.RpcResponseWrapper;
++import org.apache.hadoop.ipc.ProtobufRpcEngine.RpcRequestMessageWrapper;
++import org.apache.hadoop.ipc.protobuf.RpcHeaderProtos.RpcSaslProto.*;
+-import org.apache.hadoop.security.SaslRpcServer.SaslDigestCallbackHandler;
+-import org.apache.hadoop.security.SaslRpcServer.SaslGssCallbackHandler;
+-import org.apache.hadoop.security.SaslRpcServer.SaslStatus;
+-import org.apache.hadoop.security.authentication.util.KerberosName;
++import com.google.protobuf.ByteString;
++import com.google.protobuf.Message;
+-  private EnumSet<AuthMethod> enabledAuthMethods;
++  private List<AuthMethod> enabledAuthMethods;
++  private RpcSaslProto negotiateResponse;
++  @InterfaceAudience.Private
++  public static enum AuthProtocol {
++    NONE(0),
++    SASL(-33);
++    
++    public final int callId;
++    AuthProtocol(int callId) {
++      this.callId = callId;
++    }
++    
++    static AuthProtocol valueOf(int callId) {
++      for (AuthProtocol authType : AuthProtocol.values()) {
++        if (authType.callId == callId) {
++          return authType;
++        }
++      }
++      return null;
++    }
++  };
++  
++    private AuthProtocol authProtocol;
+-    // Fake 'call' for SASL context setup
+-    private static final int SASL_CALLID = -33;
+-    private final Call saslCall = new Call(SASL_CALLID, null, this);
++    private final Call saslCall = new Call(AuthProtocol.SASL.callId, null, this);
++    private boolean sentNegotiate = false;
+-      if (authMethod == SaslRpcServer.AuthMethod.DIGEST) {
++      if (authMethod == AuthMethod.TOKEN) {
+-        byte[] replyToken = null;
++        RpcSaslProto saslResponse;
+-          if (LOG.isDebugEnabled())
+-            LOG.debug("Have read input token of size " + saslToken.length
+-                + " for processing by saslServer.evaluateResponse()");
+-          replyToken = saslServer.evaluateResponse(saslToken);
++          saslResponse = processSaslMessage(saslToken);
+-          doSaslReply(SaslStatus.ERROR, null, sendToClient.getClass().getName(), 
+-              sendToClient.getLocalizedMessage());
++          // wait to send response until failure is logged
++          doSaslReply(sendToClient);
+-        if (saslServer.isComplete() && replyToken == null) {
+-          // send final response for success
+-          replyToken = new byte[0];
+-        }
+-        if (replyToken != null) {
+-          if (LOG.isDebugEnabled())
+-            LOG.debug("Will send token of size " + replyToken.length
+-                + " from saslServer.");
+-          doSaslReply(SaslStatus.SUCCESS, new BytesWritable(replyToken), null,
+-              null);
+-        }
+-        if (saslServer.isComplete()) {
++        
++        if (saslServer != null && saslServer.isComplete()) {
++        // send reply here to avoid a successful auth being logged as a
++        // failure if response can't be sent
++        doSaslReply(saslResponse);
+-    private void doSaslReply(SaslStatus status, Writable rv,
+-        String errorClass, String error) throws IOException {
+-      saslResponse.reset();
+-      DataOutputStream out = new DataOutputStream(saslResponse);
+-      out.writeInt(status.state); // write status
+-      if (status == SaslStatus.SUCCESS) {
+-        rv.write(out);
+-      } else {
+-        WritableUtils.writeString(out, errorClass);
+-        WritableUtils.writeString(out, error);
++    private RpcSaslProto processSaslMessage(byte[] buf)
++        throws IOException, InterruptedException {
++      final DataInputStream dis =
++          new DataInputStream(new ByteArrayInputStream(buf));
++      RpcRequestMessageWrapper requestWrapper = new RpcRequestMessageWrapper();
++      requestWrapper.readFields(dis);
++      
++      final RpcRequestHeaderProto rpcHeader = requestWrapper.requestHeader;
++      if (rpcHeader.getCallId() != AuthProtocol.SASL.callId) {
++        throw new SaslException("Client sent non-SASL request");
++      }      
++      final RpcSaslProto saslMessage =
++          RpcSaslProto.parseFrom(requestWrapper.theRequestRead);
++      RpcSaslProto saslResponse = null;
++      final SaslState state = saslMessage.getState(); // required      
++      switch (state) {
++        case NEGOTIATE: {
++          if (sentNegotiate) {
++            throw new AccessControlException(
++                "Client already attempted negotiation");
++          }
++          saslResponse = buildSaslNegotiateResponse();
++          break;
++        }
++        case INITIATE: {
++          if (saslMessage.getAuthsCount() != 1) {
++            throw new SaslException("Client mechanism is malformed");
++          }
++          String authMethodName = saslMessage.getAuths(0).getMethod();
++          authMethod = createSaslServer(authMethodName);
++          if (authMethod == null) { // the auth method is not supported
++            if (sentNegotiate) {
++              throw new AccessControlException(
++                  authMethodName + " authentication is not enabled."
++                      + "  Available:" + enabledAuthMethods);
++            }
++            saslResponse = buildSaslNegotiateResponse();
++            break;
++          }
++          // fallthru to process sasl token
++        }
++        case RESPONSE: {
++          if (!saslMessage.hasToken()) {
++            throw new SaslException("Client did not send a token");
++          }
++          byte[] saslToken = saslMessage.getToken().toByteArray();
++          if (LOG.isDebugEnabled()) {
++            LOG.debug("Have read input token of size " + saslToken.length
++                + " for processing by saslServer.evaluateResponse()");
++          }
++          saslToken = saslServer.evaluateResponse(saslToken);
++          saslResponse = buildSaslResponse(
++              saslServer.isComplete() ? SaslState.SUCCESS : SaslState.CHALLENGE,
++              saslToken);
++          break;
++        }
++        default:
++          throw new SaslException("Client sent unsupported state " + state);
+-      saslCall.setResponse(ByteBuffer.wrap(saslResponse.toByteArray()));
++      return saslResponse;
++    }
++    
++    private RpcSaslProto buildSaslResponse(SaslState state, byte[] replyToken)
++        throws IOException {
++      if (LOG.isDebugEnabled()) {
++        LOG.debug("Will send " + state + " token of size "
++            + ((replyToken != null) ? replyToken.length : null)
++            + " from saslServer.");
++      }
++      RpcSaslProto.Builder response = RpcSaslProto.newBuilder();
++      response.setState(state);
++      if (replyToken != null) {
++        response.setToken(ByteString.copyFrom(replyToken));
++      }
++      return response.build();
++    }
++    
++    private void doSaslReply(Message message)
++        throws IOException {
++      if (LOG.isDebugEnabled()) {
++        LOG.debug("Sending sasl message "+message);
++      }
++      setupResponse(saslResponse, saslCall,
++          RpcStatusProto.SUCCESS, null,
++          new RpcResponseWrapper(message), null, null);
++    private void doSaslReply(Exception ioe) throws IOException {
++      setupResponse(authFailedResponse, authFailedCall,
++          RpcStatusProto.FATAL, RpcErrorCodeProto.FATAL_UNAUTHORIZED,
++          null, ioe.getClass().getName(), ioe.getLocalizedMessage());
++      responder.doRespond(authFailedCall);
++    }
++    
+-
+-          byte[] method = new byte[] {connectionHeaderBuf.get(2)};
+-          authMethod = AuthMethod.read(new DataInputStream(
+-              new ByteArrayInputStream(method)));
+-          dataLengthBuffer.clear();
+-          if (authMethod == null) {
+-            throw new IOException("Unable to read authentication method");
+-          }
+-  
+-          // this may create a SASL server, or switch us into SIMPLE
+-          authMethod = initializeAuthContext(authMethod);
++          // this may switch us into SIMPLE
++          authProtocol = initializeAuthContext(connectionHeaderBuf.get(2));          
++          dataLengthBuffer.clear();
+-          if (skipInitialSaslHandshake) {
+-            data = null;
+-            skipInitialSaslHandshake = false;
+-            continue;
+-          }
+-          if (saslServer != null) {
+-            saslReadAndProcess(data.array());
++          if (authProtocol == AuthProtocol.SASL) {
++            // switch to simple must ignore next negotiate or initiate
++            if (skipInitialSaslHandshake) {
++              authProtocol = AuthProtocol.NONE;
++            } else {
++              saslReadAndProcess(data.array());
++            }
+-    private AuthMethod initializeAuthContext(AuthMethod authMethod)
++    private AuthProtocol initializeAuthContext(int authType)
++      AuthProtocol authProtocol = AuthProtocol.valueOf(authType);
++      if (authProtocol == null) {
++        IOException ioe = new IpcException("Unknown auth protocol:" + authType);
++        doSaslReply(ioe);
++        throw ioe;        
++      }
++      boolean isSimpleEnabled = enabledAuthMethods.contains(AuthMethod.SIMPLE);
++      switch (authProtocol) {
++        case NONE: {
++          // don't reply if client is simple and server is insecure
++          if (!isSimpleEnabled) {
++            IOException ioe = new AccessControlException(
++                "SIMPLE authentication is not enabled."
++                    + "  Available:" + enabledAuthMethods);
++            doSaslReply(ioe);
++            throw ioe;
++          }
++          break;
++        }
++        case SASL: {
++          if (isSimpleEnabled) { // switch to simple hack
++            skipInitialSaslHandshake = true;
++            doSaslReply(buildSaslResponse(SaslState.SUCCESS, null));
++          }
++          // else wait for a negotiate or initiate
++          break;
++        }
++      }
++      return authProtocol;
++    }
++
++    private RpcSaslProto buildSaslNegotiateResponse()
++        throws IOException, InterruptedException {
++      RpcSaslProto negotiateMessage = negotiateResponse;
++      // accelerate token negotiation by sending initial challenge
++      // in the negotiation response
++      if (enabledAuthMethods.contains(AuthMethod.TOKEN)) {
++        saslServer = createSaslServer(AuthMethod.TOKEN);
++        byte[] challenge = saslServer.evaluateResponse(new byte[0]);
++        RpcSaslProto.Builder negotiateBuilder =
++            RpcSaslProto.newBuilder(negotiateResponse);
++        negotiateBuilder.getAuthsBuilder(0)  // TOKEN is always first
++            .setChallenge(ByteString.copyFrom(challenge));
++        negotiateMessage = negotiateBuilder.build();
++      }
++      sentNegotiate = true;
++      return negotiateMessage;
++    }
++    
++    private AuthMethod createSaslServer(String authMethodName)
++        throws IOException, InterruptedException {
++      AuthMethod authMethod;
+-        if (enabledAuthMethods.contains(authMethod)) {
+-          saslServer = createSaslServer(authMethod);
+-        } else if (enabledAuthMethods.contains(AuthMethod.SIMPLE)) {
+-          doSaslReply(SaslStatus.SUCCESS, new IntWritable(
+-              SaslRpcServer.SWITCH_TO_SIMPLE_AUTH), null, null);
+-          authMethod = AuthMethod.SIMPLE;
+-          // client has already sent the initial Sasl message and we
+-          // should ignore it. Both client and server should fall back
+-          // to simple auth from now on.
+-          skipInitialSaslHandshake = true;
+-        } else {
+-          throw new AccessControlException(
+-              authMethod + " authentication is not enabled."
+-                  + "  Available:" + enabledAuthMethods);
++        authMethod = AuthMethod.valueOf(authMethodName);
++        if (!enabledAuthMethods.contains(authMethod)) {
++          authMethod = null;
+-      } catch (IOException ioe) {
+-        final String ioeClass = ioe.getClass().getName();
+-        final String ioeMessage  = ioe.getLocalizedMessage();
+-        if (authMethod == AuthMethod.SIMPLE) {
+-          setupResponse(authFailedResponse, authFailedCall,
+-              RpcStatusProto.FATAL, RpcErrorCodeProto.FATAL_UNAUTHORIZED, 
+-              null, ioeClass, ioeMessage);
+-          responder.doRespond(authFailedCall);
+-        } else {
+-          doSaslReply(SaslStatus.ERROR, null, ioeClass, ioeMessage);
+-        }
+-        throw ioe;
++      } catch (IllegalArgumentException iae) {
++        authMethod = null;
++      }
++      if (authMethod != null &&
++          // sasl server for tokens may already be instantiated
++          (saslServer == null || authMethod != AuthMethod.TOKEN)) {
++        saslServer = createSaslServer(authMethod);
+-      String hostname = null;
+-      String saslProtocol = null;
+-      CallbackHandler saslCallback = null;
+-      
+-      switch (authMethod) {
+-        case SIMPLE: {
+-          return null; // no sasl for simple
+-        }
+-        case DIGEST: {
+-          secretManager.checkAvailableForRead();
+-          hostname = SaslRpcServer.SASL_DEFAULT_REALM;
+-          saslCallback = new SaslDigestCallbackHandler(secretManager, this);
+-          break;
+-        }
+-        case KERBEROS: {
+-          String fullName = UserGroupInformation.getCurrentUser().getUserName();
+-          if (LOG.isDebugEnabled())
+-            LOG.debug("Kerberos principal name is " + fullName);
+-          KerberosName krbName = new KerberosName(fullName);
+-          hostname = krbName.getHostName();
+-          if (hostname == null) {
+-            throw new AccessControlException(
+-                "Kerberos principal name does NOT have the expected "
+-                    + "hostname part: " + fullName);
+-          }
+-          saslProtocol = krbName.getServiceName();
+-          saslCallback = new SaslGssCallbackHandler();
+-          break;
+-        }
+-        default:
+-          // we should never be able to get here
+-          throw new AccessControlException(
+-              "Server does not support SASL " + authMethod);
+-      }
+-      
+-      return createSaslServer(authMethod.getMechanismName(), saslProtocol,
+-                              hostname, saslCallback);                                    
+-    }
+-
+-    private SaslServer createSaslServer(final String mechanism,
+-                                        final String protocol,
+-                                        final String hostname,
+-                                        final CallbackHandler callback
+-        ) throws IOException, InterruptedException {
+-      SaslServer saslServer = UserGroupInformation.getCurrentUser().doAs(
+-          new PrivilegedExceptionAction<SaslServer>() {
+-            @Override
+-            public SaslServer run() throws SaslException  {
+-              return Sasl.createSaslServer(mechanism, protocol, hostname,
+-                                           SaslRpcServer.SASL_PROPS, callback);
+-            }
+-          });
+-      if (saslServer == null) {
+-        throw new AccessControlException(
+-            "Unable to find SASL server implementation for " + mechanism);
+-      }
+-      if (LOG.isDebugEnabled()) {
+-        LOG.debug("Created SASL server with mechanism = " + mechanism);
+-      }
+-      return saslServer;
++      return new SaslRpcServer(authMethod).create(this, secretManager);
+-          if (authMethod == AuthMethod.DIGEST) {
++          if (authMethod == AuthMethod.TOKEN) {
+-            && (authMethod != AuthMethod.DIGEST)) {
++            && (authMethod != AuthMethod.TOKEN)) {
++    this.negotiateResponse = buildNegotiateResponse(enabledAuthMethods);
++  
++  private RpcSaslProto buildNegotiateResponse(List<AuthMethod> authMethods)
++      throws IOException {
++    RpcSaslProto.Builder negotiateBuilder = RpcSaslProto.newBuilder();
++    negotiateBuilder.setState(SaslState.NEGOTIATE);
++    for (AuthMethod authMethod : authMethods) {
++      if (authMethod == AuthMethod.SIMPLE) { // not a SASL method
++        continue;
++      }
++      SaslRpcServer saslRpcServer = new SaslRpcServer(authMethod);      
++      negotiateBuilder.addAuthsBuilder()
++          .setMethod(authMethod.toString())
++          .setMechanism(saslRpcServer.mechanism)
++          .setProtocol(saslRpcServer.protocol)
++          .setServerId(saslRpcServer.serverId);
++    }
++    return negotiateBuilder.build();
++  }
+-  private EnumSet<AuthMethod> getAuthMethods(SecretManager<?> secretManager,
++  private List<AuthMethod> getAuthMethods(SecretManager<?> secretManager,
+-    EnumSet<AuthMethod> authMethods =
+-        EnumSet.of(confAuthenticationMethod.getAuthMethod()); 
+-        
++    List<AuthMethod> authMethods = new ArrayList<AuthMethod>();
++      // most preferred, go to the front of the line!
++    authMethods.add(confAuthenticationMethod.getAuthMethod());        
+
+MOV26 MOV26 MOV26 MOV26 MOV26 UPD40 UPD40 UPD40 UPD40 UPD40 INS23 INS71 MOV23 INS31 UPD74 INS83 INS43 INS59 INS78 INS83 INS83 INS42 INS72 INS72 INS23 INS31 INS31 INS23 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS83 INS43 INS42 INS44 INS43 INS8 UPD74 UPD43 INS42 INS42 INS40 INS42 INS34 INS42 MOV38 INS83 INS83 INS39 INS59 INS42 INS44 INS8 INS83 INS43 INS42 INS44 INS8 INS43 INS83 INS39 INS59 INS83 INS43 INS42 MOV44 INS43 INS43 INS8 INS83 INS43 INS42 INS44 INS44 MOV43 INS8 INS83 INS39 INS42 INS44 MOV43 INS8 INS83 INS39 INS42 INS44 MOV43 INS8 INS83 INS43 INS42 INS44 MOV43 MOV43 INS8 MOV83 UPD43 MOV43 UPD42 MOV42 INS43 INS43 INS8 UPD83 MOV83 MOV43 INS42 INS44 INS43 MOV43 INS8 INS83 MOV43 INS42 MOV44 INS43 MOV43 INS8 INS21 INS42 UPD74 MOV74 INS42 INS42 INS60 INS21 INS70 INS41 UPD43 INS21 UPD42 INS42 INS39 INS42 INS21 INS42 INS39 INS42 INS70 MOV41 INS42 UPD42 INS42 INS9 UPD42 MOV42 INS5 INS42 UPD42 MOV42 INS42 INS60 MOV60 MOV21 INS60 INS25 INS60 INS60 INS60 INS50 INS41 UPD42 MOV42 INS43 INS42 MOV5 INS42 INS25 INS60 MOV21 INS25 INS41 INS43 INS42 INS25 INS21 MOV21 INS43 INS42 INS21 MOV21 UPD42 MOV42 INS39 INS42 INS60 INS25 INS60 INS50 INS41 UPD42 UPD42 MOV42 INS42 INS60 INS25 INS21 INS41 MOV43 INS42 INS42 INS60 INS54 INS25 MOV41 INS42 MOV41 INS7 UPD43 INS43 INS59 INS32 MOV44 INS42 INS8 INS32 UPD42 INS74 MOV32 INS7 INS44 INS32 INS8 INS40 INS39 INS85 INS83 INS43 INS59 UPD43 INS83 INS43 INS59 UPD27 MOV27 MOV8 INS83 INS43 INS59 INS43 INS59 INS83 INS43 INS59 INS42 INS49 INS8 INS49 INS8 INS49 MOV8 INS49 INS53 INS42 UPD42 MOV42 MOV32 MOV8 INS43 INS59 INS27 INS8 INS32 INS42 MOV32 INS8 INS32 INS42 MOV32 INS43 INS59 MOV27 INS8 INS39 INS59 INS42 MOV49 INS8 INS49 INS8 INS42 INS43 INS59 INS32 INS8 INS7 INS42 INS43 INS59 INS8 INS12 INS27 MOV8 INS32 INS22 INS32 UPD42 INS40 INS42 INS32 INS42 INS42 INS40 INS25 INS60 INS21 INS42 INS42 INS43 INS43 INS14 UPD42 UPD42 INS22 INS42 INS43 INS42 INS42 INS42 INS25 UPD40 MOV21 INS42 INS42 MOV14 UPD42 UPD42 UPD42 UPD42 INS42 INS42 INS42 INS40 INS32 UPD40 INS53 INS42 INS42 INS32 INS42 INS42 INS33 INS42 INS42 INS32 INS42 INS25 INS21 INS10 INS42 INS25 INS60 MOV21 INS25 INS42 INS25 INS60 INS21 INS10 INS14 INS40 INS42 INS32 UPD42 UPD42 UPD42 INS42 INS33 INS21 INS42 INS42 MOV21 INS42 INS42 INS42 INS40 INS33 INS14 INS33 INS33 UPD42 UPD42 INS42 INS40 INS40 INS33 MOV32 MOV32 UPD42 MOV42 INS42 INS32 UPD42 INS60 MOV21 MOV53 INS42 MOV32 INS42 INS25 INS10 INS42 INS25 INS10 UPD42 MOV42 INS42 INS42 INS42 INS42 INS40 INS21 INS60 INS60 INS21 INS21 INS42 INS9 INS42 INS42 INS21 MOV25 INS44 INS8 INS27 INS36 INS14 INS42 INS52 INS42 INS52 INS42 INS42 INS42 INS42 INS42 MOV27 INS8 INS43 INS59 INS32 INS42 INS42 INS74 INS52 INS42 INS42 INS27 INS8 INS43 INS8 MOV27 MOV32 UPD43 INS42 INS42 INS14 UPD42 MOV42 UPD42 MOV42 INS40 UPD42 MOV42 INS42 INS42 INS8 INS7 INS27 INS8 MOV43 INS59 MOV27 INS8 INS38 INS8 MOV5 INS59 INS8 INS7 MOV43 INS27 INS42 INS42 INS32 UPD43 MOV43 UPD42 MOV42 MOV21 INS42 UPD42 MOV42 UPD42 MOV42 MOV43 INS59 INS32 INS38 INS8 INS42 INS8 INS7 MOV5 INS59 INS43 INS59 INS32 INS7 INS7 INS38 INS43 INS42 INS21 INS42 INS33 INS27 INS43 INS42 INS18 INS42 INS42 INS14 INS32 INS42 INS40 INS43 INS43 INS40 INS42 INS41 INS42 UPD42 INS21 MOV21 UPD27 INS42 UPD42 UPD42 INS43 INS45 INS53 INS42 INS32 INS32 INS34 INS53 INS42 INS32 INS32 INS25 INS21 INS10 INS32 INS53 INS42 INS32 MOV21 UPD42 INS42 INS32 INS45 INS42 UPD42 UPD42 INS27 INS42 INS42 INS32 UPD42 UPD42 INS27 UPD42 INS42 INS14 UPD42 MOV42 UPD42 MOV42 INS42 INS60 INS21 INS53 MOV21 INS21 INS42 INS32 INS42 INS32 INS40 INS42 INS32 MOV32 UPD42 MOV42 INS32 INS42 INS32 INS42 INS32 MOV32 INS21 INS42 INS7 MOV27 INS27 INS42 INS43 INS42 INS32 INS42 INS40 INS42 INS42 INS42 INS7 UPD42 MOV33 INS42 INS14 UPD42 MOV42 UPD42 MOV42 INS42 INS14 INS32 INS42 INS42 INS42 INS42 MOV8 INS7 INS42 INS42 INS14 INS32 INS42 INS42 INS16 INS42 INS45 INS42 INS45 INS36 INS45 INS42 INS42 INS42 INS45 INS42 UPD27 INS8 INS43 MOV27 MOV43 INS59 INS32 INS42 INS32 INS42 INS40 INS42 INS42 MOV3 INS42 INS42 INS42 UPD42 UPD42 INS34 INS42 INS42 INS42 INS42 INS42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 INS7 INS42 INS33 UPD42 MOV42 INS40 INS42 INS32 INS42 INS40 INS42 INS32 MOV43 INS45 UPD43 MOV43 INS45 INS42 INS42 INS34 INS42 INS32 INS43 INS45 INS42 INS42 MOV32 INS40 INS40 INS16 UPD42 UPD42 INS40 INS25 INS42 UPD45 UPD42 INS42 INS14 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 INS32 INS42 INS33 UPD40 UPD40 INS32 INS42 INS32 INS42 INS42 MOV42 UPD42 INS42 INS42 INS36 INS40 INS33 MOV32 INS42 INS8 MOV8 MOV43 MOV27 UPD42 MOV42 INS40 INS33 INS42 INS42 INS42 INS42 MOV27 INS21 UPD45 INS45 UPD42 UPD42 INS7 INS42 INS40 DEL40 DEL26 DEL40 DEL26 DEL40 DEL26 DEL40 DEL26 DEL83 DEL83 DEL39 DEL42 DEL33 DEL40 DEL33 DEL42 DEL32 DEL42 DEL32 DEL42 DEL42 DEL32 DEL42 DEL7 DEL21 DEL8 DEL25 DEL42 DEL42 DEL45 DEL40 DEL45 DEL27 DEL32 DEL21 DEL25 DEL8 DEL25 DEL40 DEL42 DEL43 DEL42 DEL14 DEL33 DEL33 DEL42 DEL43 DEL42 DEL42 DEL40 DEL42 DEL42 DEL42 DEL42 DEL32 DEL21 DEL40 DEL42 DEL40 DEL40 DEL33 DEL42 DEL42 DEL40 DEL33 DEL45 DEL42 DEL27 DEL83 DEL39 DEL42 DEL43 DEL42 DEL44 DEL43 DEL42 DEL44 DEL42 DEL44 DEL42 DEL42 DEL32 DEL21 DEL42 DEL42 DEL32 DEL21 DEL42 DEL42 DEL42 DEL42 DEL32 DEL21 DEL8 DEL25 DEL42 DEL42 DEL42 DEL42 DEL32 DEL32 DEL32 DEL21 DEL8 DEL31 DEL42 DEL4 DEL3 DEL59 DEL60 DEL42 DEL42 DEL42 DEL32 DEL7 DEL21 DEL45 DEL14 DEL53 DEL8 DEL25 DEL42 DEL42 DEL42 DEL33 DEL7 DEL21 DEL42 DEL9 DEL7 DEL21 DEL18 DEL8 DEL25 DEL45 DEL42 DEL32 DEL7 DEL45 DEL42 DEL27 DEL14 DEL53 DEL42 DEL83 DEL42 DEL40 DEL40 DEL14 DEL33 DEL33 DEL32 DEL21 DEL8 DEL25 DEL25 DEL8 DEL42 DEL44 DEL83 DEL43 DEL42 DEL59 DEL60 DEL83 DEL43 DEL42 DEL59 DEL60 DEL8 DEL25 DEL8 DEL12 DEL54 DEL8 DEL31 DEL83 DEL42 DEL43 DEL42 DEL42 DEL43 DEL42 DEL33 DEL59 DEL60 DEL42 DEL43 DEL42 DEL33 DEL59 DEL60 DEL42 DEL43 DEL42 DEL33 DEL59 DEL60 DEL42 DEL42 DEL49 DEL8 DEL42 DEL49 DEL42 DEL40 DEL7 DEL21 DEL42 DEL52 DEL14 DEL7 DEL21 DEL10 DEL8 DEL42 DEL49 DEL42 DEL42 DEL42 DEL32 DEL42 DEL32 DEL59 DEL60 DEL21 DEL25 DEL43 DEL42 DEL43 DEL42 DEL14 DEL59 DEL60 DEL42 DEL32 DEL7 DEL21 DEL14 DEL53 DEL8 DEL25 DEL42 DEL42 DEL43 DEL14 DEL7 DEL21 DEL10 DEL8 DEL42 DEL43 DEL14 DEL53 DEL50 DEL42 DEL32 DEL42 DEL32 DEL41 DEL8 DEL31 DEL83 DEL43 DEL42 DEL44 DEL83 DEL43 DEL42 DEL44 DEL83 DEL42 DEL43 DEL42 DEL44 DEL83 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL42 DEL43 DEL74 DEL42 DEL78 DEL42 DEL43 DEL42 DEL42 DEL42 DEL42 DEL40 DEL32 DEL41 DEL8 DEL31 DEL1 DEL14 DEL32 DEL59 DEL60 DEL42 DEL42 DEL32 DEL42 DEL42 DEL45 DEL27 DEL32 DEL21 DEL8 DEL25 DEL8 DEL31

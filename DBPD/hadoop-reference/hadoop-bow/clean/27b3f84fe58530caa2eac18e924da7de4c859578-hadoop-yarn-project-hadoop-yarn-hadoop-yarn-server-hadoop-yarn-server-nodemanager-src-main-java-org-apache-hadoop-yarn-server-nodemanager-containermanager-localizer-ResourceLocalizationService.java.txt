@@ -1,0 +1,154 @@
+Merge trunk to HDFS-2802 branch. This involves fixing many conflict with HDFS-4434.
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/branches/HDFS-2802@1470225 13f79535-47bb-0310-9956-ffa450edef68
+
+-import java.util.LinkedList;
++import java.util.concurrent.atomic.AtomicBoolean;
++import org.apache.hadoop.classification.InterfaceAudience.Private;
++import com.google.common.annotations.VisibleForTesting;
++  
++  @VisibleForTesting
++  @Private
++  public PublicLocalizer getPublicLocalizer() {
++    return localizerTracker.publicLocalizer;
++  }
++  @VisibleForTesting
++  @Private
++  public LocalizerRunner getLocalizerRunner(String locId) {
++    return localizerTracker.privLocalizers.get(locId);
++  }
++  
++  @VisibleForTesting
++  @Private
++  public Map<String, LocalizerRunner> getPrivateLocalizers() {
++    return localizerTracker.privLocalizers;
++  }
++  
+-    // TODO hack to work around broken signaling
+-    final Map<LocalResourceRequest,List<LocalizerResourceRequestEvent>> attempts;
+-           new HashMap<Future<Path>,LocalizerResourceRequestEvent>(),
+-           new HashMap<LocalResourceRequest,List<LocalizerResourceRequestEvent>>());
++           new HashMap<Future<Path>,LocalizerResourceRequestEvent>());
+-        Map<Future<Path>,LocalizerResourceRequestEvent> pending,
+-        Map<LocalResourceRequest,List<LocalizerResourceRequestEvent>> attempts) {
++        Map<Future<Path>,LocalizerResourceRequestEvent> pending) {
+-      this.attempts = attempts;
+-//      List<String> localDirs = dirsHandler.getLocalDirs();
+-//      String[] publicFilecache = new String[localDirs.size()];
+-//      for (int i = 0, n = localDirs.size(); i < n; ++i) {
+-//        publicFilecache[i] =
+-//          new Path(localDirs.get(i), ContainerLocalizer.FILECACHE).toString();
+-//      }
+-//      conf.setStrings(PUBCACHE_CTXT, publicFilecache);
+-
+-//      this.publicDirDestPath = new LocalDirAllocator(PUBCACHE_CTXT).getLocalPathForWrite(pathStr, conf);
+-//      List<String> localDirs = dirsHandler.getLocalDirs();
+-//      String[] publicFilecache = new String[localDirs.size()];
+-//      int i = 0;
+-//      for (String localDir : localDirs) {
+-//        publicFilecache[i++] =
+-//            new Path(localDir, ContainerLocalizer.FILECACHE).toString();
+-//      }
+-      LocalResourceRequest key = request.getResource().getRequest();
++      LocalizedResource rsrc = request.getResource();
++      LocalResourceRequest key = rsrc.getRequest();
+-      synchronized (attempts) {
+-        List<LocalizerResourceRequestEvent> sigh = attempts.get(key);
+-        if (null == sigh) {
++      /*
++       * Here multiple containers may request the same resource. So we need
++       * to start downloading only when
++       * 1) ResourceState == DOWNLOADING
++       * 2) We are able to acquire non blocking semaphore lock.
++       * If not we will skip this resource as either it is getting downloaded
++       * or it FAILED / LOCALIZED.
++       */
++
++      if (rsrc.tryAcquire()) {
++        if (rsrc.getState().equals(ResourceState.DOWNLOADING)) {
+-            Path publicDirDestPath = dirsHandler.getLocalPathForWrite(
+-                "." + Path.SEPARATOR + ContainerLocalizer.FILECACHE,
+-                ContainerLocalizer.getEstimatedSize(resource), true);
++            Path publicDirDestPath =
++                dirsHandler.getLocalPathForWrite("." + Path.SEPARATOR
++                    + ContainerLocalizer.FILECACHE,
++                  ContainerLocalizer.getEstimatedSize(resource), true);
+-              publicRsrc.getPathForLocalization(key, publicDirDestPath);
++                publicRsrc.getPathForLocalization(key, publicDirDestPath);
+-              DiskChecker.checkDir(
+-                new File(publicDirDestPath.toUri().getPath()));
++              DiskChecker.checkDir(new File(publicDirDestPath.toUri().getPath()));
+-            pending.put(queue.submit(new FSDownload(
+-                lfs, null, conf, publicDirDestPath, resource)),
+-                request);
+-            attempts.put(key, new LinkedList<LocalizerResourceRequestEvent>());
++            pending.put(queue.submit(new FSDownload(lfs, null, conf,
++              publicDirDestPath, resource)), request);
++            rsrc.unlock();
++            // TODO Need to Fix IO Exceptions - Notifying resource
+-          sigh.add(request);
++          rsrc.unlock();
+-              synchronized (attempts) {
+-                attempts.remove(key);
+-              }
++              assoc.getResource().unlock();
+-              synchronized (attempts) {
+-                List<LocalizerResourceRequestEvent> reqs;
+-                reqs = attempts.get(req);
+-                if (null == reqs) {
+-                  LOG.error("Missing pending list for " + req);
+-                  return;
+-                }
+-                attempts.remove(req);
+-              }
++              assoc.getResource().unlock();
+-        if (ResourceState.LOCALIZED.equals(nRsrc.getState())) {
++        // Resource download should take place ONLY if resource is in
++        // Downloading state
++        if (!ResourceState.DOWNLOADING.equals(nRsrc.getState())) {
++        /*
++         * Multiple containers will try to download the same resource. So the
++         * resource download should start only if
++         * 1) We can acquire a non blocking semaphore lock on resource
++         * 2) Resource is still in DOWNLOADING state
++         */
+-          LocalResourceRequest nextRsrc = nRsrc.getRequest();
+-          LocalResource next =
+-            recordFactory.newRecordInstance(LocalResource.class);
+-          next.setResource(
+-              ConverterUtils.getYarnUrlFromPath(nextRsrc.getPath()));
+-          next.setTimestamp(nextRsrc.getTimestamp());
+-          next.setType(nextRsrc.getType());
+-          next.setVisibility(evt.getVisibility());
+-          next.setPattern(evt.getPattern());
+-          scheduled.put(nextRsrc, evt);
+-          return next;
++          if (nRsrc.getState().equals(ResourceState.DOWNLOADING)) {
++            LocalResourceRequest nextRsrc = nRsrc.getRequest();
++            LocalResource next =
++                recordFactory.newRecordInstance(LocalResource.class);
++            next.setResource(ConverterUtils.getYarnUrlFromPath(nextRsrc
++              .getPath()));
++            next.setTimestamp(nextRsrc.getTimestamp());
++            next.setType(nextRsrc.getType());
++            next.setVisibility(evt.getVisibility());
++            next.setPattern(evt.getPattern());
++            scheduled.put(nextRsrc, evt);
++            return next;
++          } else {
++            // Need to release acquired lock
++            nRsrc.unlock();
++          }
++
++            // unlocking the resource and removing it from scheduled resource
++            // list
++            assoc.getResource().unlock();
++            scheduled.remove(req);
++            
+-            assoc.getResource().unlock();
++
++            // unlocking the resource and removing it from scheduled resource
++            // list
++            assoc.getResource().unlock();
++            scheduled.remove(req);
++            

@@ -1,0 +1,835 @@
+JCR-3729 - S3 Datastore optimizations
+
+
+git-svn-id: https://svn.apache.org/repos/asf/jackrabbit/trunk@1577127 13f79535-47bb-0310-9956-ffa450edef68
+
++import java.util.Collections;
++import java.util.concurrent.ExecutorService;
+-import java.util.concurrent.ThreadFactory;
++import java.util.concurrent.TimeUnit;
++import org.apache.jackrabbit.core.data.AsyncUploadCallback;
++import org.apache.jackrabbit.core.data.util.NamedThreadFactory;
++import com.amazonaws.services.s3.model.ProgressEvent;
++import com.amazonaws.services.s3.model.ProgressListener;
++    /**
++     * Logger instance.
++     */
++    private static final Logger LOG = LoggerFactory.getLogger(S3Backend.class);
++
+-
+-    /**
+-     * Logger instance.
+-     */
+-    private static final Logger LOG = LoggerFactory.getLogger(S3Backend.class);
+-
++    
++    private Properties prop;
++
++    private Date startTime;
++
++        ClassLoader contextClassLoader = Thread.currentThread().getContextClassLoader();
+-            Properties prop = Utils.readConfig(config);
+-            LOG.debug("init");
++            startTime = new Date();
++            Thread.currentThread().setContextClassLoader(
++                getClass().getClassLoader());
++            prop = Utils.readConfig(config);
++            if (LOG.isDebugEnabled()) {
++                LOG.debug("init");
++            }
+-            bucket = prop.getProperty(S3Constants.S3_BUCKET);
++            if (bucket == null || "".equals(bucket.trim())) {
++                bucket = prop.getProperty(S3Constants.S3_BUCKET);
++            }
++            String propEndPoint = prop.getProperty(S3Constants.S3_END_POINT);
++            if (propEndPoint != null & !"".equals(propEndPoint)) {
++                endpoint = propEndPoint;
++            }
+-            tmx = new TransferManager(s3service, createDefaultExecutorService());
+-            LOG.debug("  done");
++
++            int writeThreads = 10;
++            String writeThreadsStr = prop.getProperty(S3Constants.S3_WRITE_THREADS);
++            if (writeThreadsStr != null) {
++                writeThreads = Integer.parseInt(writeThreadsStr);
++            }
++            LOG.info("Using thread pool of [" + writeThreads
++                + "] threads in S3 transfer manager");
++            tmx = new TransferManager(s3service,
++                (ThreadPoolExecutor) Executors.newFixedThreadPool(writeThreads,
++                    new NamedThreadFactory("s3-transfer-manager-worker")));
++            String renameKeyProp = prop.getProperty(S3Constants.S3_RENAME_KEYS);
++            boolean renameKeyBool = (renameKeyProp == null || "".equals(renameKeyProp))
++                    ? true
++                    : Boolean.parseBoolean(renameKeyProp);
++            if (renameKeyBool) {
++                renameKeys();
++            }
++            if (LOG.isDebugEnabled()) {
++                LOG.debug("S3 Backend initialized in ["
++                    + (System.currentTimeMillis() - startTime.getTime())
++                    + "] ms");
++            }
+-            LOG.debug("  error ", e);
++            if (LOG.isDebugEnabled()) {
++                LOG.debug("  error ", e);
++            }
++        } finally {
++            if (contextClassLoader != null) {
++                Thread.currentThread().setContextClassLoader(contextClassLoader);
++            }
++        this.write(identifier, file, false, null);
++
++    }
++
++    @Override
++    public void writeAsync(DataIdentifier identifier, File file,
++            AsyncUploadCallback callback) throws DataStoreException {
++        if (callback == null) {
++            throw new IllegalArgumentException(
++                "callback parameter cannot be null in asyncUpload");
++        }
++        Thread th = new Thread(new AsyncUploadJob(identifier, file, callback));
++        th.start();
++    }
++
++    /**
++     * Check if record identified by identifier exists in Amazon S3.
++     */
++    @Override
++    public boolean exists(DataIdentifier identifier) throws DataStoreException {
++        long start = System.currentTimeMillis();
++        String key = getKeyName(identifier);
++        ClassLoader contextClassLoader = Thread.currentThread().getContextClassLoader();
++        try {
++            Thread.currentThread().setContextClassLoader(
++                getClass().getClassLoader());
++            ObjectMetadata objectMetaData = s3service.getObjectMetadata(bucket,
++                key);
++            if (objectMetaData != null) {
++                if (LOG.isDebugEnabled()) {
++                    LOG.debug("exists [" + identifier + "]: [true] took ["
++                        + (System.currentTimeMillis() - start) + "] ms");
++                }
++                return true;
++            }
++            return false;
++        } catch (AmazonServiceException e) {
++            if (e.getStatusCode() == 404) {
++                LOG.info("exists [" + identifier + "]: [false] took ["
++                    + (System.currentTimeMillis() - start) + "] ms");
++                return false;
++            }
++            throw new DataStoreException(
++                "Error occured to getObjectMetadata for key ["
++                    + identifier.toString() + "]", e);
++        } finally {
++            if (contextClassLoader != null) {
++                Thread.currentThread().setContextClassLoader(contextClassLoader);
++            }
++        }
++    }
++
++    @Override
++    public boolean exists(DataIdentifier identifier, boolean touch)
++            throws DataStoreException {
++        long start = System.currentTimeMillis();
++        String key = getKeyName(identifier);
++        ObjectMetadata objectMetaData = null;
++        boolean retVal = false;
++        ClassLoader contextClassLoader = Thread.currentThread().getContextClassLoader();
++        try {
++            Thread.currentThread().setContextClassLoader(
++                getClass().getClassLoader());
++            objectMetaData = s3service.getObjectMetadata(bucket, key);
++            if (objectMetaData != null) {
++                retVal = true;
++                if (touch) {
++                    CopyObjectRequest copReq = new CopyObjectRequest(bucket,
++                        key, bucket, key);
++                    copReq.setNewObjectMetadata(objectMetaData);
++                    s3service.copyObject(copReq);
++                    if (LOG.isDebugEnabled()) {
++                        LOG.debug("[ " + identifier.toString()
++                            + "] touched took ["
++                            + (System.currentTimeMillis() - start) + "] ms");
++                    }
++                }
++            } else {
++                retVal = false;
++            }
++
++        } catch (AmazonServiceException e) {
++            if (e.getStatusCode() == 404) {
++                retVal = false;
++            } else {
++                throw new DataStoreException(
++                    "Error occured to find exists for key ["
++                        + identifier.toString() + "]", e);
++            }
++        } catch (Exception e) {
++            throw new DataStoreException(
++                "Error occured to find exists for key  "
++                    + identifier.toString(), e);
++        } finally {
++            if (contextClassLoader != null) {
++                Thread.currentThread().setContextClassLoader(contextClassLoader);
++            }
++        }
++
++        if (LOG.isDebugEnabled()) {
++            LOG.debug("exists [" + identifier + "]: [" + retVal + "] took ["
++                + (System.currentTimeMillis() - start) + "] ms");
++        }
++        return retVal;
++    }
++
++    @Override
++    public InputStream read(DataIdentifier identifier)
++            throws DataStoreException {
++        long start = System.currentTimeMillis();
++        String key = getKeyName(identifier);
++        ClassLoader contextClassLoader = Thread.currentThread().getContextClassLoader();
++        try {
++            Thread.currentThread().setContextClassLoader(
++                getClass().getClassLoader());
++            S3Object object = s3service.getObject(bucket, key);
++            InputStream in = object.getObjectContent();
++            if (LOG.isDebugEnabled()) {
++                LOG.debug("[ " + identifier.toString() + "] read took ["
++                    + (System.currentTimeMillis() - start) + "] ms");
++            }
++            return in;
++        } catch (AmazonServiceException e) {
++            throw new DataStoreException("Object not found: " + key, e);
++        } finally {
++            if (contextClassLoader != null) {
++                Thread.currentThread().setContextClassLoader(contextClassLoader);
++            }
++        }
++    }
++
++    @Override
++    public Iterator<DataIdentifier> getAllIdentifiers()
++            throws DataStoreException {
++        long start = System.currentTimeMillis();
++        ClassLoader contextClassLoader = Thread.currentThread().getContextClassLoader();
++        try {
++            Thread.currentThread().setContextClassLoader(
++                getClass().getClassLoader());
++            Set<DataIdentifier> ids = new HashSet<DataIdentifier>();
++            ObjectListing prevObjectListing = s3service.listObjects(bucket);
++            while (true) {
++                for (S3ObjectSummary s3ObjSumm : prevObjectListing.getObjectSummaries()) {
++                    String id = getIdentifierName(s3ObjSumm.getKey());
++                    if (id != null) {
++                        ids.add(new DataIdentifier(id));
++                    }
++                }
++                if (!prevObjectListing.isTruncated()) break;
++                prevObjectListing = s3service.listNextBatchOfObjects(prevObjectListing);
++            }
++            if (LOG.isDebugEnabled()) {
++                LOG.debug("getAllIdentifiers returned size [ " + ids.size()
++                    + "] took [" + (System.currentTimeMillis() - start)
++                    + "] ms");
++            }
++            return ids.iterator();
++        } catch (AmazonServiceException e) {
++            throw new DataStoreException("Could not list objects", e);
++        } finally {
++            if (contextClassLoader != null) {
++                Thread.currentThread().setContextClassLoader(contextClassLoader);
++            }
++        }
++    }
++
++    @Override
++    public long getLastModified(DataIdentifier identifier)
++            throws DataStoreException {
++        long start = System.currentTimeMillis();
++        String key = getKeyName(identifier);
++        ClassLoader contextClassLoader = Thread.currentThread().getContextClassLoader();
++        try {
++            Thread.currentThread().setContextClassLoader(
++                getClass().getClassLoader());
++            ObjectMetadata object = s3service.getObjectMetadata(bucket, key);
++            long lastModified = object.getLastModified().getTime();
++            if (LOG.isDebugEnabled()) {
++                LOG.debug("Identifier [" + identifier.toString()
++                    + "] 's lastModified = [" + lastModified + "] took ["
++                    + (System.currentTimeMillis() - start) + "] ms");
++            }
++            return lastModified;
++        } catch (AmazonServiceException e) {
++            if (e.getStatusCode() == 404) {
++                LOG.info("getLastModified:Identifier [" + identifier.toString()
++                    + "] not found. Took ["
++                    + (System.currentTimeMillis() - start) + "]ms");
++            }
++            throw new DataStoreException(e);
++        } finally {
++            if (contextClassLoader != null) {
++                Thread.currentThread().setContextClassLoader(contextClassLoader);
++            }
++        }
++    }
++
++    @Override
++    public long getLength(DataIdentifier identifier) throws DataStoreException {
++        long start = System.currentTimeMillis();
++        String key = getKeyName(identifier);
++        ClassLoader contextClassLoader = Thread.currentThread().getContextClassLoader();
++        try {
++            Thread.currentThread().setContextClassLoader(
++                getClass().getClassLoader());
++            ObjectMetadata object = s3service.getObjectMetadata(bucket, key);
++            long length = object.getContentLength();
++            if (LOG.isDebugEnabled()) {
++                LOG.debug("Identifier [" + identifier.toString()
++                    + "] 's length = [" + length + "] took ["
++                    + (System.currentTimeMillis() - start) + "] ms");
++            }
++            return length;
++        } catch (AmazonServiceException e) {
++            throw new DataStoreException("Could not length of dataIdentifier "
++                + identifier, e);
++        } finally {
++            if (contextClassLoader != null) {
++                Thread.currentThread().setContextClassLoader(contextClassLoader);
++            }
++        }
++    }
++
++    @Override
++    public void deleteRecord(DataIdentifier identifier)
++            throws DataStoreException {
++        long start = System.currentTimeMillis();
++        String key = getKeyName(identifier);
++        ClassLoader contextClassLoader = Thread.currentThread().getContextClassLoader();
++        try {
++            Thread.currentThread().setContextClassLoader(
++                getClass().getClassLoader());
++            s3service.deleteObject(bucket, key);
++            if (LOG.isDebugEnabled()) {
++                LOG.debug("Identifier [" + identifier.toString()
++                    + "] 's deleted. It took ["
++                    + (System.currentTimeMillis() - start) + "] ms");
++            }
++        } catch (AmazonServiceException e) {
++            throw new DataStoreException(
++                "Could not getLastModified of dataIdentifier " + identifier, e);
++        } finally {
++            if (contextClassLoader != null) {
++                Thread.currentThread().setContextClassLoader(contextClassLoader);
++            }
++        }
++    }
++
++    @Override
++    public Set<DataIdentifier> deleteAllOlderThan(long min)
++            throws DataStoreException {
++        long start = System.currentTimeMillis();
++        // S3 stores lastModified to lower boundary of timestamp in ms.
++        // and hence min is reduced by 1000ms.
++        min = min - 1000;
++        Set<DataIdentifier> deleteIdSet = new HashSet<DataIdentifier>(30);
++        ClassLoader contextClassLoader = Thread.currentThread().getContextClassLoader();
++        try {
++            Thread.currentThread().setContextClassLoader(
++                getClass().getClassLoader());
++            ObjectListing prevObjectListing = s3service.listObjects(bucket);
++            while (true) {
++                List<DeleteObjectsRequest.KeyVersion> deleteList = new ArrayList<DeleteObjectsRequest.KeyVersion>();
++                for (S3ObjectSummary s3ObjSumm : prevObjectListing.getObjectSummaries()) {
++                    DataIdentifier identifier = new DataIdentifier(
++                        getIdentifierName(s3ObjSumm.getKey()));
++                    long lastModified = s3ObjSumm.getLastModified().getTime();
++                    if (LOG.isDebugEnabled()) {
++                        LOG.debug("id [" + identifier + "], lastModified ["
++                            + lastModified + "]");
++                    }
++                    if (!store.isInUse(identifier) && lastModified < min) {
++                        if (LOG.isDebugEnabled()) {
++                            LOG.debug("add id :" + s3ObjSumm.getKey()
++                                + " to delete lists");
++                        }
++                        deleteList.add(new DeleteObjectsRequest.KeyVersion(
++                            s3ObjSumm.getKey()));
++                        deleteIdSet.add(identifier);
++                    }
++                }
++                if (deleteList.size() > 0) {
++                    DeleteObjectsRequest delObjsReq = new DeleteObjectsRequest(
++                        bucket);
++                    delObjsReq.setKeys(deleteList);
++                    DeleteObjectsResult dobjs = s3service.deleteObjects(delObjsReq);
++                    if (dobjs.getDeletedObjects().size() != deleteList.size()) {
++                        throw new DataStoreException(
++                            "Incomplete delete object request. only  "
++                                + dobjs.getDeletedObjects().size() + " out of "
++                                + deleteList.size() + " are deleted");
++                    } else {
++                        if (LOG.isDebugEnabled()) {
++                            LOG.debug(deleteList
++                                + " records deleted from datastore");
++                        }
++                    }
++                }
++                if (!prevObjectListing.isTruncated()) {
++                    break;
++                }
++                prevObjectListing = s3service.listNextBatchOfObjects(prevObjectListing);
++            }
++        } finally {
++            if (contextClassLoader != null) {
++                Thread.currentThread().setContextClassLoader(contextClassLoader);
++            }
++        }
++        LOG.info("deleteAllOlderThan: min=[" + min + "] exit. Deleted ["
++            + deleteIdSet + "] records. Number of records deleted ["
++            + deleteIdSet.size() + "] took ["
++            + (System.currentTimeMillis() - start) + "] ms");
++        return deleteIdSet;
++    }
++
++    @Override
++    public void close() {
++        // backend is closing. abort all mulitpart uploads from start.
++        tmx.abortMultipartUploads(bucket, startTime);
++        tmx.shutdownNow();
++        s3service.shutdown();
++        LOG.info("S3Backend closed.");
++    }
++
++    public String getBucket() {
++        return bucket;
++    }
++
++    public void setBucket(String bucket) {
++        this.bucket = bucket;
++    }
++
++    private void write(DataIdentifier identifier, File file,
++            boolean asyncUpload, AsyncUploadCallback callback)
++            throws DataStoreException {
+-        LOG.debug("write {0} length {1}", identifier, file.length());
++        ClassLoader contextClassLoader = Thread.currentThread().getContextClassLoader();
++            Thread.currentThread().setContextClassLoader(
++                getClass().getClassLoader());
+-                LOG.debug(key + "   exists");
++                if (LOG.isDebugEnabled()) {
++                    LOG.debug(key + "   exists, lastmodified ="
++                        + objectMetaData.getLastModified().getTime());
++                }
+-                LOG.debug("lastModified of " + identifier.toString()
+-                    + " updated successfully");
+-                LOG.debug("   updated");
+-            }
+-        } catch (AmazonServiceException e) {
+-            LOG.debug("   does not exist", e);
+-            // not found - create it
+-        }
+-        if (objectMetaData == null) {
+-            LOG.debug("   creating");
+-            try {
+-                // start multipart parallel upload using amazon sdk
+-                Upload up = tmx.upload(new PutObjectRequest(bucket, key, file));
+-                // wait for upload to finish
+-                up.waitForUploadResult();
+-                LOG.debug("   done");
+-            } catch (Exception e2) {
+-                LOG.debug("   could not upload", e2);
+-                throw new DataStoreException("Could not upload " + key, e2);
+-            }
+-        }
+-        LOG.debug("    ms: {0}", System.currentTimeMillis() - start);
+-
+-    }
+-
+-    /**
+-     * Check if record identified by identifier exists in Amazon S3.
+-     */
+-    @Override
+-    public boolean exists(DataIdentifier identifier) throws DataStoreException {
+-        String key = getKeyName(identifier);
+-        try {
+-            LOG.debug("exists {0}", identifier);
+-            ObjectMetadata objectMetaData = s3service.getObjectMetadata(bucket,
+-                key);
+-            if (objectMetaData != null) {
+-                LOG.debug("  true");
+-                return true;
+-            }
+-            return false;
+-        } catch (AmazonServiceException e) {
+-            if (e.getStatusCode() == 404) {
+-                LOG.info("key [" + identifier.toString() + "] not found.");
+-                return false;
+-            }
+-            throw new DataStoreException(
+-                "Error occured to getObjectMetadata for key ["
+-                    + identifier.toString() + "]", e);
+-        }
+-    }
+-
+-    @Override
+-    public void touch(DataIdentifier identifier, long minModifiedDate)
+-            throws DataStoreException {
+-        String key = getKeyName(identifier);
+-        try {
+-            if (minModifiedDate != 0) {
+-                ObjectMetadata objectMetaData = s3service.getObjectMetadata(
+-                    bucket, key);
+-                if (objectMetaData.getLastModified().getTime() < minModifiedDate) {
+-                    CopyObjectRequest copReq = new CopyObjectRequest(bucket,
+-                        key, bucket, key);
+-                    copReq.setNewObjectMetadata(objectMetaData);
+-                    s3service.copyObject(copReq);
++                if (LOG.isDebugEnabled()) {
++                if (callback != null) {
++                    callback.call(identifier, file,
++                        AsyncUploadCallback.RESULT.SUCCESS);
++                }
+-        } catch (Exception e) {
+-            throw new DataStoreException(
+-                "An Exception occurred while trying to set the last modified date of record "
+-                    + identifier.toString(), e);
++
++            if (objectMetaData == null) {
++                try {
++                    // start multipart parallel upload using amazon sdk
++                    Upload up = tmx.upload(new PutObjectRequest(bucket, key,
++                        file));
++                    // wait for upload to finish
++                    if (asyncUpload) {
++                        up.addProgressListener(new S3UploadProgressListener(
++                            identifier, file, callback));
++                        if (LOG.isDebugEnabled()) {
++                            LOG.debug("added upload progress listener to identifier ["
++                                + identifier + "]");
++                        }
++                    } else {
++                        up.waitForUploadResult();
++                        if (LOG.isDebugEnabled()) {
++                            LOG.debug("synchronous upload to identifier ["
++                                + identifier + "] completed.");
++                        }
++                        if (callback != null) {
++                            callback.call(identifier, file,
++                                AsyncUploadCallback.RESULT.SUCCESS);
++                        }
++                    }
++                } catch (Exception e2) {
++                    if (!asyncUpload) {
++                        callback.call(identifier, file,
++                            AsyncUploadCallback.RESULT.ABORTED);
++                    }
++                    throw new DataStoreException("Could not upload " + key, e2);
++                }
++            }
++        } finally {
++            if (contextClassLoader != null) {
++                Thread.currentThread().setContextClassLoader(contextClassLoader);
++            }
++        }
++        if (LOG.isDebugEnabled()) {
++            LOG.debug("write [" + identifier + "] length [" + file.length()
++                + "], in async mode [" + asyncUpload + "] in ["
++                + (System.currentTimeMillis() - start) + "] ms.");
+-    @Override
+-    public InputStream read(DataIdentifier identifier)
+-            throws DataStoreException {
+-        String key = getKeyName(identifier);
++    /**
++     * This method rename object keys in S3 concurrently. The number of
++     * concurrent threads is defined by 'maxConnections' property in
++     * aws.properties. As S3 doesn't have "move" command, this method simulate
++     * move as copy object object to new key and then delete older key.
++     */
++    private void renameKeys() throws DataStoreException {
++        long startTime = System.currentTimeMillis();
++        ClassLoader contextClassLoader = Thread.currentThread().getContextClassLoader();
++        long count = 0;
+-            LOG.debug("read {" + identifier + "}");
+-            S3Object object = s3service.getObject(bucket, key);
+-            InputStream in = object.getObjectContent();
+-            LOG.debug("  return");
+-            return in;
+-        } catch (AmazonServiceException e) {
+-            throw new DataStoreException("Object not found: " + key, e);
+-        }
+-    }
+-
+-    @Override
+-    public Iterator<DataIdentifier> getAllIdentifiers()
+-            throws DataStoreException {
+-        try {
+-            LOG.debug("getAllIdentifiers");
+-            Set<DataIdentifier> ids = new HashSet<DataIdentifier>();
++            Thread.currentThread().setContextClassLoader(
++                getClass().getClassLoader());
++            List<DeleteObjectsRequest.KeyVersion> deleteList = new ArrayList<DeleteObjectsRequest.KeyVersion>();
++            int nThreads = Integer.parseInt(prop.getProperty("maxConnections"));
++            ExecutorService executor = Executors.newFixedThreadPool(nThreads,
++                new NamedThreadFactory("s3-object-rename-worker"));
++            boolean taskAdded = false;
+-                    String id = getIdentifierName(s3ObjSumm.getKey());
+-                    if (id != null) {
+-                        ids.add(new DataIdentifier(id));
+-                    }
+-                }
+-                if (!prevObjectListing.isTruncated()) {
+-                    break;
+-                }
+-                prevObjectListing = s3service.listNextBatchOfObjects(prevObjectListing);
+-            }
+-            LOG.debug("  return");
+-            return ids.iterator();
+-        } catch (AmazonServiceException e) {
+-            throw new DataStoreException("Could not list objects", e);
+-        }
+-    }
+-
+-    @Override
+-    public long getLastModified(DataIdentifier identifier)
+-            throws DataStoreException {
+-        String key = getKeyName(identifier);
+-        try {
+-            ObjectMetadata object = s3service.getObjectMetadata(bucket, key);
+-            return object.getLastModified().getTime();
+-        } catch (AmazonServiceException e) {
+-            throw new DataStoreException(
+-                "Could not getLastModified of dataIdentifier " + identifier, e);
+-        }
+-    }
+-
+-    @Override
+-    public long getLength(DataIdentifier identifier) throws DataStoreException {
+-        String key = getKeyName(identifier);
+-        try {
+-            ObjectMetadata object = s3service.getObjectMetadata(bucket, key);
+-            return object.getContentLength();
+-        } catch (AmazonServiceException e) {
+-            throw new DataStoreException("Could not length of dataIdentifier "
+-                + identifier, e);
+-        }
+-    }
+-
+-    @Override
+-    public void deleteRecord(DataIdentifier identifier)
+-            throws DataStoreException {
+-        String key = getKeyName(identifier);
+-        try {
+-            s3service.deleteObject(bucket, key);
+-        } catch (AmazonServiceException e) {
+-            throw new DataStoreException(
+-                "Could not getLastModified of dataIdentifier " + identifier, e);
+-        }
+-    }
+-
+-    @Override
+-    public List<DataIdentifier> deleteAllOlderThan(long min)
+-            throws DataStoreException {
+-        LOG.info("deleteAllOlderThan " + new Date(min));
+-        List<DataIdentifier> diDeleteList = new ArrayList<DataIdentifier>(30);
+-        ObjectListing prevObjectListing = s3service.listObjects(bucket);
+-        while (true) {
+-            List<DeleteObjectsRequest.KeyVersion> deleteList = new ArrayList<DeleteObjectsRequest.KeyVersion>();
+-            for (S3ObjectSummary s3ObjSumm : prevObjectListing.getObjectSummaries()) {
+-                DataIdentifier identifier = new DataIdentifier(
+-                    getIdentifierName(s3ObjSumm.getKey()));
+-                if (!store.isInUse(identifier)
+-                    && s3ObjSumm.getLastModified().getTime() < min) {
+-                    LOG.info("add id :" + s3ObjSumm.getKey()
+-                        + " to delete lists");
++                    executor.execute(new KeyRenameThread(s3ObjSumm.getKey()));
++                    taskAdded = true;
++                    count++;
+-                    diDeleteList.add(new DataIdentifier(
+-                        getIdentifierName(s3ObjSumm.getKey())));
++                if (!prevObjectListing.isTruncated()) break;
++                prevObjectListing = s3service.listNextBatchOfObjects(prevObjectListing);
++            // This will make the executor accept no new threads
++            // and finish all existing threads in the queue
++            executor.shutdown();
++
++            try {
++                // Wait until all threads are finish
++                while (taskAdded
++                    && !executor.awaitTermination(10, TimeUnit.SECONDS)) {
++                    LOG.info("Rename S3 keys tasks timedout. Waiting again");
++                }
++            } catch (InterruptedException ie) {
++
++            }
++            LOG.info("Renamed [" + count + "] keys, time taken ["
++                + ((System.currentTimeMillis() - startTime) / 1000) + "] sec");
++            // Delete older keys.
+-                delObjsReq.setKeys(deleteList);
+-                DeleteObjectsResult dobjs = s3service.deleteObjects(delObjsReq);
+-                if (dobjs.getDeletedObjects().size() != deleteList.size()) {
+-                    throw new DataStoreException(
+-                        "Incomplete delete object request. only  "
+-                            + dobjs.getDeletedObjects().size() + " out of "
+-                            + deleteList.size() + " are deleted");
++                int batchSize = 500, startIndex = 0, size = deleteList.size();
++                int endIndex = batchSize < size ? batchSize : size;
++                while (endIndex <= size) {
++                    delObjsReq.setKeys(Collections.unmodifiableList(deleteList.subList(
++                        startIndex, endIndex)));
++                    DeleteObjectsResult dobjs = s3service.deleteObjects(delObjsReq);
++                    LOG.info("Records[" + dobjs.getDeletedObjects().size()
++                        + "] deleted in datastore from index [" + startIndex
++                        + "] to [" + (endIndex - 1) + "]");
++                    if (endIndex == size) {
++                        break;
++                    } else {
++                        startIndex = endIndex;
++                        endIndex = (startIndex + batchSize) < size
++                                ? (startIndex + batchSize)
++                                : size;
++                    }
+-                LOG.info(deleteList.size() + " records deleted from datastore");
+-            if (!prevObjectListing.isTruncated()) {
+-                break;
++        } finally {
++            if (contextClassLoader != null) {
++                Thread.currentThread().setContextClassLoader(contextClassLoader);
+-            prevObjectListing = s3service.listNextBatchOfObjects(prevObjectListing);
+-        LOG.info("deleteAllOlderThan  exit");
+-        return diDeleteList;
+-    @Override
+-    public void close() {
+-        s3service.shutdown();
+-        s3service = null;
+-        tmx = null;
++    /**
++     * The method convert old key format to new format. For e.g. this method
++     * converts old key dataStore_004cb70c8f87d78f04da41e7547cb434094089ea to
++     * 004c-b70c8f87d78f04da41e7547cb434094089ea.
++     */
++    private static String convertKey(String oldKey)
++            throws IllegalArgumentException {
++        if (!oldKey.startsWith(KEY_PREFIX)) {
++            throw new IllegalArgumentException("[" + oldKey
++                + "] doesn't start with prefix [" + KEY_PREFIX + "]");
++        }
++        String key = oldKey.substring(KEY_PREFIX.length());
++        return key.substring(0, 4) + DASH + key.substring(4);
+-        return KEY_PREFIX + identifier.toString();
++        String key = identifier.toString();
++        return key.substring(0, 4) + DASH + key.substring(4);
+-        if (!key.startsWith(KEY_PREFIX)) {
++        if (!key.contains(DASH)) {
+-        return key.substring(KEY_PREFIX.length());
++        return key.substring(0, 4) + key.substring(5);
+-     * Returns a new thread pool configured with the default settings.
+-     * 
+-     * @return A new thread pool configured with the default settings.
++     * The class renames object key in S3 in a thread.
+-    private ThreadPoolExecutor createDefaultExecutorService() {
+-        ThreadFactory threadFactory = new ThreadFactory() {
+-            private int threadCount = 1;
++    private class KeyRenameThread implements Runnable {
+-            @Override
+-            public Thread newThread(Runnable r) {
+-                Thread thread = new Thread(r);
+-                thread.setContextClassLoader(getClass().getClassLoader());
+-                thread.setName("s3-transfer-manager-worker-" + threadCount++);
+-                return thread;
++        private String oldKey;
++
++        public void run() {
++            ClassLoader contextClassLoader = Thread.currentThread().getContextClassLoader();
++            try {
++                Thread.currentThread().setContextClassLoader(
++                    getClass().getClassLoader());
++                String newS3Key = convertKey(oldKey);
++                CopyObjectRequest copReq = new CopyObjectRequest(bucket,
++                    oldKey, bucket, newS3Key);
++                s3service.copyObject(copReq);
++                if (LOG.isDebugEnabled()) {
++                    LOG.debug(oldKey + " renamed to " + newS3Key);
++                }
++            } finally {
++                if (contextClassLoader != null) {
++                    Thread.currentThread().setContextClassLoader(
++                        contextClassLoader);
++                }
+-        };
+-        return (ThreadPoolExecutor) Executors.newFixedThreadPool(10,
+-            threadFactory);
++        }
++
++        public KeyRenameThread(String oldKey) {
++            this.oldKey = oldKey;
++        }
++    }
++
++    /**
++     * Listener which receives callback on status of S3 upload.
++     */
++    private class S3UploadProgressListener implements ProgressListener {
++
++        private File file;
++
++        private DataIdentifier identifier;
++
++        private AsyncUploadCallback callback;
++
++        public S3UploadProgressListener(DataIdentifier identifier, File file,
++                AsyncUploadCallback callback) {
++            super();
++            this.identifier = identifier;
++            this.file = file;
++            this.callback = callback;
++        }
++
++        public void progressChanged(ProgressEvent progressEvent) {
++            switch (progressEvent.getEventCode()) {
++                case ProgressEvent.COMPLETED_EVENT_CODE:
++                    callback.call(identifier, file,
++                        AsyncUploadCallback.RESULT.SUCCESS);
++                    break;
++                case ProgressEvent.FAILED_EVENT_CODE:
++                    callback.call(identifier, file,
++                        AsyncUploadCallback.RESULT.FAILED);
++                    break;
++                default:
++                    break;
++            }
++        }
++    }
++
++    /**
++     * This class implements {@link Runnable} interface to upload {@link File}
++     * to S3 asynchronously.
++     */
++    private class AsyncUploadJob implements Runnable {
++
++        private DataIdentifier identifier;
++
++        private File file;
++
++        private AsyncUploadCallback callback;
++
++        public AsyncUploadJob(DataIdentifier identifier, File file,
++                AsyncUploadCallback callback) {
++            super();
++            this.identifier = identifier;
++            this.file = file;
++            this.callback = callback;
++        }
++
++        public void run() {
++            try {
++                write(identifier, file, true, callback);
++            } catch (DataStoreException e) {
++                LOG.error("Could not upload [" + identifier + "], file[" + file
++                    + "]", e);
++            }
++
++        }
+
+MOV26 INS26 INS26 INS26 INS26 INS26 INS26 MOV23 MOV31 INS40 INS40 UPD40 INS40 INS40 INS40 INS40 INS23 INS23 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS55 INS55 INS55 INS83 MOV43 INS59 INS83 INS43 INS59 MOV29 MOV78 MOV83 MOV39 INS42 INS44 INS44 INS43 INS8 MOV78 INS83 INS39 INS42 MOV44 INS44 INS44 INS43 INS8 MOV78 INS83 INS39 INS42 INS44 MOV44 MOV43 MOV8 UPD74 MOV74 INS8 MOV78 MOV83 MOV39 MOV42 INS8 INS83 INS43 INS42 INS8 INS83 INS39 INS42 INS44 INS8 UPD83 INS44 INS44 INS29 INS83 INS39 INS42 INS43 INS8 INS29 INS83 INS83 INS43 INS42 INS44 INS43 INS8 INS29 INS83 INS42 INS43 INS23 INS31 INS31 INS29 INS83 INS42 INS43 INS23 INS23 INS23 INS31 INS31 INS29 INS83 INS42 MOV43 INS23 INS23 INS23 INS31 INS31 INS42 INS42 INS42 INS60 INS43 INS42 INS43 INS42 INS42 INS21 INS43 INS42 INS43 INS42 INS42 INS25 INS60 INS21 INS60 INS60 INS43 INS42 UPD39 UPD42 INS60 INS60 INS60 INS60 INS25 INS41 INS60 INS60 INS60 INS60 INS60 INS60 INS60 INS60 INS60 INS60 UPD43 INS60 INS21 INS60 INS60 INS54 INS21 INS41 INS21 INS21 MOV21 INS21 INS42 INS41 INS43 INS42 INS21 INS39 INS42 INS43 INS42 MOV60 INS25 INS65 INS42 INS60 INS60 INS60 INS54 INS65 INS42 INS43 INS42 INS42 INS25 INS60 INS41 INS60 MOV65 UPD42 MOV42 MOV83 INS43 MOV59 MOV83 INS39 INS42 MOV8 INS83 INS42 INS44 INS8 INS65 INS42 INS83 INS43 INS59 INS83 MOV43 INS59 INS83 INS43 INS59 INS83 INS42 INS44 INS44 INS44 INS8 INS83 INS39 INS42 INS44 INS8 INS65 INS83 INS43 INS59 INS83 INS43 INS59 INS83 INS43 INS59 INS83 INS42 INS44 INS44 INS44 INS8 INS83 INS39 INS42 INS8 INS43 INS59 MOV60 INS8 INS42 INS42 INS32 INS42 INS42 INS27 INS8 MOV43 INS59 INS32 INS39 INS59 INS43 INS59 INS8 INS42 INS39 INS59 INS43 INS59 INS39 INS59 INS43 INS59 INS12 INS8 INS32 INS8 INS42 INS39 INS59 INS43 INS59 INS8 INS39 INS59 INS43 INS59 INS8 INS39 INS59 INS43 INS59 INS8 INS39 INS59 INS43 INS59 INS8 INS39 INS59 INS43 INS59 INS8 INS8 UPD42 INS39 INS59 INS7 UPD74 MOV74 INS59 INS43 INS59 MOV8 INS8 INS32 INS42 INS32 INS32 INS32 INS42 INS42 INS7 INS42 UPD43 INS8 INS32 INS8 INS66 INS66 INS66 INS66 INS39 INS59 INS43 INS59 INS39 INS59 INS8 INS8 INS66 INS66 INS66 INS42 INS38 INS8 INS43 INS59 INS27 INS43 INS59 INS27 UPD66 INS42 UPD42 INS54 INS43 INS42 INS21 INS66 INS42 INS42 INS42 INS42 INS42 INS43 INS42 INS43 INS42 INS43 INS42 INS46 INS21 INS21 INS21 INS43 INS42 INS50 INS66 INS65 INS66 INS65 INS66 INS42 INS42 INS42 INS42 INS42 INS42 INS43 INS42 INS43 INS42 INS43 INS42 INS46 INS21 INS21 INS21 INS54 INS42 INS42 INS32 INS21 INS21 INS21 INS25 INS25 INS25 INS60 INS60 INS25 INS21 INS60 INS60 INS25 INS25 INS25 INS52 INS42 INS42 INS42 INS9 INS33 INS42 INS33 INS53 INS42 INS14 INS42 INS42 INS42 INS32 INS42 INS42 INS32 INS25 INS42 INS32 INS42 INS42 INS33 INS42 INS9 INS42 INS42 INS32 INS21 INS21 MOV44 INS8 INS25 INS42 INS42 INS21 INS42 INS32 INS42 INS42 INS32 INS21 INS25 INS25 INS42 INS32 INS42 INS42 INS32 INS21 INS60 INS25 INS25 INS42 INS32 INS42 INS42 INS32 INS21 INS60 INS25 INS25 INS42 INS32 INS42 INS42 INS32 INS21 INS60 INS25 INS25 INS42 INS32 INS42 INS42 INS32 INS21 MOV21 INS25 INS25 INS42 INS32 INS42 INS27 UPD43 INS42 INS14 INS42 INS42 INS32 INS21 INS25 INS42 INS42 INS27 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS45 INS22 INS42 UPD42 UPD42 INS21 INS25 INS25 MOV42 UPD42 MOV42 INS21 INS42 INS32 INS42 INS42 INS32 INS42 INS34 INS21 MOV60 INS60 INS60 INS60 INS60 INS61 INS21 INS54 INS21 INS25 INS25 INS32 INS53 INS42 INS42 MOV32 INS32 INS42 INS32 INS42 INS42 INS32 INS32 INS42 INS32 INS32 INS32 INS43 INS8 INS8 INS42 INS7 UPD42 MOV42 INS42 INS42 INS7 INS7 INS7 INS42 INS32 INS49 INS21 INS10 INS49 INS21 INS10 INS49 INS10 INS42 INS42 INS42 INS42 INS42 INS7 INS7 INS7 INS8 INS12 INS32 INS42 INS7 INS32 INS7 INS32 INS8 INS27 INS8 INS43 INS27 INS8 INS39 INS59 INS43 INS59 INS27 INS8 INS32 INS43 INS59 INS39 INS59 INS42 INS8 INS32 INS8 INS25 INS27 INS8 INS14 MOV43 INS14 INS42 INS42 INS32 INS42 INS27 INS8 INS42 INS42 INS32 INS42 INS32 INS7 INS8 INS25 INS27 INS8 INS32 INS42 INS42 INS32 INS42 INS32 INS32 INS8 INS27 INS8 INS42 INS42 INS32 INS42 INS32 INS43 INS59 INS32 INS8 INS27 INS8 INS42 INS42 INS32 INS42 INS32 INS39 INS59 INS32 INS8 INS42 INS25 INS53 INS27 INS8 INS42 INS42 INS32 INS42 INS32 INS39 INS59 INS32 INS8 INS42 INS27 INS8 INS42 INS42 INS32 INS42 INS32 INS32 INS8 INS27 INS8 INS42 INS42 INS42 INS34 UPD42 UPD74 MOV74 INS34 INS32 INS42 INS32 INS27 INS8 INS45 INS42 INS45 INS42 INS45 INS32 INS45 INS36 INS45 INS52 INS42 INS32 INS42 INS32 MOV27 INS8 INS27 INS8 INS32 INS42 INS42 INS32 INS42 INS32 INS74 INS59 INS39 INS59 INS43 INS59 INS39 INS59 INS9 INS8 INS32 INS8 INS12 INS32 INS27 INS8 INS27 INS8 INS42 INS42 INS42 INS14 UPD42 INS42 INS42 INS34 INS34 INS42 INS42 INS34 INS42 INS42 INS42 INS42 INS34 INS34 INS42 INS42 INS34 UPD42 UPD42 INS42 INS42 INS34 INS34 INS42 INS42 INS34 INS42 INS42 INS32 MOV21 INS60 INS60 INS21 INS25 INS25 INS22 INS42 INS22 INS42 INS22 INS42 INS22 INS42 INS42 INS42 INS40 INS32 INS40 INS32 INS22 INS42 INS22 INS42 INS22 INS42 INS21 INS44 INS8 INS42 INS42 INS42 INS14 INS32 INS42 INS32 INS42 MOV32 INS42 INS42 MOV21 INS27 INS32 MOV21 INS42 INS42 INS32 INS27 INS38 INS21 INS42 INS34 INS42 INS42 INS32 INS42 INS33 INS21 INS42 INS42 INS27 INS42 INS42 INS32 INS42 INS16 INS21 INS42 INS42 MOV21 INS32 INS8 INS42 INS33 INS21 INS43 INS45 INS43 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS32 INS25 INS8 INS42 INS33 INS21 INS42 INS42 INS32 INS42 INS32 INS42 INS32 UPD42 INS33 INS21 INS21 INS27 INS8 MOV8 INS42 INS33 INS21 INS42 INS42 INS27 INS42 INS42 INS32 INS42 INS32 INS42 INS42 MOV21 INS42 INS33 INS21 INS42 INS42 INS32 INS42 INS32 INS42 INS42 INS32 MOV42 UPD42 MOV42 MOV21 INS42 INS33 INS21 INS42 INS42 INS32 INS42 INS32 INS42 MOV32 INS42 INS42 INS21 INS27 INS8 INS14 INS42 INS33 INS21 INS42 INS42 INS32 INS42 INS32 INS42 MOV32 INS42 INS42 INS21 INS42 INS33 INS21 INS42 INS42 INS32 INS42 INS32 INS42 INS42 INS21 INS42 INS33 INS21 UPD43 INS42 INS42 INS32 INS42 INS32 INS42 INS33 INS21 INS42 INS42 INS27 UPD42 MOV42 INS42 INS32 INS42 INS32 INS25 INS25 INS25 INS54 INS42 INS33 MOV21 MOV42 MOV42 INS27 INS42 INS42 INS32 INS42 INS32 INS43 INS43 INS42 INS14 INS42 INS32 INS42 INS42 INS32 INS42 INS9 INS70 INS25 MOV21 INS42 INS42 INS61 INS44 INS8 INS42 INS42 INS27 INS32 INS34 INS60 INS60 INS60 INS61 INS42 INS33 INS21 INS43 INS27 INS32 INS42 INS43 INS59 INS43 INS59 INS32 INS32 INS8 INS27 INS8 INS52 INS42 INS52 INS42 INS52 INS42 INS52 INS42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 INS42 INS40 INS42 INS42 INS42 INS42 INS40 INS52 INS42 INS52 INS42 INS52 INS42 INS32 INS43 INS42 INS21 MOV43 INS42 INS42 INS32 INS42 INS42 INS33 INS45 INS42 INS32 INS42 INS42 INS40 INS42 INS33 INS32 INS7 INS42 INS42 INS40 INS7 INS45 INS42 INS45 INS11 INS42 INS42 INS40 INS36 INS9 INS32 INS32 INS42 INS42 MOV21 INS32 INS42 INS42 UPD42 MOV42 UPD42 MOV42 INS32 UPD42 MOV42 INS32 INS8 INS21 MOV41 INS32 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS7 INS42 INS7 INS32 INS34 INS21 INS53 INS32 INS45 INS42 INS45 INS42 INS45 INS36 INS45 INS42 INS42 INS32 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS10 INS32 INS42 INS42 INS32 INS42 INS32 INS32 INS34 INS21 INS43 MOV42 INS32 INS42 INS42 INS32 INS42 INS32 INS32 INS42 INS42 INS32 INS42 INS32 INS32 UPD42 UPD42 MOV42 UPD42 MOV42 INS32 UPD42 MOV42 INS32 INS32 INS42 INS42 INS42 INS32 INS42 INS32 INS8 INS32 INS8 INS27 INS8 INS8 INS12 INS45 INS42 INS45 MOV32 INS45 INS42 UPD45 MOV45 INS36 INS45 INS42 INS42 INS32 INS42 INS42 INS40 INS74 INS42 INS42 INS32 INS42 INS42 INS42 INS14 INS44 INS32 INS8 INS38 INS10 INS27 INS8 INS43 INS42 INS45 INS42 INS45 INS36 INS45 INS42 INS42 INS43 INS59 INS39 INS59 INS59 INS59 INS39 INS59 INS27 INS8 INS32 INS42 INS45 INS42 INS45 INS42 INS45 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS14 INS42 INS42 INS42 INS42 INS42 MOV21 INS42 INS33 INS21 INS42 INS42 INS42 INS9 INS42 INS42 INS32 INS42 INS42 INS42 INS45 INS42 INS42 INS42 INS42 INS42 INS32 MOV43 INS32 INS27 INS42 INS42 INS42 INS42 INS27 INS32 INS42 INS42 INS42 MOV42 UPD42 MOV42 MOV21 INS32 INS32 INS42 INS42 INS42 INS42 INS9 INS25 INS42 INS9 INS42 INS42 INS7 INS14 UPD45 INS32 INS42 INS42 INS27 INS42 INS32 INS42 INS42 INS42 INS27 INS32 INS42 INS42 INS42 INS42 INS42 INS27 INS42 INS42 INS32 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS27 INS32 INS42 INS42 INS42 INS42 INS42 INS27 INS32 INS42 INS42 UPD42 MOV42 INS60 INS25 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 MOV21 INS42 INS42 MOV21 INS42 INS33 MOV21 INS60 INS25 MOV44 INS8 INS32 UPD42 INS42 INS27 INS42 INS43 INS43 INS42 INS42 INS45 INS43 INS45 INS43 INS42 INS42 INS42 MOV21 INS21 INS21 INS21 INS32 INS42 INS32 INS42 INS38 INS21 INS42 INS27 INS42 INS42 INS14 INS42 INS34 INS42 INS34 INS42 MOV32 INS42 INS16 INS42 INS42 INS21 INS60 INS21 INS25 INS32 INS42 INS42 UPD42 MOV42 INS42 INS42 INS42 INS43 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS27 INS42 INS42 INS42 INS42 INS42 UPD42 MOV42 INS42 INS42 INS14 INS27 INS32 INS45 INS36 INS45 INS42 INS42 INS42 INS42 INS27 INS42 INS42 INS32 INS8 INS42 INS9 INS43 MOV27 INS42 INS42 INS42 INS32 INS42 UPD45 INS32 INS45 INS36 UPD45 INS42 INS42 INS45 INS32 INS45 INS36 INS45 INS42 INS42 INS45 MOV32 INS45 INS42 INS45 INS36 INS45 INS42 INS42 INS27 INS42 INS42 INS45 INS32 INS45 INS42 INS45 INS36 INS45 INS42 INS42 INS45 INS32 INS45 INS36 INS45 INS42 INS42 INS39 INS59 INS32 INS8 INS8 INS42 INS42 INS43 INS59 INS42 INS8 INS8 INS25 MOV53 UPD42 MOV42 UPD42 MOV42 INS32 INS42 INS42 INS40 INS42 INS42 MOV32 INS7 INS37 INS32 INS42 INS42 INS42 INS42 INS42 INS32 INS32 INS36 INS34 INS43 INS42 INS27 INS42 INS42 INS32 INS43 INS59 INS32 INS27 INS8 INS8 INS42 INS42 INS42 UPD42 UPD42 INS32 INS42 INS42 INS45 INS42 INS45 INS42 INS45 INS43 INS45 INS42 INS33 INS45 INS42 INS42 INS27 INS27 INS45 INS42 INS45 INS36 INS45 INS42 INS42 MOV21 INS42 UPD45 UPD45 INS42 INS42 INS42 INS42 INS27 INS42 INS42 INS27 INS27 UPD45 MOV45 INS32 INS45 INS36 INS45 INS42 INS42 INS27 INS42 INS42 INS27 INS42 MOV32 INS42 INS42 INS21 INS25 INS21 INS25 UPD42 UPD42 INS42 INS42 INS40 INS42 INS42 INS32 INS21 INS25 MOV21 INS25 INS25 INS38 INS8 INS42 INS42 INS42 UPD42 INS14 INS42 INS9 INS42 INS42 INS42 INS14 INS42 INS42 INS34 INS40 INS42 INS42 INS45 INS27 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS27 INS42 INS42 INS10 MOV21 INS21 INS42 UPD45 INS42 INS42 INS42 INS42 INS32 INS32 INS45 INS42 INS45 INS36 INS45 INS27 INS32 INS42 INS32 INS42 INS32 INS42 INS42 INS42 INS27 INS32 INS42 INS32 INS42 INS32 INS42 INS32 INS8 INS32 INS32 INS8 UPD45 MOV32 MOV42 INS42 MOV14 INS32 INS32 INS8 INS32 INS8 INS27 INS8 INS42 INS21 INS43 MOV32 INS43 INS32 INS32 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS45 INS32 INS45 INS42 INS45 INS36 INS45 INS7 INS42 INS42 INS42 INS42 MOV27 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS27 INS42 INS42 MOV21 INS42 INS42 INS42 INS42 INS42 INS21 INS42 INS42 INS14 INS42 INS42 INS21 INS42 INS42 INS21 INS42 INS33 INS21 INS32 INS45 INS42 INS40 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS27 INS42 UPD42 INS42 INS16 INS42 INS42 UPD45 UPD45 INS36 INS45 INS42 INS42 INS45 INS42 INS45 INS42 INS45 INS32 INS43 INS42 INS42 INS42 INS32 INS32 INS32 INS42 INS42 INS42 INS42 INS40 INS42 INS42 INS42 INS34 INS27 INS36 INS42 INS27 UPD42 INS42 INS42 INS27 INS42 INS42 INS42 INS27 INS42 INS42 INS27 INS42 INS42 INS42 INS42 INS40 INS36 INS42 INS27 INS32 INS42 INS42 INS45 INS45 INS42 INS45 INS45 INS42 INS45 INS27 INS42 INS42 INS42 INS42 INS42 INS42 DEL42 DEL32 DEL45 DEL45 DEL45 DEL45 DEL32 DEL21 DEL34 DEL42 DEL43 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL27 DEL42 DEL42 DEL32 DEL21 DEL42 DEL31 DEL42 DEL42 DEL42 DEL45 DEL32 DEL21 DEL45 DEL32 DEL21 DEL10 DEL8 DEL45 DEL42 DEL43 DEL42 DEL27 DEL14 DEL53 DEL8 DEL45 DEL42 DEL14 DEL27 DEL32 DEL21 DEL42 DEL34 DEL14 DEL59 DEL60 DEL42 DEL42 DEL45 DEL27 DEL32 DEL21 DEL45 DEL32 DEL21 DEL42 DEL41 DEL42 DEL42 DEL45 DEL42 DEL32 DEL21 DEL45 DEL45 DEL8 DEL12 DEL42 DEL42 DEL45 DEL32 DEL21 DEL45 DEL32 DEL21 DEL8 DEL45 DEL42 DEL32 DEL21 DEL8 DEL12 DEL54 DEL8 DEL25 DEL42 DEL42 DEL14 DEL32 DEL42 DEL33 DEL33 DEL8 DEL31 DEL42 DEL34 DEL42 DEL42 DEL14 DEL42 DEL37 DEL42 DEL41 DEL66 DEL65 DEL29 DEL83 DEL42 DEL43 DEL42 DEL42 DEL43 DEL42 DEL43 DEL39 DEL23 DEL42 DEL43 DEL42 DEL42 DEL44 DEL31 DEL1 DEL14 DEL59 DEL60 DEL34 DEL32 DEL11 DEL41 DEL8 DEL31

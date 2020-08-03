@@ -1,0 +1,72 @@
+HADOOP-13590. Retry until TGT expires even if the UGI renewal thread encountered exception.
+
++import java.util.concurrent.TimeUnit;
++import org.apache.hadoop.io.retry.RetryPolicies;
++import org.apache.hadoop.io.retry.RetryPolicy;
++import org.apache.hadoop.metrics2.lib.MutableGaugeInt;
++import org.apache.hadoop.metrics2.lib.MutableGaugeLong;
+-  private static final Logger LOG = LoggerFactory.getLogger(
++  @VisibleForTesting
++  static final Logger LOG = LoggerFactory.getLogger(
++    @Metric("Renewal failures since startup")
++    private MutableGaugeLong renewalFailuresTotal;
++    @Metric("Renewal failures since last successful login")
++    private MutableGaugeInt renewalFailures;
++
++    MutableGaugeInt getRenewalFailures() {
++      return renewalFailures;
++    }
++        RetryPolicy rp = null;
++            metrics.renewalFailures.set(0);
++            rp = null;
+-            LOG.warn("Exception encountered while running the" +
+-                " renewal command. Aborting renew thread. " + ie);
+-            return;
++            metrics.renewalFailuresTotal.incr();
++            final long tgtEndTime = tgt.getEndTime().getTime();
++            LOG.warn("Exception encountered while running the renewal "
++                    + "command for {}. (TGT end time:{}, renewalFailures: {},"
++                    + "renewalFailuresTotal: {})", getUserName(), tgtEndTime,
++                metrics.renewalFailures, metrics.renewalFailuresTotal, ie);
++            final long now = Time.now();
++            if (rp == null) {
++              // Use a dummy maxRetries to create the policy. The policy will
++              // only be used to get next retry time with exponential back-off.
++              // The final retry time will be later limited within the
++              // tgt endTime in getNextTgtRenewalTime.
++              rp = RetryPolicies.exponentialBackoffRetry(Long.SIZE - 2,
++                  kerberosMinSecondsBeforeRelogin, TimeUnit.MILLISECONDS);
++            }
++            try {
++              nextRefresh = getNextTgtRenewalTime(tgtEndTime, now, rp);
++            } catch (Exception e) {
++              LOG.error("Exception when calculating next tgt renewal time", e);
++              return;
++            }
++            metrics.renewalFailures.incr();
++            // retry until close enough to tgt endTime.
++            if (now > nextRefresh) {
++              LOG.error("TGT is expired. Aborting renew thread for {}.",
++                  getUserName());
++              return;
++            }
++
++  /**
++   * Get time for next login retry. This will allow the thread to retry with
++   * exponential back-off, until tgt endtime.
++   * Last retry is {@link #kerberosMinSecondsBeforeRelogin} before endtime.
++   *
++   * @param tgtEndTime EndTime of the tgt.
++   * @param now Current time.
++   * @param rp The retry policy.
++   * @return Time for next login retry.
++   */
++  @VisibleForTesting
++  static long getNextTgtRenewalTime(final long tgtEndTime, final long now,
++      final RetryPolicy rp) throws Exception {
++    final long lastRetryTime = tgtEndTime - kerberosMinSecondsBeforeRelogin;
++    final RetryPolicy.RetryAction ra = rp.shouldRetry(null,
++        metrics.renewalFailures.value(), 0, false);
++    return Math.min(lastRetryTime, now + ra.delayMillis);
++  }
++

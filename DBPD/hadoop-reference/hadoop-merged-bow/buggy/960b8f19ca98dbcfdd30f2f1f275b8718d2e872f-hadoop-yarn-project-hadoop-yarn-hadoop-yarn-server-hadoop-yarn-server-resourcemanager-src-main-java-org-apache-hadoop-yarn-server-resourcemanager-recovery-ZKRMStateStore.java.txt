@@ -1,0 +1,846 @@
+YARN-2716. Refactor ZKRMStateStore retry code with Apache Curator. Contributed by Karthik Kambatla
+
+-import java.io.IOException;
+-import java.util.Collections;
++import org.apache.curator.framework.AuthInfo;
++import org.apache.curator.framework.CuratorFramework;
++import org.apache.curator.framework.CuratorFrameworkFactory;
++import org.apache.curator.framework.api.transaction.CuratorTransaction;
++import org.apache.curator.framework.api.transaction.CuratorTransactionFinal;
++import org.apache.curator.retry.RetryNTimes;
+-import org.apache.hadoop.util.StringUtils;
+-import org.apache.zookeeper.KeeperException;
+-import org.apache.zookeeper.KeeperException.Code;
+-import org.apache.zookeeper.Op;
+-import org.apache.zookeeper.WatchedEvent;
+-import org.apache.zookeeper.Watcher;
+-import org.apache.zookeeper.Watcher.Event;
+-import org.apache.zookeeper.ZooKeeper;
+- * Changes from 1.1 to 1.2, AMRMTokenSecretManager state has been saved
++ * {@link RMStateStore} implementation backed by ZooKeeper.
++ *
++ * The znode structure is as follows:
++ * ROOT_DIR_PATH
++ * |--- VERSION_INFO
++ * |--- EPOCH_NODE
++ * |--- RM_ZK_FENCING_LOCK
++ * |--- RM_APP_ROOT
++ * |     |----- (#ApplicationId1)
++ * |     |        |----- (#ApplicationAttemptIds)
++ * |     |
++ * |     |----- (#ApplicationId2)
++ * |     |       |----- (#ApplicationAttemptIds)
++ * |     ....
++ * |
++ * |--- RM_DT_SECRET_MANAGER_ROOT
++ *        |----- RM_DT_SEQUENTIAL_NUMBER_ZNODE_NAME
++ *        |----- RM_DELEGATION_TOKENS_ROOT_ZNODE_NAME
++ *        |       |----- Token_1
++ *        |       |----- Token_2
++ *        |       ....
++ *        |
++ *        |----- RM_DT_MASTER_KEYS_ROOT_ZNODE_NAME
++ *        |      |----- Key_1
++ *        |      |----- Key_2
++ *                ....
++ * |--- AMRMTOKEN_SECRET_MANAGER_ROOT
++ *        |----- currentMasterKey
++ *        |----- nextMasterKey
++ *
++ * Note: Changes from 1.1 to 1.2 - AMRMTokenSecretManager state has been saved
+-  private int numRetries;
++  private int numRetries;
+-
+-  long zkRetryInterval;
+-  private List<ACL> zkAcl;
+-  private List<ZKUtil.ZKAuthInfo> zkAuths;
++  int zkRetryInterval;
+-  /**
+-   *
+-   * ROOT_DIR_PATH
+-   * |--- VERSION_INFO
+-   * |--- EPOCH_NODE
+-   * |--- RM_ZK_FENCING_LOCK
+-   * |--- RM_APP_ROOT
+-   * |     |----- (#ApplicationId1)
+-   * |     |        |----- (#ApplicationAttemptIds)
+-   * |     |
+-   * |     |----- (#ApplicationId2)
+-   * |     |       |----- (#ApplicationAttemptIds)
+-   * |     ....
+-   * |
+-   * |--- RM_DT_SECRET_MANAGER_ROOT
+-   *        |----- RM_DT_SEQUENTIAL_NUMBER_ZNODE_NAME
+-   *        |----- RM_DELEGATION_TOKENS_ROOT_ZNODE_NAME
+-   *        |       |----- Token_1
+-   *        |       |----- Token_2
+-   *        |       ....
+-   *        |
+-   *        |----- RM_DT_MASTER_KEYS_ROOT_ZNODE_NAME
+-   *        |      |----- Key_1
+-   *        |      |----- Key_2
+-   *                ....
+-   * |--- AMRMTOKEN_SECRET_MANAGER_ROOT
+-   *        |----- currentMasterKey
+-   *        |----- nextMasterKey
+-   *
+-   */
++  /** Znode paths */
+-
+-  @VisibleForTesting
+-  protected ZooKeeper zkClient;
+-
+-  /* activeZkClient is not used to do actual operations,
+-   * it is only used to verify client session for watched events and
+-   * it gets activated into zkClient on connection event.
+-   */
+-  @VisibleForTesting
+-  ZooKeeper activeZkClient;
+-
++  private boolean useDefaultFencingScheme = false;
+-  private Op createFencingNodePathOp;
+-  private Op deleteFencingNodePathOp;
+-  private String zkRootNodeUsername;
+-  private final String zkRootNodePassword = Long.toString(random.nextLong());
++  /** ACL and auth info */
++  private List<ACL> zkAcl;
++  private List<ZKUtil.ZKAuthInfo> zkAuths;
+-  private boolean useDefaultFencingScheme = false;
++  private String zkRootNodeUsername;
++  private final String zkRootNodePassword = Long.toString(random.nextLong());
++  @VisibleForTesting
++  protected CuratorFramework curatorFramework;
+-    List<ACL> zkRootNodeAcl = new ArrayList<ACL>();
++    List<ACL> zkRootNodeAcl = new ArrayList<>();
+-          conf.getLong(YarnConfiguration.RM_ZK_RETRY_INTERVAL_MS,
++          conf.getInt(YarnConfiguration.RM_ZK_RETRY_INTERVAL_MS,
+-    createFencingNodePathOp = Op.create(fencingNodePath, new byte[0], zkAcl,
+-        CreateMode.PERSISTENT);
+-    deleteFencingNodePathOp = Op.delete(fencingNodePath, -1);
+-    createRootDir(zkRootNodePath);
++    create(zkRootNodePath);
+-    createRootDir(rmAppRoot);
+-    createRootDir(rmDTSecretManagerRoot);
+-    createRootDir(dtMasterKeysRootPath);
+-    createRootDir(delegationTokensRootPath);
+-    createRootDir(dtSequenceNumberPath);
+-    createRootDir(amrmTokenSecretManagerRoot);
+-  }
+-
+-  protected void createRootDir(final String rootPath) throws Exception {
+-    // For root dirs, we shouldn't use the doMulti helper methods
+-    new ZKAction<String>() {
+-      @Override
+-      public String run() throws KeeperException, InterruptedException {
+-        try {
+-          return zkClient.create(rootPath, null, zkAcl, CreateMode.PERSISTENT);
+-        } catch (KeeperException ke) {
+-          if (ke.code() == Code.NODEEXISTS) {
+-            LOG.debug(rootPath + "znode already exists!");
+-            return null;
+-          } else {
+-            throw ke;
+-          }
+-        }
+-      }
+-    }.runWithRetries();
++    create(rmAppRoot);
++    create(rmDTSecretManagerRoot);
++    create(dtMasterKeysRootPath);
++    create(delegationTokensRootPath);
++    create(dtSequenceNumberPath);
++    create(amrmTokenSecretManagerRoot);
+-    List<ACL> getAcls = getACLWithRetries(zkRootNodePath, getStat);
++    List<ACL> getAcls = getACL(zkRootNodePath);
+-    new ZKAction<Void>() {
+-      @Override
+-      public Void run() throws KeeperException, InterruptedException {
+-        zkClient.setACL(zkRootNodePath, zkRootNodeAcl, -1);
+-        return null;
+-      }
+-    }.runWithRetries();
+-
+-    // delete fencingnodepath
+-    new ZKAction<Void>() {
+-      @Override
+-      public Void run() throws KeeperException, InterruptedException {
+-        try {
+-          zkClient.multi(Collections.singletonList(deleteFencingNodePathOp));
+-        } catch (KeeperException.NoNodeException nne) {
+-          LOG.info("Fencing node " + fencingNodePath + " doesn't exist to delete");
+-        }
+-        return null;
+-      }
+-    }.runWithRetries();
++    curatorFramework.setACL().withACL(zkRootNodeAcl).forPath(zkRootNodePath);
++    delete(fencingNodePath);
+-  private synchronized void closeZkClients() throws IOException {
+-    zkClient = null;
+-    if (activeZkClient != null) {
+-      try {
+-        activeZkClient.close();
+-      } catch (InterruptedException e) {
+-        throw new IOException("Interrupted while closing ZK", e);
+-      }
+-      activeZkClient = null;
+-    }
+-  }
+-
+-    closeZkClients();
++    curatorFramework.close();
+-    if (existsWithRetries(versionNodePath, false) != null) {
+-      setDataWithRetries(versionNodePath, data, -1);
++    if (exists(versionNodePath)) {
++      safeSetData(versionNodePath, data, -1);
+-      createWithRetries(versionNodePath, data, zkAcl, CreateMode.PERSISTENT);
++      safeCreate(versionNodePath, data, zkAcl, CreateMode.PERSISTENT);
+-    if (existsWithRetries(versionNodePath, false) != null) {
+-      byte[] data = getDataWithRetries(versionNodePath, false);
+-      Version version =
+-          new VersionPBImpl(VersionProto.parseFrom(data));
+-      return version;
++    if (exists(versionNodePath)) {
++      byte[] data = getData(versionNodePath);
++      return new VersionPBImpl(VersionProto.parseFrom(data));
+-    if (existsWithRetries(epochNodePath, false) != null) {
++    if (exists(epochNodePath)) {
+-      byte[] data = getDataWithRetries(epochNodePath, false);
++      byte[] data = getData(epochNodePath);
+-      setDataWithRetries(epochNodePath, storeData, -1);
++      safeSetData(epochNodePath, storeData, -1);
+-      createWithRetries(epochNodePath, storeData, zkAcl, CreateMode.PERSISTENT);
++      safeCreate(epochNodePath, storeData, zkAcl, CreateMode.PERSISTENT);
+-    byte[] data = getDataWithRetries(amrmTokenSecretManagerRoot, false);
++    byte[] data = getData(amrmTokenSecretManagerRoot);
+-
+-        getChildrenWithRetries(dtMasterKeysRootPath, false);
++        getChildren(dtMasterKeysRootPath);
+-      byte[] childData = getDataWithRetries(childNodePath, false);
++      byte[] childData = getData(childNodePath);
+-    byte[] seqData = getDataWithRetries(dtSequenceNumberPath, false);
++    byte[] seqData = getData(dtSequenceNumberPath);
+-        getChildrenWithRetries(delegationTokensRootPath, false);
++        getChildren(delegationTokensRootPath);
+-      byte[] childData = getDataWithRetries(childNodePath, false);
++      byte[] childData = getData(childNodePath);
+-    List<String> childNodes = getChildrenWithRetries(rmAppRoot, false);
++    List<String> childNodes = getChildren(rmAppRoot);
+-      byte[] childData = getDataWithRetries(childNodePath, false);
++      byte[] childData = getData(childNodePath);
+-    List<String> attempts = getChildrenWithRetries(appPath, false);
++    List<String> attempts = getChildren(appPath);
+-        byte[] attemptData = getDataWithRetries(attemptPath, false);
++        byte[] attemptData = getData(attemptPath);
+-    createWithRetries(nodeCreatePath, appStateData, zkAcl,
+-      CreateMode.PERSISTENT);
++    safeCreate(nodeCreatePath, appStateData, zkAcl,
++        CreateMode.PERSISTENT);
+-    if (existsWithRetries(nodeUpdatePath, false) != null) {
+-      setDataWithRetries(nodeUpdatePath, appStateData, -1);
++    if (exists(nodeUpdatePath)) {
++      safeSetData(nodeUpdatePath, appStateData, -1);
+-      createWithRetries(nodeUpdatePath, appStateData, zkAcl,
+-        CreateMode.PERSISTENT);
++      safeCreate(nodeUpdatePath, appStateData, zkAcl,
++          CreateMode.PERSISTENT);
+-    createWithRetries(nodeCreatePath, attemptStateData, zkAcl,
+-      CreateMode.PERSISTENT);
++    safeCreate(nodeCreatePath, attemptStateData, zkAcl,
++        CreateMode.PERSISTENT);
+-    if (existsWithRetries(nodeUpdatePath, false) != null) {
+-      setDataWithRetries(nodeUpdatePath, attemptStateData, -1);
++    if (exists(nodeUpdatePath)) {
++      safeSetData(nodeUpdatePath, attemptStateData, -1);
+-      createWithRetries(nodeUpdatePath, attemptStateData, zkAcl,
+-        CreateMode.PERSISTENT);
++      safeCreate(nodeUpdatePath, attemptStateData, zkAcl,
++          CreateMode.PERSISTENT);
+-    ArrayList<Op> opList = new ArrayList<Op>();
+-
+-    for (ApplicationAttemptId attemptId : appState.attempts.keySet()) {
+-      String attemptRemovePath = getNodePath(appIdRemovePath, attemptId.toString());
+-      opList.add(Op.delete(attemptRemovePath, -1));
+-    }
+-    opList.add(Op.delete(appIdRemovePath, -1));
+-    doDeleteMultiWithRetries(opList);
++
++    for (ApplicationAttemptId attemptId : appState.attempts.keySet()) {
++      String attemptRemovePath = getNodePath(appIdRemovePath, attemptId.toString());
++      safeDelete(attemptRemovePath);
++    }
++    safeDelete(appIdRemovePath);
+-    ArrayList<Op> opList = new ArrayList<Op>();
+-    addStoreOrUpdateOps(opList, rmDTIdentifier, renewDate, false);
+-    doStoreMultiWithRetries(opList);
++    SafeTransaction trx = new SafeTransaction();
++    addStoreOrUpdateOps(trx, rmDTIdentifier, renewDate, false);
++    trx.commit();
+-    if (existsWithRetries(nodeRemovePath, false) != null) {
+-      ArrayList<Op> opList = new ArrayList<Op>();
+-      opList.add(Op.delete(nodeRemovePath, -1));
+-      doDeleteMultiWithRetries(opList);
+-    } else {
+-      LOG.debug("Attempted to delete a non-existing znode " + nodeRemovePath);
+-    }
++    safeDelete(nodeRemovePath);
+-    ArrayList<Op> opList = new ArrayList<Op>();
++    SafeTransaction trx = new SafeTransaction();
+-    if (existsWithRetries(nodeRemovePath, false) == null) {
+-      // in case znode doesn't exist
+-      addStoreOrUpdateOps(opList, rmDTIdentifier, renewDate, false);
+-      LOG.debug("Attempted to update a non-existing znode " + nodeRemovePath);
+-    } else {
++    if (exists(nodeRemovePath)) {
+-      addStoreOrUpdateOps(opList, rmDTIdentifier, renewDate, true);
++      addStoreOrUpdateOps(trx, rmDTIdentifier, renewDate, true);
++    } else {
++      // in case znode doesn't exist
++      addStoreOrUpdateOps(trx, rmDTIdentifier, renewDate, false);
++      LOG.debug("Attempted to update a non-existing znode " + nodeRemovePath);
+-    doStoreMultiWithRetries(opList);
++    trx.commit();
+-  private void addStoreOrUpdateOps(ArrayList<Op> opList,
++  private void addStoreOrUpdateOps(SafeTransaction trx,
+-        opList.add(Op.setData(nodeCreatePath, identifierData.toByteArray(), -1));
++        trx.setData(nodeCreatePath, identifierData.toByteArray(), -1);
+-        opList.add(Op.create(nodeCreatePath, identifierData.toByteArray(), zkAcl,
+-            CreateMode.PERSISTENT));
++        trx.create(nodeCreatePath, identifierData.toByteArray(), zkAcl,
++            CreateMode.PERSISTENT);
+-                    dtSequenceNumberPath + ". SequenceNumber: "
+-                    + rmDTIdentifier.getSequenceNumber());
++              dtSequenceNumberPath + ". SequenceNumber: "
++              + rmDTIdentifier.getSequenceNumber());
+-        opList.add(Op.setData(dtSequenceNumberPath, seqOs.toByteArray(), -1));
++        trx.setData(dtSequenceNumberPath, seqOs.toByteArray(), -1);
+-      createWithRetries(nodeCreatePath, os.toByteArray(), zkAcl,
++      safeCreate(nodeCreatePath, os.toByteArray(), zkAcl,
+-    if (existsWithRetries(nodeRemovePath, false) != null) {
+-      doDeleteMultiWithRetries(Op.delete(nodeRemovePath, -1));
+-    } else {
+-      LOG.debug("Attempted to delete a non-existing znode " + nodeRemovePath);
+-    }
++    safeDelete(nodeRemovePath);
+-    if (existsWithRetries(zkRootNodePath, false) != null) {
+-      deleteWithRetries(zkRootNodePath, false);
+-    }
++    delete(zkRootNodePath);
+-    if (existsWithRetries(appIdRemovePath, false) != null) {
+-      deleteWithRetries(appIdRemovePath, false);
+-    }
+-  }
+-
+-  // ZK related code
+-  /**
+-   * Watcher implementation which forward events to the ZKRMStateStore This
+-   * hides the ZK methods of the store from its public interface
+-   */
+-  private final class ForwardingWatcher implements Watcher {
+-    private ZooKeeper watchedZkClient;
+-
+-    public ForwardingWatcher(ZooKeeper client) {
+-      this.watchedZkClient = client;
+-    }
+-
+-    @Override
+-    public void process(WatchedEvent event) {
+-      try {
+-        ZKRMStateStore.this.processWatchEvent(watchedZkClient, event);
+-      } catch (Throwable t) {
+-        LOG.error("Failed to process watcher event " + event + ": "
+-            + StringUtils.stringifyException(t));
+-      }
+-    }
++    delete(appIdRemovePath);
+-  @Private
+-  @Unstable
+-  public synchronized void processWatchEvent(ZooKeeper zk,
+-      WatchedEvent event) throws Exception {
+-    // only process watcher event from current ZooKeeper Client session.
+-    if (zk != activeZkClient) {
+-      LOG.info("Ignore watcher event type: " + event.getType() +
+-          " with state:" + event.getState() + " for path:" +
+-          event.getPath() + " from old session");
+-      return;
+-    }
+-
+-    Event.EventType eventType = event.getType();
+-    LOG.info("Watcher event type: " + eventType + " with state:"
+-        + event.getState() + " for path:" + event.getPath() + " for " + this);
+-
+-    if (eventType == Event.EventType.None) {
+-
+-      // the connection state has changed
+-      switch (event.getState()) {
+-        case SyncConnected:
+-          LOG.info("ZKRMStateStore Session connected");
+-          if (zkClient == null) {
+-            // the SyncConnected must be from the client that sent Disconnected
+-            zkClient = activeZkClient;
+-            ZKRMStateStore.this.notifyAll();
+-            LOG.info("ZKRMStateStore Session restored");
+-          }
+-          break;
+-        case Disconnected:
+-          LOG.info("ZKRMStateStore Session disconnected");
+-          zkClient = null;
+-          break;
+-        case Expired:
+-          // the connection got terminated because of session timeout
+-          // call listener to reconnect
+-          LOG.info("ZKRMStateStore Session expired");
+-          createConnection();
+-          break;
+-        default:
+-          LOG.error("Unexpected Zookeeper" +
+-              " watch event state: " + event.getState());
+-          break;
+-      }
+-    }
+-  }
+-
+-  @VisibleForTesting
+-  @Private
+-  @Unstable
+-  /**
+-   * Helper method that creates fencing node, executes the passed operations,
+-   * and deletes the fencing node.
+-   */
+-  private synchronized void doStoreMultiWithRetries(
+-      final List<Op> opList) throws Exception {
+-    final List<Op> execOpList = new ArrayList<Op>(opList.size() + 2);
+-    execOpList.add(createFencingNodePathOp);
+-    execOpList.addAll(opList);
+-    execOpList.add(deleteFencingNodePathOp);
+-    new ZKAction<Void>() {
+-      @Override
+-      public Void run() throws KeeperException, InterruptedException {
+-        zkClient.multi(execOpList);
+-        return null;
+-      }
+-    }.runWithRetries();
+-  }
+-
+-  /**
+-   * Helper method that creates fencing node, executes the passed operation,
+-   * and deletes the fencing node.
+-   */
+-  private void doStoreMultiWithRetries(final Op op) throws Exception {
+-    doStoreMultiWithRetries(Collections.singletonList(op));
+-  }
+-
+-  /**
+-   * Helper method that creates fencing node, executes the passed
+-   * delete related operations and deletes the fencing node.
+-   */
+-  private synchronized void doDeleteMultiWithRetries(
+-      final List<Op> opList) throws Exception {
+-    final List<Op> execOpList = new ArrayList<Op>(opList.size() + 2);
+-    execOpList.add(createFencingNodePathOp);
+-    execOpList.addAll(opList);
+-    execOpList.add(deleteFencingNodePathOp);
+-    new ZKAction<Void>() {
+-      @Override
+-      public Void run() throws KeeperException, InterruptedException {
+-        setHasDeleteNodeOp(true);
+-        zkClient.multi(execOpList);
+-        return null;
+-      }
+-    }.runWithRetries();
+-  }
+-
+-  private void doDeleteMultiWithRetries(final Op op) throws Exception {
+-    doDeleteMultiWithRetries(Collections.singletonList(op));
+-  }
+-
+-  @VisibleForTesting
+-  @Private
+-  @Unstable
+-  public void createWithRetries(
+-      final String path, final byte[] data, final List<ACL> acl,
+-      final CreateMode mode) throws Exception {
+-    doStoreMultiWithRetries(Op.create(path, data, acl, mode));
+-  }
+-
+-  @VisibleForTesting
+-  @Private
+-  @Unstable
+-  public void setDataWithRetries(final String path, final byte[] data,
+-                                 final int version) throws Exception {
+-    doStoreMultiWithRetries(Op.setData(path, data, version));
+-  }
+-
+-  @VisibleForTesting
+-  @Private
+-  @Unstable
+-  public byte[] getDataWithRetries(final String path, final boolean watch)
+-      throws Exception {
+-    return new ZKAction<byte[]>() {
+-      @Override
+-      public byte[] run() throws KeeperException, InterruptedException {
+-        return zkClient.getData(path, watch, null);
+-      }
+-    }.runWithRetries();
+-  }
+-
+-  private List<ACL> getACLWithRetries(
+-      final String path, final Stat stat) throws Exception {
+-    return new ZKAction<List<ACL>>() {
+-      @Override
+-      public List<ACL> run() throws KeeperException, InterruptedException {
+-        return zkClient.getACL(path, stat);
+-      }
+-    }.runWithRetries();
+-  }
+-
+-  private List<String> getChildrenWithRetries(
+-      final String path, final boolean watch) throws Exception {
+-    return new ZKAction<List<String>>() {
+-      @Override
+-      List<String> run() throws KeeperException, InterruptedException {
+-        return zkClient.getChildren(path, watch);
+-      }
+-    }.runWithRetries();
+-  }
+-
+-  private Stat existsWithRetries(
+-      final String path, final boolean watch) throws Exception {
+-    return new ZKAction<Stat>() {
+-      @Override
+-      Stat run() throws KeeperException, InterruptedException {
+-        return zkClient.exists(path, watch);
+-      }
+-    }.runWithRetries();
+-  }
+-
+-  private void deleteWithRetries(
+-      final String path, final boolean watch) throws Exception {
+-    new ZKAction<Void>() {
+-      @Override
+-      Void run() throws KeeperException, InterruptedException {
+-        recursiveDeleteWithRetriesHelper(path, watch);
+-        return null;
+-      }
+-    }.runWithRetries();
+-  }
+-
+-  /**
+-   * Helper method that deletes znodes recursively
+-   */
+-  private void recursiveDeleteWithRetriesHelper(String path, boolean watch)
+-          throws KeeperException, InterruptedException {
+-    List<String> children = zkClient.getChildren(path, watch);
+-    for (String child : children) {
+-      recursiveDeleteWithRetriesHelper(path + "/" + child, false);
+-    }
+-
+-    try {
+-      zkClient.delete(path, -1);
+-    } catch (KeeperException.NoNodeException nne) {
+-      LOG.info("Node " + path + " doesn't exist to delete");
+-    }
+-  }
+-
+-  /**
+-   * Helper class that periodically attempts creating a znode to ensure that
+-   * this RM continues to be the Active.
+-   */
+-  private class VerifyActiveStatusThread extends Thread {
+-    private List<Op> emptyOpList = new ArrayList<Op>();
+-
+-    VerifyActiveStatusThread() {
+-      super(VerifyActiveStatusThread.class.getName());
+-    }
+-
+-    public void run() {
+-      try {
+-        while (true) {
+-          if(isFencedState()) { 
+-            break;
+-          }
+-          doStoreMultiWithRetries(emptyOpList);
+-          Thread.sleep(zkSessionTimeout);
+-        }
+-      } catch (InterruptedException ie) {
+-        LOG.info(VerifyActiveStatusThread.class.getName() + " thread " +
+-            "interrupted! Exiting!");
+-      } catch (Exception e) {
+-        notifyStoreOperationFailed(new StoreFencedException());
+-      }
+-    }
+-  }
+-
+-  private abstract class ZKAction<T> {
+-    private boolean hasDeleteNodeOp = false;
+-    void setHasDeleteNodeOp(boolean hasDeleteOp) {
+-      this.hasDeleteNodeOp = hasDeleteOp;
+-    }
+-    // run() expects synchronization on ZKRMStateStore.this
+-    abstract T run() throws KeeperException, InterruptedException;
+-
+-    T runWithCheck() throws Exception {
+-      long startTime = System.currentTimeMillis();
+-      synchronized (ZKRMStateStore.this) {
+-        while (zkClient == null) {
+-          ZKRMStateStore.this.wait(zkSessionTimeout);
+-          if (zkClient != null) {
+-            break;
+-          }
+-          if (System.currentTimeMillis() - startTime > zkSessionTimeout) {
+-            throw new IOException("Wait for ZKClient creation timed out");
+-          }
+-        }
+-        return run();
+-      }
+-    }
+-
+-    private boolean shouldRetry(Code code) {
+-      switch (code) {
+-        case CONNECTIONLOSS:
+-        case OPERATIONTIMEOUT:
+-        case SESSIONEXPIRED:
+-        case SESSIONMOVED:
+-          return true;
+-        default:
+-          break;
+-      }
+-      return false;
+-    }
+-
+-    T runWithRetries() throws Exception {
+-      int retry = 0;
+-      while (true) {
+-        try {
+-          return runWithCheck();
+-        } catch (KeeperException.NoAuthException nae) {
+-          if (HAUtil.isHAEnabled(getConfig())) {
+-            // NoAuthException possibly means that this store is fenced due to
+-            // another RM becoming active. Even if not,
+-            // it is safer to assume we have been fenced
+-            throw new StoreFencedException();
+-          }
+-        } catch (KeeperException ke) {
+-          if (ke.code() == Code.NODEEXISTS) {
+-            LOG.info("znode already exists!");
+-            return null;
+-          }
+-          if (hasDeleteNodeOp && ke.code() == Code.NONODE) {
+-            LOG.info("znode has already been deleted!");
+-            return null;
+-          }
+-
+-          LOG.info("Exception while executing a ZK operation.", ke);
+-          if (shouldRetry(ke.code()) && ++retry < numRetries) {
+-            LOG.info("Retrying operation on ZK. Retry no. " + retry);
+-            Thread.sleep(zkRetryInterval);
+-            createConnection();
+-            continue;
+-          }
+-          LOG.info("Maxed out ZK retries. Giving up!");
+-          throw ke;
+-        }
+-      }
+-    }
+-  }
+-
+-  private synchronized void createConnection()
+-      throws IOException, InterruptedException {
+-    closeZkClients();
+-    for (int retries = 0; retries < numRetries && zkClient == null;
+-        retries++) {
+-      try {
+-        activeZkClient = getNewZooKeeper();
+-        zkClient = activeZkClient;
+-        for (ZKUtil.ZKAuthInfo zkAuth : zkAuths) {
+-          zkClient.addAuthInfo(zkAuth.getScheme(), zkAuth.getAuth());
+-        }
+-        if (useDefaultFencingScheme) {
+-          zkClient.addAuthInfo(zkRootNodeAuthScheme,
+-              (zkRootNodeUsername + ":" + zkRootNodePassword).getBytes(Charset.forName("UTF-8")));
+-        }
+-      } catch (IOException ioe) {
+-        // Retry in case of network failures
+-        LOG.info("Failed to connect to the ZooKeeper on attempt - " +
+-            (retries + 1));
+-        ioe.printStackTrace();
+-      }
+-    }
+-    if (zkClient == null) {
+-      LOG.error("Unable to connect to Zookeeper");
+-      throw new YarnRuntimeException("Unable to connect to Zookeeper");
+-    }
+-    ZKRMStateStore.this.notifyAll();
+-    LOG.info("Created new ZK connection");
+-  }
+-
+-  // protected to mock for testing
+-  @VisibleForTesting
+-  @Private
+-  @Unstable
+-  protected synchronized ZooKeeper getNewZooKeeper()
+-      throws IOException, InterruptedException {
+-    ZooKeeper zk = new ZooKeeper(zkHostPort, zkSessionTimeout, null);
+-    zk.register(new ForwardingWatcher(zk));
+-    return zk;
+-  }
+-
+-    setDataWithRetries(amrmTokenSecretManagerRoot, stateData, -1);
++    safeSetData(amrmTokenSecretManagerRoot, stateData, -1);
+-      createRootDir(sb.toString());
++      create(sb.toString());
++    }
++  }
++
++  /*
++   * ZK operations using curator
++   */
++  private void createConnection() throws Exception {
++    // Curator connection
++    CuratorFrameworkFactory.Builder builder = CuratorFrameworkFactory.builder();
++    builder = builder.connectString(zkHostPort)
++        .connectionTimeoutMs(zkSessionTimeout)
++        .retryPolicy(new RetryNTimes(numRetries, zkRetryInterval));
++
++    // Set up authorization based on fencing scheme
++    List<AuthInfo> authInfos = new ArrayList<>();
++    for (ZKUtil.ZKAuthInfo zkAuth : zkAuths) {
++      authInfos.add(new AuthInfo(zkAuth.getScheme(), zkAuth.getAuth()));
++    }
++    if (useDefaultFencingScheme) {
++      byte[] defaultFencingAuth =
++          (zkRootNodeUsername + ":" + zkRootNodePassword).getBytes(
++              Charset.forName("UTF-8"));
++      authInfos.add(new AuthInfo(zkRootNodeAuthScheme, defaultFencingAuth));
++    }
++    builder = builder.authorization(authInfos);
++
++    // Connect to ZK
++    curatorFramework = builder.build();
++    curatorFramework.start();
++  }
++
++  @VisibleForTesting
++  byte[] getData(final String path) throws Exception {
++    return curatorFramework.getData().forPath(path);
++  }
++
++  private List<ACL> getACL(final String path) throws Exception {
++    return curatorFramework.getACL().forPath(path);
++  }
++
++  private List<String> getChildren(final String path) throws Exception {
++    return curatorFramework.getChildren().forPath(path);
++  }
++
++  private boolean exists(final String path) throws Exception {
++    return curatorFramework.checkExists().forPath(path) != null;
++  }
++
++  @VisibleForTesting
++  void create(final String path) throws Exception {
++    if (!exists(path)) {
++      curatorFramework.create()
++          .withMode(CreateMode.PERSISTENT).withACL(zkAcl)
++          .forPath(path, null);
++    }
++  }
++
++  @VisibleForTesting
++  void delete(final String path) throws Exception {
++    if (exists(path)) {
++      curatorFramework.delete().deletingChildrenIfNeeded().forPath(path);
++    }
++  }
++
++  private void safeCreate(String path, byte[] data, List<ACL> acl,
++      CreateMode mode) throws Exception {
++    if (!exists(path)) {
++      SafeTransaction transaction = new SafeTransaction();
++      transaction.create(path, data, acl, mode);
++      transaction.commit();
++    }
++  }
++
++  private void safeDelete(final String path) throws Exception {
++    if (exists(path)) {
++      SafeTransaction transaction = new SafeTransaction();
++      transaction.delete(path);
++      transaction.commit();
++    }
++  }
++
++  private void safeSetData(String path, byte[] data, int version)
++      throws Exception {
++    SafeTransaction transaction = new SafeTransaction();
++    transaction.setData(path, data, version);
++    transaction.commit();
++  }
++
++  /**
++   * Use curator transactions to ensure zk-operations are performed in an all
++   * or nothing fashion. This is equivalent to using ZooKeeper#multi.
++   *
++   * TODO (YARN-3774): Curator 3.0 introduces CuratorOp similar to Op. We ll
++   * have to rewrite this inner class when we adopt that.
++   */
++  private class SafeTransaction {
++    private CuratorTransactionFinal transactionFinal;
++
++    SafeTransaction() throws Exception {
++      CuratorTransaction transaction = curatorFramework.inTransaction();
++      transactionFinal =
++          transaction.create()
++              .withMode(CreateMode.PERSISTENT).withACL(zkAcl)
++              .forPath(fencingNodePath, new byte[0]).and();
++    }
++
++    public void commit() throws Exception {
++      transactionFinal = transactionFinal.delete()
++          .forPath(fencingNodePath).and();
++      transactionFinal.commit();
++    }
++
++    public void create(String path, byte[] data, List<ACL> acl, CreateMode mode)
++        throws Exception {
++      transactionFinal = transactionFinal.create()
++          .withMode(mode).withACL(acl).forPath(path, data).and();
++    }
++
++    public void delete(String path) throws Exception {
++      transactionFinal = transactionFinal.delete().forPath(path).and();
++    }
++
++    public void setData(String path, byte[] data, int version)
++        throws Exception {
++      transactionFinal = transactionFinal.setData()
++          .withVersion(version).forPath(path, data).and();
++    }
++  }
++
++  /**
++   * Helper class that periodically attempts creating a znode to ensure that
++   * this RM continues to be the Active.
++   */
++  private class VerifyActiveStatusThread extends Thread {
++    VerifyActiveStatusThread() {
++      super(VerifyActiveStatusThread.class.getName());
++    }
++
++    public void run() {
++      try {
++        while (true) {
++          if(isFencedState()) {
++            break;
++          }
++          // Create and delete fencing node
++          new SafeTransaction().commit();
++          Thread.sleep(zkSessionTimeout);
++        }
++      } catch (InterruptedException ie) {
++        LOG.info(VerifyActiveStatusThread.class.getName() + " thread " +
++            "interrupted! Exiting!");
++      } catch (Exception e) {
++        notifyStoreOperationFailed(new StoreFencedException());
++      }
+
+MOV26 MOV26 MOV26 MOV26 MOV26 MOV26 MOV23 MOV23 MOV23 MOV23 MOV23 MOV23 MOV23 MOV31 MOV31 UPD40 UPD40 UPD40 UPD40 UPD40 UPD40 INS29 INS83 INS42 INS31 INS31 INS31 INS31 INS55 INS65 UPD39 INS29 MOV43 MOV59 INS29 MOV78 UPD83 UPD43 MOV43 MOV25 MOV78 MOV78 INS8 INS83 MOV39 INS42 MOV43 INS8 MOV78 MOV5 INS42 MOV44 MOV43 MOV8 MOV74 UPD42 MOV44 MOV43 MOV74 UPD42 MOV44 MOV43 UPD39 UPD42 MOV44 MOV43 UPD42 MOV44 MOV43 INS8 MOV78 MOV39 INS42 MOV44 MOV43 INS8 MOV83 INS39 UPD42 MOV42 MOV44 INS44 INS44 INS44 MOV43 INS8 INS39 INS42 MOV44 MOV43 INS8 INS42 INS44 INS44 MOV43 INS29 INS83 INS42 INS23 INS31 INS31 INS31 MOV31 MOV31 INS65 UPD66 MOV66 UPD66 MOV66 MOV66 MOV66 MOV66 MOV66 MOV66 MOV66 MOV66 MOV66 MOV66 MOV66 MOV66 MOV66 MOV66 MOV66 MOV66 MOV66 MOV66 MOV66 MOV66 MOV66 MOV66 MOV66 MOV66 MOV66 MOV66 MOV66 INS66 INS66 INS66 INS65 INS65 UPD42 UPD42 INS60 MOV60 MOV60 MOV21 MOV8 INS43 INS42 MOV21 MOV21 MOV21 MOV60 INS21 MOV60 MOV70 MOV25 MOV21 MOV21 MOV21 INS41 INS41 INS41 INS41 INS25 INS25 UPD43 UPD42 MOV5 INS42 MOV74 INS42 INS43 INS42 INS25 INS25 INS43 INS42 MOV5 INS42 UPD39 UPD42 INS60 INS21 MOV21 MOV65 INS83 INS43 INS59 INS42 MOV43 INS8 INS83 MOV39 UPD42 MOV42 MOV43 MOV8 UPD83 MOV83 UPD39 MOV39 UPD42 MOV42 MOV44 MOV44 INS44 MOV44 MOV43 INS8 UPD83 UPD42 INS44 MOV43 UPD83 INS39 INS42 MOV44 INS44 INS44 MOV43 INS42 INS66 INS66 INS32 INS32 INS32 MOV5 MOV74 INS59 MOV5 INS32 INS32 INS32 INS43 INS32 INS43 INS32 INS42 INS32 UPD43 INS7 UPD74 MOV74 INS7 INS7 INS32 INS32 INS32 INS27 INS38 INS8 INS32 INS8 UPD42 UPD42 MOV42 INS38 INS8 INS32 INS8 INS42 INS43 INS59 INS32 INS66 INS66 INS66 UPD66 UPD42 MOV42 INS42 MOV60 INS21 INS21 MOV21 UPD43 UPD42 MOV74 UPD42 MOV42 INS21 INS43 INS42 INS21 MOV5 INS42 INS39 INS42 INS21 UPD42 UPD42 UPD42 UPD42 UPD42 UPD42 UPD42 INS32 UPD42 INS42 UPD42 MOV42 INS42 INS42 UPD42 UPD42 MOV42 MOV42 UPD42 MOV42 MOV42 UPD42 MOV42 MOV42 INS42 INS32 UPD42 UPD42 UPD42 MOV42 MOV42 UPD42 UPD42 MOV42 MOV42 UPD42 MOV42 MOV42 UPD42 MOV42 UPD42 UPD42 UPD42 UPD42 UPD42 MOV42 MOV42 UPD42 MOV42 UPD42 UPD42 MOV42 MOV42 UPD42 UPD42 UPD42 MOV42 MOV42 UPD42 UPD42 UPD42 MOV38 UPD40 UPD42 INS42 INS32 UPD43 UPD42 INS60 INS42 INS32 INS42 INS32 UPD42 UPD42 INS32 UPD42 MOV42 INS42 INS32 UPD42 MOV42 UPD42 MOV42 INS32 UPD42 MOV42 UPD42 MOV42 INS32 INS33 INS32 MOV21 UPD42 MOV42 MOV42 INS21 INS32 INS60 INS21 INS21 INS42 INS42 INS60 INS21 INS21 UPD42 MOV42 INS42 INS14 INS42 INS42 INS42 INS42 INS42 UPD42 UPD42 INS43 INS7 INS7 UPD42 INS7 UPD42 MOV42 INS7 INS7 UPD74 UPD42 INS32 UPD42 MOV42 MOV42 INS5 MOV14 MOV5 UPD42 INS42 INS42 MOV5 UPD42 UPD42 UPD42 MOV5 UPD42 MOV5 UPD42 UPD42 INS32 INS43 INS43 UPD42 UPD42 INS32 INS42 INS14 UPD42 UPD74 MOV74 MOV5 INS59 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 INS32 UPD42 MOV42 UPD42 MOV42 INS42 INS42 INS32 UPD42 MOV42 MOV42 INS43 INS59 INS32 INS32 INS43 INS59 INS32 INS32 INS43 UPD42 MOV42 UPD42 INS42 INS32 INS42 INS32 INS42 UPD42 INS42 INS32 INS42 INS32 INS42 INS32 UPD42 MOV42 MOV42 UPD42 MOV38 UPD42 INS39 INS85 UPD42 MOV38 UPD42 UPD42 MOV38 UPD42 UPD42 MOV38 UPD42 UPD42 MOV42 MOV42 UPD42 MOV42 UPD42 MOV42 UPD42 UPD42 UPD42 UPD42 INS32 INS42 INS42 INS43 INS42 INS42 UPD42 INS42 INS14 INS42 MOV32 UPD42 INS42 INS14 UPD42 MOV42 UPD42 MOV42 INS32 UPD42 MOV42 INS42 INS33 INS32 INS42 MOV42 UPD42 MOV42 INS42 INS14 INS42 INS42 INS42 INS42 INS42 INS42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 INS42 INS14 INS42 UPD42 MOV42 MOV42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 UPD42 UPD42 INS32 INS42 INS32 INS42 INS32 UPD42 MOV42 INS32 INS42 INS32 INS42 UPD42 UPD42 UPD42 UPD42 UPD42 UPD42 MOV5 INS32 INS32 MOV32 UPD42 MOV42 INS42 INS42 INS42 INS43 MOV32 MOV32 INS43 INS42 INS42 INS32 UPD42 MOV42 UPD42 MOV42 INS32 INS42 INS43 INS43 INS32 INS42 INS42 MOV3 INS32 INS42 INS42 INS32 UPD42 MOV42 UPD42 MOV42 INS42 INS32 UPD42 MOV42 UPD42 MOV42 INS32 UPD42 MOV42 UPD42 MOV42 INS42 UPD42 MOV42 MOV42 MOV42 MOV32 MOV38 UPD42 MOV42 MOV42 MOV42 MOV32 MOV42 MOV40 UPD42 INS42 INS42 INS32 UPD42 MOV42 INS40 INS42 INS42 UPD42 MOV42 UPD42 MOV42 INS32 INS42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 INS32 INS42 INS42 UPD42 MOV42 UPD42 MOV42 INS32 INS42 INS42 UPD42 UPD42 MOV42 MOV42 INS32 UPD42 MOV42 INS40 INS32 UPD42 MOV42 UPD42 MOV42 INS42 INS42 INS14 UPD42 UPD42 MOV42 INS42 UPD42 MOV42 UPD42 MOV42 INS43 INS42 DEL40 DEL26 DEL40 DEL26 DEL40 DEL26 DEL40 DEL26 DEL66 DEL65 DEL29 DEL83 DEL42 DEL42 DEL43 DEL42 DEL59 DEL65 DEL29 DEL83 DEL23 DEL42 DEL78 DEL83 DEL42 DEL43 DEL42 DEL59 DEL23 DEL42 DEL43 DEL42 DEL59 DEL23 DEL42 DEL43 DEL42 DEL42 DEL42 DEL42 DEL42 DEL40 DEL32 DEL7 DEL21 DEL42 DEL42 DEL42 DEL42 DEL32 DEL7 DEL21 DEL83 DEL39 DEL42 DEL83 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL43 DEL74 DEL42 DEL78 DEL83 DEL42 DEL43 DEL42 DEL42 DEL43 DEL42 DEL43 DEL42 DEL42 DEL42 DEL33 DEL42 DEL40 DEL32 DEL41 DEL8 DEL42 DEL43 DEL42 DEL44 DEL42 DEL42 DEL32 DEL40 DEL27 DEL42 DEL42 DEL42 DEL45 DEL27 DEL32 DEL21 DEL33 DEL41 DEL8 DEL42 DEL53 DEL8 DEL25 DEL8 DEL12 DEL54 DEL8 DEL31 DEL1 DEL14 DEL42 DEL32 DEL21 DEL8 DEL31 DEL42 DEL42 DEL43 DEL42 DEL43 DEL74 DEL42 DEL78 DEL83 DEL42 DEL43 DEL42 DEL42 DEL43 DEL42 DEL43 DEL34 DEL38 DEL32 DEL21 DEL33 DEL41 DEL8 DEL31 DEL1 DEL14 DEL42 DEL43 DEL42 DEL43 DEL74 DEL42 DEL78 DEL83 DEL42 DEL43 DEL42 DEL42 DEL43 DEL42 DEL43 DEL42 DEL42 DEL42 DEL42 DEL32 DEL32 DEL21 DEL8 DEL40 DEL43 DEL42 DEL44 DEL42 DEL42 DEL45 DEL42 DEL45 DEL27 DEL32 DEL21 DEL8 DEL12 DEL54 DEL33 DEL41 DEL8 DEL31 DEL1 DEL14 DEL42 DEL83 DEL83 DEL39 DEL42 DEL42 DEL43 DEL42 DEL33 DEL7 DEL21 DEL42 DEL33 DEL27 DEL42 DEL42 DEL32 DEL21 DEL8 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL45 DEL42 DEL14 DEL53 DEL8 DEL12 DEL54 DEL42 DEL33 DEL7 DEL21 DEL8 DEL25 DEL8 DEL31 DEL9 DEL32 DEL33 DEL27 DEL42 DEL43 DEL9 DEL32 DEL33 DEL27 DEL9 DEL42 DEL59 DEL60 DEL42 DEL9 DEL32 DEL33 DEL27 DEL9 DEL34 DEL38 DEL9 DEL9 DEL9 DEL9 DEL9 DEL9 DEL9 DEL9 DEL42 DEL42 DEL42 DEL9 DEL32 DEL59 DEL60 DEL9 DEL9 DEL32 DEL33 DEL27 DEL9 DEL32 DEL33 DEL27 DEL42 DEL43 DEL42 DEL43 DEL74 DEL42 DEL42 DEL43 DEL42 DEL43 DEL74 DEL14 DEL59 DEL60 DEL42 DEL42 DEL42 DEL34 DEL38 DEL32 DEL32 DEL42 DEL42 DEL42 DEL34 DEL38 DEL32 DEL32 DEL42 DEL42 DEL32 DEL21 DEL43 DEL42 DEL43 DEL74 DEL43 DEL42 DEL43 DEL74 DEL42 DEL42 DEL42 DEL32 DEL32 DEL42 DEL42 DEL9 DEL32 DEL33 DEL27 DEL42 DEL43 DEL42 DEL43 DEL74 DEL42 DEL42 DEL43 DEL42 DEL43 DEL74 DEL14 DEL59 DEL60 DEL42 DEL42 DEL32 DEL21 DEL8 DEL42 DEL42 DEL45 DEL42 DEL27 DEL32 DEL21 DEL8 DEL25 DEL43 DEL42 DEL43 DEL74 DEL43 DEL42 DEL43 DEL74 DEL9 DEL32 DEL33 DEL27 DEL42 DEL42 DEL42 DEL32 DEL32 DEL42 DEL42 DEL32 DEL32 DEL42 DEL42 DEL32 DEL42 DEL42 DEL34 DEL38 DEL32 DEL32 DEL42 DEL42 DEL9 DEL32 DEL33 DEL27 DEL8 DEL42 DEL42 DEL45 DEL42 DEL27 DEL32 DEL21 DEL8 DEL25 DEL9 DEL42 DEL42 DEL9 DEL32 DEL33 DEL27 DEL8 DEL25 DEL8 DEL9 DEL42 DEL42 DEL9 DEL32 DEL33 DEL27 DEL8 DEL25 DEL66 DEL66 DEL65 DEL29 DEL83 DEL83 DEL42 DEL42 DEL43 DEL83 DEL42 DEL43 DEL42 DEL59 DEL23 DEL83 DEL42 DEL42 DEL43 DEL42 DEL44 DEL52 DEL42 DEL22 DEL42 DEL7 DEL21 DEL8 DEL31 DEL42 DEL78 DEL83 DEL42 DEL42 DEL43 DEL42 DEL44 DEL42 DEL52 DEL42 DEL42 DEL42 DEL32 DEL21 DEL8 DEL42 DEL43 DEL42 DEL44 DEL42 DEL42 DEL45 DEL42 DEL45 DEL42 DEL42 DEL42 DEL32 DEL27 DEL32 DEL21 DEL8 DEL12 DEL54 DEL8 DEL31 DEL55 DEL42 DEL78 DEL42 DEL78 DEL83 DEL83 DEL39 DEL42 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL44 DEL42 DEL42 DEL27 DEL42 DEL42 DEL45 DEL42 DEL42 DEL32 DEL45 DEL42 DEL42 DEL32 DEL45 DEL42 DEL42 DEL32 DEL45 DEL27 DEL32 DEL21 DEL41 DEL8 DEL25 DEL42 DEL45 DEL42 DEL45 DEL42 DEL42 DEL32 DEL45 DEL42 DEL42 DEL32 DEL45 DEL52 DEL27 DEL32 DEL21 DEL42 DEL40 DEL27 DEL42 DEL42 DEL32 DEL42 DEL49 DEL42 DEL42 DEL45 DEL32 DEL21 DEL42 DEL33 DEL27 DEL42 DEL42 DEL7 DEL21 DEL42 DEL52 DEL42 DEL32 DEL21 DEL42 DEL42 DEL45 DEL32 DEL21 DEL8 DEL25 DEL10 DEL42 DEL49 DEL42 DEL42 DEL45 DEL32 DEL21 DEL42 DEL33 DEL7 DEL21 DEL10 DEL42 DEL49 DEL42 DEL42 DEL45 DEL32 DEL21 DEL42 DEL32 DEL21 DEL10 DEL49 DEL42 DEL42 DEL45 DEL45 DEL42 DEL42 DEL32 DEL27 DEL32 DEL21 DEL10 DEL50 DEL8 DEL25 DEL8 DEL31 DEL42 DEL78 DEL42 DEL78 DEL34 DEL38 DEL83 DEL42 DEL43 DEL42 DEL43 DEL74 DEL42 DEL43 DEL42 DEL43 DEL42 DEL43 DEL74 DEL42 DEL42 DEL32 DEL34 DEL27 DEL42 DEL42 DEL42 DEL32 DEL42 DEL32 DEL42 DEL32 DEL21 DEL33 DEL41 DEL66 DEL66 DEL65 DEL29 DEL83 DEL83 DEL39 DEL42 DEL83 DEL42 DEL44 DEL42 DEL43 DEL42 DEL43 DEL74 DEL42 DEL78 DEL83 DEL42 DEL43 DEL42 DEL42 DEL43 DEL42 DEL43 DEL31 DEL1 DEL14 DEL42 DEL32 DEL21 DEL8 DEL31 DEL66 DEL66 DEL65 DEL29 DEL39 DEL83 DEL42 DEL43 DEL42 DEL44 DEL32 DEL32 DEL21 DEL66 DEL66 DEL65 DEL29 DEL83 DEL39 DEL83 DEL42 DEL43 DEL42 DEL43 DEL74 DEL42 DEL44 DEL83 DEL42 DEL43 DEL42 DEL43 DEL74 DEL42 DEL42 DEL43 DEL42 DEL43 DEL74 DEL32 DEL34 DEL27 DEL14 DEL59 DEL60 DEL42 DEL42 DEL32 DEL21 DEL42 DEL42 DEL42 DEL32 DEL21 DEL42 DEL42 DEL32 DEL21 DEL42 DEL43 DEL42 DEL43 DEL74 DEL42 DEL78 DEL83 DEL42 DEL43 DEL42 DEL42 DEL43 DEL42 DEL43 DEL42 DEL9 DEL32 DEL21 DEL42 DEL42 DEL42 DEL32 DEL21 DEL33 DEL41 DEL8 DEL31 DEL1 DEL14 DEL42 DEL32 DEL21 DEL83 DEL42 DEL43 DEL42 DEL44 DEL32 DEL32 DEL21 DEL42 DEL78 DEL42 DEL78 DEL83 DEL42 DEL32 DEL83 DEL42 DEL44 DEL83 DEL42 DEL44 DEL8 DEL83 DEL42 DEL78 DEL42 DEL78 DEL83 DEL42 DEL83 DEL39 DEL42 DEL44 DEL42 DEL42 DEL42 DEL42 DEL32 DEL32 DEL21 DEL8 DEL31 DEL42 DEL78 DEL42 DEL78 DEL42 DEL78 DEL83 DEL42 DEL83 DEL39 DEL42 DEL44 DEL42 DEL43 DEL74 DEL42 DEL78 DEL83 DEL42 DEL42 DEL43 DEL42 DEL43 DEL42 DEL42 DEL42 DEL33 DEL32 DEL41 DEL8 DEL31 DEL1 DEL14 DEL42 DEL32 DEL41 DEL8 DEL31 DEL42 DEL43 DEL42 DEL43 DEL43 DEL74 DEL74 DEL42 DEL78 DEL83 DEL42 DEL42 DEL43 DEL42 DEL43 DEL42 DEL42 DEL32 DEL41 DEL8 DEL31 DEL1 DEL14 DEL42 DEL32 DEL41 DEL8 DEL31 DEL83 DEL42 DEL83 DEL39 DEL42 DEL44 DEL43 DEL42 DEL43 DEL43 DEL74 DEL74 DEL42 DEL78 DEL42 DEL43 DEL42 DEL43 DEL74 DEL42 DEL42 DEL43 DEL42 DEL43 DEL42 DEL42 DEL32 DEL41 DEL8 DEL31 DEL1 DEL14 DEL42 DEL32 DEL41 DEL8 DEL31 DEL42 DEL43 DEL42 DEL83 DEL39 DEL42 DEL44 DEL43 DEL42 DEL43 DEL74 DEL42 DEL78 DEL42 DEL43 DEL42 DEL43 DEL42 DEL43 DEL42 DEL32 DEL41 DEL8 DEL31 DEL1 DEL14 DEL32 DEL41 DEL8 DEL42 DEL83 DEL42 DEL43 DEL43 DEL74 DEL42 DEL78 DEL42 DEL43 DEL42 DEL42 DEL43 DEL42 DEL43 DEL33 DEL41 DEL8 DEL31 DEL1 DEL14 DEL42 DEL32 DEL21 DEL43 DEL42 DEL43 DEL74 DEL42 DEL42 DEL42 DEL52 DEL42 DEL39 DEL42 DEL32 DEL59 DEL60 DEL42 DEL52 DEL42 DEL33 DEL27 DEL42 DEL33 DEL27 DEL10 DEL8 DEL25 DEL42 DEL42 DEL32 DEL42 DEL27 DEL42 DEL27 DEL42 DEL43 DEL45 DEL14 DEL53 DEL8 DEL25 DEL8 DEL61 DEL42 DEL32 DEL41 DEL8 DEL51 DEL83 DEL83 DEL83 DEL43 DEL42 DEL43 DEL42 DEL32 DEL21 DEL39 DEL42 DEL34 DEL59 DEL58 DEL42 DEL42 DEL27 DEL42 DEL33 DEL27 DEL27 DEL42 DEL37 DEL42 DEL42 DEL32 DEL7 DEL21 DEL42 DEL42 DEL7 DEL21 DEL8 DEL42 DEL43 DEL42 DEL44 DEL45 DEL42 DEL34 DEL27 DEL36 DEL27 DEL32 DEL21 DEL32 DEL21 DEL8 DEL12 DEL54 DEL8 DEL24 DEL42 DEL33 DEL27 DEL42 DEL42 DEL45 DEL32 DEL21 DEL42 DEL43 DEL45 DEL14 DEL53 DEL8 DEL25 DEL42 DEL52 DEL42 DEL32 DEL21 DEL42 DEL42 DEL45 DEL32 DEL21 DEL42 DEL78 DEL42 DEL78 DEL42 DEL78 DEL83 DEL42 DEL43 DEL42 DEL42 DEL43 DEL42 DEL43 DEL42 DEL43 DEL42 DEL42 DEL43 DEL42 DEL42 DEL33 DEL14 DEL59 DEL60 DEL42 DEL43 DEL42 DEL14 DEL32 DEL21 DEL42 DEL41 DEL29 DEL83 DEL39 DEL42 DEL39 DEL42 DEL44 DEL43 DEL42 DEL43 DEL42 DEL43 DEL42 DEL44 DEL42 DEL42 DEL45 DEL42 DEL27 DEL9 DEL32 DEL21 DEL8 DEL70 DEL42 DEL42 DEL34 DEL38 DEL32 DEL21 DEL8 DEL40 DEL43 DEL42 DEL44 DEL42 DEL45 DEL42 DEL45 DEL27 DEL32 DEL21 DEL8 DEL12 DEL54 DEL8 DEL31 DEL83 DEL42 DEL43 DEL42 DEL43 DEL74 DEL42 DEL42 DEL43 DEL42 DEL43 DEL74 DEL14 DEL59 DEL23 DEL42 DEL83 DEL83 DEL42 DEL42 DEL73 DEL83 DEL39 DEL42 DEL9 DEL59 DEL23 DEL39 DEL42 DEL44 DEL52 DEL42 DEL22 DEL42 DEL7 DEL21 DEL8 DEL31 DEL83 DEL42 DEL43 DEL42 DEL42 DEL43 DEL42 DEL43 DEL31 DEL42 DEL43 DEL42 DEL31 DEL42 DEL42 DEL49 DEL42 DEL49 DEL42 DEL49 DEL42 DEL49 DEL9 DEL41 DEL49 DEL10 DEL50 DEL9 DEL41 DEL8 DEL31 DEL42 DEL43 DEL42 DEL39 DEL42 DEL34 DEL59 DEL60 DEL9 DEL42 DEL32 DEL41 DEL8 DEL40 DEL43 DEL44 DEL42 DEL42 DEL42 DEL32 DEL32 DEL42 DEL43 DEL14 DEL53 DEL8 DEL25 DEL8 DEL12 DEL42 DEL43 DEL42 DEL44 DEL42 DEL42 DEL32 DEL40 DEL27 DEL42 DEL42 DEL45 DEL32 DEL21 DEL33 DEL41 DEL8 DEL25 DEL42 DEL32 DEL40 DEL27 DEL27 DEL42 DEL42 DEL45 DEL32 DEL21 DEL33 DEL41 DEL8 DEL25 DEL42 DEL42 DEL45 DEL32 DEL21 DEL42 DEL42 DEL32 DEL32 DEL42 DEL38 DEL42 DEL27 DEL27 DEL45 DEL42 DEL27 DEL32 DEL21 DEL42 DEL42 DEL32 DEL21 DEL42 DEL32 DEL21 DEL18 DEL8 DEL25 DEL42 DEL42 DEL45 DEL32 DEL21 DEL42 DEL53 DEL8 DEL12 DEL54 DEL8 DEL61 DEL8 DEL31 DEL55

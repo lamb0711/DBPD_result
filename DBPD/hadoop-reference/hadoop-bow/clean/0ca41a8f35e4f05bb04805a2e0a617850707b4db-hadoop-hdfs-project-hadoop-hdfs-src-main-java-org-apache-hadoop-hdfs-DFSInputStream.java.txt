@@ -1,0 +1,144 @@
+HDFS-6591. while loop is executed tens of thousands of times in Hedged Read. Contributed by Liang Xie.
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/trunk@1606927 13f79535-47bb-0310-9956-ffa450edef68
+
++import java.util.concurrent.CancellationException;
++import java.util.concurrent.CompletionService;
+-import java.util.concurrent.CountDownLatch;
++import java.util.concurrent.ExecutorCompletionService;
+-import java.util.concurrent.TimeoutException;
++import java.util.concurrent.atomic.AtomicLong;
++  private long hedgedReadOpsLoopNumForTesting = 0;
+-      final Map<ExtendedBlock, Set<DatanodeInfo>> corruptedBlockMap,
+-      final CountDownLatch latch) {
++      final Map<ExtendedBlock, Set<DatanodeInfo>> corruptedBlockMap) {
+-        try {
+-          byte[] buf = bb.array();
+-          int offset = bb.position();
+-          actualGetFromOneDataNode(datanode, block, start, end, buf, offset,
+-              corruptedBlockMap);
+-          return bb;
+-        } finally {
+-          latch.countDown();
+-        }
++        byte[] buf = bb.array();
++        int offset = bb.position();
++        actualGetFromOneDataNode(datanode, block, start, end, buf, offset,
++            corruptedBlockMap);
++        return bb;
++        DFSClientFaultInjector.get().fetchFromDatanodeException();
++    CompletionService<ByteBuffer> hedgedService =
++        new ExecutorCompletionService<ByteBuffer>(
++        dfsClient.getHedgedReadsThreadPool());
+-    // Latch shared by all outstanding reads.  First to finish closes
+-    CountDownLatch hasReceivedResult = new CountDownLatch(1);
++      // see HDFS-6591, this metric is used to verify/catch unnecessary loops
++      hedgedReadOpsLoopNumForTesting++;
+-      Future<ByteBuffer> future = null;
+-      // futures is null if there is no request already executing.
++      // there is no request already executing.
+-        // chooseDataNode is a commitment.  If no node, we go to
+-        // the NN to reget block locations.  Only go here on first read.
++        // chooseDataNode is a commitment. If no node, we go to
++        // the NN to reget block locations. Only go here on first read.
+-        future = getHedgedReadFuture(chosenNode, block, start, end, bb,
+-          corruptedBlockMap, hasReceivedResult);
++        Callable<ByteBuffer> getFromDataNodeCallable = getFromOneDataNode(
++            chosenNode, block, start, end, bb, corruptedBlockMap);
++        Future<ByteBuffer> firstRequest = hedgedService
++            .submit(getFromDataNodeCallable);
++        futures.add(firstRequest);
+-          future.get(dfsClient.getHedgedReadTimeout(), TimeUnit.MILLISECONDS);
+-          return;
+-        } catch (TimeoutException e) {
++          Future<ByteBuffer> future = hedgedService.poll(
++              dfsClient.getHedgedReadTimeout(), TimeUnit.MILLISECONDS);
++          if (future != null) {
++            future.get();
++            return;
++          }
+-            DFSClient.LOG.debug("Waited " + dfsClient.getHedgedReadTimeout() +
+-              "ms to read from " + chosenNode.info + "; spawning hedged read");
++            DFSClient.LOG.debug("Waited " + dfsClient.getHedgedReadTimeout()
++                + "ms to read from " + chosenNode.info
++                + "; spawning hedged read");
+-          futures.add(future);
+-        // We are starting up a 'hedged' read.  We have a read already
++        // We are starting up a 'hedged' read. We have a read already
+-          chosenNode = getBestNodeDNAddrPair(block.getLocations(), ignored);
++          try {
++            chosenNode = getBestNodeDNAddrPair(block.getLocations(), ignored);
++          } catch (IOException ioe) {
++            chosenNode = chooseDataNode(block, ignored);
++          }
+-          future = getHedgedReadFuture(chosenNode, block, start, end, bb,
+-            corruptedBlockMap, hasReceivedResult);
+-          futures.add(future);
++          Callable<ByteBuffer> getFromDataNodeCallable = getFromOneDataNode(
++              chosenNode, block, start, end, bb, corruptedBlockMap);
++          Future<ByteBuffer> oneMoreRequest = hedgedService
++              .submit(getFromDataNodeCallable);
++          futures.add(oneMoreRequest);
+-            DFSClient.LOG.debug("Failed getting node for hedged read: " +
+-              ioe.getMessage());
++            DFSClient.LOG.debug("Failed getting node for hedged read: "
++                + ioe.getMessage());
+-          ByteBuffer result = getFirstToComplete(futures, hasReceivedResult);
++          ByteBuffer result = getFirstToComplete(hedgedService, futures);
+-          // Ignore
+-        } catch (ExecutionException e) {
+-          // exception already handled in the call method. getFirstToComplete
+-          // will remove the failing future from the list. nothing more to do.
++          // Ignore and retry
+-        // We got here if exception.  Ignore this node on next go around IFF
++        // We got here if exception. Ignore this node on next go around IFF
+-      // executed if we get an error from a data node
+-      block = getBlockAt(block.getStartOffset(), false);
+-  private Future<ByteBuffer> getHedgedReadFuture(final DNAddrPair chosenNode,
+-      final LocatedBlock block, long start,
+-      final long end, final ByteBuffer bb,
+-      final Map<ExtendedBlock, Set<DatanodeInfo>> corruptedBlockMap,
+-      final CountDownLatch hasReceivedResult) {
+-    Callable<ByteBuffer> getFromDataNodeCallable =
+-        getFromOneDataNode(chosenNode, block, start, end, bb,
+-          corruptedBlockMap, hasReceivedResult);
+-    return dfsClient.getHedgedReadsThreadPool().submit(getFromDataNodeCallable);
++  @VisibleForTesting
++  public long getHedgedReadOpsLoopNumForTesting() {
++    return hedgedReadOpsLoopNumForTesting;
+-  private ByteBuffer getFirstToComplete(ArrayList<Future<ByteBuffer>> futures,
+-      CountDownLatch latch) throws ExecutionException, InterruptedException {
+-    latch.await();
+-    for (Future<ByteBuffer> future : futures) {
+-      if (future.isDone()) {
+-        try {
+-          return future.get();
+-        } catch (ExecutionException e) {
+-          // already logged in the Callable
+-          futures.remove(future);
+-          throw e;
+-        }
+-      }
++  private ByteBuffer getFirstToComplete(
++      CompletionService<ByteBuffer> hedgedService,
++      ArrayList<Future<ByteBuffer>> futures) throws InterruptedException {
++    if (futures.isEmpty()) {
++      throw new InterruptedException("let's retry");
+-    throw new InterruptedException("latch has counted down to zero but no"
+-        + "result available yet, for safety try to request another one from"
+-        + "outside loop, this should be rare");
++    Future<ByteBuffer> future = null;
++    try {
++      future = hedgedService.take();
++      ByteBuffer bb = future.get();
++      futures.remove(future);
++      return bb;
++    } catch (ExecutionException e) {
++      // already logged in the Callable
++      futures.remove(future);
++    } catch (CancellationException ce) {
++      // already logged in the Callable
++      futures.remove(future);
++    }
++
++    throw new InterruptedException("let's retry");

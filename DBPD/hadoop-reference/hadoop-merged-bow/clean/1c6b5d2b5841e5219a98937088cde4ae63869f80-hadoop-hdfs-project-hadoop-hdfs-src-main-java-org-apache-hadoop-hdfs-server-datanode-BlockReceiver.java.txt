@@ -1,0 +1,210 @@
+HDFS-5583. Make DN send an OOB Ack on shutdown before restarting. Contributed by Kihwal Lee.
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/branches/HDFS-5535@1571491 13f79535-47bb-0310-9956-ffa450edef68
+
+-      LOG.info("Exception for " + block, ioe);
+-      throw ioe;
++      if (datanode.isRestarting()) {
++        // Do not throw if shutting down for restart. Otherwise, it will cause
++        // premature termination of responder.
++        LOG.info("Shutting down for restart (" + block + ").");
++      } else {
++        LOG.info("Exception for " + block, ioe);
++        throw ioe;
++      }
+-      if (!responderClosed) { // Abnormal termination of the flow above
+-        IOUtils.closeStream(this);
++      // Clear the previous interrupt state of this thread.
++      Thread.interrupted();
++
++      // If a shutdown for restart was initiated, upstream needs to be notified.
++      // There is no need to do anything special if the responder was closed
++      // normally.
++      if (!responderClosed) { // Data transfer was not complete.
++          // In case this datanode is shutting down for quick restart,
++          // send a special ack upstream.
++          if (datanode.isRestarting()) {
++            try {
++              ((PacketResponder) responder.getRunnable()).
++                  sendOOBResponse(PipelineAck.getRestartOOBStatus());
++            } catch (InterruptedException ie) {
++              // It is already going down. Ignore this.
++            } catch (IOException ioe) {
++              LOG.info("Error sending OOB Ack.", ioe);
++              // The OOB ack could not be sent. Since the datanode is going
++              // down, this is ignored.
++            }
++          }
++        IOUtils.closeStream(this);
+-          throw new IOException("Interrupted receiveBlock");
++          // do not throw if shutting down for restart.
++          if (!datanode.isRestarting()) {
++            throw new IOException("Interrupted receiveBlock");
++          }
++    private boolean sending = false;
+-      return running && datanode.shouldRun;
++      // When preparing for a restart, it should continue to run until
++      // interrupted by the receiver thread.
++      return running && (datanode.shouldRun || datanode.isRestarting());
+-      synchronized(this) {
++      synchronized(ackQueue) {
+-          notifyAll();
++          ackQueue.notifyAll();
++        }
++      }
++    }
++
++    /**
++     * Send an OOB response. If all acks have been sent already for the block
++     * and the responder is about to close, the delivery is not guaranteed.
++     * This is because the other end can close the connection independently.
++     * An OOB coming from downstream will be automatically relayed upstream
++     * by the responder. This method is used only by originating datanode.
++     *
++     * @param ackStatus the type of ack to be sent
++     */
++    void sendOOBResponse(final Status ackStatus) throws IOException,
++        InterruptedException {
++      if (!running) {
++        LOG.info("Cannot send OOB response " + ackStatus + 
++            ". Responder not running.");
++        return;
++      }
++
++      synchronized(this) {
++        if (sending) {
++          wait(PipelineAck.getOOBTimeout(ackStatus));
++          // Didn't get my turn in time. Give up.
++          if (sending) {
++            throw new IOException("Could not send OOB reponse in time: "
++                + ackStatus);
++          }
++        }
++        sending = true;
++      }
++
++      LOG.info("Sending an out of band ack of type " + ackStatus);
++      try {
++        sendAckUpstreamUnprotected(null, PipelineAck.UNKOWN_SEQNO, 0L, 0L,
++            ackStatus);
++      } finally {
++        // Let others send ack. Unless there are miltiple OOB send
++        // calls, there can be only one waiter, the responder thread.
++        // In any case, only one needs to be notified.
++        synchronized(this) {
++          sending = false;
++          notify();
+-    synchronized Packet waitForAckHead(long seqno) throws InterruptedException {
+-      while (isRunning() && ackQueue.size() == 0) {
+-        if (LOG.isDebugEnabled()) {
+-          LOG.debug(myString + ": seqno=" + seqno +
+-                    " waiting for local datanode to finish write.");
++    Packet waitForAckHead(long seqno) throws InterruptedException {
++      synchronized(ackQueue) {
++        while (isRunning() && ackQueue.size() == 0) {
++          if (LOG.isDebugEnabled()) {
++            LOG.debug(myString + ": seqno=" + seqno +
++                      " waiting for local datanode to finish write.");
++          }
++          ackQueue.wait();
+-        wait();
++        return isRunning() ? ackQueue.getFirst() : null;
+-      return isRunning() ? ackQueue.getFirst() : null;
+-    public synchronized void close() {
+-      while (isRunning() && ackQueue.size() != 0) {
+-        try {
+-          wait();
+-        } catch (InterruptedException e) {
+-          running = false;
+-          Thread.currentThread().interrupt();
++    public void close() {
++      synchronized(ackQueue) {
++        while (isRunning() && ackQueue.size() != 0) {
++          try {
++            ackQueue.wait();
++          } catch (InterruptedException e) {
++            running = false;
++            Thread.currentThread().interrupt();
++          }
++        if(LOG.isDebugEnabled()) {
++          LOG.debug(myString + ": closing");
++        }
++        running = false;
++        ackQueue.notifyAll();
+-      if(LOG.isDebugEnabled()) {
+-        LOG.debug(myString + ": closing");
++
++      synchronized(this) {
++        notifyAll();
+-      running = false;
+-      notifyAll();
++              // Process an OOB ACK.
++              Status oobStatus = ack.getOOBStatus();
++              if (oobStatus != null) {
++                LOG.info("Relaying an out of band ack of type " + oobStatus);
++                sendAckUpstream(ack, PipelineAck.UNKOWN_SEQNO, 0L, 0L,
++                    Status.SUCCESS);
++                continue;
++              }
++             *
++             * The receiver thread can also interrupt this thread for sending
++             * an out-of-band response upstream.
++     * The wrapper for the unprotected version. This is only called by
++     * the responder's run() method.
++     *
++     * @param myStatus the local ack status
++      try {
++        // Wait for other sender to finish. Unless there is an OOB being sent,
++        // the responder won't have to wait.
++        synchronized(this) {
++          while(sending) {
++            wait();
++          }
++          sending = true;
++        }
++
++        try {
++          if (!running) return;
++          sendAckUpstreamUnprotected(ack, seqno, totalAckTimeNanos,
++              offsetInBlock, myStatus);
++        } finally {
++          synchronized(this) {
++            sending = false;
++            notify();
++          }
++        }
++      } catch (InterruptedException ie) {
++        // The responder was interrupted. Make it go down without
++        // interrupting the receiver(writer) thread.  
++        running = false;
++      }
++    }
++
++    /**
++     * @param ack Ack received from downstream
++     * @param seqno sequence number of ack to be sent upstream
++     * @param totalAckTimeNanos total ack time including all the downstream
++     *          nodes
++     * @param offsetInBlock offset in block for the data in packet
++     * @param myStatus the local ack status
++     */
++    private void sendAckUpstreamUnprotected(PipelineAck ack, long seqno,
++        long totalAckTimeNanos, long offsetInBlock, Status myStatus)
++        throws IOException {
+-      if (mirrorError) { // ack read error
++      if (ack == null) {
++        // A new OOB response is being sent from this node. Regardless of
++        // downstream nodes, reply should contain one reply.
++        replies = new Status[1];
++        replies[0] = myStatus;
++      } else if (mirrorError) { // ack read error
+-    private synchronized void removeAckHead() {
+-      ackQueue.removeFirst();
+-      notifyAll();
++    private void removeAckHead() {
++      synchronized(ackQueue) {
++        ackQueue.removeFirst();
++        ackQueue.notifyAll();
++      }
+
+INS23 INS31 INS31 INS83 INS39 INS59 INS29 INS39 INS42 INS44 INS43 INS43 INS8 INS8 INS8 INS29 INS83 INS39 INS42 INS44 INS44 INS44 INS44 INS44 INS43 INS8 UPD42 INS8 INS42 INS9 INS65 INS65 INS83 INS43 INS42 INS42 INS42 INS25 INS51 INS21 INS54 INS51 INS51 INS51 INS65 INS65 INS65 INS65 INS65 INS65 INS43 INS42 INS39 INS42 INS39 INS42 INS39 INS42 INS43 INS42 INS42 INS54 INS65 INS25 INS51 INS8 INS21 INS25 INS42 INS66 INS66 INS66 INS66 INS66 INS42 INS66 INS42 INS38 INS8 INS52 INS8 INS32 INS8 INS8 INS42 MOV8 INS42 MOV8 INS52 INS8 INS66 INS66 INS42 INS66 INS42 INS66 INS42 INS66 INS66 INS42 INS66 INS42 INS66 INS42 INS42 INS8 INS12 INS42 INS66 INS27 INS8 MOV25 INS42 MOV8 INS25 INS32 MOV38 INS8 INS36 INS42 INS21 INS41 INS25 INS21 INS42 INS42 INS27 INS21 INS51 MOV21 INS51 INS54 INS44 INS8 INS42 INS33 INS21 INS21 INS32 INS8 MOV8 INS42 INS42 MOV25 MOV21 MOV21 INS27 INS32 INS42 INS8 INS7 INS45 INS42 INS32 INS52 INS8 INS52 INS8 INS8 INS8 INS43 INS42 INS21 INS7 INS7 INS42 INS42 INS21 MOV27 MOV40 INS32 INS21 INS42 INS42 INS27 INS21 INS25 INS42 INS9 INS42 INS33 INS40 INS34 INS34 INS42 INS21 INS21 INS42 INS61 INS21 INS25 INS21 INS51 INS42 INS7 INS42 INS3 INS2 INS42 INS42 INS32 MOV21 INS42 INS42 INS32 INS45 INS42 INS45 INS32 INS42 INS8 INS7 INS32 INS8 INS42 MOV8 INS7 INS38 INS41 INS32 INS52 INS8 INS42 INS9 INS5 INS34 INS42 INS34 INS42 INS42 INS27 INS32 INS8 INS25 INS42 INS42 INS42 INS32 INS53 INS42 INS9 INS42 INS42 INS21 INS42 INS9 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS21 INS21 INS43 INS85 INS45 INS42 INS45 INS42 INS42 INS54 INS38 INS8 INS42 INS42 INS42 INS14 INS32 INS7 INS32 INS42 INS8 INS12 INS12 INS32 MOV53 INS43 INS27 INS42 INS42 INS60 INS25 INS42 INS9 INS42 INS21 INS44 INS8 INS44 INS8 INS42 INS42 INS42 INS45 INS42 INS43 INS59 INS27 INS8 INS32 INS43 INS42 INS43 INS42 INS21 INS42 INS42 INS32 INS42 INS33 INS21 INS21 INS18 INS36 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS32 INS32 INS11 INS42 INS42 INS42 INS42 INS45 INS42 INS42 INS42 INS27 INS42 INS42 INS40 INS34 INS34 INS40 INS43 INS32 INS45 INS42 INS42 INS42 INS42 DEL8 DEL52 DEL83 DEL83 DEL83

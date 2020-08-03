@@ -1,0 +1,149 @@
+YARN-569. Add support for requesting and enforcing preemption requests via
+a capacity monitor. Contributed by Carlo Curino, Chris Douglas
+
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/trunk@1502083 13f79535-47bb-0310-9956-ffa450edef68
+
++import java.util.Collections;
++import java.util.HashSet;
++import java.util.Set;
+-import org.apache.hadoop.yarn.exceptions.YarnRuntimeException;
++import org.apache.hadoop.yarn.server.resourcemanager.scheduler.Allocation;
++import org.apache.hadoop.yarn.util.resource.ResourceCalculator;
+-  private Map<ContainerId, RMContainer> liveContainers
+-  = new HashMap<ContainerId, RMContainer>();
+-  private List<RMContainer> newlyAllocatedContainers = 
+-      new ArrayList<RMContainer>();
++  private Map<ContainerId, RMContainer> liveContainers =
++    new HashMap<ContainerId, RMContainer>();
++  private List<RMContainer> newlyAllocatedContainers =
++    new ArrayList<RMContainer>();
+-  
++  private final Set<ContainerId> containersToPreempt =
++    new HashSet<ContainerId>();
++
+-  synchronized public void containerCompleted(RMContainer rmContainer,
++  synchronized public boolean containerCompleted(RMContainer rmContainer,
+-    
++
++    // Remove from the list of containers
++    if (null == liveContainers.remove(rmContainer.getContainerId())) {
++      return false;
++    }
++
+-    
++
+-    
+-    // Remove from the list of containers
+-    liveContainers.remove(rmContainer.getContainerId());
++
++    containersToPreempt.remove(rmContainer.getContainerId());
++
++    return true;
+-   * Return the number of times the application has been given an opportunity
++   * @param priority Target priority
++   * @return the number of times the application has been given an opportunity
+-  public synchronized void unreserve(FiCaSchedulerNode node, Priority priority) {
+-    Map<NodeId, RMContainer> reservedContainers = 
+-        this.reservedContainers.get(priority);
+-    RMContainer reservedContainer = reservedContainers.remove(node.getNodeID());
+-    if (reservedContainers.isEmpty()) {
+-      this.reservedContainers.remove(priority);
+-    }
+-    
+-    // reservedContainer should not be null here
+-    if (reservedContainer == null) {
+-      String errorMesssage =
+-          "Application " + getApplicationId() + " is trying to unreserve "
+-              + " on node " + node + ", currently has "
+-              + reservedContainers.size() + " at priority " + priority
+-              + "; currentReservation " + currentReservation;
+-      LOG.warn(errorMesssage);
+-      throw new YarnRuntimeException(errorMesssage);
+-    }
+-    // Reset the re-reservation count
+-    resetReReservations(priority);
++  public synchronized boolean unreserve(FiCaSchedulerNode node, Priority priority) {
++    Map<NodeId, RMContainer> reservedContainers =
++      this.reservedContainers.get(priority);
+-    Resource resource = reservedContainer.getContainer().getResource();
+-    Resources.subtractFrom(currentReservation, resource);
++    if (reservedContainers != null) {
++      RMContainer reservedContainer = reservedContainers.remove(node.getNodeID());
+-    LOG.info("Application " + getApplicationId() + " unreserved " + " on node "
+-        + node + ", currently has " + reservedContainers.size() + " at priority "
+-        + priority + "; currentReservation " + currentReservation);
++      // unreserve is now triggered in new scenarios (preemption)
++      // as a consequence reservedcontainer might be null, adding NP-checks
++      if (reservedContainer != null
++          && reservedContainer.getContainer() != null
++          && reservedContainer.getContainer().getResource() != null) {
++
++        if (reservedContainers.isEmpty()) {
++          this.reservedContainers.remove(priority);
++        }
++        // Reset the re-reservation count
++        resetReReservations(priority);
++
++        Resource resource = reservedContainer.getContainer().getResource();
++        Resources.subtractFrom(currentReservation, resource);
++
++        LOG.info("Application " + getApplicationId() + " unreserved "
++            + " on node " + node + ", currently has " + reservedContainers.size()
++            + " at priority " + priority + "; currentReservation "
++            + currentReservation);
++        return true;
++      }
++    }
++    return false;
++
++  public Resource getTotalPendingRequests() {
++    Resource ret = Resource.newInstance(0, 0);
++    for (ResourceRequest rr : appSchedulingInfo.getAllResourceRequests()) {
++      // to avoid double counting we count only "ANY" resource requests
++      if (ResourceRequest.isAnyLocation(rr.getResourceName())){
++        Resources.addTo(ret,
++            Resources.multiply(rr.getCapability(), rr.getNumContainers()));
++      }
++    }
++    return ret;
++  }
++
++  public synchronized void addPreemptContainer(ContainerId cont){
++    // ignore already completed containers
++    if (liveContainers.containsKey(cont)) {
++      containersToPreempt.add(cont);
++    }
++  }
++
++  /**
++   * This method produces an Allocation that includes the current view
++   * of the resources that will be allocated to and preempted from this
++   * application.
++   *
++   * @param rc
++   * @param clusterResource
++   * @param minimumAllocation
++   * @return an allocation
++   */
++  public synchronized Allocation getAllocation(ResourceCalculator rc,
++      Resource clusterResource, Resource minimumAllocation) {
++
++    Set<ContainerId> currentContPreemption = Collections.unmodifiableSet(
++        new HashSet<ContainerId>(containersToPreempt));
++    containersToPreempt.clear();
++    Resource tot = Resource.newInstance(0, 0);
++    for(ContainerId c : currentContPreemption){
++      Resources.addTo(tot,
++          liveContainers.get(c).getContainer().getResource());
++    }
++    int numCont = (int) Math.ceil(
++        Resources.divide(rc, clusterResource, tot, minimumAllocation));
++    ResourceRequest rr = ResourceRequest.newInstance(
++        Priority.UNDEFINED, ResourceRequest.ANY,
++        minimumAllocation, numCont);
++    return new Allocation(pullNewlyAllocatedContainers(), getHeadroom(),
++                          null, currentContPreemption,
++                          Collections.singletonList(rr));
++  }
++

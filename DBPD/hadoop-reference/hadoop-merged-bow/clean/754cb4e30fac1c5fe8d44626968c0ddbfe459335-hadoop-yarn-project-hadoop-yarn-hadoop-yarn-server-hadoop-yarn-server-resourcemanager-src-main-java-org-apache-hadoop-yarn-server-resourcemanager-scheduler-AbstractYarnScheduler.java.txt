@@ -1,0 +1,190 @@
+YARN-5047. Refactor nodeUpdate across schedulers. (Ray Chiang via kasha)
+
++import org.apache.hadoop.yarn.api.records.NodeState;
++import org.apache.hadoop.yarn.server.resourcemanager.rmnode.RMNodeResourceUpdateEvent;
++import org.apache.hadoop.yarn.server.resourcemanager.rmnode.UpdatedContainerInfo;
++import org.apache.hadoop.yarn.server.utils.Lock;
++import org.apache.hadoop.yarn.util.Clock;
++import org.apache.hadoop.yarn.util.SystemClock;
+-  
++
++  protected SchedulerHealth schedulerHealth = new SchedulerHealth();
++  protected volatile long lastNodeUpdateTime;
++
++  private volatile Clock clock;
++    clock = SystemClock.getInstance();
++  public SchedulerHealth getSchedulerHealth() {
++    return this.schedulerHealth;
++  }
++
++  protected void setLastNodeUpdateTime(long time) {
++    this.lastNodeUpdateTime = time;
++  }
++
++  public long getLastNodeUpdateTime() {
++    return lastNodeUpdateTime;
++  }
++
+-      SchedulerApplicationAttempt application = getCurrentAttemptForContainer(
+-          containerId);
++      SchedulerApplicationAttempt application =
++          getCurrentAttemptForContainer(containerId);
+-  
++
++
+-  public void recoverContainersOnNode(
++  public synchronized void recoverContainersOnNode(
+-   * Recover resource request back from RMContainer when a container is 
++   * Recover resource request back from RMContainer when a container is
+-  public SchedulerNode getSchedulerNode(NodeId nodeId) {
++  public N getSchedulerNode(NodeId nodeId) {
++  public Clock getClock() {
++    return clock;
++  }
++
++  @VisibleForTesting
++  public void setClock(Clock clock) {
++    this.clock = clock;
++  }
++
++  @Lock(Lock.NoLock.class)
++  public SchedulerNode getNode(NodeId nodeId) {
++    return nodeTracker.getNode(nodeId);
++  }
++
++  /**
++   * Get lists of new containers from NodeManager and process them.
++   * @param nm The RMNode corresponding to the NodeManager
++   * @return list of completed containers
++   */
++  protected List<ContainerStatus> updateNewContainerInfo(RMNode nm) {
++    SchedulerNode node = getNode(nm.getNodeID());
++
++    List<UpdatedContainerInfo> containerInfoList = nm.pullContainerUpdates();
++    List<ContainerStatus> newlyLaunchedContainers =
++        new ArrayList<>();
++    List<ContainerStatus> completedContainers =
++        new ArrayList<>();
++
++    for(UpdatedContainerInfo containerInfo : containerInfoList) {
++      newlyLaunchedContainers
++          .addAll(containerInfo.getNewlyLaunchedContainers());
++      completedContainers.addAll(containerInfo.getCompletedContainers());
++    }
++
++    // Processing the newly launched containers
++    for (ContainerStatus launchedContainer : newlyLaunchedContainers) {
++      containerLaunchedOnNode(launchedContainer.getContainerId(), node);
++    }
++
++    // Processing the newly increased containers
++    List<Container> newlyIncreasedContainers =
++        nm.pullNewlyIncreasedContainers();
++    for (Container container : newlyIncreasedContainers) {
++      containerIncreasedOnNode(container.getId(), node, container);
++    }
++
++    return completedContainers;
++  }
++
++  /**
++   * Process completed container list.
++   * @param completedContainers Extracted list of completed containers
++   * @param releasedResources Reference resource object for completed containers
++   * @return The total number of released containers
++   */
++  protected int updateCompletedContainers(List<ContainerStatus>
++      completedContainers, Resource releasedResources) {
++    int releasedContainers = 0;
++    for (ContainerStatus completedContainer : completedContainers) {
++      ContainerId containerId = completedContainer.getContainerId();
++      LOG.debug("Container FINISHED: " + containerId);
++      RMContainer container = getRMContainer(containerId);
++      completedContainer(getRMContainer(containerId),
++          completedContainer, RMContainerEventType.FINISHED);
++      if (container != null) {
++        releasedContainers++;
++        Resource ars = container.getAllocatedResource();
++        if (ars != null) {
++          Resources.addTo(releasedResources, ars);
++        }
++        Resource rrs = container.getReservedResource();
++        if (rrs != null) {
++          Resources.addTo(releasedResources, rrs);
++        }
++      }
++    }
++    return releasedContainers;
++  }
++
++  /**
++   * Update schedulerHealth information.
++   * @param releasedResources Reference resource object for completed containers
++   * @param releasedContainers Count of released containers
++   */
++  protected void updateSchedulerHealthInformation(Resource releasedResources,
++      int releasedContainers) {
++
++    schedulerHealth.updateSchedulerReleaseDetails(getLastNodeUpdateTime(),
++        releasedResources);
++    schedulerHealth.updateSchedulerReleaseCounts(releasedContainers);
++  }
++
++  /**
++   * Update container and utilization information on the NodeManager.
++   * @param nm The NodeManager to update
++   */
++  protected void updateNodeResourceUtilization(RMNode nm) {
++    SchedulerNode node = getNode(nm.getNodeID());
++    // Updating node resource utilization
++    node.setAggregatedContainersUtilization(
++        nm.getAggregatedContainersUtilization());
++    node.setNodeUtilization(nm.getNodeUtilization());
++
++  }
++
++  /**
++   * Process a heartbeat update from a node.
++   * @param nm The RMNode corresponding to the NodeManager
++   */
++  protected synchronized void nodeUpdate(RMNode nm) {
++    if (LOG.isDebugEnabled()) {
++      LOG.debug("nodeUpdate: " + nm +
++          " cluster capacity: " + getClusterResource());
++    }
++
++    // Process new container information
++    List<ContainerStatus> completedContainers = updateNewContainerInfo(nm);
++
++    // Process completed containers
++    Resource releasedResources = Resource.newInstance(0, 0);
++    int releasedContainers = updateCompletedContainers(completedContainers,
++        releasedResources);
++
++    // If the node is decommissioning, send an update to have the total
++    // resource equal to the used resource, so no available resource to
++    // schedule.
++    // TODO YARN-5128: Fix possible race-condition when request comes in before
++    // update is propagated
++    if (nm.getState() == NodeState.DECOMMISSIONING) {
++      this.rmContext
++          .getDispatcher()
++          .getEventHandler()
++          .handle(
++              new RMNodeResourceUpdateEvent(nm.getNodeID(), ResourceOption
++                  .newInstance(getSchedulerNode(nm.getNodeID())
++                      .getAllocatedResource(), 0)));
++    }
++
++    updateSchedulerHealthInformation(releasedResources, releasedContainers);
++    updateNodeResourceUtilization(nm);
++
++    // Now node data structures are up-to-date and ready for scheduling.
++    if(LOG.isDebugEnabled()) {
++      SchedulerNode node = getNode(nm.getNodeID());
++      LOG.debug("Node being looked for scheduling " + nm +
++          " availableResource: " + node.getUnallocatedResource());
++    }
++  }
+
+INS26 INS26 INS26 INS26 INS26 INS26 INS40 INS40 INS40 INS40 INS40 INS40 INS23 INS23 INS23 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS83 INS43 INS59 INS83 INS83 INS39 INS59 INS83 INS83 INS43 INS59 INS83 INS43 INS42 INS8 INS83 INS39 INS42 INS44 INS8 INS83 INS39 INS42 INS8 INS83 INS43 INS83 INS43 INS42 INS8 INS78 INS83 INS39 INS42 INS44 INS8 INS79 INS83 MOV43 INS42 INS44 INS8 INS29 INS83 INS74 INS42 INS44 INS8 INS29 INS83 INS39 INS42 INS44 INS44 INS8 INS29 INS83 INS39 INS42 INS44 INS44 INS8 INS29 INS83 INS39 INS42 INS44 INS8 INS29 INS83 INS83 INS39 INS42 INS44 INS8 INS42 INS42 INS14 INS42 INS42 INS42 INS21 INS42 INS41 INS39 INS42 INS21 INS41 INS42 INS42 INS41 INS42 INS43 INS42 INS21 INS42 INS57 INS43 INS42 INS41 INS65 INS65 INS65 INS43 INS43 INS43 INS42 INS60 INS60 INS60 INS60 INS70 INS70 INS60 INS70 INS41 INS65 INS65 INS65 INS65 INS74 INS42 INS43 INS42 INS60 INS70 INS41 INS65 INS65 INS65 INS43 INS42 INS39 INS42 INS21 INS21 INS65 INS65 INS43 INS42 INS60 INS21 INS21 INS65 INS65 INS43 INS42 INS25 INS60 INS60 INS60 INS25 INS21 INS21 INS25 INS43 INS7 INS22 INS7 INS42 UPD66 INS42 INS42 INS7 INS43 INS42 INS32 INS66 INS42 INS66 INS66 INS42 INS42 INS42 INS43 INS59 INS74 INS59 INS74 INS59 INS74 INS59 INS44 INS42 INS8 INS44 INS42 INS8 INS74 INS59 INS44 INS42 INS8 INS42 INS66 INS42 INS66 INS42 INS66 INS66 INS43 INS43 INS42 INS39 INS59 INS44 INS42 INS8 INS42 INS66 INS42 INS66 INS42 INS66 INS42 INS32 INS32 INS66 INS42 INS66 INS42 INS43 INS59 INS32 INS32 INS66 INS42 INS66 INS42 INS32 INS8 INS74 INS59 INS43 INS59 INS39 INS59 INS27 INS8 INS32 INS32 INS32 INS8 INS42 INS42 INS32 INS52 INS42 INS22 INS42 INS22 INS42 INS40 INS42 INS42 INS42 INS42 INS42 INS32 INS43 INS43 INS42 INS32 INS43 INS43 INS42 INS14 INS43 INS43 INS42 INS14 INS43 INS42 INS21 INS21 INS43 INS42 INS21 INS43 INS43 INS42 INS32 INS43 INS42 INS21 INS42 INS42 INS42 INS34 INS43 INS42 INS60 INS21 INS60 INS21 INS25 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS21 INS43 INS43 INS42 INS32 INS42 INS42 INS32 INS42 INS32 INS32 INS40 INS21 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS60 INS21 INS42 INS42 INS52 INS42 INS52 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS74 INS42 INS42 INS74 INS42 INS32 INS32 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS43 INS59 INS32 INS43 INS59 INS32 INS27 INS8 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS34 INS34 INS42 INS42 INS42 INS42 INS42 INS32 INS43 INS59 INS32 INS42 INS42 INS43 INS43 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS27 INS42 INS42 INS32 INS42 INS32 INS42 INS40 INS42 INS33 INS21 INS60 INS25 INS60 INS25 INS42 INS42 INS42 INS42 INS27 INS32 INS42 INS14 INS42 INS42 INS32 INS42 INS42 INS27 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS45 INS42 INS42 INS42 INS42 INS42 INS37 INS43 INS59 INS27 INS8 INS43 INS59 INS27 INS8 INS45 INS42 INS45 INS32 INS32 INS42 INS43 INS32 INS32 INS42 INS32 INS45 INS42 INS45 INS32 INS42 INS42 INS42 INS32 INS42 INS33 INS21 INS42 INS42 INS32 INS42 INS33 INS21 INS42 INS22 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS34 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS32 INS52 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS42

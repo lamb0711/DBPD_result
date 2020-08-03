@@ -1,0 +1,198 @@
+HADOOP-9567. Provide auto-renewal for keytab based logins. Contributed by Hrishikesh Gadre, Gary Helmling  and Harsh J.
+
+Signed-off-by: Wei-Chiu Chuang <weichiu@apache.org>
+
++import static org.apache.hadoop.fs.CommonConfigurationKeysPublic.HADOOP_KERBEROS_KEYTAB_LOGIN_AUTORENEWAL_ENABLED;
++import static org.apache.hadoop.fs.CommonConfigurationKeysPublic.HADOOP_KERBEROS_KEYTAB_LOGIN_AUTORENEWAL_ENABLED_DEFAULT;
++import java.util.Optional;
++import java.util.concurrent.ExecutorService;
++import java.util.concurrent.Executors;
++import java.util.concurrent.ThreadFactory;
++  /** Boolean flag to enable auto-renewal for keytab based loging. */
++  private static boolean kerberosKeyTabLoginRenewalEnabled;
++  /** A reference to Kerberos login auto renewal thread. */
++  private static Optional<ExecutorService> kerberosLoginRenewalExecutor =
++          Optional.empty();
++
++    kerberosKeyTabLoginRenewalEnabled = conf.getBoolean(
++            HADOOP_KERBEROS_KEYTAB_LOGIN_AUTORENEWAL_ENABLED,
++            HADOOP_KERBEROS_KEYTAB_LOGIN_AUTORENEWAL_ENABLED_DEFAULT);
++
++    kerberosKeyTabLoginRenewalEnabled = false;
++    kerberosLoginRenewalExecutor = Optional.empty();
+-  
++
++  @InterfaceAudience.Private
++  @InterfaceStability.Evolving
++  @VisibleForTesting
++  static boolean isKerberosKeyTabLoginRenewalEnabled() {
++    ensureInitialized();
++    return kerberosKeyTabLoginRenewalEnabled;
++  }
++
++  @InterfaceAudience.Private
++  @InterfaceStability.Evolving
++  @VisibleForTesting
++  static Optional<ExecutorService> getKerberosLoginRenewalExecutor() {
++    ensureInitialized();
++    return kerberosLoginRenewalExecutor;
++  }
++
++  /**
++   * Spawn a thread to do periodic renewals of kerberos credentials. NEVER
++   * directly call this method. This method should only be used for ticket cache
++   * based kerberos credentials.
++   *
++   * @param force - used by tests to forcibly spawn thread
++   */
+-  /**
+-   * Spawn a thread to do periodic renewals of kerberos credentials from
+-   * a ticket cache.  NEVER directly call this method.
+-   * @param force - used by tests to forcibly spawn thread
+-   */
+-    Thread t =
+-        new Thread(new AutoRenewalForUserCredsRunnable(tgt, cmd, nextRefresh));
+-    t.setDaemon(true);
+-    t.setName("TGT Renewer for " + getUserName());
+-    t.start();
++    executeAutoRenewalTask(getUserName(),
++            new TicketCacheRenewalRunnable(tgt, cmd, nextRefresh));
++  /**
++   * Spawn a thread to do periodic renewals of kerberos credentials from a
++   * keytab file.
++   */
++  private void spawnAutoRenewalThreadForKeytab() {
++    if (!shouldRelogin() || isFromTicket()) {
++      return;
++    }
++
++    // spawn thread only if we have kerb credentials
++    KerberosTicket tgt = getTGT();
++    if (tgt == null) {
++      return;
++    }
++    long nextRefresh = getRefreshTime(tgt);
++    executeAutoRenewalTask(getUserName(),
++            new KeytabRenewalRunnable(tgt, nextRefresh));
++  }
++
++  /**
++   * Spawn a thread to do periodic renewals of kerberos credentials from a
++   * keytab file. NEVER directly call this method.
++   *
++   * @param userName Name of the user for which login needs to be renewed.
++   * @param task  The reference of the login renewal task.
++   */
++  private void executeAutoRenewalTask(final String userName,
++                                      AutoRenewalForUserCredsRunnable task) {
++    kerberosLoginRenewalExecutor = Optional.of(
++            Executors.newSingleThreadExecutor(
++                  new ThreadFactory() {
++                    @Override
++                    public Thread newThread(Runnable r) {
++                      Thread t = new Thread(r);
++                      t.setDaemon(true);
++                      t.setName("TGT Renewer for " + userName);
++                      return t;
++                    }
++                  }
++            ));
++    kerberosLoginRenewalExecutor.get().submit(task);
++  }
++
++  /**
++   * An abstract class which encapsulates the functionality required to
++   * auto renew Kerbeors TGT. The concrete implementations of this class
++   * are expected to provide implementation required to perform actual
++   * TGT renewal (see {@code TicketCacheRenewalRunnable} and
++   * {@code KeytabRenewalRunnable}).
++   */
++  @InterfaceAudience.Private
++  @InterfaceStability.Unstable
+-  class AutoRenewalForUserCredsRunnable implements Runnable {
++  abstract class AutoRenewalForUserCredsRunnable implements Runnable {
+-    private String kinitCmd;
+-    AutoRenewalForUserCredsRunnable(KerberosTicket tgt, String kinitCmd,
+-        long nextRefresh){
++    AutoRenewalForUserCredsRunnable(KerberosTicket tgt, long nextRefresh) {
+-      this.kinitCmd = kinitCmd;
++    /**
++     * This method is used to perform renewal of kerberos login ticket.
++     * The concrete implementations of this class should provide specific
++     * logic required to perform renewal as part of this method.
++     */
++    protected abstract void relogin() throws IOException;
++
+-          String output = Shell.execCommand(kinitCmd, "-R");
+-          if (LOG.isDebugEnabled()) {
+-            LOG.debug("Renewed ticket. kinit output: {}", output);
+-          }
+-          reloginFromTicketCache();
++          relogin();
++   * A concrete implementation of {@code AutoRenewalForUserCredsRunnable} class
++   * which performs TGT renewal using kinit command.
++   */
++  @InterfaceAudience.Private
++  @InterfaceStability.Unstable
++  @VisibleForTesting
++  final class TicketCacheRenewalRunnable
++      extends AutoRenewalForUserCredsRunnable {
++    private String kinitCmd;
++
++    TicketCacheRenewalRunnable(KerberosTicket tgt, String kinitCmd,
++        long nextRefresh) {
++      super(tgt, nextRefresh);
++      this.kinitCmd = kinitCmd;
++    }
++
++    @Override
++    public void relogin() throws IOException {
++      String output = Shell.execCommand(kinitCmd, "-R");
++      if (LOG.isDebugEnabled()) {
++        LOG.debug("Renewed ticket. kinit output: {}", output);
++      }
++      reloginFromTicketCache();
++    }
++  }
++
++  /**
++   * A concrete implementation of {@code AutoRenewalForUserCredsRunnable} class
++   * which performs TGT renewal using specified keytab.
++   */
++  @InterfaceAudience.Private
++  @InterfaceStability.Unstable
++  @VisibleForTesting
++  final class KeytabRenewalRunnable extends AutoRenewalForUserCredsRunnable {
++
++    KeytabRenewalRunnable(KerberosTicket tgt, long nextRefresh) {
++      super(tgt, nextRefresh);
++    }
++
++    @Override
++    public void relogin() throws IOException {
++      reloginFromKeytab();
++    }
++  }
++
++  /**
+-    setLoginUser(loginUserFromKeytabAndReturnUGI(user, path));
+-    LOG.info("Login successful for user " + user
+-        + " using keytab file " + path);
++    UserGroupInformation u = loginUserFromKeytabAndReturnUGI(user, path);
++    if (isKerberosKeyTabLoginRenewalEnabled()) {
++      u.spawnAutoRenewalThreadForKeytab();
++    }
++
++    setLoginUser(u);
++
++    LOG.info("Login successful for user {} using keytab file {}. Keytab auto" +
++            " renewal enabled : {}",
++            user, path, isKerberosKeyTabLoginRenewalEnabled());
++
++    // Shutdown the background task performing login renewal.
++    if (getKerberosLoginRenewalExecutor().isPresent()) {
++      getKerberosLoginRenewalExecutor().get().shutdownNow();
++    }
++
+
+INS26 INS26 INS26 INS26 INS26 INS26 INS40 INS40 INS40 INS40 INS40 INS40 INS23 INS23 INS31 INS31 INS31 INS31 INS55 INS55 INS29 INS83 INS83 INS39 INS59 INS29 INS83 INS83 INS74 INS59 INS78 INS78 INS78 INS83 INS39 INS42 INS8 INS78 INS78 INS78 INS83 INS74 INS42 INS8 INS29 INS29 INS83 INS39 INS42 INS8 INS29 INS83 INS39 INS42 INS44 INS44 INS8 INS29 INS78 INS78 INS83 INS31 INS29 INS78 INS78 INS78 INS83 INS42 INS43 MOV23 INS31 INS31 INS29 INS78 INS78 INS78 INS83 INS42 INS43 INS31 INS31 INS65 INS42 INS65 INS43 INS43 INS42 INS32 INS21 INS21 INS21 INS40 INS40 INS42 INS21 INS41 INS40 INS40 INS42 INS43 INS43 INS21 INS41 INS65 INS65 INS21 INS65 INS25 INS60 INS25 INS60 INS21 INS65 INS65 INS65 INS83 INS43 INS42 MOV43 INS42 INS21 INS21 INS65 INS40 INS40 INS29 INS83 INS83 INS39 INS42 INS43 INS65 INS40 INS40 INS42 INS42 INS42 INS44 MOV44 INS44 INS8 INS78 INS83 INS39 INS42 INS43 INS8 INS65 INS40 INS40 INS42 INS42 INS42 INS44 INS44 INS8 INS78 INS83 INS39 INS42 INS43 INS8 INS60 INS25 INS25 INS66 INS66 INS42 INS42 INS42 INS42 INS7 INS7 INS7 INS32 INS42 INS42 INS42 INS32 INS42 INS66 INS66 INS66 INS42 INS66 INS32 INS66 INS66 INS27 INS8 INS43 INS59 INS27 INS8 INS39 INS59 INS32 INS66 INS66 INS42 INS66 INS42 INS66 INS42 INS7 INS32 INS66 INS66 INS66 INS66 INS65 INS66 INS65 INS66 INS65 INS42 INS66 INS65 INS66 INS66 INS43 INS42 INS39 INS42 INS46 MOV21 INS42 INS42 MOV60 MOV25 MOV21 INS66 INS65 INS66 INS66 INS43 INS42 INS39 INS42 INS46 INS42 INS42 INS21 INS43 INS59 INS32 INS8 INS32 INS8 INS42 INS32 INS42 INS9 INS42 INS32 INS42 INS42 INS42 MOV32 INS14 INS38 INS32 INS41 INS42 INS42 INS32 INS42 INS33 INS41 INS42 INS32 INS42 INS32 INS14 INS42 INS32 INS32 INS42 INS42 INS66 INS66 INS66 INS66 INS66 INS66 INS42 INS42 INS42 INS66 INS42 INS42 INS42 INS32 INS42 INS42 MOV32 INS42 INS21 INS42 INS27 INS42 INS42 INS32 INS32 INS42 INS21 INS42 INS42 INS42 INS42 INS42 INS42 INS43 MOV42 MOV42 MOV42 INS32 INS42 INS42 INS42 INS42 INS42 INS43 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS32 UPD45 MOV45 INS45 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS14 INS42 INS42 INS32 INS42 INS43 INS1 INS21 INS32 INS42 INS42 INS31 INS32 INS42 INS78 INS83 INS43 INS42 INS44 INS8 INS42 INS42 INS42 INS43 INS42 INS60 MOV21 INS21 INS41 INS42 MOV43 INS59 INS32 INS42 INS42 INS14 INS42 INS42 INS27 MOV43 INS42 INS45 INS42 DEL42 DEL14 DEL14 DEL59 DEL60 DEL42 DEL42 DEL45 DEL27 DEL32 DEL21 DEL42 DEL42 DEL32 DEL21 DEL42 DEL45 DEL42 DEL27

@@ -1,0 +1,371 @@
+HDFS-347. DFS read performance suboptimal when client co-located on nodes with data. Contributed by Colin Patrick McCabe.
+
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/trunk@1467538 13f79535-47bb-0310-9956-ffa450edef68
+
+-import java.io.File;
++import org.apache.hadoop.conf.Configuration;
++
++import java.io.BufferedInputStream;
+-import java.net.Socket;
+-import java.security.PrivilegedExceptionAction;
+-import java.util.Collections;
+-import java.util.HashMap;
+-import java.util.LinkedHashMap;
+-import java.util.Map;
+-import org.apache.hadoop.conf.Configuration;
+-import org.apache.hadoop.fs.FileSystem;
+-import org.apache.hadoop.hdfs.protocol.BlockLocalPathInfo;
+-import org.apache.hadoop.hdfs.protocol.ClientDatanodeProtocol;
+-import org.apache.hadoop.hdfs.protocol.DatanodeInfo;
++import org.apache.hadoop.hdfs.protocol.DatanodeID;
+-import org.apache.hadoop.hdfs.protocol.datatransfer.IOStreamPair;
+-import org.apache.hadoop.hdfs.security.token.block.BlockTokenIdentifier;
+-import org.apache.hadoop.ipc.RPC;
+-import org.apache.hadoop.security.UserGroupInformation;
+-import org.apache.hadoop.security.token.Token;
+- * <li>The client gets the path to the file where block is stored using
+- * {@link org.apache.hadoop.hdfs.protocol.ClientDatanodeProtocol#getBlockLocalPathInfo(ExtendedBlock, Token)}
+- * RPC call</li>
+- * <li>Client uses kerberos authentication to connect to the datanode over RPC,
+- * if security is enabled.</li>
++ * <li>The client gets the file descriptors for the metadata file and the data 
++ * file for the block using
++ * {@link org.apache.hadoop.hdfs.server.datanode.DataXceiver#requestShortCircuitFds}.
++ * </li>
++ * <li>The client reads the file descriptors.</li>
+-  private static final Log LOG = LogFactory.getLog(DFSClient.class);
+-
+-  //Stores the cache and proxy for a local datanode.
+-  private static class LocalDatanodeInfo {
+-    private ClientDatanodeProtocol proxy = null;
+-    private final Map<ExtendedBlock, BlockLocalPathInfo> cache;
+-
+-    LocalDatanodeInfo() {
+-      final int cacheSize = 10000;
+-      final float hashTableLoadFactor = 0.75f;
+-      int hashTableCapacity = (int) Math.ceil(cacheSize / hashTableLoadFactor) + 1;
+-      cache = Collections
+-          .synchronizedMap(new LinkedHashMap<ExtendedBlock, BlockLocalPathInfo>(
+-              hashTableCapacity, hashTableLoadFactor, true) {
+-            private static final long serialVersionUID = 1;
+-
+-            @Override
+-            protected boolean removeEldestEntry(
+-                Map.Entry<ExtendedBlock, BlockLocalPathInfo> eldest) {
+-              return size() > cacheSize;
+-            }
+-          });
+-    }
+-
+-    private synchronized ClientDatanodeProtocol getDatanodeProxy(
+-        UserGroupInformation ugi, final DatanodeInfo node,
+-        final Configuration conf, final int socketTimeout,
+-        final boolean connectToDnViaHostname) throws IOException {
+-      if (proxy == null) {
+-        try {
+-          proxy = ugi.doAs(new PrivilegedExceptionAction<ClientDatanodeProtocol>() {
+-            @Override
+-            public ClientDatanodeProtocol run() throws Exception {
+-              return DFSUtil.createClientDatanodeProtocolProxy(node, conf,
+-                  socketTimeout, connectToDnViaHostname);
+-            }
+-          });
+-        } catch (InterruptedException e) {
+-          LOG.warn("encountered exception ", e);
+-        }
+-      }
+-      return proxy;
+-    }
+-    
+-    private synchronized void resetDatanodeProxy() {
+-      if (null != proxy) {
+-        RPC.stopProxy(proxy);
+-        proxy = null;
+-      }
+-    }
+-
+-    private BlockLocalPathInfo getBlockLocalPathInfo(ExtendedBlock b) {
+-      return cache.get(b);
+-    }
+-
+-    private void setBlockLocalPathInfo(ExtendedBlock b, BlockLocalPathInfo info) {
+-      cache.put(b, info);
+-    }
+-
+-    private void removeBlockLocalPathInfo(ExtendedBlock b) {
+-      cache.remove(b);
+-    }
+-  }
+-  
+-  // Multiple datanodes could be running on the local machine. Store proxies in
+-  // a map keyed by the ipc port of the datanode.
+-  private static Map<Integer, LocalDatanodeInfo> localDatanodeInfoMap = new HashMap<Integer, LocalDatanodeInfo>();
++  static final Log LOG = LogFactory.getLog(BlockReaderLocal.class);
++  private final boolean verifyChecksum;
+-  private final boolean verifyChecksum;
++
++  private final DatanodeID datanodeID;
++  private final ExtendedBlock block;
+-  /**
+-   * The only way this object can be instantiated.
+-   */
+-  static BlockReaderLocal newBlockReader(UserGroupInformation ugi,
+-      Configuration conf, String file, ExtendedBlock blk,
+-      Token<BlockTokenIdentifier> token, DatanodeInfo node, int socketTimeout,
+-      long startOffset, long length, boolean connectToDnViaHostname)
+-      throws IOException {
++  private static int getSlowReadBufferNumChunks(Configuration conf,
++      int bytesPerChecksum) {
+-    LocalDatanodeInfo localDatanodeInfo = getLocalDatanodeInfo(node
+-        .getIpcPort());
+-    // check the cache first
+-    BlockLocalPathInfo pathinfo = localDatanodeInfo.getBlockLocalPathInfo(blk);
+-    if (pathinfo == null) {
+-      pathinfo = getBlockPathInfo(ugi, blk, node, conf, socketTimeout, token,
+-          connectToDnViaHostname);
+-    }
++    int bufSize =
++        conf.getInt(DFSConfigKeys.DFS_CLIENT_READ_SHORTCIRCUIT_BUFFER_SIZE_KEY,
++            DFSConfigKeys.DFS_CLIENT_READ_SHORTCIRCUIT_BUFFER_SIZE_DEFAULT);
+-    // check to see if the file exists. It may so happen that the
+-    // HDFS file has been deleted and this block-lookup is occurring
+-    // on behalf of a new HDFS file. This time, the block file could
+-    // be residing in a different portion of the fs.data.dir directory.
+-    // In this case, we remove this entry from the cache. The next
+-    // call to this method will re-populate the cache.
+-    FileInputStream dataIn = null;
+-    FileInputStream checksumIn = null;
+-    BlockReaderLocal localBlockReader = null;
+-    boolean skipChecksumCheck = skipChecksumCheck(conf);
+-    try {
+-      // get a local file system
+-      File blkfile = new File(pathinfo.getBlockPath());
+-      dataIn = new FileInputStream(blkfile);
+-
+-      if (LOG.isDebugEnabled()) {
+-        LOG.debug("New BlockReaderLocal for file " + blkfile + " of size "
+-            + blkfile.length() + " startOffset " + startOffset + " length "
+-            + length + " short circuit checksum " + !skipChecksumCheck);
+-      }
+-
+-      if (!skipChecksumCheck) {
+-        // get the metadata file
+-        File metafile = new File(pathinfo.getMetaPath());
+-        checksumIn = new FileInputStream(metafile);
+-
+-        // read and handle the common header here. For now just a version
+-        BlockMetadataHeader header = BlockMetadataHeader
+-            .readHeader(new DataInputStream(checksumIn));
+-        short version = header.getVersion();
+-        if (version != BlockMetadataHeader.VERSION) {
+-          LOG.warn("Wrong version (" + version + ") for metadata file for "
+-              + blk + " ignoring ...");
+-        }
+-        DataChecksum checksum = header.getChecksum();
+-        long firstChunkOffset = startOffset
+-            - (startOffset % checksum.getBytesPerChecksum());
+-        localBlockReader = new BlockReaderLocal(conf, file, blk, token,
+-            startOffset, length, pathinfo, checksum, true, dataIn,
+-            firstChunkOffset, checksumIn);
+-      } else {
+-        localBlockReader = new BlockReaderLocal(conf, file, blk, token,
+-            startOffset, length, pathinfo, dataIn);
+-      }
+-    } catch (IOException e) {
+-      // remove from cache
+-      localDatanodeInfo.removeBlockLocalPathInfo(blk);
+-      DFSClient.LOG.warn("BlockReaderLocal: Removing " + blk
+-          + " from cache because local file " + pathinfo.getBlockPath()
+-          + " could not be opened.");
+-      throw e;
+-    } finally {
+-      if (localBlockReader == null) {
+-        if (dataIn != null) {
+-          dataIn.close();
+-        }
+-        if (checksumIn != null) {
+-          checksumIn.close();
+-        }
+-      }
+-    }
+-    return localBlockReader;
+-  }
+-  
+-  private static synchronized LocalDatanodeInfo getLocalDatanodeInfo(int port) {
+-    LocalDatanodeInfo ldInfo = localDatanodeInfoMap.get(port);
+-    if (ldInfo == null) {
+-      ldInfo = new LocalDatanodeInfo();
+-      localDatanodeInfoMap.put(port, ldInfo);
+-    }
+-    return ldInfo;
+-  }
+-  
+-  private static BlockLocalPathInfo getBlockPathInfo(UserGroupInformation ugi,
+-      ExtendedBlock blk, DatanodeInfo node, Configuration conf, int timeout,
+-      Token<BlockTokenIdentifier> token, boolean connectToDnViaHostname)
+-      throws IOException {
+-    LocalDatanodeInfo localDatanodeInfo = getLocalDatanodeInfo(node.getIpcPort());
+-    BlockLocalPathInfo pathinfo = null;
+-    ClientDatanodeProtocol proxy = localDatanodeInfo.getDatanodeProxy(ugi, node,
+-        conf, timeout, connectToDnViaHostname);
+-    try {
+-      // make RPC to local datanode to find local pathnames of blocks
+-      pathinfo = proxy.getBlockLocalPathInfo(blk, token);
+-      if (pathinfo != null) {
+-        if (LOG.isDebugEnabled()) {
+-          LOG.debug("Cached location of block " + blk + " as " + pathinfo);
+-        }
+-        localDatanodeInfo.setBlockLocalPathInfo(blk, pathinfo);
+-      }
+-    } catch (IOException e) {
+-      localDatanodeInfo.resetDatanodeProxy(); // Reset proxy on error
+-      throw e;
+-    }
+-    return pathinfo;
+-  }
+-  
+-  private static boolean skipChecksumCheck(Configuration conf) {
+-    return conf.getBoolean(
+-        DFSConfigKeys.DFS_CLIENT_READ_SHORTCIRCUIT_SKIP_CHECKSUM_KEY,
+-        DFSConfigKeys.DFS_CLIENT_READ_SHORTCIRCUIT_SKIP_CHECKSUM_DEFAULT);
+-  }
+-  
+-  private static int getSlowReadBufferNumChunks(Configuration conf, int bytesPerChecksum) {
+-    int bufferSizeBytes = conf.getInt(DFSConfigKeys.DFS_CLIENT_READ_SHORTCIRCUIT_BUFFER_SIZE_KEY,
+-        DFSConfigKeys.DFS_CLIENT_READ_SHORTCIRCUIT_BUFFER_SIZE_DEFAULT);
+-
+-    if (bufferSizeBytes < bytesPerChecksum) {
+-      throw new IllegalArgumentException("Configured BlockReaderLocal buffer size (" + bufferSizeBytes + ") " +
+-          "is not large enough to hold a single chunk (" + bytesPerChecksum +  "). Please configure " +
++    if (bufSize < bytesPerChecksum) {
++      throw new IllegalArgumentException("Configured BlockReaderLocal buffer size (" +
++          bufSize + ") is not large enough to hold a single chunk (" +
++          bytesPerChecksum +  "). Please configure " +
+-    return bufferSizeBytes / bytesPerChecksum;
++    return bufSize / bytesPerChecksum;
+-  private BlockReaderLocal(Configuration conf, String hdfsfile,
+-      ExtendedBlock block, Token<BlockTokenIdentifier> token, long startOffset,
+-      long length, BlockLocalPathInfo pathinfo, FileInputStream dataIn)
+-      throws IOException {
+-    this(conf, hdfsfile, block, token, startOffset, length, pathinfo,
+-        DataChecksum.newDataChecksum(DataChecksum.Type.NULL, 4), false,
+-        dataIn, startOffset, null);
+-  }
+-
+-  private BlockReaderLocal(Configuration conf, String hdfsfile,
+-      ExtendedBlock block, Token<BlockTokenIdentifier> token, long startOffset,
+-      long length, BlockLocalPathInfo pathinfo, DataChecksum checksum,
+-      boolean verifyChecksum, FileInputStream dataIn, long firstChunkOffset,
+-      FileInputStream checksumIn) throws IOException {
+-    this.filename = hdfsfile;
+-    this.checksum = checksum;
+-    this.verifyChecksum = verifyChecksum;
+-    this.startOffset = Math.max(startOffset, 0);
+-
+-    bytesPerChecksum = this.checksum.getBytesPerChecksum();
+-    checksumSize = this.checksum.getChecksumSize();
+-
++  public BlockReaderLocal(Configuration conf, String filename,
++      ExtendedBlock block, long startOffset, long length,
++      FileInputStream dataIn, FileInputStream checksumIn,
++      DatanodeID datanodeID, boolean verifyChecksum) throws IOException {
+-    this.offsetFromChunkBoundary = (int) (startOffset-firstChunkOffset);
++    this.startOffset = Math.max(startOffset, 0);
++    this.filename = filename;
++    this.datanodeID = datanodeID;
++    this.block = block;
+-    int chunksPerChecksumRead = getSlowReadBufferNumChunks(conf, bytesPerChecksum);
+-    slowReadBuff = bufferPool.getBuffer(bytesPerChecksum * chunksPerChecksumRead);
+-    checksumBuff = bufferPool.getBuffer(checksumSize * chunksPerChecksumRead);
+-    // Initially the buffers have nothing to read.
+-    slowReadBuff.flip();
+-    checksumBuff.flip();
++    // read and handle the common header here. For now just a version
++    checksumIn.getChannel().position(0);
++    BlockMetadataHeader header = BlockMetadataHeader
++        .readHeader(new DataInputStream(
++            new BufferedInputStream(checksumIn,
++                BlockMetadataHeader.getHeaderSize())));
++    short version = header.getVersion();
++    if (version != BlockMetadataHeader.VERSION) {
++      throw new IOException("Wrong version (" + version + ") of the " +
++          "metadata file for " + filename + ".");
++    }
++    if (!verifyChecksum) {
++      this.verifyChecksum = false; 
++    } else {
++      this.verifyChecksum = !conf.getBoolean(DFSConfigKeys.
++          DFS_CLIENT_READ_SHORTCIRCUIT_SKIP_CHECKSUM_KEY, 
++        DFSConfigKeys.DFS_CLIENT_READ_SHORTCIRCUIT_SKIP_CHECKSUM_DEFAULT);
++    }
++    long firstChunkOffset;
++    if (this.verifyChecksum) {
++      this.checksum = header.getChecksum();
++      this.bytesPerChecksum = this.checksum.getBytesPerChecksum();
++      this.checksumSize = this.checksum.getChecksumSize();
++      firstChunkOffset = startOffset
++          - (startOffset % checksum.getBytesPerChecksum());
++      this.offsetFromChunkBoundary = (int) (startOffset - firstChunkOffset);
++
++      int chunksPerChecksumRead = getSlowReadBufferNumChunks(conf, bytesPerChecksum);
++      slowReadBuff = bufferPool.getBuffer(bytesPerChecksum * chunksPerChecksumRead);
++      checksumBuff = bufferPool.getBuffer(checksumSize * chunksPerChecksumRead);
++      // Initially the buffers have nothing to read.
++      slowReadBuff.flip();
++      checksumBuff.flip();
++      long checkSumOffset = (firstChunkOffset / bytesPerChecksum) * checksumSize;
++      IOUtils.skipFully(checksumIn, checkSumOffset);
++    } else {
++      firstChunkOffset = startOffset;
++      this.checksum = null;
++      this.bytesPerChecksum = 0;
++      this.checksumSize = 0;
++      this.offsetFromChunkBoundary = 0;
++    }
++    
+-      // Skip both input streams to beginning of the chunk containing startOffset
+-      IOUtils.skipFully(dataIn, firstChunkOffset);
+-      if (checksumIn != null) {
+-        long checkSumOffset = (firstChunkOffset / bytesPerChecksum) * checksumSize;
+-        IOUtils.skipFully(checksumIn, checkSumOffset);
+-      }
++      // Reposition both input streams to the beginning of the chunk
++      // containing startOffset
++      this.dataIn.getChannel().position(firstChunkOffset);
+-        bufferPool.returnBuffer(slowReadBuff);
+-        bufferPool.returnBuffer(checksumBuff);
++        if (slowReadBuff != null) bufferPool.returnBuffer(slowReadBuff);
++        if (checksumBuff != null) bufferPool.returnBuffer(checksumBuff);
+-  public synchronized void close() throws IOException {
+-    dataIn.close();
+-    if (checksumIn != null) {
+-      checksumIn.close();
++  public synchronized void close(PeerCache peerCache,
++      FileInputStreamCache fisCache) throws IOException {
++    if (fisCache != null) {
++      if (LOG.isDebugEnabled()) {
++        LOG.debug("putting FileInputStream for " + filename +
++            " back into FileInputStreamCache");
++      }
++      fisCache.put(datanodeID, block, new FileInputStream[] {dataIn, checksumIn});
++    } else {
++      LOG.debug("closing FileInputStream for " + filename);
++      IOUtils.cleanup(LOG, dataIn, checksumIn);
+-  public Socket takeSocket() {
+-    return null;
+-  }
+-
+-  @Override
+-  public boolean hasSentStatusCode() {
+-    return false;
+-  }
+-
+-  @Override
+-  public IOStreamPair getStreams() {
+-    return null;
++  public int available() throws IOException {
++    // We never do network I/O in BlockReaderLocal.
++    return Integer.MAX_VALUE;
+
+MOV26 MOV23 UPD40 UPD40 MOV23 INS23 MOV44 MOV44 INS43 MOV83 MOV83 MOV43 MOV59 UPD83 MOV44 MOV21 MOV21 INS44 INS44 MOV78 UPD39 UPD42 MOV43 UPD66 INS66 UPD66 UPD66 UPD66 UPD42 MOV42 UPD42 UPD42 UPD42 UPD43 UPD42 INS21 INS21 INS21 INS60 MOV60 INS25 INS25 INS60 INS25 INS43 INS42 INS43 INS42 INS25 INS67 UPD42 INS7 INS7 INS32 MOV43 INS59 MOV27 INS8 INS38 INS8 MOV8 INS39 INS59 MOV22 INS8 INS8 INS42 INS42 INS27 INS8 MOV8 INS40 INS40 INS42 MOV43 UPD42 UPD42 UPD42 UPD42 INS22 INS42 INS22 INS42 INS32 INS42 INS34 INS42 INS32 INS53 INS42 MOV21 INS21 INS42 INS21 MOV21 MOV21 INS21 MOV21 MOV60 MOV21 MOV21 MOV21 MOV21 MOV60 MOV21 INS21 MOV21 INS21 INS21 INS21 INS42 INS33 INS25 INS21 INS21 INS52 INS42 INS52 INS42 INS42 INS42 INS42 INS42 INS14 INS14 INS7 INS7 INS7 INS7 INS7 INS7 INS7 MOV32 INS8 INS32 INS32 MOV43 INS14 MOV43 INS27 INS22 INS9 INS22 INS38 INS22 MOV32 INS22 INS22 INS42 MOV27 INS42 INS42 INS33 INS22 INS34 INS22 INS34 INS22 INS34 INS32 UPD42 INS25 INS25 MOV21 INS42 INS42 INS42 INS42 INS3 INS42 INS42 INS27 INS42 INS42 INS42 UPD42 UPD42 UPD42 UPD45 INS43 INS42 INS32 INS45 INS42 INS45 INS45 INS42 INS45 INS52 INS42 INS52 INS42 MOV32 INS52 INS42 INS52 INS42 INS52 INS42 INS52 INS42 INS52 INS42 INS52 INS42 INS22 UPD42 MOV42 INS27 MOV21 INS27 MOV21 INS5 INS4 INS45 INS42 INS42 INS42 INS42 INS52 INS42 INS42 INS33 INS42 INS33 INS42 UPD42 INS27 MOV43 INS85 INS42 INS42 INS45 INS42 INS45 DEL40 DEL26 DEL40 DEL26 DEL40 DEL26 DEL40 DEL26 DEL40 DEL26 DEL40 DEL26 DEL40 DEL26 DEL40 DEL26 DEL40 DEL26 DEL40 DEL26 DEL40 DEL26 DEL40 DEL26 DEL40 DEL26 DEL40 DEL26 DEL40 DEL42 DEL42 DEL43 DEL69 DEL42 DEL43 DEL69 DEL68 DEL83 DEL42 DEL43 DEL83 DEL83 DEL42 DEL83 DEL42 DEL43 DEL42 DEL33 DEL59 DEL23 DEL42 DEL83 DEL39 DEL42 DEL34 DEL59 DEL60 DEL83 DEL39 DEL42 DEL34 DEL59 DEL60 DEL39 DEL42 DEL39 DEL42 DEL42 DEL42 DEL42 DEL27 DEL32 DEL11 DEL34 DEL27 DEL59 DEL60 DEL42 DEL42 DEL42 DEL42 DEL43 DEL42 DEL43 DEL42 DEL43 DEL74 DEL42 DEL42 DEL9 DEL83 DEL39 DEL23 DEL42 DEL78 DEL83 DEL39 DEL42 DEL40 DEL43 DEL42 DEL43 DEL74 DEL42 DEL44 DEL42 DEL32 DEL42 DEL27 DEL41 DEL8 DEL31 DEL1 DEL14 DEL32 DEL7 DEL21 DEL8 DEL31 DEL83 DEL83 DEL42 DEL43 DEL42 DEL42 DEL43 DEL42 DEL44 DEL83 DEL42 DEL43 DEL42 DEL44 DEL83 DEL42 DEL43 DEL42 DEL44 DEL83 DEL39 DEL42 DEL44 DEL83 DEL39 DEL42 DEL44 DEL42 DEL33 DEL27 DEL42 DEL42 DEL42 DEL42 DEL43 DEL42 DEL43 DEL74 DEL42 DEL78 DEL83 DEL42 DEL43 DEL42 DEL42 DEL43 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL41 DEL8 DEL31 DEL1 DEL14 DEL32 DEL7 DEL21 DEL8 DEL42 DEL43 DEL42 DEL44 DEL42 DEL42 DEL45 DEL42 DEL32 DEL21 DEL8 DEL12 DEL54 DEL8 DEL25 DEL42 DEL41 DEL8 DEL31 DEL83 DEL83 DEL39 DEL42 DEL33 DEL42 DEL27 DEL42 DEL42 DEL42 DEL32 DEL21 DEL42 DEL33 DEL7 DEL21 DEL8 DEL25 DEL8 DEL31 DEL83 DEL42 DEL43 DEL42 DEL42 DEL43 DEL42 DEL44 DEL42 DEL42 DEL42 DEL32 DEL41 DEL8 DEL31 DEL83 DEL39 DEL42 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL44 DEL42 DEL42 DEL42 DEL42 DEL32 DEL21 DEL8 DEL31 DEL83 DEL39 DEL42 DEL42 DEL43 DEL42 DEL44 DEL42 DEL42 DEL42 DEL32 DEL21 DEL8 DEL31 DEL55 DEL83 DEL83 DEL42 DEL43 DEL42 DEL43 DEL42 DEL43 DEL74 DEL42 DEL42 DEL43 DEL42 DEL43 DEL42 DEL43 DEL74 DEL14 DEL59 DEL23 DEL43 DEL42 DEL43 DEL42 DEL43 DEL74 DEL34 DEL66 DEL65 DEL29 DEL83 DEL42 DEL43 DEL42 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL43 DEL74 DEL42 DEL44 DEL42 DEL43 DEL42 DEL44 DEL39 DEL42 DEL44 DEL39 DEL42 DEL44 DEL39 DEL42 DEL44 DEL39 DEL42 DEL44 DEL42 DEL43 DEL42 DEL43 DEL42 DEL42 DEL42 DEL42 DEL32 DEL32 DEL59 DEL60 DEL42 DEL43 DEL42 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL33 DEL27 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL7 DEL21 DEL8 DEL25 DEL42 DEL43 DEL42 DEL33 DEL59 DEL60 DEL42 DEL43 DEL42 DEL33 DEL59 DEL60 DEL42 DEL33 DEL59 DEL60 DEL39 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL43 DEL42 DEL42 DEL43 DEL42 DEL42 DEL32 DEL14 DEL59 DEL60 DEL42 DEL42 DEL43 DEL42 DEL14 DEL7 DEL21 DEL42 DEL42 DEL32 DEL42 DEL42 DEL45 DEL42 DEL45 DEL42 DEL42 DEL32 DEL45 DEL42 DEL45 DEL42 DEL45 DEL42 DEL38 DEL27 DEL32 DEL21 DEL8 DEL25 DEL42 DEL38 DEL42 DEL43 DEL42 DEL42 DEL43 DEL42 DEL42 DEL32 DEL14 DEL59 DEL60 DEL42 DEL42 DEL14 DEL7 DEL21 DEL42 DEL42 DEL42 DEL42 DEL14 DEL32 DEL59 DEL60 DEL42 DEL42 DEL45 DEL42 DEL45 DEL42 DEL45 DEL27 DEL32 DEL21 DEL8 DEL25 DEL42 DEL43 DEL42 DEL59 DEL60 DEL39 DEL42 DEL59 DEL60 DEL42 DEL42 DEL43 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL9 DEL42 DEL42 DEL42 DEL14 DEL7 DEL21 DEL8 DEL42 DEL42 DEL43 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL14 DEL7 DEL21 DEL8 DEL25 DEL8 DEL42 DEL44 DEL42 DEL42 DEL42 DEL32 DEL21 DEL40 DEL42 DEL45 DEL42 DEL45 DEL42 DEL42 DEL32 DEL45 DEL27 DEL32 DEL21 DEL42 DEL53 DEL8 DEL12 DEL42 DEL33 DEL27 DEL42 DEL33 DEL27 DEL42 DEL42 DEL32 DEL21 DEL8 DEL25 DEL42 DEL33 DEL27 DEL42 DEL42 DEL32 DEL21 DEL8 DEL25 DEL8 DEL25 DEL8 DEL54 DEL42 DEL41 DEL8 DEL31 DEL83 DEL83 DEL83 DEL42 DEL43 DEL42 DEL39 DEL42 DEL44 DEL42 DEL43 DEL42 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL33 DEL27 DEL42 DEL42 DEL43 DEL14 DEL7 DEL21 DEL42 DEL42 DEL42 DEL42 DEL32 DEL21 DEL8 DEL25 DEL42 DEL41 DEL8 DEL31 DEL83 DEL83 DEL42 DEL43 DEL42 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL44 DEL39 DEL42 DEL44 DEL42 DEL43 DEL42 DEL43 DEL74 DEL42 DEL44 DEL39 DEL42 DEL44 DEL42 DEL43 DEL42 DEL43 DEL42 DEL42 DEL42 DEL42 DEL32 DEL32 DEL59 DEL60 DEL42 DEL43 DEL42 DEL33 DEL59 DEL60 DEL42 DEL43 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL7 DEL21 DEL42 DEL33 DEL27 DEL42 DEL42 DEL45 DEL42 DEL45 DEL42 DEL27 DEL32 DEL21 DEL8 DEL25 DEL42 DEL42 DEL42 DEL42 DEL32 DEL21 DEL8 DEL25 DEL8 DEL42 DEL43 DEL42 DEL44 DEL42 DEL42 DEL32 DEL21 DEL42 DEL53 DEL8 DEL12 DEL54 DEL42 DEL41 DEL8 DEL31 DEL83 DEL83 DEL39 DEL42 DEL42 DEL43 DEL42 DEL44 DEL31 DEL45 DEL83 DEL42 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL43 DEL74 DEL42 DEL44 DEL39 DEL42 DEL44 DEL39 DEL42 DEL44 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL40 DEL34 DEL32 DEL9 DEL42 DEL42 DEL33 DEL17 DEL8 DEL31 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL43 DEL74 DEL42 DEL44 DEL42 DEL43 DEL42 DEL44 DEL39 DEL42 DEL44 DEL42 DEL41 DEL42 DEL42 DEL42 DEL42 DEL42 DEL33 DEL27 DEL8 DEL25 DEL42 DEL42 DEL33 DEL27 DEL25 DEL83 DEL42 DEL43 DEL42 DEL33 DEL41 DEL8 DEL31 DEL42 DEL78 DEL9 DEL42 DEL78 DEL83 DEL42 DEL43 DEL42 DEL33 DEL41 DEL8 DEL31

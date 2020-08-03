@@ -1,0 +1,158 @@
+Merge branch 'trunk' into HADOOP-12756
+
++import org.apache.hadoop.hdfs.DFSUtilClient;
++import org.apache.hadoop.hdfs.server.datanode.LocalReplica;
++import org.apache.hadoop.hdfs.server.datanode.ReplicaInfo;
++import org.apache.hadoop.hdfs.server.common.HdfsServerConstants.ReplicaState;
++import org.apache.hadoop.util.DiskChecker.DiskOutOfSpaceException;
++import org.apache.hadoop.hdfs.server.datanode.ReplicaBuilder;
++import org.apache.hadoop.hdfs.server.datanode.LocalReplicaInPipeline;
++import org.apache.hadoop.hdfs.server.datanode.ReplicaInPipeline;
+-
++  private final Configuration conf;
++    this.conf = conf;
+-  File addFinalizedBlock(String bpid, Block b, File f, long bytesReserved)
+-      throws IOException {
++  ReplicaInfo addFinalizedBlock(String bpid, Block b, ReplicaInfo replicaInfo,
++      long bytesReserved) throws IOException {
+-    return getBlockPoolSlice(bpid).addFinalizedBlock(b, f);
++    File dest = getBlockPoolSlice(bpid).addFinalizedBlock(b, replicaInfo);
++    return new ReplicaBuilder(ReplicaState.FINALIZED)
++        .setBlock(replicaInfo)
++        .setFsVolume(this)
++        .setDirectoryToUse(dest.getParentFile())
++        .build();
+-  void addBlockPool(String bpid, Configuration conf) throws IOException {
+-    addBlockPool(bpid, conf, null);
++  void addBlockPool(String bpid, Configuration c) throws IOException {
++    addBlockPool(bpid, c, null);
+-  void addBlockPool(String bpid, Configuration conf, Timer timer)
++  void addBlockPool(String bpid, Configuration c, Timer timer)
+-      bp = new BlockPoolSlice(bpid, this, bpdir, conf, new Timer());
++      bp = new BlockPoolSlice(bpid, this, bpdir, c, new Timer());
+-      bp = new BlockPoolSlice(bpid, this, bpdir, conf, timer);
++      bp = new BlockPoolSlice(bpid, this, bpdir, c, timer);
++
++
++  public ReplicaInPipeline append(String bpid, ReplicaInfo replicaInfo,
++      long newGS, long estimateBlockLen) throws IOException {
++
++    long bytesReserved = estimateBlockLen - replicaInfo.getNumBytes();
++    if (getAvailable() < bytesReserved) {
++      throw new DiskOutOfSpaceException("Insufficient space for appending to "
++          + replicaInfo);
++    }
++
++    assert replicaInfo.getVolume() == this:
++      "The volume of the replica should be the same as this volume";
++
++    // construct a RBW replica with the new GS
++    File newBlkFile = new File(getRbwDir(bpid), replicaInfo.getBlockName());
++    LocalReplicaInPipeline newReplicaInfo = new ReplicaBuilder(ReplicaState.RBW)
++        .setBlockId(replicaInfo.getBlockId())
++        .setLength(replicaInfo.getNumBytes())
++        .setGenerationStamp(newGS)
++        .setFsVolume(this)
++        .setDirectoryToUse(newBlkFile.getParentFile())
++        .setWriterThread(Thread.currentThread())
++        .setBytesToReserve(bytesReserved)
++        .buildLocalReplicaInPipeline();
++
++    // rename meta file to rbw directory
++    // rename block file to rbw directory
++    newReplicaInfo.moveReplicaFrom(replicaInfo, newBlkFile);
++
++    reserveSpaceForReplica(bytesReserved);
++    return newReplicaInfo;
++  }
++
++  public ReplicaInPipeline createRbw(ExtendedBlock b) throws IOException {
++
++    File f = createRbwFile(b.getBlockPoolId(), b.getLocalBlock());
++    LocalReplicaInPipeline newReplicaInfo = new ReplicaBuilder(ReplicaState.RBW)
++        .setBlockId(b.getBlockId())
++        .setGenerationStamp(b.getGenerationStamp())
++        .setFsVolume(this)
++        .setDirectoryToUse(f.getParentFile())
++        .setBytesToReserve(b.getNumBytes())
++        .buildLocalReplicaInPipeline();
++    return newReplicaInfo;
++  }
++
++  public ReplicaInPipeline convertTemporaryToRbw(ExtendedBlock b,
++      ReplicaInfo temp) throws IOException {
++
++    final long blockId = b.getBlockId();
++    final long expectedGs = b.getGenerationStamp();
++    final long visible = b.getNumBytes();
++    final long numBytes = temp.getNumBytes();
++
++    // move block files to the rbw directory
++    BlockPoolSlice bpslice = getBlockPoolSlice(b.getBlockPoolId());
++    final File dest = FsDatasetImpl.moveBlockFiles(b.getLocalBlock(), temp,
++        bpslice.getRbwDir());
++    // create RBW
++    final LocalReplicaInPipeline rbw = new ReplicaBuilder(ReplicaState.RBW)
++        .setBlockId(blockId)
++        .setLength(numBytes)
++        .setGenerationStamp(expectedGs)
++        .setFsVolume(this)
++        .setDirectoryToUse(dest.getParentFile())
++        .setWriterThread(Thread.currentThread())
++        .setBytesToReserve(0)
++        .buildLocalReplicaInPipeline();
++    rbw.setBytesAcked(visible);
++    return rbw;
++  }
++
++  public ReplicaInPipeline createTemporary(ExtendedBlock b) throws IOException {
++    // create a temporary file to hold block in the designated volume
++    File f = createTmpFile(b.getBlockPoolId(), b.getLocalBlock());
++    LocalReplicaInPipeline newReplicaInfo =
++        new ReplicaBuilder(ReplicaState.TEMPORARY)
++          .setBlockId(b.getBlockId())
++          .setGenerationStamp(b.getGenerationStamp())
++          .setDirectoryToUse(f.getParentFile())
++          .setBytesToReserve(b.getLocalBlock().getNumBytes())
++          .setFsVolume(this)
++          .buildLocalReplicaInPipeline();
++    return newReplicaInfo;
++  }
++
++  public ReplicaInPipeline updateRURCopyOnTruncate(ReplicaInfo rur,
++      String bpid, long newBlockId, long recoveryId, long newlength)
++      throws IOException {
++
++    rur.breakHardLinksIfNeeded();
++    File[] copiedReplicaFiles =
++        copyReplicaWithNewBlockIdAndGS(rur, bpid, newBlockId, recoveryId);
++    File blockFile = copiedReplicaFiles[1];
++    File metaFile = copiedReplicaFiles[0];
++    LocalReplica.truncateBlock(blockFile, metaFile,
++        rur.getNumBytes(), newlength);
++
++    LocalReplicaInPipeline newReplicaInfo = new ReplicaBuilder(ReplicaState.RBW)
++        .setBlockId(newBlockId)
++        .setGenerationStamp(recoveryId)
++        .setFsVolume(this)
++        .setDirectoryToUse(blockFile.getParentFile())
++        .setBytesToReserve(newlength)
++        .buildLocalReplicaInPipeline();
++    return newReplicaInfo;
++  }
++
++  private File[] copyReplicaWithNewBlockIdAndGS(
++      ReplicaInfo replicaInfo, String bpid, long newBlkId, long newGS)
++      throws IOException {
++    String blockFileName = Block.BLOCK_FILE_PREFIX + newBlkId;
++    FsVolumeImpl v = (FsVolumeImpl) replicaInfo.getVolume();
++    final File tmpDir = v.getBlockPoolSlice(bpid).getTmpDir();
++    final File destDir = DatanodeUtil.idToBlockDir(tmpDir, newBlkId);
++    final File dstBlockFile = new File(destDir, blockFileName);
++    final File dstMetaFile = FsDatasetUtil.getMetaFile(dstBlockFile, newGS);
++    return FsDatasetImpl.copyBlockFiles(replicaInfo, dstMetaFile,
++        dstBlockFile, true, DFSUtilClient.getSmallBufferSize(conf), conf);
++  }
++
+
+INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS23 INS31 INS31 INS31 INS31 INS31 INS31 INS83 INS83 INS43 INS59 INS43 INS83 INS43 INS42 INS44 INS44 INS44 INS44 INS43 INS8 INS83 INS43 INS42 INS44 INS43 INS8 INS83 INS43 INS42 INS44 INS44 INS43 INS8 INS83 INS43 INS42 INS44 INS43 INS8 INS83 INS43 INS42 INS44 INS44 INS44 INS44 INS44 INS43 INS8 INS83 INS5 INS42 INS44 INS44 INS44 INS44 INS43 INS8 INS42 INS42 INS21 INS42 INS43 INS42 INS60 UPD42 UPD42 INS42 INS43 INS42 INS43 INS42 INS39 INS42 INS39 INS42 INS42 INS60 INS25 INS6 INS60 INS60 INS21 INS21 INS41 INS42 INS43 INS42 INS42 INS60 INS60 INS41 INS42 INS43 INS42 INS43 INS42 INS42 INS60 INS60 INS60 INS60 INS60 INS60 INS60 INS21 INS41 INS42 INS43 INS42 INS42 INS60 INS60 INS41 INS42 INS43 INS42 INS43 INS42 INS39 INS42 INS39 INS42 INS39 INS42 INS42 INS21 INS60 INS60 INS60 INS21 INS60 INS41 INS43 INS85 INS43 INS42 INS43 INS42 INS39 INS42 INS39 INS42 INS42 INS60 INS60 INS60 INS60 INS60 INS60 INS41 INS7 INS42 MOV43 INS59 INS32 INS42 INS42 INS39 INS59 INS27 INS8 INS27 INS45 MOV43 INS59 INS43 INS59 INS32 INS32 INS42 INS42 INS43 INS59 INS43 INS59 INS42 INS42 INS42 INS83 INS39 INS59 INS83 INS39 INS59 INS83 INS39 INS59 INS83 INS39 INS59 INS43 INS59 INS83 INS43 INS59 INS83 INS43 INS59 INS32 INS42 INS42 INS43 INS59 INS43 INS59 INS42 INS42 INS42 INS32 INS5 INS59 INS43 INS59 INS43 INS59 INS32 INS43 INS59 INS42 INS42 INS42 INS42 INS43 INS59 INS43 INS59 INS83 INS43 INS59 INS83 INS43 INS59 INS83 INS43 INS59 INS83 INS43 INS59 INS32 INS22 INS42 INS42 MOV32 INS32 INS42 UPD42 INS42 INS27 INS32 INS42 INS53 INS32 INS52 INS42 INS14 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS32 INS42 INS32 INS42 INS32 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS43 INS85 INS42 INS32 INS42 INS42 INS2 INS42 INS42 INS2 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS32 INS42 INS42 INS27 INS42 INS42 INS11 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS14 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS9 INS32 INS42 INS52 INS42 UPD42 INS32 INS42 INS32 INS42 INS32 INS42 INS14 INS42 INS42 INS43 INS32 INS32 INS32 INS42 INS42 INS32 INS32 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS32 INS32 INS42 INS42 INS32 INS32 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS34 INS42 INS34 INS42 INS42 INS32 INS42 INS40 INS42 INS43 INS32 INS32 INS42 INS42 INS42 INS42 INS42 INS43 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS52 INS42 INS42 INS42 INS42 INS43 INS27 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS34 INS42 INS42 INS42 INS42 INS32 INS42 INS52 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS14 INS42 INS42 UPD42 UPD42 INS42 INS45 INS42 INS32 INS42 INS32 INS32 INS42 INS32 INS42 INS42 INS32 INS42 INS32 INS32 INS42 INS32 INS32 INS42 INS32 INS43 INS40 INS32 INS42 INS32 INS42 INS42 INS32 INS42 INS52 INS42 INS42 INS32 INS42 INS32 INS42 INS42 INS32 INS42 INS32 INS32 INS42 INS32 INS42 INS52 INS42 INS42 INS42 INS32 INS42 INS52 INS42 INS42 INS32 INS42 INS32 INS32 INS42 INS52 INS42 INS42 INS32 INS42 INS32 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS14 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS14 INS42 INS32 INS42 INS42 INS14 INS42 INS42 INS32 INS42 INS32 INS43 INS40 INS42 INS42 INS32 INS42 INS42 INS43 INS40 INS42 INS42 INS43 INS40 INS14 INS42 INS32 INS42 INS42 INS42 INS14 INS42 INS42 INS42 INS42 INS43 INS40 INS42 INS42 INS43 INS40 INS42 INS42 DEL42

@@ -1,0 +1,173 @@
+HDDS-896. Handle over replicated containers in SCM.
+Contributed by Nandakumar.
+
++import java.util.Comparator;
++import java.util.LinkedHashMap;
++import java.util.Map;
++import java.util.UUID;
++import org.apache.hadoop.hdds.protocol.proto.HddsProtos;
++import org.apache.hadoop.hdds.scm.container.DeleteContainerCommandWatcher;
++import org.apache.hadoop.ozone.protocol.commands.DeleteContainerCommand;
+-import com.google.common.base.Preconditions;
++
++import static org.apache.hadoop.hdds.scm.events.SCMEvents
++    .TRACK_DELETE_CONTAINER_COMMAND;
++  private DeleteContainerCommandWatcher deleteContainerCommandWatcher;
++    this.deleteContainerCommandWatcher =
++        new DeleteContainerCommandWatcher(TRACK_DELETE_CONTAINER_COMMAND,
++            SCMEvents.DELETE_CONTAINER_COMMAND_COMPLETE,
++            commandWatcherLeaseManager);
++
+-        ContainerInfo containerInfo =
+-            containerManager.getContainer(containerID);
++        ContainerInfo container = containerManager.getContainer(containerID);
++        final HddsProtos.LifeCycleState state = container.getState();
+-        Preconditions.checkNotNull(containerInfo,
+-            "No information about the container " + request.getContainerId());
+-
+-        Preconditions
+-            .checkState(containerInfo.getState() == LifeCycleState.CLOSED,
+-                "Container should be in closed state");
++        if (state != LifeCycleState.CLOSED &&
++            state != LifeCycleState.QUASI_CLOSED) {
++          LOG.warn("Cannot replicate the container {} when in {} state.",
++              containerID, state);
++          continue;
++        }
+-        ReplicationRequest finalRequest = request;
++        final ReplicationRequest finalRequest = request;
+-            e -> e.request.getContainerId() == finalRequest.getContainerId())
++            e -> e.getRequest().getContainerId()
++                == finalRequest.getContainerId())
++            .size();
++
++        int inFlightDelete = deleteContainerCommandWatcher.getTimeoutEvents(
++            e -> e.getRequest().getContainerId()
++                == finalRequest.getContainerId())
+-            request.getExpecReplicationCount() - containerReplicas.size()
+-                - inFlightReplications;
++            (request.getExpecReplicationCount() - containerReplicas.size())
++                - (inFlightReplications - inFlightDelete);
++              .sorted((r1, r2) ->
++                  r2.getSequenceId().compareTo(r1.getSequenceId()))
+-              .chooseDatanodes(datanodes, deficit,
+-                  containerInfo.getUsedBytes());
++              .chooseDatanodes(datanodes, deficit, container.getUsedBytes());
++            LOG.info("Container {} is under replicated." +
++                " Expected replica count is {}, but found {}." +
++                " Re-replicating it on {}.",
++                container.containerID(), request.getExpecReplicationCount(),
++                containerReplicas.size(), datanode);
++
+-          //TODO: too many replicas. Not handled yet.
+-          LOG.debug("Too many replicas is not handled yet.");
++
++          int numberOfReplicasToDelete = Math.abs(deficit);
++
++          final Map<UUID, List<DatanodeDetails>> originIdToDnMap =
++              new LinkedHashMap<>();
++
++          containerReplicas.stream()
++              .sorted(Comparator.comparing(ContainerReplica::getSequenceId))
++              .forEach(replica -> {
++                originIdToDnMap.computeIfAbsent(
++                    replica.getOriginDatanodeId(), key -> new ArrayList<>());
++                originIdToDnMap.get(replica.getOriginDatanodeId())
++                    .add(replica.getDatanodeDetails());
++              });
++
++          for(UUID originId : originIdToDnMap.keySet()) {
++            final List<DatanodeDetails> listOfReplica =
++                originIdToDnMap.get(originId);
++            if (listOfReplica.size() > 1) {
++              final int toDelete = Math.min(listOfReplica.size() - 1,
++                  numberOfReplicasToDelete);
++              final DeleteContainerCommand deleteContainer =
++                  new DeleteContainerCommand(containerID.getId());
++              for (int i = 0; i < toDelete; i++) {
++                LOG.info("Container {} is over replicated." +
++                    " Expected replica count is {}, but found {}." +
++                    " Deleting the replica on {}.",
++                    container.containerID(), request.getExpecReplicationCount(),
++                    containerReplicas.size(), listOfReplica.get(i));
++                eventPublisher.fireEvent(SCMEvents.DATANODE_COMMAND,
++                    new CommandForDatanode<>(listOfReplica.get(i).getUuid(),
++                        deleteContainer));
++                DeletionRequestToRepeat timeoutEvent =
++                    new DeletionRequestToRepeat(deleteContainer.getId(),
++                        request);
++
++                eventPublisher.fireEvent(
++                    TRACK_DELETE_CONTAINER_COMMAND, timeoutEvent);
++              }
++              numberOfReplicasToDelete -= toDelete;
++            }
++            if (numberOfReplicasToDelete == 0) {
++              break;
++            }
++          }
++
++          if (numberOfReplicasToDelete != 0) {
++            final int expectedReplicaCount = container
++                .getReplicationFactor().getNumber();
++
++            LOG.warn("Not able to delete the container replica of Container" +
++                " {} even though it is over replicated. Expected replica" +
++                " count is {}, current replica count is {}.",
++                containerID, expectedReplicaCount,
++                expectedReplicaCount + numberOfReplicasToDelete);
++          }
+-   * Event for the ReplicationCommandWatcher to repeate the embedded request.
++   * Event for the ReplicationCommandWatcher to repeat the embedded request.
++      extends ContainerRequestToRepeat {
++
++    public ReplicationRequestToRepeat(
++        long commandId, ReplicationRequest request) {
++      super(commandId, request);
++    }
++  }
++
++  /**
++   * Event for the DeleteContainerCommandWatcher to repeat the
++   * embedded request. In case fof timeout.
++   */
++  public static class DeletionRequestToRepeat
++      extends ContainerRequestToRepeat {
++
++    public DeletionRequestToRepeat(
++        long commandId, ReplicationRequest request) {
++      super(commandId, request);
++    }
++  }
++
++  /**
++   * Container Request wrapper which will be used by ReplicationManager to
++   * perform the intended operation.
++   */
++  public static class ContainerRequestToRepeat
+-    public ReplicationRequestToRepeat(long commandId,
++    ContainerRequestToRepeat(long commandId,
+-      ReplicationRequestToRepeat that = (ReplicationRequestToRepeat) o;
++      ContainerRequestToRepeat that = (ContainerRequestToRepeat) o;
+-   * Add javadoc.
++   * Event which indicates that the replicate operation is completed.
++
++  /**
++   * Event which indicates that the container deletion operation is completed.
++   */
++  public static class DeleteContainerCommandCompleted
++      implements IdentifiableEventPayload {
++
++    private final long uuid;
++
++    public DeleteContainerCommandCompleted(long uuid) {
++      this.uuid = uuid;
++    }
++
++    @Override
++    public long getId() {
++      return uuid;
++    }
++  }
+
+MOV26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS40 INS40 INS40 INS40 INS40 INS40 UPD40 INS40 INS23 INS55 INS55 INS55 INS83 INS43 INS59 INS29 INS83 INS83 INS42 INS43 INS31 INS29 INS83 INS83 INS42 INS43 INS31 UPD42 INS29 INS83 INS83 INS42 INS43 INS23 INS31 INS31 INS42 INS42 INS21 INS65 INS42 INS83 INS42 INS44 INS44 INS8 INS65 INS42 INS83 INS42 INS44 INS44 INS8 UPD42 INS65 INS42 INS83 INS83 INS39 INS59 INS83 INS42 INS44 INS8 INS78 INS83 INS39 INS42 INS8 INS7 INS66 INS66 INS39 INS42 INS43 INS42 INS46 INS66 INS66 INS39 INS42 INS43 INS42 INS46 UPD66 UPD66 UPD66 INS66 INS42 INS39 INS42 INS21 INS42 INS41 INS22 INS14 INS42 INS42 INS42 INS42 INS42 INS42 UPD43 INS7 INS42 INS52 INS42 INS43 INS42 INS40 INS42 UPD42 INS22 INS42 INS42 INS60 INS25 INS60 INS25 UPD43 INS52 INS42 INS83 INS43 INS59 INS27 INS8 INS83 INS39 INS59 MOV27 MOV8 INS25 UPD42 UPD42 INS40 INS42 INS32 INS27 INS27 INS21 INS18 INS42 INS32 INS27 MOV27 INS8 INS42 INS42 INS42 INS40 INS42 INS40 INS32 INS32 INS42 INS36 INS36 INS60 INS60 MOV21 INS70 INS25 INS42 INS42 INS45 INS42 INS42 UPD42 MOV42 UPD42 MOV42 INS86 MOV27 INS27 INS21 INS39 INS59 INS83 INS74 INS59 INS32 INS44 INS32 INS8 INS27 INS8 INS59 INS27 INS42 INS42 INS32 INS42 INS32 INS43 INS43 INS74 INS42 INS14 INS32 INS42 INS86 INS43 INS42 INS42 INS42 INS60 INS25 INS25 INS42 INS34 INS60 INS21 INS42 MOV32 INS32 INS32 UPD42 INS42 INS42 INS27 INS32 INS32 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS43 INS43 INS74 INS32 INS42 INS32 INS59 INS8 INS42 INS83 INS74 INS59 INS27 INS8 INS27 INS8 INS83 INS39 INS59 INS32 INS32 INS32 INS42 INS42 MOV32 INS42 INS86 INS45 INS45 INS45 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS43 UPD42 MOV42 UPD42 MOV42 INS42 INS42 INS90 INS42 INS21 INS21 INS43 INS43 INS42 INS32 INS32 INS34 INS60 INS60 INS24 INS21 INS42 INS34 INS10 INS42 INS32 INS42 INS42 INS27 INS42 INS42 INS27 INS42 INS42 INS42 UPD42 MOV42 INS59 INS59 INS32 INS42 INS42 INS42 INS32 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS83 INS39 INS59 INS83 INS43 INS59 INS58 INS27 INS37 INS8 INS7 INS32 INS42 INS45 INS45 INS45 INS42 INS42 INS42 INS42 INS32 INS42 INS32 INS42 INS42 INS32 INS86 INS32 INS42 INS32 INS42 INS32 INS42 INS42 INS14 INS39 INS59 INS42 INS42 INS42 MOV21 INS21 INS60 INS21 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS59 INS14 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS27 INS42 INS43 INS32 INS42 INS34 INS32 INS43 INS59 INS32 INS42 INS74 INS42 INS42 INS32 INS34 INS42 INS42 INS42 UPD42 INS27 INS32 INS32 INS32 INS32 INS42 INS42 INS40 INS14 INS42 INS42 INS14 INS42 INS42 INS42 INS42 INS43 INS42 INS42 INS45 INS45 INS45 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS74 INS32 INS42 INS43 INS32 INS42 INS42 INS43 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 DEL42 DEL45 DEL27 DEL32 DEL21 DEL40 DEL42 DEL42 DEL42 DEL32 DEL40 DEL27 DEL45 DEL32 DEL45 DEL8 DEL25 DEL25 DEL83

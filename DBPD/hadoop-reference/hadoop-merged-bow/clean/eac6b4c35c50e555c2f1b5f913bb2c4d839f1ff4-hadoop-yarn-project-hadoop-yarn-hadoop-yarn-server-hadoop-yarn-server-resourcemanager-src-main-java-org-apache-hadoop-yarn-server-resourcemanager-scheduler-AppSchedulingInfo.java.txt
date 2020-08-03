@@ -1,0 +1,287 @@
+YARN-6216. Unify Container Resizing code paths with Container Updates making it scheduler agnostic. (Arun Suresh via wangda)
+
+-  final Map<NodeId, Map<SchedulerRequestKey, Map<ContainerId,
+-      SchedContainerChangeRequest>>> containerIncreaseRequestMap =
+-      new ConcurrentHashMap<>();
++
+-  public boolean hasIncreaseRequest(NodeId nodeId) {
+-    try {
+-      this.readLock.lock();
+-      Map<SchedulerRequestKey, Map<ContainerId, SchedContainerChangeRequest>>
+-          requestsOnNode = containerIncreaseRequestMap.get(nodeId);
+-      return requestsOnNode == null ? false : requestsOnNode.size() > 0;
+-    } finally {
+-      this.readLock.unlock();
+-    }
+-  }
+-
+-  public Map<ContainerId, SchedContainerChangeRequest>
+-      getIncreaseRequests(NodeId nodeId, SchedulerRequestKey schedulerKey) {
+-    try {
+-      this.readLock.lock();
+-      Map<SchedulerRequestKey, Map<ContainerId, SchedContainerChangeRequest>>
+-          requestsOnNode = containerIncreaseRequestMap.get(nodeId);
+-      return requestsOnNode == null ? null : requestsOnNode.get(
+-          schedulerKey);
+-    } finally {
+-      this.readLock.unlock();
+-    }
+-  }
+-
+-  /**
+-   * return true if any of the existing increase requests are updated,
+-   *        false if none of them are updated
+-   */
+-  public boolean updateIncreaseRequests(
+-      List<SchedContainerChangeRequest> increaseRequests) {
+-    boolean resourceUpdated = false;
+-
+-    try {
+-      this.writeLock.lock();
+-      for (SchedContainerChangeRequest r : increaseRequests) {
+-        if (r.getRMContainer().getState() != RMContainerState.RUNNING) {
+-          LOG.warn("rmContainer's state is not RUNNING, for increase request"
+-              + " with container-id=" + r.getContainerId());
+-          continue;
+-        }
+-        try {
+-          RMServerUtils.checkSchedContainerChangeRequest(r, true);
+-        } catch (YarnException e) {
+-          LOG.warn("Error happens when checking increase request, Ignoring.."
+-              + " exception=", e);
+-          continue;
+-        }
+-        NodeId nodeId = r.getRMContainer().getAllocatedNode();
+-
+-        Map<SchedulerRequestKey, Map<ContainerId, SchedContainerChangeRequest>>
+-            requestsOnNode = containerIncreaseRequestMap.get(nodeId);
+-        if (null == requestsOnNode) {
+-          requestsOnNode = new TreeMap<>();
+-          containerIncreaseRequestMap.put(nodeId, requestsOnNode);
+-        }
+-
+-        SchedContainerChangeRequest prevChangeRequest =
+-            getIncreaseRequest(nodeId,
+-                r.getRMContainer().getAllocatedSchedulerKey(),
+-                r.getContainerId());
+-        if (null != prevChangeRequest) {
+-          if (Resources.equals(prevChangeRequest.getTargetCapacity(),
+-              r.getTargetCapacity())) {
+-            // increase request hasn't changed
+-            continue;
+-          }
+-
+-          // remove the old one, as we will use the new one going forward
+-          removeIncreaseRequest(nodeId,
+-              prevChangeRequest.getRMContainer().getAllocatedSchedulerKey(),
+-              prevChangeRequest.getContainerId());
+-        }
+-
+-        if (Resources.equals(r.getTargetCapacity(),
+-            r.getRMContainer().getAllocatedResource())) {
+-          if (LOG.isDebugEnabled()) {
+-            LOG.debug("Trying to increase container " + r.getContainerId()
+-                + ", target capacity = previous capacity = " + prevChangeRequest
+-                + ". Will ignore this increase request.");
+-          }
+-          continue;
+-        }
+-
+-        // add the new one
+-        resourceUpdated = true;
+-        insertIncreaseRequest(r);
+-      }
+-      return resourceUpdated;
+-    } finally {
+-      this.writeLock.unlock();
+-    }
+-  }
+-
+-  /**
+-   * Insert increase request, adding any missing items in the data-structure
+-   * hierarchy.
+-   */
+-  private void insertIncreaseRequest(SchedContainerChangeRequest request) {
+-    NodeId nodeId = request.getNodeId();
+-    SchedulerRequestKey schedulerKey =
+-        request.getRMContainer().getAllocatedSchedulerKey();
+-    ContainerId containerId = request.getContainerId();
+-    
+-    Map<SchedulerRequestKey, Map<ContainerId, SchedContainerChangeRequest>>
+-        requestsOnNode = containerIncreaseRequestMap.get(nodeId);
+-    if (null == requestsOnNode) {
+-      requestsOnNode = new HashMap<>();
+-      containerIncreaseRequestMap.put(nodeId, requestsOnNode);
+-    }
+-
+-    Map<ContainerId, SchedContainerChangeRequest> requestsOnNodeWithPriority =
+-        requestsOnNode.get(schedulerKey);
+-    if (null == requestsOnNodeWithPriority) {
+-      requestsOnNodeWithPriority = new TreeMap<>();
+-      requestsOnNode.put(schedulerKey, requestsOnNodeWithPriority);
+-      incrementSchedulerKeyReference(schedulerKey);
+-    }
+-
+-    requestsOnNodeWithPriority.put(containerId, request);
+-
+-    // update resources
+-    String partition = request.getRMContainer().getNodeLabelExpression();
+-    Resource delta = request.getDeltaCapacity();
+-    appResourceUsage.incPending(partition, delta);
+-    queue.incPendingResource(partition, delta);
+-    
+-    if (LOG.isDebugEnabled()) {
+-      LOG.debug("Added increase request:" + request.getContainerId()
+-          + " delta=" + delta);
+-    }
+-  }
+-  public boolean removeIncreaseRequest(NodeId nodeId,
+-      SchedulerRequestKey schedulerKey, ContainerId containerId) {
+-    try {
+-      this.writeLock.lock();
+-      Map<SchedulerRequestKey, Map<ContainerId, SchedContainerChangeRequest>>
+-          requestsOnNode = containerIncreaseRequestMap.get(nodeId);
+-      if (null == requestsOnNode) {
+-        return false;
+-      }
+-
+-      Map<ContainerId, SchedContainerChangeRequest> requestsOnNodeWithPriority =
+-          requestsOnNode.get(schedulerKey);
+-      if (null == requestsOnNodeWithPriority) {
+-        return false;
+-      }
+-
+-      SchedContainerChangeRequest request =
+-          requestsOnNodeWithPriority.remove(containerId);
+-    
+-      // remove hierarchies if it becomes empty
+-      if (requestsOnNodeWithPriority.isEmpty()) {
+-        requestsOnNode.remove(schedulerKey);
+-        decrementSchedulerKeyReference(schedulerKey);
+-      }
+-      if (requestsOnNode.isEmpty()) {
+-        containerIncreaseRequestMap.remove(nodeId);
+-      }
+-
+-      if (request == null) {
+-        return false;
+-      }
+-
+-      // update queue's pending resource if request exists
+-      String partition = request.getRMContainer().getNodeLabelExpression();
+-      Resource delta = request.getDeltaCapacity();
+-      appResourceUsage.decPending(partition, delta);
+-      queue.decPendingResource(partition, delta);
+-
+-      if (LOG.isDebugEnabled()) {
+-        LOG.debug("remove increase request:" + request);
+-      }
+-
+-      return true;
+-    } finally {
+-      this.writeLock.unlock();
+-    }
+-  }
+-  
+-  public SchedContainerChangeRequest getIncreaseRequest(NodeId nodeId,
+-      SchedulerRequestKey schedulerKey, ContainerId containerId) {
+-    try {
+-      this.readLock.lock();
+-      Map<SchedulerRequestKey, Map<ContainerId, SchedContainerChangeRequest>>
+-          requestsOnNode = containerIncreaseRequestMap.get(nodeId);
+-      if (null == requestsOnNode) {
+-        return null;
+-      }
+-
+-      Map<ContainerId, SchedContainerChangeRequest> requestsOnNodeWithPriority =
+-          requestsOnNode.get(schedulerKey);
+-      return requestsOnNodeWithPriority == null ? null
+-          : requestsOnNodeWithPriority.get(containerId);
+-    } finally {
+-      this.readLock.unlock();
+-    }
+-  }
+-
+-  private boolean hasRequestLabelChanged(ResourceRequest requestOne,
+-      ResourceRequest requestTwo) {
+-    String requestOneLabelExp = requestOne.getNodeLabelExpression();
+-    String requestTwoLabelExp = requestTwo.getNodeLabelExpression();
+-    // First request label expression can be null and second request
+-    // is not null then we have to consider it as changed.
+-    if ((null == requestOneLabelExp) && (null != requestTwoLabelExp)) {
+-      return true;
+-    }
+-    // If the label is not matching between both request when
+-    // requestOneLabelExp is not null.
+-    return ((null != requestOneLabelExp) && !(requestOneLabelExp
+-        .equals(requestTwoLabelExp)));
+-  }
+-
+-  public SchedulingPlacementSet getFirstSchedulingPlacementSet() {
+-    try {
+-      readLock.lock();
+-      for (SchedulerRequestKey key : schedulerKeys.keySet()) {
+-        SchedulingPlacementSet ps = schedulerKeyToPlacementSets.get(key);
+-        if (null != ps) {
+-          return ps;
+-        }
+-      }
+-      return null;
+-    } finally {
+-      readLock.unlock();
+-    }
+-
+-  }
+-
+-  public void increaseContainer(SchedContainerChangeRequest increaseRequest) {
+-    NodeId nodeId = increaseRequest.getNodeId();
+-    SchedulerRequestKey schedulerKey =
+-        increaseRequest.getRMContainer().getAllocatedSchedulerKey();
+-    ContainerId containerId = increaseRequest.getContainerId();
+-    Resource deltaCapacity = increaseRequest.getDeltaCapacity();
+-
+-    if (LOG.isDebugEnabled()) {
+-      LOG.debug("allocated increase request : applicationId=" + applicationId
+-          + " container=" + containerId + " host="
+-          + increaseRequest.getNodeId() + " user=" + user + " resource="
+-          + deltaCapacity);
+-    }
+-    try {
+-      this.writeLock.lock();
+-      // Set queue metrics
+-      queue.getMetrics().allocateResources(user, deltaCapacity);
+-      // remove the increase request from pending increase request map
+-      removeIncreaseRequest(nodeId, schedulerKey, containerId);
+-      // update usage
+-      appResourceUsage.incUsed(increaseRequest.getNodePartition(),
+-          deltaCapacity);
+-    } finally {
+-      this.writeLock.unlock();
+-    }
+-  }
+-  
+-  public void decreaseContainer(SchedContainerChangeRequest decreaseRequest) {
+-    // Delta is negative when it's a decrease request
+-    Resource absDelta = Resources.negate(decreaseRequest.getDeltaCapacity());
+-
+-    if (LOG.isDebugEnabled()) {
+-      LOG.debug("Decrease container : applicationId=" + applicationId
+-          + " container=" + decreaseRequest.getContainerId() + " host="
+-          + decreaseRequest.getNodeId() + " user=" + user + " resource="
+-          + absDelta);
+-    }
+-
+-    try {
+-      this.writeLock.lock();
+-      // Set queue metrics
+-      queue.getMetrics().releaseResources(user, absDelta);
+-
+-      // update usage
+-      appResourceUsage.decUsed(decreaseRequest.getNodePartition(), absDelta);
+-    } finally {
+-      this.writeLock.unlock();
+-    }
+-  }
+-
+
+DEL83 DEL42 DEL43 DEL42 DEL43 DEL42 DEL43 DEL42 DEL43 DEL42 DEL43 DEL42 DEL43 DEL42 DEL43 DEL74 DEL74 DEL74 DEL42 DEL42 DEL43 DEL74 DEL14 DEL59 DEL23 DEL83 DEL39 DEL42 DEL42 DEL43 DEL42 DEL44 DEL52 DEL42 DEL22 DEL42 DEL32 DEL21 DEL42 DEL43 DEL42 DEL43 DEL42 DEL43 DEL42 DEL43 DEL42 DEL43 DEL74 DEL74 DEL42 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL33 DEL27 DEL9 DEL42 DEL42 DEL32 DEL34 DEL27 DEL16 DEL41 DEL8 DEL52 DEL42 DEL22 DEL42 DEL32 DEL21 DEL8 DEL54 DEL8 DEL31 DEL83 DEL42 DEL43 DEL42 DEL43 DEL42 DEL43 DEL74 DEL42 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL44 DEL52 DEL42 DEL22 DEL42 DEL32 DEL21 DEL42 DEL43 DEL42 DEL43 DEL42 DEL43 DEL42 DEL43 DEL42 DEL43 DEL74 DEL74 DEL42 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL33 DEL27 DEL33 DEL42 DEL42 DEL42 DEL32 DEL16 DEL41 DEL8 DEL52 DEL42 DEL22 DEL42 DEL32 DEL21 DEL8 DEL54 DEL8 DEL31 DEL66 DEL66 DEL65 DEL29 DEL83 DEL39 DEL42 DEL42 DEL43 DEL42 DEL43 DEL74 DEL42 DEL44 DEL39 DEL42 DEL9 DEL59 DEL60 DEL52 DEL42 DEL22 DEL42 DEL32 DEL21 DEL42 DEL43 DEL42 DEL44 DEL42 DEL42 DEL42 DEL32 DEL42 DEL32 DEL40 DEL27 DEL42 DEL42 DEL45 DEL45 DEL42 DEL42 DEL32 DEL27 DEL32 DEL21 DEL18 DEL8 DEL25 DEL42 DEL42 DEL42 DEL9 DEL32 DEL21 DEL8 DEL42 DEL43 DEL42 DEL44 DEL42 DEL42 DEL45 DEL45 DEL27 DEL42 DEL32 DEL21 DEL18 DEL8 DEL12 DEL54 DEL42 DEL43 DEL42 DEL42 DEL42 DEL32 DEL42 DEL32 DEL59 DEL60 DEL42 DEL43 DEL42 DEL43 DEL42 DEL43 DEL42 DEL43 DEL42 DEL43 DEL74 DEL74 DEL42 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL33 DEL42 DEL27 DEL42 DEL42 DEL43 DEL74 DEL14 DEL7 DEL21 DEL42 DEL42 DEL42 DEL42 DEL32 DEL21 DEL8 DEL25 DEL42 DEL43 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL42 DEL32 DEL42 DEL42 DEL32 DEL32 DEL59 DEL60 DEL33 DEL42 DEL27 DEL42 DEL42 DEL42 DEL42 DEL32 DEL42 DEL42 DEL32 DEL32 DEL18 DEL8 DEL25 DEL42 DEL42 DEL42 DEL42 DEL32 DEL42 DEL32 DEL42 DEL42 DEL32 DEL32 DEL21 DEL8 DEL25 DEL42 DEL42 DEL42 DEL42 DEL32 DEL42 DEL42 DEL32 DEL42 DEL32 DEL32 DEL42 DEL42 DEL32 DEL42 DEL42 DEL45 DEL42 DEL42 DEL32 DEL45 DEL42 DEL45 DEL27 DEL32 DEL21 DEL8 DEL25 DEL18 DEL8 DEL25 DEL42 DEL9 DEL7 DEL21 DEL42 DEL42 DEL32 DEL21 DEL8 DEL70 DEL42 DEL41 DEL8 DEL52 DEL42 DEL22 DEL42 DEL32 DEL21 DEL8 DEL54 DEL8 DEL31 DEL66 DEL66 DEL65 DEL29 DEL83 DEL39 DEL42 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL43 DEL42 DEL42 DEL42 DEL32 DEL42 DEL32 DEL59 DEL60 DEL42 DEL43 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL43 DEL42 DEL43 DEL42 DEL43 DEL42 DEL43 DEL42 DEL43 DEL74 DEL74 DEL42 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL33 DEL42 DEL27 DEL42 DEL42 DEL43 DEL74 DEL14 DEL7 DEL21 DEL42 DEL42 DEL42 DEL42 DEL32 DEL21 DEL8 DEL25 DEL42 DEL43 DEL42 DEL43 DEL42 DEL43 DEL74 DEL42 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL33 DEL42 DEL27 DEL42 DEL42 DEL43 DEL74 DEL14 DEL7 DEL21 DEL42 DEL42 DEL42 DEL42 DEL32 DEL21 DEL42 DEL42 DEL32 DEL21 DEL8 DEL25 DEL42 DEL42 DEL42 DEL42 DEL32 DEL21 DEL42 DEL43 DEL42 DEL42 DEL42 DEL32 DEL42 DEL32 DEL59 DEL60 DEL42 DEL43 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL42 DEL42 DEL42 DEL32 DEL21 DEL42 DEL42 DEL42 DEL42 DEL32 DEL21 DEL42 DEL42 DEL32 DEL42 DEL42 DEL45 DEL42 DEL42 DEL32 DEL45 DEL42 DEL27 DEL32 DEL21 DEL8 DEL25 DEL8 DEL31 DEL83 DEL39 DEL42 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL44 DEL52 DEL42 DEL22 DEL42 DEL32 DEL21 DEL42 DEL43 DEL42 DEL43 DEL42 DEL43 DEL42 DEL43 DEL42 DEL43 DEL74 DEL74 DEL42 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL33 DEL42 DEL27 DEL9 DEL41 DEL8 DEL25 DEL42 DEL43 DEL42 DEL43 DEL42 DEL43 DEL74 DEL42 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL33 DEL42 DEL27 DEL9 DEL41 DEL8 DEL25 DEL42 DEL43 DEL42 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL42 DEL32 DEL42 DEL42 DEL42 DEL32 DEL21 DEL42 DEL42 DEL32 DEL21 DEL8 DEL25 DEL42 DEL42 DEL32 DEL42 DEL42 DEL42 DEL32 DEL21 DEL8 DEL25 DEL42 DEL33 DEL27 DEL9 DEL41 DEL8 DEL25 DEL42 DEL43 DEL42 DEL42 DEL42 DEL32 DEL42 DEL32 DEL59 DEL60 DEL42 DEL43 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL42 DEL42 DEL42 DEL32 DEL21 DEL42 DEL42 DEL42 DEL42 DEL32 DEL21 DEL42 DEL42 DEL32 DEL42 DEL42 DEL45 DEL42 DEL27 DEL32 DEL21 DEL8 DEL25 DEL9 DEL41 DEL8 DEL52 DEL42 DEL22 DEL42 DEL32 DEL21 DEL8 DEL54 DEL8 DEL31 DEL83 DEL42 DEL43 DEL42 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL44 DEL52 DEL42 DEL22 DEL42 DEL32 DEL21 DEL42 DEL43 DEL42 DEL43 DEL42 DEL43 DEL42 DEL43 DEL42 DEL43 DEL74 DEL74 DEL42 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL33 DEL42 DEL27 DEL33 DEL41 DEL8 DEL25 DEL42 DEL43 DEL42 DEL43 DEL42 DEL43 DEL74 DEL42 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL33 DEL27 DEL33 DEL42 DEL42 DEL42 DEL32 DEL16 DEL41 DEL8 DEL52 DEL42 DEL22 DEL42 DEL32 DEL21 DEL8 DEL54 DEL8 DEL31 DEL83 DEL39 DEL42 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL43 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL33 DEL42 DEL27 DEL36 DEL33 DEL42 DEL27 DEL36 DEL27 DEL9 DEL41 DEL8 DEL25 DEL33 DEL42 DEL27 DEL36 DEL42 DEL42 DEL42 DEL32 DEL36 DEL38 DEL27 DEL36 DEL41 DEL8 DEL31 DEL83 DEL42 DEL43 DEL42 DEL42 DEL42 DEL32 DEL21 DEL42 DEL43 DEL42 DEL44 DEL42 DEL42 DEL32 DEL42 DEL43 DEL42 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL33 DEL42 DEL27 DEL42 DEL41 DEL8 DEL25 DEL8 DEL70 DEL33 DEL41 DEL8 DEL42 DEL42 DEL32 DEL21 DEL8 DEL54 DEL8 DEL31 DEL83 DEL39 DEL42 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL43 DEL42 DEL42 DEL42 DEL32 DEL42 DEL32 DEL59 DEL60 DEL42 DEL43 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL43 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL42 DEL32 DEL42 DEL42 DEL45 DEL42 DEL45 DEL42 DEL45 DEL42 DEL42 DEL32 DEL45 DEL42 DEL45 DEL42 DEL27 DEL32 DEL21 DEL8 DEL25 DEL52 DEL42 DEL22 DEL42 DEL32 DEL21 DEL42 DEL42 DEL32 DEL42 DEL42 DEL42 DEL32 DEL21 DEL42 DEL42 DEL42 DEL42 DEL32 DEL21 DEL42 DEL42 DEL42 DEL42 DEL32 DEL42 DEL32 DEL21 DEL8 DEL52 DEL42 DEL22 DEL42 DEL32 DEL21 DEL8 DEL54 DEL8 DEL31 DEL83 DEL39 DEL42 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL32 DEL59 DEL60 DEL42 DEL42 DEL32 DEL42 DEL42 DEL45 DEL42 DEL45 DEL42 DEL42 DEL32 DEL45 DEL42 DEL42 DEL32 DEL45 DEL42 DEL45 DEL42 DEL27 DEL32 DEL21 DEL8 DEL25 DEL52 DEL42 DEL22 DEL42 DEL32 DEL21 DEL42 DEL42 DEL32 DEL42 DEL42 DEL42 DEL32 DEL21 DEL42 DEL42 DEL42 DEL42 DEL32 DEL42 DEL32 DEL21 DEL8 DEL52 DEL42 DEL22 DEL42 DEL32 DEL21 DEL8 DEL54 DEL8 DEL31

@@ -1,0 +1,514 @@
+HDDS-357. Use DBStore and TableStore for OzoneManager non-background service.
+Contributed by Nandakumar.
+
+-import org.apache.commons.lang3.tuple.ImmutablePair;
+-import org.apache.hadoop.hdfs.DFSUtil;
++import org.apache.commons.lang3.StringUtils;
+-import org.apache.hadoop.ozone.om.helpers.OmKeyInfo;
+-import org.apache.hadoop.ozone.om.helpers.OmBucketInfo;
+-import org.apache.hadoop.ozone.om.helpers.OmKeyLocationInfoGroup;
+-import org.apache.hadoop.ozone.om.helpers.OmVolumeArgs;
+-import org.apache.hadoop.ozone.common.BlockGroup;
++import org.apache.hadoop.hdfs.DFSUtil;
++import org.apache.hadoop.ozone.common.BlockGroup;
++import org.apache.hadoop.ozone.om.helpers.OmBucketInfo;
++import org.apache.hadoop.ozone.om.helpers.OmKeyInfo;
++import org.apache.hadoop.ozone.om.helpers.OmKeyLocationInfoGroup;
++import org.apache.hadoop.ozone.om.helpers.OmVolumeArgs;
+-
+-import org.apache.hadoop.utils.BatchOperation;
+-import org.apache.hadoop.utils.MetadataKeyFilters;
+-import org.apache.hadoop.utils.MetadataKeyFilters.KeyPrefixFilter;
+-import org.apache.hadoop.utils.MetadataKeyFilters.MetadataKeyFilter;
+-import org.apache.hadoop.utils.MetadataStore;
+-import org.apache.hadoop.utils.MetadataStoreBuilder;
++import org.apache.hadoop.utils.db.DBStore;
++import org.apache.hadoop.utils.db.DBStoreBuilder;
++import org.apache.hadoop.utils.db.Table;
++import org.apache.hadoop.utils.db.TableIterator;
++import org.eclipse.jetty.util.StringUtil;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++import java.nio.file.Paths;
++import java.util.ArrayList;
++import java.util.Arrays;
+-import java.util.ArrayList;
++import static org.apache.hadoop.hdds.server.ServerUtils.getOzoneMetaDirPath;
+-import static org.apache.hadoop.ozone.OzoneConsts.DELETING_KEY_PREFIX;
+-import static org.apache.hadoop.ozone.OzoneConsts.OPEN_KEY_ID_DELIMINATOR;
+-import static org.apache.hadoop.ozone.OzoneConsts.OPEN_KEY_PREFIX;
+-import static org.apache.hadoop.ozone.om.OMConfigKeys
+-    .OZONE_OM_DB_CACHE_SIZE_DEFAULT;
+-import static org.apache.hadoop.ozone.om.OMConfigKeys
+-    .OZONE_OM_DB_CACHE_SIZE_MB;
+-import static org.apache.hadoop.hdds.server.ServerUtils.getOzoneMetaDirPath;
++import static org.apache.hadoop.ozone.OzoneConsts.OM_KEY_PREFIX;
++  private static final Logger LOG =
++      LoggerFactory.getLogger(OmMetadataManagerImpl.class);
+-  private final MetadataStore store;
++  /**
++   * OM RocksDB Structure .
++   * <p>
++   * OM DB stores metadata as KV pairs in different column families.
++   * <p>
++   * OM DB Schema:
++   * |-------------------------------------------------------------------|
++   * |  Column Family     |        VALUE                                 |
++   * |-------------------------------------------------------------------|
++   * | userTable          |     user->VolumeList                         |
++   * |-------------------------------------------------------------------|
++   * | volumeTable        |     /volume->VolumeInfo                      |
++   * |-------------------------------------------------------------------|
++   * | bucketTable        |     /volume/bucket-> BucketInfo              |
++   * |-------------------------------------------------------------------|
++   * | keyTable           | /volumeName/bucketName/keyName->KeyInfo      |
++   * |-------------------------------------------------------------------|
++   * | deletedTable       | /volumeName/bucketName/keyName->KeyInfo      |
++   * |-------------------------------------------------------------------|
++   * | openKey            | /volumeName/bucketName/keyName/id->KeyInfo   |
++   * |-------------------------------------------------------------------|
++   */
++
++  private static final String USER_TABLE = "userTable";
++  private static final String VOLUME_TABLE = "volumeTable";
++  private static final String BUCKET_TABLE = "bucketTable";
++  private static final String KEY_TABLE = "keyTable";
++  private static final String DELETED_TABLE = "deletedTable";
++  private static final String OPEN_KEY_TABLE = "openKeyTable";
++
++  private final DBStore store;
++
++  // TODO: Make this lock move into Table instead of *ONE* lock for the whole
++  // DB.
++  private final Table userTable;
++  private final Table volumeTable;
++  private final Table bucketTable;
++  private final Table keyTable;
++  private final Table deletedTable;
++  private final Table openKeyTable;
++
+-    final int cacheSize = conf.getInt(OZONE_OM_DB_CACHE_SIZE_MB,
+-        OZONE_OM_DB_CACHE_SIZE_DEFAULT);
+-    File omDBFile = new File(metaDir.getPath(), OM_DB_NAME);
+-    this.store = MetadataStoreBuilder.newBuilder()
+-        .setConf(conf)
+-        .setDbFile(omDBFile)
+-        .setCacheSize(cacheSize * OzoneConsts.MB)
+-        .build();
++
++    this.store = DBStoreBuilder.newBuilder(conf)
++        .setName(OM_DB_NAME)
++        .setPath(Paths.get(metaDir.getPath()))
++        .addTable(USER_TABLE)
++        .addTable(VOLUME_TABLE)
++        .addTable(BUCKET_TABLE)
++        .addTable(KEY_TABLE)
++        .addTable(DELETED_TABLE)
++        .addTable(OPEN_KEY_TABLE)
++        .build();
++
++    userTable = this.store.getTable(USER_TABLE);
++    checkTableStatus(userTable, USER_TABLE);
++
++    volumeTable = this.store.getTable(VOLUME_TABLE);
++    checkTableStatus(volumeTable, VOLUME_TABLE);
++
++    bucketTable = this.store.getTable(BUCKET_TABLE);
++    checkTableStatus(bucketTable, BUCKET_TABLE);
++
++    keyTable = this.store.getTable(KEY_TABLE);
++    checkTableStatus(keyTable, KEY_TABLE);
++
++    deletedTable = this.store.getTable(DELETED_TABLE);
++    checkTableStatus(deletedTable, DELETED_TABLE);
++
++    openKeyTable = this.store.getTable(OPEN_KEY_TABLE);
++    checkTableStatus(openKeyTable, OPEN_KEY_TABLE);
++
++  }
++
++  @Override
++  public Table getUserTable() {
++    return userTable;
++  }
++
++  @Override
++  public Table getVolumeTable() {
++    return volumeTable;
++  }
++
++  @Override
++  public Table getBucketTable() {
++    return bucketTable;
++  }
++
++  @Override
++  public Table getKeyTable() {
++    return keyTable;
++  }
++
++  @Override
++  public Table getDeletedTable() {
++    return deletedTable;
++  }
++
++  @Override
++  public Table getOpenKeyTable() {
++    return openKeyTable;
++  }
++
++  private void checkTableStatus(Table table, String name) throws IOException {
++    String logMessage = "Unable to get a reference to %s table. Cannot " +
++        "continue.";
++    String errMsg = "Inconsistent DB state, Table - %s. Please check the logs" +
++        "for more info.";
++    if (table == null) {
++      LOG.error(String.format(logMessage, name));
++      throw new IOException(String.format(errMsg, name));
++    }
+-  public void stop() throws IOException {
++  public void stop() throws Exception {
++   *
+-  public MetadataStore getStore() {
++  public DBStore getStore() {
++   *
++  @Override
+-    String dbVolumeName = OzoneConsts.OM_VOLUME_PREFIX + volume;
+-    return DFSUtil.string2Bytes(dbVolumeName);
++    return DFSUtil.string2Bytes(OzoneConsts.OM_KEY_PREFIX + volume);
++   *
++  @Override
+-    String dbUserName = OzoneConsts.OM_USER_PREFIX + user;
+-    return DFSUtil.string2Bytes(dbUserName);
++    return DFSUtil.string2Bytes(user);
++   *
++  @Override
+-    String bucketKeyString = OzoneConsts.OM_VOLUME_PREFIX + volume
+-        + OzoneConsts.OM_BUCKET_PREFIX + bucket;
+-    return DFSUtil.string2Bytes(bucketKeyString);
+-  }
++    StringBuilder builder =
++        new StringBuilder().append(OM_KEY_PREFIX).append(volume);
+-  /**
+-   * @param volume
+-   * @param bucket
+-   * @return
+-   */
+-  private String getBucketWithDBPrefix(String volume, String bucket) {
+-    StringBuffer sb = new StringBuffer();
+-    sb.append(OzoneConsts.OM_VOLUME_PREFIX)
+-        .append(volume)
+-        .append(OzoneConsts.OM_BUCKET_PREFIX);
+-    if (!Strings.isNullOrEmpty(bucket)) {
+-      sb.append(bucket);
++    if (StringUtils.isNotBlank(bucket)) {
++      builder.append(OM_KEY_PREFIX).append(bucket);
+-    return sb.toString();
++    return DFSUtil.string2Bytes(builder.toString());
+-  public String getKeyWithDBPrefix(String volume, String bucket, String key) {
+-    String keyVB = OzoneConsts.OM_KEY_PREFIX + volume
+-        + OzoneConsts.OM_KEY_PREFIX + bucket
+-        + OzoneConsts.OM_KEY_PREFIX;
+-    return Strings.isNullOrEmpty(key) ? keyVB : keyVB + key;
++  public byte[] getOzoneKeyBytes(String volume, String bucket, String key) {
++    StringBuilder builder = new StringBuilder()
++        .append(OM_KEY_PREFIX).append(volume);
++    // TODO : Throw if the Bucket is null?
++    builder.append(OM_KEY_PREFIX).append(bucket);
++    if (StringUtil.isNotBlank(key)) {
++      builder.append(OM_KEY_PREFIX).append(key);
++    }
++    return DFSUtil.string2Bytes(builder.toString());
+-  public byte[] getDBKeyBytes(String volume, String bucket, String key) {
+-    return DFSUtil.string2Bytes(getKeyWithDBPrefix(volume, bucket, key));
+-  }
+-
+-  @Override
+-  public byte[] getDeletedKeyName(byte[] keyName) {
+-    return DFSUtil.string2Bytes(
+-        DELETING_KEY_PREFIX + DFSUtil.bytes2String(keyName));
+-  }
+-
+-  @Override
+-  public byte[] getOpenKeyNameBytes(String keyName, int id) {
+-    return DFSUtil.string2Bytes(OPEN_KEY_PREFIX + id +
+-        OPEN_KEY_ID_DELIMINATOR + keyName);
++  public byte[] getOpenKeyBytes(String volume, String bucket,
++                                    String key, long id) {
++    String openKey = OM_KEY_PREFIX + volume + OM_KEY_PREFIX + bucket +
++        OM_KEY_PREFIX + key + OM_KEY_PREFIX + id;
++    return DFSUtil.string2Bytes(openKey);
++   *
++   *
+-   * Returns the value associated with this key.
+-   * @param key - key
+-   * @return value
++   * Returns true if the firstArray startsWith the bytes of secondArray.
++   *
++   * @param firstArray - Byte array
++   * @param secondArray - Byte array
++   * @return true if the first array bytes match the bytes in the second array.
+-  @Override
+-  public byte[] get(byte[] key) throws IOException {
+-    return store.get(key);
+-  }
++  private boolean startsWith(byte[] firstArray, byte[] secondArray) {
+-  /**
+-   * Puts a Key into Metadata DB.
+-   * @param key   - key
+-   * @param value - value
+-   */
+-  @Override
+-  public void put(byte[] key, byte[] value) throws IOException {
+-    store.put(key, value);
+-  }
++    if (firstArray == null) {
++      // if both are null, then the arrays match, else if first is null and
++      // second is not, then this function returns false.
++      return secondArray == null;
++    }
+-  /**
+-   * Deletes a Key from Metadata DB.
+-   * @param key   - key
+-   */
+-  public void delete(byte[] key) throws IOException {
+-    store.delete(key);
+-  }
+-  @Override
+-  public void writeBatch(BatchOperation batch) throws IOException {
+-    this.store.writeBatch(batch);
++    if (secondArray != null) {
++      // If the second array is longer then first array cannot be starting with
++      // the bytes of second array.
++      if (secondArray.length > firstArray.length) {
++        return false;
++      }
++
++      for (int ndx = 0; ndx < secondArray.length; ndx++) {
++        if (firstArray[ndx] != secondArray[ndx]) {
++          return false;
++        }
++      }
++      return true; //match, return true.
++    }
++    return false; // if first is not null and second is null, we define that
++    // array does not start with same chars.
++   * We iterate in the bucket table and see if there is any key that starts with
++   * the volume prefix. We actually look for /volume/, since if we don't have
++   * the trailing slash it is possible that we might match some other volume.
++   * <p>
++   * For example, vol1 and vol122 might match, to avoid that we look for /vol1/
++   *
++  @Override
+-    String dbVolumeRootName = OzoneConsts.OM_VOLUME_PREFIX + volume
+-        + OzoneConsts.OM_BUCKET_PREFIX;
+-    byte[] dbVolumeRootKey = DFSUtil.string2Bytes(dbVolumeRootName);
+-    ImmutablePair<byte[], byte[]> volumeRoot =
+-        store.peekAround(0, dbVolumeRootKey);
+-    if (volumeRoot != null) {
+-      return !DFSUtil.bytes2String(volumeRoot.getKey())
+-          .startsWith(dbVolumeRootName);
++    byte[] volumePrefix = getVolumeKey(volume + OM_KEY_PREFIX);
++    try (TableIterator<Table.KeyValue> bucketIter = bucketTable.iterator()) {
++      Table.KeyValue kv = bucketIter.seek(volumePrefix);
++      if (kv != null && startsWith(kv.getKey(), volumePrefix)) {
++        return false; // we found at least one bucket with this volume prefix.
++      }
+-   * Given a volume/bucket, check if it is empty,
+-   * i.e there are no keys inside it.
++   * Given a volume/bucket, check if it is empty, i.e there are no keys inside
++   * it. Prefix is /volume/bucket/, and we lookup the keyTable.
++   *
++  @Override
+-    String keyRootName = getKeyWithDBPrefix(volume, bucket, null);
+-    byte[] keyRoot = DFSUtil.string2Bytes(keyRootName);
+-    ImmutablePair<byte[], byte[]> firstKey = store.peekAround(0, keyRoot);
+-    if (firstKey != null) {
+-      return !DFSUtil.bytes2String(firstKey.getKey())
+-          .startsWith(keyRootName);
++    byte[] keyPrefix = getBucketKey(volume, bucket + OM_KEY_PREFIX);
++    try (TableIterator<Table.KeyValue> keyIter = keyTable.iterator()) {
++      Table.KeyValue kv = keyIter.seek(keyPrefix);
++      if (kv != null && startsWith(kv.getKey(), keyPrefix)) {
++        return false; // we found at least one key with this vol/bucket prefix.
++      }
+-                                        final String startBucket, final String bucketPrefix,
+-                                        final int maxNumOfBuckets) throws IOException {
++      final String startBucket, final String bucketPrefix,
++      final int maxNumOfBuckets) throws IOException {
+-    if (store.get(volumeNameBytes) == null) {
++    if (volumeTable.get(volumeNameBytes) == null) {
+-    // A bucket starts with /#volume/#bucket_prefix
+-    MetadataKeyFilter filter = (preKey, currentKey, nextKey) -> {
+-      if (currentKey != null) {
+-        String bucketNamePrefix =
+-                getBucketWithDBPrefix(volumeName, bucketPrefix);
+-        String bucket = DFSUtil.bytes2String(currentKey);
+-        return bucket.startsWith(bucketNamePrefix);
+-      }
+-      return false;
+-    };
+-
+-    List<Map.Entry<byte[], byte[]>> rangeResult;
+-    if (!Strings.isNullOrEmpty(startBucket)) {
+-      // Since we are excluding start key from the result,
+-      // the maxNumOfBuckets is incremented.
+-      rangeResult = store.getSequentialRangeKVs(
+-          getBucketKey(volumeName, startBucket),
+-          maxNumOfBuckets + 1, filter);
+-      if (!rangeResult.isEmpty()) {
+-        //Remove start key from result.
+-        rangeResult.remove(0);
+-      }
++    byte[] startKey;
++    boolean skipStartKey = false;
++    if (StringUtil.isNotBlank(startBucket)) {
++      // if the user has specified a start key, we need to seek to that key
++      // and avoid that key in the response set.
++      startKey = getBucketKey(volumeName, startBucket);
++      skipStartKey = true;
+-      rangeResult = store.getSequentialRangeKVs(null, maxNumOfBuckets, filter);
++      // If the user has specified a prefix key, we need to get to the first
++      // of the keys with the prefix match. We can leverage RocksDB to do that.
++      // However, if the user has specified only a prefix, we cannot skip
++      // the first prefix key we see, the boolean skipStartKey allows us to
++      // skip the startkey or not depending on what patterns are specified.
++      startKey = getBucketKey(volumeName, bucketPrefix);
+-    for (Map.Entry<byte[], byte[]> entry : rangeResult) {
+-      OmBucketInfo info = OmBucketInfo.getFromProtobuf(
+-          BucketInfo.parseFrom(entry.getValue()));
+-      result.add(info);
++    byte[] seekPrefix;
++    if (StringUtil.isNotBlank(bucketPrefix)) {
++      seekPrefix = getBucketKey(volumeName, bucketPrefix);
++    } else {
++      seekPrefix = getVolumeKey(volumeName + OM_KEY_PREFIX);
++    }
++    int currentCount = 0;
++    try (TableIterator<Table.KeyValue> bucketIter = bucketTable.iterator()) {
++      Table.KeyValue kv = bucketIter.seek(startKey);
++      while (currentCount < maxNumOfBuckets && bucketIter.hasNext()) {
++        kv = bucketIter.next();
++        // Skip the Start Bucket if needed.
++        if (kv != null && skipStartKey &&
++            Arrays.equals(kv.getKey(), startKey)) {
++          continue;
++        }
++        if (kv != null && startsWith(kv.getKey(), seekPrefix)) {
++          result.add(OmBucketInfo.getFromProtobuf(
++              BucketInfo.parseFrom(kv.getValue())));
++          currentCount++;
++        } else {
++          // The SeekPrefix does not match any more, we can break out of the
++          // loop.
++          break;
++        }
++      }
+-                                  String startKey, String keyPrefix, int maxKeys) throws IOException {
++      String startKey, String keyPrefix, int maxKeys) throws IOException {
+-    if (store.get(bucketNameBytes) == null) {
++    if (getBucketTable().get(bucketNameBytes) == null) {
+-    MetadataKeyFilter filter = new KeyPrefixFilter()
+-        .addFilter(getKeyWithDBPrefix(volumeName, bucketName, keyPrefix));
+-
+-    List<Map.Entry<byte[], byte[]>> rangeResult;
+-    if (!Strings.isNullOrEmpty(startKey)) {
+-      //Since we are excluding start key from the result,
+-      // the maxNumOfBuckets is incremented.
+-      rangeResult = store.getSequentialRangeKVs(
+-          getDBKeyBytes(volumeName, bucketName, startKey),
+-          maxKeys + 1, filter);
+-      if (!rangeResult.isEmpty()) {
+-        //Remove start key from result.
+-        rangeResult.remove(0);
+-      }
++    byte[] seekKey;
++    boolean skipStartKey = false;
++    if (StringUtil.isNotBlank(startKey)) {
++      // Seek to the specified key.
++      seekKey = getOzoneKeyBytes(volumeName, bucketName, startKey);
++      skipStartKey = true;
+-      rangeResult = store.getSequentialRangeKVs(null, maxKeys, filter);
++      // This allows us to seek directly to the first key with the right prefix.
++      seekKey = getOzoneKeyBytes(volumeName, bucketName, keyPrefix);
+-    for (Map.Entry<byte[], byte[]> entry : rangeResult) {
+-      OmKeyInfo info = OmKeyInfo.getFromProtobuf(
+-          KeyInfo.parseFrom(entry.getValue()));
+-      result.add(info);
++    byte[] seekPrefix;
++    if (StringUtil.isNotBlank(keyPrefix)) {
++      seekPrefix = getOzoneKeyBytes(volumeName, bucketName, keyPrefix);
++    } else {
++      seekPrefix = getBucketKey(volumeName, bucketName + OM_KEY_PREFIX);
++    }
++    int currentCount = 0;
++    try (TableIterator<Table.KeyValue> keyIter = getKeyTable().iterator()) {
++      Table.KeyValue kv = keyIter.seek(seekKey);
++      while (currentCount < maxKeys && keyIter.hasNext()) {
++        kv = keyIter.next();
++        // Skip the Start key if needed.
++        if (kv != null && skipStartKey && Arrays.equals(kv.getKey(), seekKey)) {
++          continue;
++        }
++        if (kv != null && startsWith(kv.getKey(), seekPrefix)) {
++          result.add(OmKeyInfo.getFromProtobuf(
++              KeyInfo.parseFrom(kv.getValue())));
++          currentCount++;
++        } else {
++          // The SeekPrefix does not match any more, we can break out of the
++          // loop.
++          break;
++        }
++      }
+-                                        String prefix, String startKey, int maxKeys) throws IOException {
++      String prefix, String startKey, int maxKeys) throws IOException {
+-    if (Strings.isNullOrEmpty(userName)) {
+-      volumes = getAllVolumes();
+-    } else {
+-      volumes = getVolumesByUser(userName);
++    if (StringUtil.isBlank(userName)) {
++      throw new OMException("User name is required to list Volumes.",
++          ResultCodes.FAILED_USER_NOT_FOUND);
++    volumes = getVolumesByUser(userName);
+-        byte[] volumeInfo = store.get(this.getVolumeKey(volumeName));
++        byte[] volumeInfo = getVolumeTable().get(this.getVolumeKey(volumeName));
+-      byte[] volumesInBytes = store.get(userNameKey);
++      byte[] volumesInBytes = getUserTable().get(userNameKey);
+-  private VolumeList getAllVolumes() throws IOException {
+-    // Scan all users in database
+-    KeyPrefixFilter filter =
+-        new KeyPrefixFilter().addFilter(OzoneConsts.OM_USER_PREFIX);
+-    // We are not expecting a huge number of users per cluster,
+-    // it should be fine to scan all users in db and return us a
+-    // list of volume names in string per user.
+-    List<Map.Entry<byte[], byte[]>> rangeKVs = store
+-        .getSequentialRangeKVs(null, Integer.MAX_VALUE, filter);
+-
+-    VolumeList.Builder builder = VolumeList.newBuilder();
+-    for (Map.Entry<byte[], byte[]> entry : rangeKVs) {
+-      VolumeList volumes = this.getVolumesByUser(entry.getKey());
+-      builder.addAllVolumeNames(volumes.getVolumeNamesList());
+-    }
+-
+-    return builder.build();
+-  }
+-
+-    List<Map.Entry<byte[], byte[]>> rangeResult =
+-        store.getRangeKVs(null, count,
+-            MetadataKeyFilters.getDeletingKeyFilter());
++    // TODO: Fix this later, Not part of this patch.
++    List<Map.Entry<byte[], byte[]>> rangeResult = Collections.emptyList();
+-          .map(b->new BlockID(b.getContainerID(), b.getLocalID()))
++          .map(b -> new BlockID(b.getContainerID(), b.getLocalID()))
+-    final MetadataKeyFilter openKeyFilter =
+-        new KeyPrefixFilter().addFilter(OPEN_KEY_PREFIX);
+-    List<Map.Entry<byte[], byte[]>> rangeResult =
+-        store.getSequentialRangeKVs(null, Integer.MAX_VALUE,
+-            openKeyFilter);
++    // TODO: Fix the getExpiredOpenKeys, Not part of this patch.
++    List<Map.Entry<byte[], byte[]>> rangeResult = Collections.emptyList();
++
+-          .map(b->new BlockID(b.getContainerID(), b.getLocalID()))
++          .map(b -> new BlockID(b.getContainerID(), b.getLocalID()))
+
+MOV26 MOV26 MOV26 MOV26 MOV26 MOV26 MOV26 MOV26 MOV26 MOV26 MOV26 MOV26 UPD40 UPD40 UPD40 UPD40 UPD40 UPD40 UPD40 UPD40 UPD40 UPD40 UPD40 INS23 INS23 INS23 INS23 INS23 INS23 INS23 INS23 INS23 INS23 INS23 INS23 INS23 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS83 INS43 INS59 INS29 INS83 INS83 INS83 MOV43 INS59 INS83 INS83 INS83 MOV43 INS59 INS83 INS83 INS83 MOV43 INS59 INS83 INS83 INS83 MOV43 INS59 INS83 INS83 INS83 MOV43 INS59 INS83 INS83 INS83 MOV43 INS59 INS83 INS83 INS43 MOV59 INS83 INS83 INS43 INS59 INS83 INS83 INS43 INS59 INS83 INS83 INS43 INS59 INS83 INS83 INS43 INS59 INS83 INS83 INS43 INS59 INS83 INS83 INS43 INS59 INS83 INS42 MOV44 MOV43 INS8 MOV78 INS83 INS43 INS42 INS8 INS78 INS83 INS43 INS42 INS8 INS78 INS83 INS43 INS42 INS8 MOV78 INS83 INS43 INS42 INS8 MOV78 INS83 INS43 INS42 INS8 MOV78 INS83 INS43 INS42 INS8 MOV83 INS39 UPD42 MOV42 MOV44 INS44 MOV43 INS8 UPD43 UPD43 MOV78 MOV78 MOV29 INS78 INS83 MOV5 INS42 MOV44 MOV44 MOV8 MOV78 MOV83 MOV5 UPD42 MOV42 MOV44 MOV44 MOV44 INS8 INS78 MOV83 MOV5 UPD42 MOV42 MOV44 MOV44 MOV44 MOV44 INS8 MOV29 UPD83 MOV83 UPD39 MOV39 UPD42 MOV42 MOV44 MOV44 INS8 INS78 INS78 MOV78 MOV83 MOV74 MOV42 MOV44 MOV44 MOV44 MOV44 MOV44 MOV43 INS8 INS42 INS42 INS32 INS65 INS42 INS45 INS42 INS45 INS42 INS45 INS42 INS45 INS42 INS45 INS42 INS45 INS42 INS42 INS42 INS42 INS42 INS42 INS42 UPD42 MOV42 INS42 INS42 INS42 UPD42 MOV42 INS42 MOV60 MOV21 MOV21 MOV21 INS21 INS21 INS21 INS21 INS21 INS21 INS21 INS21 INS21 INS21 MOV21 INS21 INS42 INS41 INS42 INS42 INS41 INS42 INS42 INS41 INS42 INS41 INS42 INS41 INS42 INS41 UPD43 UPD42 MOV43 INS42 INS60 INS60 INS25 UPD42 UPD42 INS42 INS60 MOV60 INS21 INS25 MOV41 INS42 UPD39 INS60 MOV41 INS65 MOV5 UPD42 MOV5 UPD42 INS25 INS25 MOV41 INS42 INS54 INS42 INS54 INS41 INS60 INS60 INS25 INS60 INS25 INS60 INS54 MOV60 MOV25 MOV25 MOV60 MOV25 MOV60 MOV60 MOV25 INS60 INS25 INS60 INS54 MOV41 MOV21 INS60 MOV60 INS42 INS42 INS57 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS7 INS32 INS7 INS32 INS7 INS32 INS7 INS32 INS7 INS32 INS7 INS32 INS42 INS42 INS42 INS42 INS42 INS42 UPD42 MOV43 INS59 MOV43 INS59 INS27 INS8 UPD43 MOV43 INS59 INS32 INS43 INS32 INS32 INS8 MOV43 INS59 UPD66 UPD42 UPD66 UPD42 UPD66 INS66 INS27 INS8 INS27 INS8 INS66 INS66 INS66 INS66 INS66 MOV5 INS58 INS8 UPD66 UPD66 MOV5 INS58 INS8 INS9 MOV5 INS59 INS39 INS59 INS32 INS8 INS8 MOV5 INS59 INS32 INS8 INS8 INS39 INS59 INS58 INS8 MOV5 INS39 INS32 MOV5 INS59 INS32 INS8 INS8 INS39 INS59 INS58 INS8 MOV74 INS59 INS43 INS42 INS32 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS42 MOV32 INS42 INS42 INS42 INS42 INS27 INS42 INS27 INS42 INS33 INS21 INS53 INS27 UPD42 UPD42 UPD42 MOV42 INS32 UPD42 MOV42 UPD42 MOV42 MOV42 INS42 UPD42 INS32 INS42 UPD42 INS32 INS32 INS42 INS42 INS42 INS42 INS42 INS21 INS32 INS42 INS27 UPD42 UPD42 UPD42 INS42 INS33 INS41 INS42 INS33 INS25 INS24 MOV41 INS42 INS32 INS74 INS59 MOV60 MOV25 UPD42 INS74 INS59 MOV60 MOV25 UPD42 MOV42 UPD42 MOV42 INS9 INS42 INS42 INS42 MOV21 INS21 INS21 INS42 INS42 INS42 INS42 INS21 INS21 INS42 INS34 INS74 INS59 INS60 INS61 INS42 UPD42 INS9 UPD42 MOV42 UPD42 MOV42 MOV42 MOV21 INS42 INS42 INS42 UPD42 MOV42 INS21 MOV21 INS42 INS34 INS74 INS59 MOV60 INS61 UPD42 UPD42 INS53 INS42 INS32 UPD42 MOV42 INS32 INS22 INS42 INS42 INS22 INS42 INS42 INS22 UPD42 MOV42 UPD42 MOV42 INS22 INS42 INS42 INS22 INS42 INS42 UPD42 UPD42 INS45 INS45 INS45 INS45 INS32 INS14 INS40 INS42 INS32 MOV42 MOV42 INS42 MOV42 INS32 INS42 INS42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 INS32 UPD42 MOV42 UPD42 MOV42 INS42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 INS42 INS42 INS42 INS27 INS27 INS8 INS58 INS27 INS37 INS8 INS42 INS27 INS43 INS43 UPD42 MOV42 MOV32 INS43 INS27 INS8 UPD42 INS27 INS43 INS43 UPD42 MOV42 MOV32 INS43 INS27 INS8 UPD42 INS7 INS7 INS7 INS7 UPD43 MOV43 UPD43 MOV43 UPD42 MOV42 INS32 INS43 INS59 INS27 INS8 INS32 INS7 INS7 INS7 INS43 INS43 UPD42 MOV42 MOV32 INS43 INS27 INS8 INS14 MOV5 INS42 INS42 UPD42 UPD42 INS32 INS42 INS42 INS52 INS42 INS52 INS42 INS52 INS42 INS52 INS42 INS52 INS42 INS42 INS42 INS32 MOV43 INS32 INS14 MOV42 INS42 INS32 INS42 INS14 INS42 INS42 INS32 UPD42 MOV42 MOV42 INS42 INS33 INS40 INS40 INS41 INS39 INS59 INS42 INS40 INS42 INS25 MOV42 INS42 INS42 INS40 UPD42 UPD42 INS40 UPD42 INS27 INS32 INS41 INS42 INS42 INS42 INS40 UPD42 UPD42 INS40 UPD42 INS27 INS32 INS41 INS42 MOV32 INS42 INS9 INS42 INS32 INS42 INS32 INS42 INS32 UPD42 UPD40 INS42 INS42 INS40 INS42 INS32 INS27 INS32 MOV21 INS25 INS25 UPD42 MOV42 INS42 INS32 INS42 INS9 UPD42 INS42 INS32 INS42 INS32 UPD42 MOV42 INS40 INS32 UPD42 UPD40 MOV40 UPD42 INS27 INS32 INS21 INS25 INS25 INS43 INS45 INS40 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 UPD43 MOV43 UPD42 MOV42 MOV42 INS42 INS43 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 INS9 INS42 INS34 INS27 INS8 UPD42 UPD42 UPD42 UPD42 MOV42 MOV33 UPD42 MOV42 MOV32 UPD42 MOV42 INS9 UPD42 UPD42 UPD42 UPD42 MOV42 MOV33 UPD42 MOV42 MOV32 UPD42 MOV42 INS9 UPD42 MOV42 MOV42 MOV42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 INS27 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 INS42 INS42 UPD42 MOV42 UPD42 MOV42 INS7 INS27 INS8 INS27 INS8 INS8 UPD42 MOV42 MOV42 MOV42 MOV42 UPD42 UPD42 UPD42 UPD42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 INS27 INS42 UPD42 UPD42 UPD42 INS42 INS42 INS42 INS42 INS7 INS27 INS8 INS27 INS8 INS8 INS42 INS32 MOV32 INS42 INS42 UPD42 INS42 INS2 INS2 INS41 UPD42 UPD42 INS42 INS42 INS42 INS32 INS27 INS32 INS18 INS27 INS32 INS21 MOV21 INS10 INS42 INS42 INS42 INS32 INS27 INS32 INS18 INS27 INS32 MOV21 INS21 INS10 UPD42 MOV42 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS9 UPD42 MOV42 UPD42 MOV42 INS27 INS42 INS42 INS42 INS32 INS42 INS42 INS33 UPD42 MOV42 INS32 INS42 INS32 INS37 UPD42 MOV42 UPD42 MOV42 INS27 INS42 INS42 INS42 INS32 INS42 INS42 INS33 UPD42 MOV42 MOV32 INS42 INS37 INS32 MOV32 UPD42 MOV42 INS42 INS42 INS33 INS42 UPD42 MOV42 UPD42 MOV42 INS42 INS42 INS42 INS32 INS42 INS42 INS33 INS42 INS42 UPD42 UPD42 UPD42 INS32 INS42 UPD42 MOV42 INS32 UPD42 INS42 MOV42 MOV42 MOV32 INS42 INS42 INS32 MOV32 UPD42 MOV42 INS32 INS42 INS42 MOV32 UPD42 UPD42 INS42 INS42 MOV32 UPD42 UPD42 UPD42 UPD42 INS42 DEL40 DEL26 DEL43 DEL42 DEL40 DEL27 DEL83 DEL42 DEL83 DEL39 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL43 DEL42 DEL43 DEL42 DEL14 DEL59 DEL60 DEL8 DEL31 DEL42 DEL40 DEL42 DEL27 DEL59 DEL60 DEL42 DEL42 DEL40 DEL42 DEL27 DEL59 DEL60 DEL14 DEL59 DEL60 DEL42 DEL40 DEL32 DEL32 DEL42 DEL40 DEL32 DEL21 DEL32 DEL38 DEL40 DEL42 DEL40 DEL42 DEL40 DEL27 DEL42 DEL42 DEL32 DEL27 DEL83 DEL42 DEL42 DEL40 DEL42 DEL40 DEL42 DEL27 DEL59 DEL60 DEL42 DEL32 DEL41 DEL8 DEL31 DEL42 DEL65 DEL42 DEL65 DEL65 DEL29 DEL42 DEL43 DEL42 DEL44 DEL31 DEL32 DEL42 DEL42 DEL42 DEL27 DEL16 DEL41 DEL8 DEL31 DEL83 DEL42 DEL42 DEL32 DEL32 DEL41 DEL8 DEL31 DEL83 DEL39 DEL85 DEL5 DEL42 DEL42 DEL44 DEL8 DEL31 DEL39 DEL85 DEL5 DEL42 DEL44 DEL42 DEL42 DEL27 DEL32 DEL41 DEL8 DEL31 DEL66 DEL65 DEL42 DEL66 DEL65 DEL66 DEL65 DEL29 DEL83 DEL39 DEL85 DEL5 DEL42 DEL42 DEL44 DEL42 DEL43 DEL8 DEL31 DEL42 DEL43 DEL42 DEL42 DEL42 DEL42 DEL32 DEL21 DEL8 DEL31 DEL66 DEL65 DEL42 DEL66 DEL65 DEL29 DEL83 DEL39 DEL42 DEL42 DEL44 DEL42 DEL42 DEL42 DEL32 DEL21 DEL8 DEL31 DEL83 DEL39 DEL42 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL8 DEL31 DEL42 DEL40 DEL40 DEL27 DEL42 DEL42 DEL43 DEL39 DEL85 DEL5 DEL74 DEL34 DEL27 DEL42 DEL32 DEL42 DEL32 DEL38 DEL41 DEL8 DEL59 DEL60 DEL42 DEL33 DEL42 DEL42 DEL43 DEL39 DEL85 DEL5 DEL74 DEL34 DEL27 DEL42 DEL32 DEL42 DEL32 DEL38 DEL41 DEL8 DEL59 DEL60 DEL42 DEL42 DEL42 DEL42 DEL34 DEL27 DEL42 DEL32 DEL34 DEL32 DEL42 DEL42 DEL42 DEL32 DEL42 DEL43 DEL42 DEL59 DEL59 DEL42 DEL59 DEL42 DEL33 DEL27 DEL42 DEL32 DEL59 DEL60 DEL42 DEL43 DEL42 DEL32 DEL59 DEL60 DEL42 DEL42 DEL32 DEL41 DEL8 DEL25 DEL8 DEL86 DEL59 DEL60 DEL39 DEL85 DEL5 DEL39 DEL85 DEL5 DEL74 DEL74 DEL59 DEL60 DEL32 DEL38 DEL32 DEL38 DEL8 DEL25 DEL8 DEL42 DEL42 DEL33 DEL32 DEL7 DEL21 DEL8 DEL25 DEL40 DEL43 DEL39 DEL85 DEL5 DEL39 DEL85 DEL5 DEL74 DEL42 DEL44 DEL42 DEL42 DEL43 DEL42 DEL32 DEL59 DEL60 DEL8 DEL70 DEL42 DEL43 DEL42 DEL42 DEL43 DEL14 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL32 DEL42 DEL43 DEL40 DEL43 DEL39 DEL85 DEL5 DEL39 DEL85 DEL5 DEL74 DEL74 DEL32 DEL38 DEL42 DEL42 DEL42 DEL32 DEL42 DEL34 DEL27 DEL42 DEL32 DEL42 DEL42 DEL34 DEL32 DEL42 DEL42 DEL32 DEL38 DEL8 DEL25 DEL33 DEL42 DEL32 DEL42 DEL43 DEL14 DEL40 DEL42 DEL43 DEL43 DEL39 DEL85 DEL5 DEL39 DEL85 DEL5 DEL74 DEL74 DEL33 DEL40 DEL40 DEL43 DEL39 DEL85 DEL5 DEL39 DEL85 DEL5 DEL74 DEL42 DEL44 DEL42 DEL42 DEL43 DEL42 DEL42 DEL32 DEL32 DEL32 DEL59 DEL60 DEL8 DEL70 DEL8 DEL31 DEL42 DEL42 DEL32 DEL7 DEL21 DEL8 DEL83 DEL42 DEL43 DEL42 DEL43 DEL59 DEL60 DEL40 DEL43 DEL42 DEL32 DEL59 DEL60 DEL40 DEL43 DEL39 DEL85 DEL5 DEL39 DEL85 DEL5 DEL74 DEL42 DEL44 DEL42 DEL42 DEL43 DEL42 DEL52 DEL32 DEL59 DEL60 DEL8 DEL70 DEL42 DEL42 DEL32 DEL41 DEL8 DEL31 DEL42 DEL33 DEL42 DEL42 DEL32 DEL83 DEL42 DEL43 DEL42 DEL42 DEL43 DEL14 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL42 DEL42 DEL33 DEL40 DEL42 DEL32 DEL59 DEL60

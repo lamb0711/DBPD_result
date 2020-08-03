@@ -1,0 +1,178 @@
+Complete commit of prior merge.
+
+The previous merge accidentally only committed the hdfs project instead of common and MR
+as well.
+
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/branches/HDFS-347@1463203 13f79535-47bb-0310-9956-ffa450edef68
+
++import org.apache.hadoop.io.IOUtils;
++import org.apache.hadoop.util.Shell;
+-  private final FileContext lfs;
++  private static final int WIN_MAX_PATH = 260;
+-  private static final String WRAPPER_LAUNCH_SCRIPT = 
+-      "default_container_executor.sh";
++  private final FileContext lfs;
+-    Path wrapperScriptDst = new Path(containerWorkDir, WRAPPER_LAUNCH_SCRIPT);
+-    DataOutputStream wrapperScriptOutStream =
+-        lfs.create(wrapperScriptDst,
+-            EnumSet.of(CREATE, OVERWRITE));
++    LocalWrapperScriptBuilder sb = Shell.WINDOWS ?
++      new WindowsLocalWrapperScriptBuilder(containerIdStr, containerWorkDir) :
++      new UnixLocalWrapperScriptBuilder(containerWorkDir);
++
++    // Fail fast if attempting to launch the wrapper script would fail due to
++    // Windows path length limitation.
++    if (Shell.WINDOWS &&
++        sb.getWrapperScriptPath().toString().length() > WIN_MAX_PATH) {
++      throw new IOException(String.format(
++        "Cannot launch container using script at path %s, because it exceeds " +
++        "the maximum supported path length of %d characters.  Consider " +
++        "configuring shorter directories in %s.", sb.getWrapperScriptPath(),
++        WIN_MAX_PATH, YarnConfiguration.NM_LOCAL_DIRS));
++    }
+-      writeLocalWrapperScript(wrapperScriptOutStream, launchDst.toUri()
+-          .getPath().toString(), pidFile.toString());
++      sb.writeLocalWrapperScript(launchDst, pidFile);
+-      lfs.setPermission(wrapperScriptDst,
++      lfs.setPermission(sb.getWrapperScriptPath(),
+-      String[] command = {"bash",
+-          wrapperScriptDst.toUri().getPath().toString()};
++      String[] command = getRunCommand(sb.getWrapperScriptPath().toString(),
++        containerIdStr, this.getConf());
++
+-  private void writeLocalWrapperScript(DataOutputStream out,
+-      String launchScriptDst, String pidFilePath) throws IOException {
+-    // We need to do a move as writing to a file is not atomic
+-    // Process reading a file being written to may get garbled data
+-    // hence write pid to tmp file first followed by a mv
+-    StringBuilder sb = new StringBuilder("#!/bin/bash\n\n");
+-    sb.append("echo $$ > " + pidFilePath + ".tmp\n");
+-    sb.append("/bin/mv -f " + pidFilePath + ".tmp " + pidFilePath + "\n");
+-    sb.append(ContainerExecutor.isSetsidAvailable? "exec setsid" : "exec");
+-    sb.append(" /bin/bash ");
+-    sb.append("\"");
+-    sb.append(launchScriptDst);
+-    sb.append("\"\n");
+-    PrintStream pout = null;
+-    try {
+-      pout = new PrintStream(out);
+-      pout.append(sb);
+-    } finally {
+-      if (out != null) {
+-        out.close();
++  private abstract class LocalWrapperScriptBuilder {
++
++    private final Path wrapperScriptPath;
++
++    public Path getWrapperScriptPath() {
++      return wrapperScriptPath;
++    }
++
++    public void writeLocalWrapperScript(Path launchDst, Path pidFile) throws IOException {
++      DataOutputStream out = null;
++      PrintStream pout = null;
++
++      try {
++        out = lfs.create(wrapperScriptPath, EnumSet.of(CREATE, OVERWRITE));
++        pout = new PrintStream(out);
++        writeLocalWrapperScript(launchDst, pidFile, pout);
++      } finally {
++        IOUtils.cleanup(LOG, pout, out);
++
++    protected abstract void writeLocalWrapperScript(Path launchDst, Path pidFile,
++        PrintStream pout);
++
++    protected LocalWrapperScriptBuilder(Path wrapperScriptPath) {
++      this.wrapperScriptPath = wrapperScriptPath;
++    }
++  }
++
++  private final class UnixLocalWrapperScriptBuilder
++      extends LocalWrapperScriptBuilder {
++
++    public UnixLocalWrapperScriptBuilder(Path containerWorkDir) {
++      super(new Path(containerWorkDir, "default_container_executor.sh"));
++    }
++
++    @Override
++    public void writeLocalWrapperScript(Path launchDst, Path pidFile,
++        PrintStream pout) {
++
++      // We need to do a move as writing to a file is not atomic
++      // Process reading a file being written to may get garbled data
++      // hence write pid to tmp file first followed by a mv
++      pout.println("#!/bin/bash");
++      pout.println();
++      pout.println("echo $$ > " + pidFile.toString() + ".tmp");
++      pout.println("/bin/mv -f " + pidFile.toString() + ".tmp " + pidFile);
++      String exec = ContainerExecutor.isSetsidAvailable? "exec setsid" : "exec";
++      pout.println(exec + " /bin/bash -c \"" +
++        launchDst.toUri().getPath().toString() + "\"");
++    }
++  }
++
++  private final class WindowsLocalWrapperScriptBuilder
++      extends LocalWrapperScriptBuilder {
++
++    private final String containerIdStr;
++
++    public WindowsLocalWrapperScriptBuilder(String containerIdStr,
++        Path containerWorkDir) {
++
++      super(new Path(containerWorkDir, "default_container_executor.cmd"));
++      this.containerIdStr = containerIdStr;
++    }
++
++    @Override
++    public void writeLocalWrapperScript(Path launchDst, Path pidFile,
++        PrintStream pout) {
++
++      // On Windows, the pid is the container ID, so that it can also serve as
++      // the name of the job object created by winutils for task management.
++      // Write to temp file followed by atomic move.
++      String normalizedPidFile = new File(pidFile.toString()).getPath();
++      pout.println("@echo " + containerIdStr + " > " + normalizedPidFile +
++        ".tmp");
++      pout.println("@move /Y " + normalizedPidFile + ".tmp " +
++        normalizedPidFile);
++      pout.println("@call " + launchDst.toString());
++    }
+-    try {
+-      sendSignal(sigpid, Signal.NULL);
+-    } catch (ExitCodeException e) {
++    if (!containerIsAlive(sigpid)) {
+-      sendSignal(sigpid, signal);
++      killContainer(sigpid, signal);
+-      try {
+-        sendSignal(sigpid, Signal.NULL);
+-      } catch (IOException ignore) {
++      if (!containerIsAlive(sigpid)) {
++   * Returns true if the process with the specified pid is alive.
++   * 
++   * @param pid String pid
++   * @return boolean true if the process is alive
++   */
++  private boolean containerIsAlive(String pid) throws IOException {
++    try {
++      new ShellCommandExecutor(getCheckProcessIsAliveCommand(pid)).execute();
++      // successful execution means process is alive
++      return true;
++    }
++    catch (ExitCodeException e) {
++      // failure (non-zero exit code) means process is not alive
++      return false;
++    }
++  }
++
++  /**
+-  protected void sendSignal(String pid, Signal signal) throws IOException {
+-    ShellCommandExecutor shexec = null;
+-    String[] arg = { "kill", "-" + signal.getValue(), pid };
+-    shexec = new ShellCommandExecutor(arg);
+-    shexec.execute();
++  private void killContainer(String pid, Signal signal) throws IOException {
++    new ShellCommandExecutor(getSignalKillCommand(signal.getValue(), pid))
++      .execute();
+
+INS26 INS26 MOV23 INS40 INS40 INS55 INS55 INS55 INS31 INS39 INS83 INS83 INS42 INS23 INS31 INS31 INS31 INS31 INS83 INS83 INS42 INS43 INS31 INS31 INS83 INS83 INS42 INS43 INS23 INS31 INS31 INS29 INS83 INS39 INS42 INS44 INS43 INS8 UPD83 UPD42 UPD42 INS34 INS25 INS83 INS83 INS43 INS59 INS83 INS43 INS42 INS8 INS83 MOV39 MOV42 INS44 INS44 MOV43 INS8 INS83 INS83 INS39 INS42 INS44 INS44 MOV44 INS83 INS42 MOV44 INS8 UPD42 MOV42 INS83 INS42 INS44 INS8 INS78 INS83 INS39 INS42 INS44 INS44 INS44 INS8 INS42 INS83 INS83 MOV43 INS59 INS83 INS42 MOV44 INS44 INS8 INS78 INS83 INS39 INS42 INS44 INS44 INS44 INS8 INS25 INS65 INS65 INS65 INS43 INS42 INS42 MOV54 INS21 INS43 INS27 INS8 INS42 INS42 INS42 INS41 MOV43 INS42 MOV43 INS42 INS60 MOV60 INS54 INS43 INS42 INS43 INS42 INS43 UPD42 INS43 INS42 INS21 INS43 INS42 INS46 INS42 INS43 INS42 INS43 INS42 INS43 INS42 INS21 INS21 MOV21 MOV21 INS60 MOV21 INS42 UPD42 INS43 INS42 INS46 MOV21 INS42 INS43 INS42 INS43 INS42 INS43 INS42 INS60 MOV21 MOV21 INS21 INS38 MOV8 INS66 INS42 INS66 INS66 INS42 INS32 INS42 UPD42 INS16 INS40 INS27 INS53 INS21 INS42 MOV43 INS59 INS8 INS8 INS42 INS42 INS42 INS42 INS7 INS42 INS14 INS42 INS42 INS42 INS32 INS32 MOV43 INS59 INS42 INS14 INS7 INS42 INS42 INS42 INS43 INS59 INS32 INS32 INS8 INS41 INS14 MOV42 INS40 INS14 INS14 INS32 INS42 INS14 INS32 INS42 INS33 INS21 MOV21 INS21 INS21 INS22 INS42 UPD43 MOV43 INS42 UPD45 MOV45 INS42 INS42 INS45 INS42 INS42 UPD42 UPD42 UPD42 UPD42 INS42 MOV16 UPD42 UPD42 INS27 INS43 INS42 INS45 INS22 INS42 INS42 INS42 INS32 UPD42 UPD42 INS27 UPD42 INS27 INS42 INS42 INS27 INS42 INS42 INS25 MOV53 INS32 INS9 MOV43 INS32 INS43 UPD42 MOV42 UPD42 MOV42 INS43 INS42 INS32 INS42 MOV43 INS32 INS42 INS42 INS42 INS42 INS32 INS32 INS7 INS32 INS32 INS52 INS42 UPD42 MOV32 UPD45 INS32 UPD42 INS42 INS45 MOV32 INS45 INS42 INS52 INS42 INS14 INS42 INS45 INS42 INS45 INS42 INS45 INS45 INS42 INS45 INS42 INS45 INS32 UPD42 INS38 INS8 INS14 INS42 INS42 MOV32 INS42 INS42 INS42 INS32 INS42 UPD42 MOV42 INS42 INS42 INS27 INS32 INS42 INS40 INS42 UPD42 MOV42 INS42 MOV32 UPD42 MOV42 INS32 INS42 MOV32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS43 INS32 UPD42 MOV42 UPD42 MOV42 INS32 INS41 MOV43 INS32 INS42 INS42 INS45 INS45 INS45 INS42 INS42 UPD42 INS52 INS42 UPD42 INS42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 MOV42 INS9 UPD42 MOV42 UPD42 MOV42 UPD42 UPD42 DEL45 DEL14 DEL43 DEL42 DEL59 DEL60 DEL45 DEL32 DEL4 DEL42 DEL42 DEL42 DEL45 DEL42 DEL42 DEL45 DEL32 DEL45 DEL42 DEL83 DEL43 DEL42 DEL14 DEL59 DEL60 DEL42 DEL42 DEL32 DEL21 DEL42 DEL42 DEL45 DEL32 DEL21 DEL42 DEL32 DEL21 DEL8 DEL42 DEL33 DEL27 DEL32 DEL21 DEL8 DEL25 DEL8 DEL54 DEL8 DEL31 DEL40 DEL32 DEL21 DEL8 DEL42 DEL44 DEL12 DEL54 DEL8 DEL40 DEL32 DEL42 DEL33 DEL59 DEL60 DEL42 DEL43 DEL85 DEL5 DEL42 DEL45 DEL45 DEL27 DEL42 DEL4 DEL59 DEL60 DEL42 DEL42 DEL14 DEL7 DEL21 DEL42 DEL32 DEL21

@@ -1,0 +1,174 @@
+HDFS-5364. Add OpenFileCtx cache. Contributed by Brandon Li
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/trunk@1539834 13f79535-47bb-0310-9956-ffa450edef68
+
+-import java.util.Iterator;
+-import java.util.Map.Entry;
++import org.apache.hadoop.hdfs.protocol.AlreadyBeingCreatedException;
++import org.apache.hadoop.ipc.RemoteException;
+-import org.apache.hadoop.nfs.nfs3.Nfs3Constant.WriteStableHow;
+-  private final ConcurrentMap<FileHandle, OpenFileCtx> openFileMap = Maps
+-      .newConcurrentMap();
+-
++ 
+-  private final StreamMonitor streamMonitor;
+-  
++  private final int maxStreams;
++
+-  
+-  public static final long DEFAULT_STREAM_TIMEOUT = 10 * 60 * 1000; //10 minutes
+-  public static final long MINIMIUM_STREAM_TIMEOUT = 10 * 1000; //10 seconds
+-  
+-  void addOpenFileStream(FileHandle h, OpenFileCtx ctx) {
+-    openFileMap.put(h, ctx);
+-    if (LOG.isDebugEnabled()) {
+-      LOG.debug("After add the new stream " + h.getFileId()
+-          + ", the stream number:" + openFileMap.size());
++
++  private final OpenFileCtxCache fileContextCache;
++
++  static public class MultipleCachedStreamException extends IOException {
++    private static final long serialVersionUID = 1L;
++
++    public MultipleCachedStreamException(String msg) {
++      super(msg);
++  boolean addOpenFileStream(FileHandle h, OpenFileCtx ctx) {
++    return fileContextCache.put(h, ctx);
++  }
++  
+-    
+-    streamTimeout = config.getLong("dfs.nfs3.stream.timeout",
+-        DEFAULT_STREAM_TIMEOUT);
++    streamTimeout = config.getLong(Nfs3Constant.OUTPUT_STREAM_TIMEOUT,
++        Nfs3Constant.OUTPUT_STREAM_TIMEOUT_DEFAULT);
+-    if (streamTimeout < MINIMIUM_STREAM_TIMEOUT) {
++    if (streamTimeout < Nfs3Constant.OUTPUT_STREAM_TIMEOUT_MIN_DEFAULT) {
+-          + MINIMIUM_STREAM_TIMEOUT + "ms.");
+-      streamTimeout = MINIMIUM_STREAM_TIMEOUT;
++          + Nfs3Constant.OUTPUT_STREAM_TIMEOUT_MIN_DEFAULT + "ms.");
++      streamTimeout = Nfs3Constant.OUTPUT_STREAM_TIMEOUT_MIN_DEFAULT;
+-    
+-    this.streamMonitor = new StreamMonitor();
++    maxStreams = config.getInt(Nfs3Constant.MAX_OPEN_FILES,
++        Nfs3Constant.MAX_OPEN_FILES_DEFAULT);
++    LOG.info("Maximum open streams is "+ maxStreams);
++    this.fileContextCache = new OpenFileCtxCache(config, streamTimeout);
+-  private void startAsyncDataSerivce() {
+-    streamMonitor.start();
++  void startAsyncDataSerivce() {
++    if (asyncDataServiceStarted) {
++      return;
++    }
++    fileContextCache.start();
+-  private void shutdownAsyncDataService() {
+-    asyncDataService.shutdown();
++  void shutdownAsyncDataService() {
++    if (!asyncDataServiceStarted) {
++      return;
++    }
+-    streamMonitor.interrupt();
++    asyncDataService.shutdown();
++    fileContextCache.shutdown();
+-    // First write request starts the async data service
+-    if (!asyncDataServiceStarted) {
+-      startAsyncDataSerivce();
+-    }
+-
+-    long offset = request.getOffset();
+-    WriteStableHow stableHow = request.getStableHow();
+-      LOG.debug("handleWrite fileId: " + handle.getFileId() + " offset: "
+-          + offset + " length:" + count + " stableHow:" + stableHow.getValue());
++      LOG.debug("handleWrite " + request);
+-    OpenFileCtx openFileCtx = openFileMap.get(fileHandle);
++    OpenFileCtx openFileCtx = fileContextCache.get(fileHandle);
++      } catch (RemoteException e) {
++        IOException io = e.unwrapRemoteException();
++        if (io instanceof AlreadyBeingCreatedException) {
++          LOG.warn("Can't append file:" + fileIdPath
++              + ". Possibly the file is being closed. Drop the request:"
++              + request + ", wait for the client to retry...");
++          return;
++        }
++        throw e;
+-      addOpenFileStream(fileHandle, openFileCtx);
++
++      if (!addOpenFileStream(fileHandle, openFileCtx)) {
++        LOG.info("Can't add new stream. Close it. Tell client to retry.");
++        try {
++          fos.close();
++        } catch (IOException e) {
++          LOG.error("Can't close stream for fileId:" + handle.getFileId());
++        }
++        // Notify client to retry
++        WccData fileWcc = new WccData(latestAttr.getWccAttr(), latestAttr);
++        WRITE3Response response = new WRITE3Response(Nfs3Status.NFS3ERR_JUKEBOX,
++            fileWcc, 0, request.getStableHow(), Nfs3Constant.WRITE_COMMIT_VERF);
++        Nfs3Utils.writeChannel(channel,
++            response.writeHeaderAndResponse(new XDR(), xid, new VerifierNone()),
++            xid);
++        return;
++      }
++
+-        LOG.debug("opened stream for file:" + fileHandle.getFileId());
++        LOG.debug("Opened stream for appending file:" + fileHandle.getFileId());
+-    OpenFileCtx openFileCtx = openFileMap.get(fileHandle);
++    OpenFileCtx openFileCtx = fileContextCache.get(fileHandle);
+-      OpenFileCtx openFileCtx = openFileMap.get(fileHandle);
++      OpenFileCtx openFileCtx = fileContextCache.get(fileHandle);
+-      OpenFileCtx openFileCtx = openFileMap
+-          .get(new FileHandle(attr.getFileId()));
++      OpenFileCtx openFileCtx = fileContextCache.get(new FileHandle(attr
++          .getFileId()));
+-   
++
+-  ConcurrentMap<FileHandle, OpenFileCtx> getOpenFileMap() {
+-    return this.openFileMap;
+-  }
+-  
+-  /**
+-   * StreamMonitor wakes up periodically to find and closes idle streams.
+-   */
+-  class StreamMonitor extends Daemon {
+-    private int rotation = 5 * 1000; // 5 seconds
+-    private long lastWakeupTime = 0;
+-
+-    @Override
+-    public void run() {
+-      while (true) {
+-        Iterator<Entry<FileHandle, OpenFileCtx>> it = openFileMap.entrySet()
+-            .iterator();
+-        if (LOG.isTraceEnabled()) {
+-          LOG.trace("openFileMap size:" + openFileMap.size());
+-        }
+-        while (it.hasNext()) {
+-          Entry<FileHandle, OpenFileCtx> pairs = it.next();
+-          OpenFileCtx ctx = pairs.getValue();
+-          if (ctx.streamCleanup((pairs.getKey()).getFileId(), streamTimeout)) {
+-            it.remove();
+-            if (LOG.isDebugEnabled()) {
+-              LOG.debug("After remove stream " + pairs.getKey().getFileId()
+-                  + ", the stream number:" + openFileMap.size());
+-            }
+-          }
+-        }
+-
+-        // Check if it can sleep
+-        try {
+-          long workedTime = System.currentTimeMillis() - lastWakeupTime;
+-          if (workedTime < rotation) {
+-            if (LOG.isTraceEnabled()) {
+-              LOG.trace("StreamMonitor can still have a sleep:"
+-                  + ((rotation - workedTime) / 1000));
+-            }
+-            Thread.sleep(rotation - workedTime);
+-          }
+-          lastWakeupTime = System.currentTimeMillis();
+-
+-        } catch (InterruptedException e) {
+-          LOG.info("StreamMonitor got interrupted");
+-          return;
+-        }
+-      }
+-    }
++  OpenFileCtxCache getOpenFileCtxCache() {
++    return this.fileContextCache;

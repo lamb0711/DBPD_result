@@ -1,0 +1,243 @@
+YARN-4360. Improve GreedyReservationAgent to support "early" allocations, and performance improvements (curino via asuresh)
+
++import java.util.HashSet;
++import java.util.Set;
++import org.apache.hadoop.yarn.server.resourcemanager.reservation.RLESparseResourceAllocation.RLEOperator;
++  private final boolean allocateLeft;
+-      StageAllocator algStageAllocator) {
++      StageAllocator algStageAllocator, boolean allocateLeft) {
++    this.allocateLeft = allocateLeft;
+-    initialize(plan, reservation);
+-
+-    // If the job has been previously reserved, logically remove its allocation
+-    ReservationAllocation oldReservation =
+-        plan.getReservationById(reservationId);
+-    if (oldReservation != null) {
+-      ignoreOldAllocation(oldReservation);
+-    }
++    initialize(plan, reservationId, reservation);
+-    // Get a reverse iterator for the set of stages
+-    ListIterator<ReservationRequest> li =
+-        reservation
+-            .getReservationRequests()
+-            .getReservationResources()
+-            .listIterator(
+-                reservation.getReservationRequests().getReservationResources()
+-                    .size());
++    StageProvider stageProvider = new StageProvider(allocateLeft, reservation);
+-    // Index, points on the current node
+-    int index =
+-        reservation.getReservationRequests().getReservationResources().size();
+-
++    long predecessorEndTime = stepRoundDown(reservation.getArrival(), step);
++    long stageArrivalTime = -1;
+-    while (li.hasPrevious()) {
++    while (stageProvider.hasNext()) {
+-      currentReservationStage = li.previous();
+-      index -= 1;
++      currentReservationStage = stageProvider.next();
+-      long stageArrivalTime = reservation.getArrival();
+-      if (jobType == ReservationRequestInterpreter.R_ORDER
+-          || jobType == ReservationRequestInterpreter.R_ORDER_NO_GAP) {
+-        stageArrivalTime =
+-            computeEarliestStartingTime(plan, reservation, index,
+-                currentReservationStage, stageDeadline);
+-      }
+-      stageArrivalTime = stepRoundUp(stageArrivalTime, step);
+-      stageArrivalTime = Math.max(stageArrivalTime, reservation.getArrival());
++      if (allocateLeft) {
++        stageArrivalTime = predecessorEndTime;
++      } else {
++        stageArrivalTime = reservation.getArrival();
++        if (jobType == ReservationRequestInterpreter.R_ORDER
++            || jobType == ReservationRequestInterpreter.R_ORDER_NO_GAP) {
++          stageArrivalTime =
++              computeEarliestStartingTime(plan, reservation,
++                  stageProvider.getCurrentIndex(), currentReservationStage,
++                  stageDeadline);
++        }
++        stageArrivalTime = stepRoundUp(stageArrivalTime, step);
++        stageArrivalTime = Math.max(stageArrivalTime, reservation.getArrival());
++      }
+-        return null;
++        throw new PlanningException("The request cannot be satisfied");
++        // CHECK ORDER_NO_GAP
++        // note that the test is different left-to-right and right-to-left
+-            && successorStartingTime > stageEndTime) {
+-
+-          return null;
+-
++            && ((allocateLeft && predecessorEndTime < stageStartTime) ||
++                (!allocateLeft && (stageEndTime < successorStartingTime))
++               )
++            || (!isNonPreemptiveAllocation(curAlloc))) {
++          throw new PlanningException(
++              "The allocation found does not respect ORDER_NO_GAP");
+-        // Store the stageStartTime and set the new stageDeadline
+-        successorStartingTime = stageStartTime;
+-        stageDeadline = stageStartTime;
+-
++        if (allocateLeft) {
++          // Store the stageStartTime and set the new stageDeadline
++          predecessorEndTime = stageEndTime;
++        } else {
++          // Store the stageStartTime and set the new stageDeadline
++          successorStartingTime = stageStartTime;
++          stageDeadline = stageStartTime;
++        }
+-
+-      return null;
++      throw new PlanningException("The request cannot be satisfied");
+-  protected void initialize(Plan plan, ReservationDefinition reservation) {
++  protected void initialize(Plan plan, ReservationId reservationId,
++      ReservationDefinition reservation) throws PlanningException {
+-    // Dirty read of plan load
+-    planLoads = getAllLoadsInInterval(plan, jobArrival, jobDeadline);
+-
++    // Dirty read of plan load
++
++    // planLoads are not used by other StageAllocators... and don't deal
++    // well with huge reservation ranges
++    if (this.algStageAllocator instanceof StageAllocatorLowCostAligned) {
++      planLoads = getAllLoadsInInterval(plan, jobArrival, jobDeadline);
++      ReservationAllocation oldRes = plan.getReservationById(reservationId);
++      if (oldRes != null) {
++        planModifications =
++            RLESparseResourceAllocation.merge(plan.getResourceCalculator(),
++                plan.getTotalCapacity(), planModifications,
++                oldRes.getResourcesOverTime(), RLEOperator.subtract,
++                jobArrival, jobDeadline);
++      }
++    }
++
+-  private void ignoreOldAllocation(ReservationAllocation oldReservation) {
+-
+-    // If there is no old reservation, return
+-    if (oldReservation == null) {
+-      return;
+-    }
+-
+-    // Subtract each allocation interval from the planModifications
+-    for (Entry<ReservationInterval, Resource> entry : oldReservation
+-        .getAllocationRequests().entrySet()) {
+-
+-      // Read the entry
+-      ReservationInterval interval = entry.getKey();
+-      Resource resource = entry.getValue();
+-
+-      // Find the actual request
+-      Resource negativeResource = Resources.multiply(resource, -1);
+-
+-      // Insert it into planModifications as a 'negative' request, to
+-      // represent available resources
+-      planModifications.addInterval(interval, negativeResource);
+-
+-    }
+-
+-  }
+-
+-          "Individual capability requests should not exceed cluster's " +
+-          "maxAlloc");
++          "Individual capability requests should not exceed cluster's "
++              + "maxAlloc");
++  private boolean isNonPreemptiveAllocation(
++      Map<ReservationInterval, Resource> curAlloc) {
++
++    // Checks whether a stage allocation is non preemptive or not.
++    // Assumption: the intervals are non-intersecting (as returned by
++    // computeStageAllocation()).
++    // For a non-preemptive allocation, only two end points appear exactly once
++
++    Set<Long> endPoints = new HashSet<Long>(2 * curAlloc.size());
++    for (Entry<ReservationInterval, Resource> entry : curAlloc.entrySet()) {
++
++      ReservationInterval interval = entry.getKey();
++      Resource resource = entry.getValue();
++
++      // Ignore intervals with no allocation
++      if (Resources.equals(resource, Resource.newInstance(0, 0))) {
++        continue;
++      }
++
++      // Get endpoints
++      Long left = interval.getStartTime();
++      Long right = interval.getEndTime();
++
++      // Add left endpoint if we haven't seen it before, remove otherwise
++      if (!endPoints.contains(left)) {
++        endPoints.add(left);
++      } else {
++        endPoints.remove(left);
++      }
++
++      // Add right endpoint if we haven't seen it before, remove otherwise
++      if (!endPoints.contains(right)) {
++        endPoints.add(right);
++      } else {
++        endPoints.remove(right);
++      }
++    }
++
++    // Non-preemptive only if endPoints is of size 2
++    return (endPoints.size() == 2);
++
++  }
++
++  /**
++   * Helper class that provide a list of ReservationRequests and iterates
++   * forward or backward depending whether we are allocating left-to-right or
++   * right-to-left.
++   */
++  public static class StageProvider {
++
++    private final boolean allocateLeft;
++
++    private ListIterator<ReservationRequest> li;
++
++    public StageProvider(boolean allocateLeft,
++        ReservationDefinition reservation) {
++
++      this.allocateLeft = allocateLeft;
++      int startingIndex;
++      if (allocateLeft) {
++        startingIndex = 0;
++      } else {
++        startingIndex =
++            reservation.getReservationRequests().getReservationResources()
++                .size();
++      }
++      // Get a reverse iterator for the set of stages
++      li =
++          reservation.getReservationRequests().getReservationResources()
++              .listIterator(startingIndex);
++
++    }
++
++    public boolean hasNext() {
++      if (allocateLeft) {
++        return li.hasNext();
++      } else {
++        return li.hasPrevious();
++      }
++    }
++
++    public ReservationRequest next() {
++      if (allocateLeft) {
++        return li.next();
++      } else {
++        return li.previous();
++      }
++    }
++
++    public int getCurrentIndex() {
++      if (allocateLeft) {
++        return li.nextIndex() - 1;
++      } else {
++        return li.previousIndex() + 1;
++      }
++    }
++
++  }
++
+
+INS26 INS26 INS26 MOV31 INS40 INS40 INS40 INS23 INS55 INS83 INS83 INS39 INS59 INS44 MOV60 MOV60 INS44 INS43 UPD39 UPD42 INS29 INS83 INS83 INS42 INS23 INS23 INS31 INS31 INS31 INS31 INS42 INS39 INS42 INS21 INS60 INS43 INS42 INS42 INS25 INS74 UPD42 INS60 INS41 INS65 INS83 INS83 INS39 INS59 INS83 MOV74 INS59 INS83 INS42 INS44 INS44 INS8 INS83 INS39 INS42 INS8 INS83 INS43 INS42 INS8 INS83 INS39 INS42 INS8 INS7 INS43 INS59 INS39 UPD39 INS32 INS42 INS62 INS8 INS43 INS43 MOV43 INS74 INS59 INS36 INS66 INS66 INS66 INS42 INS42 INS39 INS42 INS43 INS42 INS21 INS60 INS25 INS21 INS25 INS42 INS25 INS25 INS22 INS42 INS42 INS42 INS42 INS14 UPD42 INS32 UPD42 MOV38 INS42 INS42 INS25 INS53 INS22 INS43 MOV21 MOV60 INS25 INS42 UPD42 MOV42 INS43 INS43 INS42 INS14 UPD42 MOV42 INS25 INS60 INS60 INS25 INS25 INS27 INS42 INS7 INS39 INS59 INS42 INS8 INS8 INS7 INS42 INS8 INS8 INS42 INS8 INS8 INS42 INS8 INS8 INS52 INS42 INS43 INS42 INS42 INS42 INS32 INS42 INS42 INS8 INS8 INS8 INS14 INS52 INS42 INS42 INS27 INS8 INS42 INS42 INS74 INS27 INS32 INS8 INS43 INS59 INS43 INS59 INS38 INS8 INS8 INS38 INS8 INS8 INS32 INS34 INS22 INS42 INS42 INS21 INS21 INS42 MOV32 INS41 INS41 INS41 INS41 INS41 INS41 INS42 INS42 INS42 INS32 MOV21 INS21 MOV25 MOV21 MOV21 INS53 INS25 INS25 INS43 INS45 UPD42 INS42 INS33 INS21 INS43 INS43 INS34 INS32 MOV42 UPD42 MOV42 MOV42 INS32 INS18 INS42 INS42 INS32 INS42 INS42 INS32 INS32 INS21 INS21 INS32 INS21 INS21 INS42 INS42 INS52 INS42 INS7 INS7 UPD42 MOV42 INS32 MOV32 INS32 MOV32 INS27 INS27 INS42 INS42 UPD7 INS7 INS14 INS27 INS8 INS42 INS8 MOV8 INS42 INS7 INS42 INS42 INS42 INS42 INS42 INS42 INS34 INS34 UPD42 MOV42 INS42 MOV42 INS42 INS42 INS42 INS42 INS32 INS32 INS42 INS42 INS42 INS32 INS32 INS42 INS34 INS42 MOV32 INS42 INS42 INS42 INS42 INS32 INS34 INS32 INS34 UPD42 INS42 INS42 MOV32 INS43 INS45 INS27 INS36 INS53 INS21 INS42 INS32 INS42 INS42 INS42 INS42 UPD42 MOV42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 MOV27 INS36 INS38 INS14 INS7 INS42 INS42 INS32 INS32 INS42 INS32 INS40 INS42 INS42 INS27 INS32 INS43 INS45 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS36 INS36 INS42 INS42 INS42 INS42 UPD42 MOV42 INS27 INS27 INS42 INS27 INS38 INS36 INS42 INS42 INS42 INS27 INS42 INS42 DEL42 DEL33 DEL27 DEL42 DEL42 DEL32 DEL21 DEL8 DEL25 DEL34 DEL39 DEL42 DEL59 DEL60 DEL33 DEL41 DEL42 DEL42 DEL27 DEL27 DEL33 DEL41 DEL8 DEL25 DEL33 DEL41 DEL43 DEL42 DEL33 DEL27 DEL41 DEL8 DEL25 DEL42 DEL32 DEL42 DEL32 DEL59 DEL60 DEL42 DEL32 DEL21 DEL42 DEL42 DEL32 DEL42 DEL32 DEL32

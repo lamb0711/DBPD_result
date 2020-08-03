@@ -1,0 +1,199 @@
+HDFS-14401. Refine the implementation for HDFS cache on SCM. Contributed by Feilong He.
+
++import java.util.List;
+-public class PmemVolumeManager {
++public final class PmemVolumeManager {
+-  private class UsedBytesCount {
++  private static class UsedBytesCount {
++    private final long maxBytes;
++    UsedBytesCount(long maxBytes) {
++      this.maxBytes = maxBytes;
++    }
++
+-        if (next > cacheCapacity) {
++        if (next > maxBytes) {
+-    long get() {
++    long getUsedBytes() {
++
++    long getMaxBytes() {
++      return maxBytes;
++    }
++
++    long getAvailableBytes() {
++      return maxBytes - usedBytes.get();
++    }
++  public static final String CACHE_DIR = "hdfs_pmem_cache";
++  private static PmemVolumeManager pmemVolumeManager = null;
+-  private final UsedBytesCount usedBytesCount;
++  private final List<UsedBytesCount> usedBytesCounts = new ArrayList<>();
+-   * It is 0L if the specific mappableBlockLoader couldn't cache data to pmem.
+-  private final long cacheCapacity;
++  private long cacheCapacity;
++  private static long maxBytesPerPmem = -1;
+-  // Strict atomic operation is not guaranteed for the performance sake.
+-  private int i = 0;
++  private byte nextIndex = 0;
+-  PmemVolumeManager(long maxBytes, String[] pmemVolumesConfigured)
+-      throws IOException {
+-    if (pmemVolumesConfigured == null || pmemVolumesConfigured.length == 0) {
++  private PmemVolumeManager(String[] pmemVolumesConfig) throws IOException {
++    if (pmemVolumesConfig == null || pmemVolumesConfig.length == 0) {
+-    this.loadVolumes(pmemVolumesConfigured);
+-    this.usedBytesCount = new UsedBytesCount();
+-    this.cacheCapacity = maxBytes;
++    this.loadVolumes(pmemVolumesConfig);
++    cacheCapacity = 0L;
++    for (UsedBytesCount counter : usedBytesCounts) {
++      cacheCapacity += counter.getMaxBytes();
++    }
++  }
++
++  public synchronized static void init(String[] pmemVolumesConfig)
++      throws IOException {
++    if (pmemVolumeManager == null) {
++      pmemVolumeManager = new PmemVolumeManager(pmemVolumesConfig);
++    }
++  }
++
++  public static PmemVolumeManager getInstance() {
++    if (pmemVolumeManager == null) {
++      throw new RuntimeException(
++          "The pmemVolumeManager should be instantiated!");
++    }
++    return pmemVolumeManager;
++  }
++
++  @VisibleForTesting
++  public static void setMaxBytes(long maxBytes) {
++    maxBytesPerPmem = maxBytes;
+-    return usedBytesCount.get();
++    long usedBytes = 0L;
++    for (UsedBytesCount counter : usedBytesCounts) {
++      usedBytes += counter.getUsedBytes();
++    }
++    return usedBytes;
++   * @param key           The ExtendedBlockId for a block.
++   *
+-  long reserve(long bytesCount) {
+-    return usedBytesCount.reserve(bytesCount);
++  synchronized long reserve(ExtendedBlockId key, long bytesCount) {
++    try {
++      byte index = chooseVolume(bytesCount);
++      long usedBytes = usedBytesCounts.get(index).reserve(bytesCount);
++      // Put the entry into blockKeyToVolume if reserving bytes succeeded.
++      if (usedBytes > 0) {
++        blockKeyToVolume.put(key, index);
++      }
++      return usedBytes;
++    } catch (IOException e) {
++      LOG.warn(e.getMessage());
++      return -1L;
++    }
++   * @param key           The ExtendedBlockId for a block.
++   *
+-  long release(long bytesCount) {
+-    return usedBytesCount.release(bytesCount);
++  long release(ExtendedBlockId key, long bytesCount) {
++    Byte index = blockKeyToVolume.remove(key);
++    return usedBytesCounts.get(index).release(bytesCount);
+-  private void loadVolumes(String[] volumes) throws IOException {
++  private void loadVolumes(String[] volumes)
++      throws IOException {
+-    for (String volume: volumes) {
++    for (byte n = 0; n < volumes.length; n++) {
+-        File pmemDir = new File(volume);
+-        verifyIfValidPmemVolume(pmemDir);
+-        // Remove all files under the volume.
+-        FileUtils.cleanDirectory(pmemDir);
++        File pmemDir = new File(volumes[n]);
++        File realPmemDir = verifyIfValidPmemVolume(pmemDir);
++        this.pmemVolumes.add(realPmemDir.getPath());
++        long maxBytes;
++        if (maxBytesPerPmem == -1) {
++          maxBytes = realPmemDir.getUsableSpace();
++        } else {
++          maxBytes = maxBytesPerPmem;
++        }
++        UsedBytesCount usedBytesCount = new UsedBytesCount(maxBytes);
++        this.usedBytesCounts.add(usedBytesCount);
++        LOG.info("Added persistent memory - {} with size={}",
++            volumes[n], maxBytes);
+-        LOG.error("Failed to parse persistent memory volume " + volume, e);
++        LOG.error("Failed to parse persistent memory volume " + volumes[n], e);
+-        LOG.error("Bad persistent memory volume: " + volume, e);
++        LOG.error("Bad persistent memory volume: " + volumes[n], e);
+-      pmemVolumes.add(volume);
+-      LOG.info("Added persistent memory - " + volume);
++    cleanup();
++  }
++
++  void cleanup() {
++    // Remove all files under the volume.
++    for (String pmemDir: pmemVolumes) {
++      try {
++        FileUtils.cleanDirectory(new File(pmemDir));
++      } catch (IOException e) {
++        LOG.error("Failed to clean up " + pmemDir, e);
++      }
++    }
+-  static void verifyIfValidPmemVolume(File pmemDir)
++  static File verifyIfValidPmemVolume(File pmemDir)
+-
++    File realPmemDir = new File(getRealPmemDir(pmemDir.getPath()));
++    if (!realPmemDir.exists() && !realPmemDir.mkdir()) {
++      throw new IOException("Failed to create " + realPmemDir.getPath());
++    }
++
+-    String testFilePath = pmemDir.getPath() + "/.verify.pmem." + uuidStr;
++    String testFilePath = realPmemDir.getPath() + "/.verify.pmem." + uuidStr;
+-        throw new IOException("Failed to map the test file under " + pmemDir);
++        throw new IOException(
++            "Failed to map the test file under " + realPmemDir);
++      return realPmemDir;
+-              pmemDir, e);
++              realPmemDir, e);
++  public static String getRealPmemDir(String rawPmemDir) {
++    return new File(rawPmemDir, CACHE_DIR).getAbsolutePath();
++  }
++
+-  Byte getOneVolumeIndex() throws IOException {
+-    if (count != 0) {
+-      return (byte)(i++ % count);
+-    } else {
++  synchronized Byte chooseVolume(long bytesCount) throws IOException {
++    if (count == 0) {
++    int k = 0;
++    long maxAvailableSpace = 0L;
++    while (k++ != count) {
++      if (nextIndex == count) {
++        nextIndex = 0;
++      }
++      byte index = nextIndex++;
++      long availableBytes = usedBytesCounts.get(index).getAvailableBytes();
++      if (availableBytes >= bytesCount) {
++        return index;
++      }
++      if (availableBytes > maxAvailableSpace) {
++        maxAvailableSpace = availableBytes;
++      }
++    }
++    throw new IOException("There is no enough persistent memory space " +
++        "for caching. The current max available space is " +
++        maxAvailableSpace + ", but " + bytesCount + "is required.");
+-  public String getCacheFilePath(ExtendedBlockId key) {
++  public String getCachePath(ExtendedBlockId key) {
+-
+-  /**
+-   * Add cached block's ExtendedBlockId and its cache volume index to a map
+-   * after cache.
+-   */
+-  public void afterCache(ExtendedBlockId key, Byte volumeIndex) {
+-    blockKeyToVolume.put(key, volumeIndex);
+-  }
+-
+-  /**
+-   * Remove the record in blockKeyToVolume for uncached block after uncache.
+-   */
+-  public void afterUncache(ExtendedBlockId key) {
+-    blockKeyToVolume.remove(key);
+-  }

@@ -1,0 +1,249 @@
+JCR-2699: Improve read/write concurrency
+
+Refactor the LRU cache handling from MLRUItemStateCache and BundleCache to a new LRUCache class. Add a test case for the cache.
+
+Switch from LinkedHashMap to ConcurrentHashMap with explicitly managed LRU linked list to reduce the size of the synchronized blocks.
+
+git-svn-id: https://svn.apache.org/repos/asf/jackrabbit/trunk@1003542 13f79535-47bb-0310-9956-ffa450edef68
+
+-import java.util.ArrayList;
+-import java.util.LinkedHashMap;
+-import java.util.List;
+-import java.util.Map;
+-
+-import org.apache.jackrabbit.core.cache.Cache;
+-import org.apache.jackrabbit.core.cache.CacheAccessListener;
++import org.apache.jackrabbit.core.cache.CacheManager;
++import org.apache.jackrabbit.core.cache.LRUCache;
+-public class MLRUItemStateCache implements ItemStateCache, Cache {
++public class MLRUItemStateCache implements ItemStateCache {
++
+-    /** the amount of memory the entries use */
+-    private volatile long totalMem;
+-
+-    /** the maximum of memory the cache may use */
+-    private volatile long maxMem;
+-
+-    private volatile long numWrites;
++    private volatile long numWrites = 0;
+-    /** the access count */
+-    private volatile long accessCount;
++    private final LRUCache<ItemId, ItemState> cache =
++        new LRUCache<ItemId, ItemState>(DEFAULT_MAX_MEM);
+-    /** the cache access listeners */
+-    private CacheAccessListener accessListener;
+-
+-    /**
+-     * A cache for <code>ItemState</code> instances
+-     */
+-    private final Map<ItemId, Entry> cache;
+-
+-    /**
+-     * Constructs a new, empty <code>ItemStateCache</code> with a maximum amount
+-     * of memory of {@link #DEFAULT_MAX_MEM}.
+-     */
+-    public MLRUItemStateCache() {
+-        this(DEFAULT_MAX_MEM);
+-    }
+-
+-    /**
+-     * Constructs a new, empty <code>ItemStateCache</code> with the specified
+-     * maximum memory.
+-     *
+-     * @param maxMem the maximum amount of memory this cache may use.
+-     */
+-    @SuppressWarnings("serial")
+-    private MLRUItemStateCache(int maxMem) {
+-        this.maxMem = maxMem;
+-        this.cache = new LinkedHashMap<ItemId, MLRUItemStateCache.Entry>(
+-                maxMem / 1024, 0.75f, true /* access-ordered */) {
+-            @Override
+-            protected boolean removeEldestEntry(Map.Entry<ItemId, Entry> e) {
+-                long maxMem = MLRUItemStateCache.this.maxMem;
+-                if (totalMem <= maxMem) {
+-                    return false;
+-                } else if (totalMem - e.getValue().size <= maxMem) {
+-                    totalMem -= e.getValue().size;
+-                    return true;
+-                } else {
+-                    shrink();
+-                    return false;
+-                }
+-            }
+-        };
++    public MLRUItemStateCache(CacheManager cacheMgr) {
++        cacheMgr.add(cache);
++        cache.setAccessListener(cacheMgr);
++
+-        synchronized (cache) {
+-            return cache.containsKey(id);
+-        }
++        return cache.containsKey(id);
+-        touch();
+-        synchronized (cache) {
+-            Entry entry = cache.get(id);
+-            if (entry != null) {
+-                return entry.state;
+-            } else {
+-                return null;
+-            }
+-        }
++        return cache.get(id);
+-        synchronized (cache) {
+-            ItemState[] states = new ItemState[cache.size()];
+-            int i = 0;
+-            for (Entry entry : cache.values()) {
+-                states[i++] = entry.state;
+-            }
+-            return states;
+-        }
++        return cache.values();
+-    public void update(ItemId id) {
+-        touch();
+-        synchronized (cache) {
+-            Entry entry = cache.get(id);
+-            if (entry != null) {
+-                totalMem -= entry.size;
+-                entry.recalc();
+-                totalMem += entry.size;
+-            }
+-        }
+-    }
++    public synchronized void cache(ItemState state) {
++        cache.put(state.getId(), state, state.calculateMemoryFootprint());
+-    /**
+-     * {@inheritDoc}
+-     */
+-    public void cache(ItemState state) {
+-        touch();
+-        synchronized (cache) {
+-            ItemId id = state.getId();
+-            if (cache.containsKey(id)) {
+-                log.warn("overwriting cached entry " + id);
+-                evict(id);
+-            }
+-            Entry entry = new Entry(state);
+-            totalMem += entry.size;
+-            cache.put(id, entry);
+-            if (numWrites++ % 10000 == 0 && log.isDebugEnabled()) {
+-                log.debug(this + " size=" + cache.size() + ", " + totalMem + "/" + maxMem);
+-            }
++        if (numWrites++ % 10000 == 0 && log.isDebugEnabled()) {
++            log.debug("Item state cache size: {}% of {} bytes",
++                    cache.getMemoryUsed() * 100 / cache.getMaxMemorySize(),
++                    cache.getMaxMemorySize());
+-        touch();
+-        synchronized (cache) {
+-            Entry entry = cache.remove(id);
+-            if (entry != null) {
+-                totalMem -= entry.size;
+-            }
+-        }
++        cache.remove(id);
+-        synchronized (cache) {
+-            cache.clear();
+-            totalMem = 0;
+-        }
++        cache.clear();
+-        synchronized (cache) {
+-            return cache.isEmpty();
+-        }
+-    }
+-
+-    private void touch() {
+-        accessCount++;
+-        if ((accessCount % CacheAccessListener.ACCESS_INTERVAL) == 0) {
+-            if (accessListener != null) {
+-                accessListener.cacheAccessed();
+-            }
+-        }
+-    }
+-
+-    /**
+-     * {@inheritDoc}
+-     */
+-    public long getAccessCount() {
+-        return accessCount;
+-    }
+-
+-    /**
+-     * {@inheritDoc}
+-     */
+-    public long getMaxMemorySize() {
+-        return maxMem;
+-    }
+-
+-    /**
+-     * {@inheritDoc}
+-     */
+-    public long getMemoryUsed() {
+-        return totalMem;
+-    }
+-
+-    /**
+-     * {@inheritDoc}
+-     */
+-    public void resetAccessCount() {
+-        synchronized (cache) {
+-            accessCount = 0;
+-        }
+-    }
+-
+-    /**
+-     * {@inheritDoc}
+-     */
+-    public void setMaxMemorySize(long size) {
+-        synchronized (cache) {
+-            this.maxMem = size;
+-
+-            // remove items, if too many
+-            if (totalMem > maxMem) {
+-                shrink();
+-            }
+-        }
+-    }
+-
+-    private void shrink() {
+-        List<Map.Entry<ItemId, Entry>> list =
+-            new ArrayList<Map.Entry<ItemId, Entry>>(cache.entrySet());
+-        for (int i = list.size() - 1; totalMem > maxMem && i >= 0; i--) {
+-            Map.Entry<ItemId, Entry> last = list.get(i);
+-            totalMem -= last.getValue().size;
+-            cache.remove(last.getKey());
+-        }
+-    }
+-
+-    /**
+-     * Set the cache access listener. Only one listener per cache is supported.
+-     *
+-     * @param listener the new listener
+-     */
+-    public void setAccessListener(CacheAccessListener listener) {
+-        this.accessListener = listener;
++        return cache.isEmpty();
+-        synchronized (cache) {
+-            if (accessListener != null) {
+-                accessListener.disposeCache(this);
+-            }
+-        }
+-    }
+-
+-
+-    /**
+-     * Internal cache entry.
+-     */
+-    private static class Entry {
+-
+-        private final ItemState state;
+-
+-        private long size;
+-
+-        public Entry(ItemState state) {
+-            this.state = state;
+-            this.size = 64 + state.calculateMemoryFootprint();
+-        }
+-
+-        public void recalc() {
+-            size = 64 + state.calculateMemoryFootprint();
+-        }
++        cache.dispose();

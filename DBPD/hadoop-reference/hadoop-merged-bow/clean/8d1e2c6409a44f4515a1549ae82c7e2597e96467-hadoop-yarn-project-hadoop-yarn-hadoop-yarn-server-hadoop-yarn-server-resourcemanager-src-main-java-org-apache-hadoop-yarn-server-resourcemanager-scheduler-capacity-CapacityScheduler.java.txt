@@ -1,0 +1,158 @@
+Merge branch 'YARN-6592' into trunk
+
++import org.apache.hadoop.yarn.api.records.ExecutionType;
++import org.apache.hadoop.yarn.api.records.ResourceSizing;
++import org.apache.hadoop.yarn.api.records.SchedulingRequest;
++import org.apache.hadoop.yarn.exceptions.SchedulerInvalidResoureRequestException;
++import org.apache.hadoop.yarn.server.resourcemanager.rmcontainer.RMContainerImpl;
++import org.apache.hadoop.yarn.server.resourcemanager.scheduler.SchedulerApplicationAttempt;
++import org.apache.hadoop.yarn.server.resourcemanager.scheduler.SchedulerNode;
++import org.apache.hadoop.yarn.server.resourcemanager.scheduler.constraint.InvalidAllocationTagsQueryException;
++import org.apache.hadoop.yarn.server.resourcemanager.scheduler.constraint.PlacementConstraintsUtil;
++import org.apache.hadoop.yarn.server.scheduler.SchedulerRequestKey;
++import org.apache.hadoop.yarn.server.utils.BuilderUtils;
+-            cs.tryCommit(cs.getClusterResource(), request);
++            cs.tryCommit(cs.getClusterResource(), request, true);
++  /**
++   * Normalize a list of SchedulingRequest.
++   *
++   * @param asks scheduling request
++   */
++  private void normalizeSchedulingRequests(List<SchedulingRequest> asks) {
++    if (asks == null) {
++      return;
++    }
++    for (SchedulingRequest ask: asks) {
++      ResourceSizing sizing = ask.getResourceSizing();
++      if (sizing != null && sizing.getResources() != null) {
++        sizing.setResources(getNormalizedResource(sizing.getResources()));
++      }
++    }
++  }
++
+-      List<ResourceRequest> ask, List<ContainerId> release,
+-      List<String> blacklistAdditions, List<String> blacklistRemovals,
+-      ContainerUpdates updateRequests) {
++      List<ResourceRequest> ask, List<SchedulingRequest> schedulingRequests,
++      List<ContainerId> release, List<String> blacklistAdditions,
++      List<String> blacklistRemovals, ContainerUpdates updateRequests) {
++    if ((!getConfiguration().getBoolean(
++        CapacitySchedulerConfiguration.SCHEDULING_REQUEST_ALLOWED,
++        CapacitySchedulerConfiguration.DEFAULT_SCHEDULING_REQUEST_ALLOWED))
++        && schedulingRequests != null && (!schedulingRequests.isEmpty())) {
++      throw new SchedulerInvalidResoureRequestException(
++          "Application attempt:" + applicationAttemptId
++              + " is using SchedulingRequest, which is disabled. Please update "
++              + CapacitySchedulerConfiguration.SCHEDULING_REQUEST_ALLOWED
++              + " to true in capacity-scheduler.xml in order to use this "
++              + "feature.");
++    }
++
+-    normalizeRequests(ask);
++    normalizeResourceRequests(ask);
++
++    // Normalize scheduling requests
++    normalizeSchedulingRequests(schedulingRequests);
+-      if (!ask.isEmpty()) {
++      if (!ask.isEmpty() || (schedulingRequests != null && !schedulingRequests
++          .isEmpty())) {
+-        if (application.updateResourceRequests(ask)) {
++        if (application.updateResourceRequests(ask) || application
++            .updateSchedulingRequests(schedulingRequests)) {
+-      tryCommit(cluster, request);
++      tryCommit(cluster, request, true);
++  @Override
++  public boolean attemptAllocationOnNode(SchedulerApplicationAttempt appAttempt,
++      SchedulingRequest schedulingRequest, SchedulerNode schedulerNode) {
++    if (schedulingRequest.getResourceSizing() != null) {
++      if (schedulingRequest.getResourceSizing().getNumAllocations() > 1) {
++        LOG.warn("The SchedulingRequest has requested more than 1 allocation," +
++            " but only 1 will be attempted !!");
++      }
++      if (!appAttempt.isStopped()) {
++        Resource resource =
++            schedulingRequest.getResourceSizing().getResources();
++        schedulingRequest.getResourceSizing().setResources(
++            getNormalizedResource(resource));
++        ResourceCommitRequest<FiCaSchedulerApp, FiCaSchedulerNode>
++            resourceCommitRequest = createResourceCommitRequest(
++            appAttempt, schedulingRequest, schedulerNode);
++
++        // Validate placement constraint is satisfied before
++        // committing the request.
++        try {
++          if (!PlacementConstraintsUtil.canSatisfyConstraints(
++              appAttempt.getApplicationId(),
++              schedulingRequest, schedulerNode,
++              rmContext.getPlacementConstraintManager(),
++              rmContext.getAllocationTagsManager())) {
++            LOG.debug("Failed to allocate container for application "
++                + appAttempt.getApplicationId() + " on node "
++                + schedulerNode.getNodeName()
++                + " because this allocation violates the"
++                + " placement constraint.");
++            return false;
++          }
++        } catch (InvalidAllocationTagsQueryException e) {
++          LOG.warn("Unable to allocate container", e);
++          return false;
++        }
++        return tryCommit(getClusterResource(), resourceCommitRequest, false);
++      }
++    }
++    return false;
++  }
++
++  // This assumes numContainers = 1 for the request.
++  private ResourceCommitRequest<FiCaSchedulerApp, FiCaSchedulerNode>
++      createResourceCommitRequest(SchedulerApplicationAttempt appAttempt,
++      SchedulingRequest schedulingRequest, SchedulerNode schedulerNode) {
++    ContainerAllocationProposal<FiCaSchedulerApp, FiCaSchedulerNode> allocated =
++        null;
++    Resource resource = schedulingRequest.getResourceSizing().getResources();
++    if (Resources.greaterThan(calculator, getClusterResource(),
++        resource, Resources.none())) {
++      ContainerId cId =
++          ContainerId.newContainerId(appAttempt.getApplicationAttemptId(),
++              appAttempt.getAppSchedulingInfo().getNewContainerId());
++      Container container = BuilderUtils.newContainer(
++          cId, schedulerNode.getNodeID(), schedulerNode.getHttpAddress(),
++          resource, schedulingRequest.getPriority(), null,
++          ExecutionType.GUARANTEED,
++          schedulingRequest.getAllocationRequestId());
++      RMContainer rmContainer = new RMContainerImpl(container,
++          SchedulerRequestKey.extractFrom(container),
++          appAttempt.getApplicationAttemptId(), container.getNodeId(),
++          appAttempt.getUser(), rmContext, false);
++      ((RMContainerImpl)rmContainer).setAllocationTags(
++          new HashSet<>(schedulingRequest.getAllocationTags()));
++
++      allocated = new ContainerAllocationProposal<>(
++          getSchedulerContainer(rmContainer, true),
++          null, null, NodeType.NODE_LOCAL, NodeType.NODE_LOCAL,
++          SchedulingMode.RESPECT_PARTITION_EXCLUSIVITY,
++          resource);
++    }
++
++    if (null != allocated) {
++      List<ContainerAllocationProposal<FiCaSchedulerApp, FiCaSchedulerNode>>
++          allocationsList = new ArrayList<>();
++      allocationsList.add(allocated);
++
++      return new ResourceCommitRequest<>(allocationsList, null, null);
++    }
++    return null;
++  }
++
+-  public void tryCommit(Resource cluster, ResourceCommitRequest r) {
++  public boolean tryCommit(Resource cluster, ResourceCommitRequest r,
++      boolean updatePending) {
++    boolean isSuccess = false;
+-        if (app.accept(cluster, request)) {
+-          app.apply(cluster, request);
++        if (app.accept(cluster, request, updatePending)) {
++          app.apply(cluster, request, updatePending);
++          isSuccess = true;
++    return isSuccess;
+
+INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS31 INS31 INS31 INS29 INS83 INS39 INS42 INS44 INS8 INS44 INS78 INS83 INS39 INS42 INS44 INS44 INS44 INS8 INS83 INS74 INS42 INS44 INS44 INS44 INS8 UPD39 INS44 INS65 INS65 INS74 INS42 INS25 INS70 INS74 INS42 INS25 INS21 INS42 INS43 INS42 INS43 INS42 INS43 INS42 INS25 INS41 INS43 INS43 INS43 INS43 INS42 INS43 INS42 INS43 INS42 INS60 INS60 INS25 INS25 INS41 INS39 INS42 INS60 INS41 INS66 INS42 INS66 INS43 INS43 INS27 INS8 INS44 INS42 INS8 INS43 INS43 INS27 INS8 INS32 INS42 INS42 INS42 INS27 INS8 INS9 INS42 INS42 INS42 INS42 INS42 INS42 INS74 INS59 INS43 INS59 INS32 INS8 INS27 INS8 INS33 INS39 INS59 INS42 INS42 INS42 INS42 INS33 INS41 INS43 INS42 INS60 INS25 INS42 INS42 INS27 INS36 INS53 UPD42 INS42 INS42 INS32 INS33 INS25 INS25 INS43 INS43 INS43 INS42 INS33 INS42 INS42 INS32 INS42 INS42 INS42 INS32 INS42 INS32 INS60 INS60 INS60 INS21 INS21 INS33 INS42 INS60 INS21 INS41 INS42 INS9 INS42 INS43 INS59 INS27 INS8 INS36 INS27 INS38 INS14 INS27 INS42 INS42 INS27 INS8 INS38 INS8 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS43 INS59 INS43 INS59 INS43 INS59 INS32 INS7 INS74 INS59 INS32 INS14 INS42 INS42 INS32 INS27 INS27 INS21 INS38 INS42 INS33 INS32 INS43 INS27 MOV38 INS36 INS9 INS32 INS34 INS21 INS32 INS60 INS21 INS60 INS54 INS41 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS14 INS36 INS42 INS14 INS42 INS14 INS43 INS74 INS42 INS14 INS42 INS42 INS42 INS74 INS42 INS33 INS33 INS42 INS42 INS42 INS33 INS32 INS33 INS32 INS32 INS42 INS42 INS42 INS45 INS42 INS45 INS40 INS45 INS45 INS27 INS27 INS32 INS42 INS32 INS42 INS42 INS43 INS59 INS32 INS74 INS59 INS8 INS12 INS32 INS42 INS42 INS32 INS32 INS42 INS42 INS42 INS32 INS32 INS42 INS32 INS33 INS40 INS32 INS43 INS42 INS32 INS32 INS32 INS32 INS42 INS9 INS11 INS74 INS32 INS74 INS32 INS33 INS33 INS40 INS40 INS40 INS42 INS42 INS43 INS43 INS43 INS74 INS43 INS42 INS42 INS42 INS42 INS32 INS32 INS42 INS40 INS40 INS27 INS38 MOV32 INS32 INS42 INS42 INS42 INS42 INS27 INS42 INS42 INS32 INS32 INS42 INS32 INS43 INS43 INS43 INS42 INS32 INS25 INS44 INS8 INS42 INS32 INS42 INS9 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS43 INS42 INS43 INS42 INS42 INS43 INS42 INS42 INS9 INS42 INS42 INS42 INS43 INS42 INS42 INS21 INS42 INS32 INS42 INS42 INS33 INS32 INS42 INS42 INS42 INS45 INS45 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS38 INS8 INS43 INS42 INS21 INS41 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS7 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS21 INS41 INS42 INS32 INS9 INS42 INS42 INS9 INS9 INS42 INS42 INS32 INS42 INS42 INS32 INS32 INS32 INS9 INS42 INS42 INS45 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS27 INS45 INS32 INS45 INS32 INS45 INS45 INS42 INS42 INS42 INS42

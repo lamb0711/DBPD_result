@@ -1,0 +1,204 @@
+HADOOP-13396. Allow pluggable audit loggers in KMS. Contributed by Xiao Chen
+
++import static org.apache.hadoop.crypto.key.kms.server.KMSAuditLogger.AuditEvent;
++import static org.apache.hadoop.crypto.key.kms.server.KMSAuditLogger.OpStatus;
++
++import com.google.common.base.Preconditions;
++import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.util.ReflectionUtils;
++import org.apache.hadoop.util.Time;
+-import com.google.common.base.Joiner;
+-import java.util.LinkedList;
+-import java.util.List;
+-import java.util.Set;
++import java.util.HashSet;
+-import java.util.concurrent.atomic.AtomicLong;
++import java.util.Collection;
++import java.util.LinkedList;
++import java.util.List;
++import java.util.Set;
+- * Provides convenience methods for audit logging consistently the different
++ * Provides convenience methods for audit logging consisting different
+-
+-  private static class AuditEvent {
+-    private final AtomicLong accessCount = new AtomicLong(-1);
+-    private final String keyName;
+-    private final String user;
+-    private final KMS.KMSOp op;
+-    private final String extraMsg;
+-    private final long startTime = System.currentTimeMillis();
+-
+-    private AuditEvent(String keyName, String user, KMS.KMSOp op, String msg) {
+-      this.keyName = keyName;
+-      this.user = user;
+-      this.op = op;
+-      this.extraMsg = msg;
+-    }
+-
+-    public String getExtraMsg() {
+-      return extraMsg;
+-    }
+-
+-    public AtomicLong getAccessCount() {
+-      return accessCount;
+-    }
+-
+-    public String getKeyName() {
+-      return keyName;
+-    }
+-
+-    public String getUser() {
+-      return user;
+-    }
+-
+-    public KMS.KMSOp getOp() {
+-      return op;
+-    }
+-
+-    public long getStartTime() {
+-      return startTime;
+-    }
+-  }
+-
+-  public static enum OpStatus {
+-    OK, UNAUTHORIZED, UNAUTHENTICATED, ERROR;
+-  }
+-
+-  private static Set<KMS.KMSOp> AGGREGATE_OPS_WHITELIST = Sets.newHashSet(
++  @VisibleForTesting
++  static final Set<KMS.KMSOp> AGGREGATE_OPS_WHITELIST = Sets.newHashSet(
+-  private static Logger AUDIT_LOG = LoggerFactory.getLogger(KMS_LOGGER_NAME);
++  private final static Logger LOG = LoggerFactory.getLogger(KMSAudit.class);
++  private final List<KMSAuditLogger> auditLoggers = new LinkedList<>();
+-   * @param windowMs Duplicate events within the aggregation window are quashed
+-   *                 to reduce log traffic. A single message for aggregated
+-   *                 events is printed at the end of the window, along with a
+-   *                 count of the number of aggregated events.
++   * @param conf The configuration object.
+-  KMSAudit(long windowMs) {
++  KMSAudit(Configuration conf) {
++    // Duplicate events within the aggregation window are quashed
++    // to reduce log traffic. A single message for aggregated
++    // events is printed at the end of the window, along with a
++    // count of the number of aggregated events.
++    long windowMs = conf.getLong(KMSConfiguration.KMS_AUDIT_AGGREGATION_WINDOW,
++        KMSConfiguration.KMS_AUDIT_AGGREGATION_WINDOW_DEFAULT);
+-                  KMSAudit.this.logEvent(event);
++                  KMSAudit.this.logEvent(OpStatus.OK, event);
++    initializeAuditLoggers(conf);
+-  private void logEvent(AuditEvent event) {
+-    AUDIT_LOG.info(
+-        "OK[op={}, key={}, user={}, accessCount={}, interval={}ms] {}",
+-        event.getOp(), event.getKeyName(), event.getUser(),
+-        event.getAccessCount().get(),
+-        (System.currentTimeMillis() - event.getStartTime()),
+-        event.getExtraMsg());
++  /**
++   * Read the KMSAuditLogger classes from configuration. If any loggers fail to
++   * load, a RumTimeException will be thrown.
++   *
++   * @param conf The configuration.
++   * @return Collection of KMSAudigLogger classes.
++   */
++  private Set<Class<? extends KMSAuditLogger>> getAuditLoggerClasses(
++      final Configuration conf) {
++    Set<Class<? extends KMSAuditLogger>> result = new HashSet<>();
++    // getTrimmedStringCollection will remove duplicates.
++    Collection<String> classes =
++        conf.getTrimmedStringCollection(KMSConfiguration.KMS_AUDIT_LOGGER_KEY);
++    if (classes.isEmpty()) {
++      LOG.info("No audit logger configured, using default.");
++      result.add(SimpleKMSAuditLogger.class);
++      return result;
++    }
++
++    for (String c : classes) {
++      try {
++        Class<?> cls = conf.getClassByName(c);
++        result.add(cls.asSubclass(KMSAuditLogger.class));
++      } catch (ClassNotFoundException cnfe) {
++        throw new RuntimeException("Failed to load " + c + ", please check "
++            + "configuration " + KMSConfiguration.KMS_AUDIT_LOGGER_KEY, cnfe);
++      }
++    }
++    return result;
+-  private void op(OpStatus opStatus, final KMS.KMSOp op, final String user,
+-      final String key, final String extraMsg) {
++  /**
++   * Create a collection of KMSAuditLoggers from configuration, and initialize
++   * them. If any logger failed to be created or initialized, a RunTimeException
++   * is thrown.
++   */
++  private void initializeAuditLoggers(Configuration conf) {
++    Set<Class<? extends KMSAuditLogger>> classes = getAuditLoggerClasses(conf);
++    Preconditions
++        .checkState(!classes.isEmpty(), "Should have at least 1 audit logger.");
++    for (Class<? extends KMSAuditLogger> c : classes) {
++      final KMSAuditLogger logger = ReflectionUtils.newInstance(c, conf);
++      auditLoggers.add(logger);
++    }
++    for (KMSAuditLogger logger: auditLoggers) {
++      try {
++        LOG.info("Initializing audit logger {}", logger.getClass());
++        logger.initialize(conf);
++      } catch (Exception ex) {
++        throw new RuntimeException(
++            "Failed to initialize " + logger.getClass().getName(), ex);
++      }
++    }
++  }
++
++  private void logEvent(final OpStatus status, AuditEvent event) {
++    event.setEndTime(Time.now());
++    for (KMSAuditLogger logger: auditLoggers) {
++      logger.logAuditEvent(status, event);
++    }
++  }
++
++  private void op(final OpStatus opStatus, final KMS.KMSOp op,
++      final UserGroupInformation ugi, final String key, final String remoteHost,
++      final String extraMsg) {
++    final String user = ugi == null ? null: ugi.getShortUserName();
+-        AUDIT_LOG.info("UNAUTHORIZED[op={}, key={}, user={}] {}", op, key, user,
+-            extraMsg);
++        logEvent(opStatus, new AuditEvent(op, ugi, key, remoteHost, extraMsg));
+-              return new AuditEvent(key, user, op, extraMsg);
++              return new AuditEvent(op, ugi, key, remoteHost, extraMsg);
+-            logEvent(event);
++            logEvent(opStatus, event);
+-      List<String> kvs = new LinkedList<String>();
+-      if (op != null) {
+-        kvs.add("op=" + op);
+-      }
+-      if (!Strings.isNullOrEmpty(key)) {
+-        kvs.add("key=" + key);
+-      }
+-      if (!Strings.isNullOrEmpty(user)) {
+-        kvs.add("user=" + user);
+-      }
+-      if (kvs.size() == 0) {
+-        AUDIT_LOG.info("{} {}", opStatus.toString(), extraMsg);
+-      } else {
+-        String join = Joiner.on(", ").join(kvs);
+-        AUDIT_LOG.info("{}[{}] {}", opStatus.toString(), join, extraMsg);
+-      }
++      logEvent(opStatus, new AuditEvent(op, ugi, key, remoteHost, extraMsg));
+-    op(OpStatus.OK, op, user.getShortUserName(), key, extraMsg);
++    op(OpStatus.OK, op, user, key, "Unknown", extraMsg);
+-    op(OpStatus.OK, op, user.getShortUserName(), null, extraMsg);
++    op(OpStatus.OK, op, user, null, "Unknown", extraMsg);
+-    op(OpStatus.UNAUTHORIZED, op, user.getShortUserName(), key, "");
++    op(OpStatus.UNAUTHORIZED, op, user, key, "Unknown", "");
+-    op(OpStatus.ERROR, null, user.getShortUserName(), null, "Method:'" + method
++    op(OpStatus.ERROR, null, user, null, "Unknown", "Method:'" + method
+-    op(OpStatus.UNAUTHENTICATED, null, null, null, "RemoteHost:"
++    op(OpStatus.UNAUTHENTICATED, null, null, null, remoteHost, "RemoteHost:"
++    for (KMSAuditLogger logger : auditLoggers) {
++      try {
++        logger.cleanup();
++      } catch (Exception ex) {
++        LOG.error("Failed to cleanup logger {}", logger.getClass(), ex);
++      }
++    }
+
+MOV26 MOV26 MOV26 MOV26 MOV26 INS26 INS26 INS26 INS26 INS26 INS26 INS40 INS40 UPD40 INS40 INS40 INS40 UPD40 INS40 INS23 INS23 INS31 INS31 INS31 INS78 INS83 INS83 INS83 INS83 MOV43 INS59 MOV83 MOV83 UPD74 MOV74 MOV59 INS29 INS83 INS74 INS42 INS44 INS8 INS29 UPD83 MOV83 INS39 INS42 INS44 INS8 INS83 INS39 INS42 MOV44 MOV44 INS8 INS44 INS44 MOV44 MOV44 MOV44 MOV44 MOV44 MOV44 INS8 UPD66 INS42 INS42 INS32 INS43 UPD42 INS43 INS42 INS60 INS21 INS65 INS65 INS65 INS43 INS74 INS83 INS43 INS42 INS60 INS60 INS25 INS70 MOV41 INS65 INS43 INS42 INS60 INS21 INS70 INS70 INS83 UPD42 INS21 INS70 INS83 INS43 INS42 INS43 UPD42 INS83 MOV43 INS42 INS60 MOV21 INS70 INS42 INS42 INS57 INS42 UPD74 UPD42 UPD66 INS42 INS39 INS59 INS32 INS66 INS66 INS42 INS66 INS66 UPD42 MOV42 INS43 INS76 UPD42 MOV42 INS74 INS59 INS74 INS59 INS32 INS8 MOV44 INS42 INS8 UPD42 INS66 INS66 INS66 UPD42 MOV42 INS74 INS59 INS32 INS44 INS42 INS8 INS44 INS42 INS8 INS32 INS44 INS42 INS8 INS42 INS42 INS83 MOV43 INS59 INS44 INS42 INS8 INS43 INS42 INS32 INS42 INS42 INS42 INS43 INS43 INS74 UPD42 MOV42 INS14 INS43 MOV43 UPD42 MOV42 INS32 INS42 INS42 INS21 INS21 INS41 UPD42 INS54 INS43 INS74 INS42 INS32 INS42 INS42 INS38 INS45 INS74 INS42 INS60 INS21 INS43 INS42 INS54 MOV42 INS42 INS32 INS43 INS42 INS21 INS42 INS16 INS21 MOV42 INS45 MOV42 INS45 MOV42 INS45 MOV42 INS45 INS42 INS43 INS42 INS54 INS42 INS42 INS42 INS40 INS40 UPD42 MOV42 UPD42 MOV42 INS43 INS76 INS74 UPD42 MOV42 INS42 INS42 INS40 INS32 INS32 INS42 INS8 INS12 INS42 INS43 INS76 INS42 INS42 INS32 INS43 INS76 INS83 INS43 INS59 INS32 INS42 INS8 INS12 UPD42 MOV42 INS42 INS42 INS32 INS27 INS33 INS32 INS32 INS42 INS8 INS12 INS42 INS43 INS43 UPD42 MOV42 UPD42 MOV42 INS45 INS42 INS42 INS57 INS60 INS21 INS44 INS8 UPD42 MOV42 INS43 INS42 INS42 INS42 INS43 INS42 INS42 INS32 INS42 INS42 UPD42 MOV42 INS21 INS21 INS44 INS8 INS42 UPD42 MOV42 UPD42 MOV42 INS42 INS42 INS33 INS42 INS42 INS42 MOV42 INS14 INS21 INS44 INS8 INS42 INS42 INS43 INS74 INS59 INS32 INS43 INS42 INS53 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS32 INS43 INS42 INS53 INS43 INS42 INS42 INS42 INS42 INS42 INS32 INS43 INS42 INS21 UPD42 MOV42 INS43 INS76 INS42 INS32 INS42 INS42 INS32 INS42 INS14 UPD42 MOV42 MOV42 UPD45 MOV45 MOV32 UPD42 MOV42 UPD42 MOV42 INS42 INS42 INS14 UPD42 UPD42 INS14 UPD42 MOV42 INS42 INS42 INS42 INS32 UPD42 MOV42 INS42 INS42 INS42 INS42 INS42 INS57 INS43 INS27 INS42 UPD42 UPD42 INS43 INS27 INS42 MOV43 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS45 INS32 INS42 INS43 UPD42 MOV42 INS45 INS42 INS45 INS45 INS40 INS42 INS45 INS32 INS42 INS42 INS42 MOV32 UPD42 MOV42 UPD42 UPD42 INS42 INS40 INS43 INS42 UPD42 UPD42 INS42 INS42 DEL83 DEL83 DEL42 DEL43 DEL42 DEL43 DEL34 DEL38 DEL14 DEL59 DEL23 DEL83 DEL83 DEL43 DEL42 DEL59 DEL23 DEL83 DEL83 DEL43 DEL42 DEL59 DEL23 DEL83 DEL83 DEL40 DEL43 DEL59 DEL23 DEL83 DEL83 DEL43 DEL59 DEL23 DEL83 DEL83 DEL39 DEL42 DEL32 DEL59 DEL23 DEL83 DEL42 DEL43 DEL42 DEL44 DEL43 DEL42 DEL44 DEL40 DEL43 DEL42 DEL44 DEL52 DEL42 DEL22 DEL42 DEL7 DEL21 DEL52 DEL42 DEL22 DEL42 DEL7 DEL21 DEL52 DEL42 DEL22 DEL42 DEL7 DEL21 DEL52 DEL42 DEL22 DEL42 DEL7 DEL21 DEL8 DEL31 DEL83 DEL43 DEL42 DEL8 DEL31 DEL43 DEL42 DEL42 DEL41 DEL8 DEL31 DEL83 DEL43 DEL42 DEL42 DEL41 DEL8 DEL31 DEL83 DEL42 DEL43 DEL42 DEL42 DEL41 DEL8 DEL31 DEL83 DEL40 DEL43 DEL42 DEL42 DEL41 DEL8 DEL31 DEL83 DEL39 DEL42 DEL42 DEL41 DEL8 DEL31 DEL55 DEL83 DEL83 DEL42 DEL42 DEL72 DEL42 DEL72 DEL42 DEL72 DEL42 DEL72 DEL71 DEL83 DEL83 DEL83 DEL42 DEL42 DEL42 DEL32 DEL59 DEL23 DEL66 DEL66 DEL66 DEL39 DEL42 DEL83 DEL39 DEL42 DEL32 DEL42 DEL42 DEL32 DEL32 DEL42 DEL42 DEL32 DEL32 DEL27 DEL36 DEL32 DEL32 DEL21 DEL8 DEL31 DEL45 DEL42 DEL42 DEL42 DEL42 DEL42 DEL60 DEL42 DEL33 DEL27 DEL42 DEL42 DEL45 DEL42 DEL27 DEL32 DEL21 DEL8 DEL25 DEL42 DEL42 DEL42 DEL32 DEL38 DEL42 DEL42 DEL45 DEL42 DEL27 DEL32 DEL21 DEL8 DEL25 DEL42 DEL42 DEL42 DEL32 DEL38 DEL42 DEL42 DEL45 DEL42 DEL27 DEL32 DEL21 DEL8 DEL25 DEL42 DEL42 DEL32 DEL34 DEL27 DEL42 DEL42 DEL45 DEL42 DEL32 DEL42 DEL32 DEL21 DEL8 DEL43 DEL42 DEL42 DEL42 DEL45 DEL32 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL42 DEL45 DEL42 DEL42 DEL32 DEL42 DEL42 DEL32 DEL21 DEL8 DEL25 DEL42 DEL32 DEL42 DEL32 DEL42 DEL32 DEL42 DEL32 DEL8

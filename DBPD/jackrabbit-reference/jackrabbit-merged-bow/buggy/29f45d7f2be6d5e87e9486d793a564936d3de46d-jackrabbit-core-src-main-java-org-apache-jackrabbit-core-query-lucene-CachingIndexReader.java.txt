@@ -1,0 +1,290 @@
+JCR-1884: CachingIndexReader.initializeParents() does not scale well with large indexes
+
+git-svn-id: https://svn.apache.org/repos/asf/jackrabbit/trunk@721495 13f79535-47bb-0310-9956-ffa450edef68
+
++import EDU.oswego.cs.dl.util.concurrent.Executor;
++import EDU.oswego.cs.dl.util.concurrent.PooledExecutor;
++import EDU.oswego.cs.dl.util.concurrent.LinkedQueue;
++
++     * The single thread of this executor initializes the
++     * {@link #parents} when background initialization is requested.
++     */
++    private static final Executor SERIAL_EXECUTOR = new PooledExecutor(
++            new LinkedQueue(), 1) {
++        {
++            setKeepAliveTime(500);
++        }
++    };
++
++    /**
++     * Initializes the {@link #parents} cache.
++     */
++    private CacheInitializer cacheInitializer;
++
++    /**
++     * @param initCache if the {@link #parents} cache should be initialized
++     *                  when this index reader is constructed. Otherwise
++     *                  initialization happens in a background thread.
+-    CachingIndexReader(IndexReader delegatee, DocNumberCache cache)
++    CachingIndexReader(IndexReader delegatee,
++                       DocNumberCache cache,
++                       boolean initCache)
+-        parents = new DocId[delegatee.maxDoc()];
+-        initializeParents(delegatee);
++        this.parents = new DocId[delegatee.maxDoc()];
++        this.cacheInitializer = new CacheInitializer(delegatee);
++        if (initCache) {
++            cacheInitializer.run();
++        } else {
++            try {
++                SERIAL_EXECUTOR.execute(cacheInitializer);
++            } catch (InterruptedException e) {
++                // ignore
++            }
++        }
++    /**
++     * {@inheritDoc}
++     */
++    protected void doClose() throws IOException {
++        try {
++            cacheInitializer.waitUntilStopped();
++        } catch (InterruptedException e) {
++            // ignore
++        }
++        super.doClose();
++    }
+-     * Initializes the {@link #parents} <code>DocId</code> array.
+-     *
+-     * @param reader the underlying index reader.
+-     * @throws IOException if an error occurs while reading from the index.
++     * Initializes the {@link CachingIndexReader#parents} cache.
+-    private void initializeParents(IndexReader reader) throws IOException {
+-        long time = System.currentTimeMillis();
+-        Map docs = new HashMap();
+-        for (int i = 0; i < reader.maxDoc(); i++) {
+-            if (!reader.isDeleted(i)) {
+-                Document doc = reader.document(i, FieldSelectors.UUID_AND_PARENT);
+-                UUID uuid = UUID.fromString(doc.get(FieldNames.UUID));
+-                UUID parent = null;
+-                try {
+-                    parent = UUID.fromString(doc.get(FieldNames.PARENT));
+-                } catch (IllegalArgumentException e) {
+-                    // root node does not have a parent
++    private class CacheInitializer implements Runnable {
++
++        /**
++         * From where to read.
++         */
++        private final IndexReader reader;
++
++        /**
++         * Set to <code>true</code> while this initializer does its work.
++         */
++        private boolean running = false;
++
++        /**
++         * Set to <code>true</code> when this index reader is about to be closed.
++         */
++        private volatile boolean stopRequested = false;
++
++        /**
++         * Creates a new initializer with the given <code>reader</code>.
++         *
++         * @param reader an index reader.
++         */
++        public CacheInitializer(IndexReader reader) {
++            this.reader = reader;
++        }
++
++        /**
++         * Initializes the cache.
++         */
++        public void run() {
++            synchronized (this) {
++                running = true;
++            }
++            try {
++                if (stopRequested) {
++                    // immediately return when stop is requested
++                    return;
+-                NodeInfo info = new NodeInfo(i, uuid, parent);
+-                docs.put(uuid, info);
++                initializeParents(reader);
++            } catch (Exception e) {
++                // only log warn message during regular operation
++                if (!stopRequested) {
++                    log.warn("Error initializing parents cache.", e);
++                }
++            } finally {
++                synchronized (this) {
++                    running = false;
++                    notifyAll();
++                }
+-        double foreignParents = 0;
+-        Iterator it = docs.values().iterator();
+-        while (it.hasNext()) {
+-            NodeInfo info = (NodeInfo) it.next();
+-            NodeInfo parent = (NodeInfo) docs.get(info.parent);
+-            if (parent != null) {
+-                parents[info.docId] = DocId.create(parent.docId);
+-            } else if (info.parent != null) {
+-                foreignParents++;
+-                parents[info.docId] = DocId.create(info.parent);
+-            } else {
+-                // no parent -> root node
+-                parents[info.docId] = DocId.NULL;
++
++        /**
++         * Waits until this cache initializer is stopped.
++         *
++         * @throws InterruptedException if the current thread is interrupted.
++         */
++        public void waitUntilStopped() throws InterruptedException {
++            stopRequested = true;
++            synchronized (this) {
++                while (running) {
++                    wait();
++                }
+-        if (log.isDebugEnabled()) {
+-            NumberFormat nf = NumberFormat.getPercentInstance();
+-            nf.setMaximumFractionDigits(1);
+-            time = System.currentTimeMillis() - time;
+-            if (parents.length > 0) {
+-                foreignParents /= parents.length;
++
++        /**
++         * Initializes the {@link CachingIndexReader#parents} <code>DocId</code>
++         * array.
++         *
++         * @param reader the underlying index reader.
++         * @throws IOException if an error occurs while reading from the index.
++         */
++        private void initializeParents(IndexReader reader) throws IOException {
++            long time = System.currentTimeMillis();
++            final Map docs = new HashMap();
++            // read UUIDs
++            collectTermDocs(reader, new Term(FieldNames.UUID, ""), new TermDocsCollector() {
++                public void collect(Term term, TermDocs tDocs) throws IOException {
++                    UUID uuid = UUID.fromString(term.text());
++                    if (tDocs.next()) {
++                        NodeInfo info = new NodeInfo(tDocs.doc(), uuid);
++                        docs.put(new Integer(info.docId), info);
++                    }
++                }
++            });
++
++            // read PARENTs
++            collectTermDocs(reader, new Term(FieldNames.PARENT, "0"), new TermDocsCollector() {
++                public void collect(Term term, TermDocs tDocs) throws IOException {
++                    while (tDocs.next()) {
++                        UUID uuid = UUID.fromString(term.text());
++                        Integer docId = new Integer(tDocs.doc());
++                        NodeInfo info = (NodeInfo) docs.get(docId);
++                        info.parent = uuid;
++                        docs.remove(docId);
++                        docs.put(info.uuid, info);
++                    }
++                }
++            });
++
++            if (stopRequested) {
++                return;
+-            log.debug("initialized {} DocIds in {} ms, {} foreign parents",
+-                    new Object[]{
+-                        new Integer(parents.length),
+-                        new Long(time),
+-                        nf.format(foreignParents)
+-                    });
++
++            double foreignParents = 0;
++            Iterator it = docs.values().iterator();
++            while (it.hasNext()) {
++                NodeInfo info = (NodeInfo) it.next();
++                NodeInfo parent = (NodeInfo) docs.get(info.parent);
++                if (parent != null) {
++                    parents[info.docId] = DocId.create(parent.docId);
++                } else if (info.parent != null) {
++                    foreignParents++;
++                    parents[info.docId] = DocId.create(info.parent);
++                } else {
++                    // no parent -> root node
++                    parents[info.docId] = DocId.NULL;
++                }
++            }
++            if (log.isDebugEnabled()) {
++                NumberFormat nf = NumberFormat.getPercentInstance();
++                nf.setMaximumFractionDigits(1);
++                time = System.currentTimeMillis() - time;
++                if (parents.length > 0) {
++                    foreignParents /= parents.length;
++                }
++                log.debug("initialized {} DocIds in {} ms, {} foreign parents",
++                        new Object[]{
++                            new Integer(parents.length),
++                            new Long(time),
++                            nf.format(foreignParents)
++                        });
++            }
++
++        /**
++         * Collects term docs for a given start term. All terms with the same
++         * field as <code>start</code> are enumerated.
++         *
++         * @param reader the index reader.
++         * @param start the term where to start the term enumeration.
++         * @param collector collects the term docs for each term.
++         * @throws IOException if an error occurs while reading from the index.
++         */
++        private void collectTermDocs(IndexReader reader,
++                                     Term start,
++                                     TermDocsCollector collector)
++                throws IOException {
++            TermDocs tDocs = reader.termDocs();
++            try {
++                TermEnum terms = reader.terms(start);
++                try {
++                    int count = 0;
++                    do {
++                        Term t = terms.term();
++                        if (t != null && t.field() == start.field()) {
++                            tDocs.seek(terms);
++                            collector.collect(t, tDocs);
++                        } else {
++                            break;
++                        }
++                        // once in a while check if we should quit
++                        if (++count % 10000 == 0) {
++                            if (stopRequested) {
++                                break;
++                            }
++                        }
++                    } while (terms.next());
++                } finally {
++                    terms.close();
++                }
++            } finally {
++                tDocs.close();
++            }
++        }
++    }
++
++    /**
++     * Simple interface to collect a term and its term docs.
++     */
++    private interface TermDocsCollector {
++
++        /**
++         * Called for each term encountered.
++         *
++         * @param term the term.
++         * @param tDocs the term docs of <code>term</code>.
++         * @throws IOException if an error occurs while reading from the index.
++         */
++        void collect(Term term, TermDocs tDocs) throws IOException;
+-        final UUID parent;
++        UUID parent;
+-        public NodeInfo(int docId, UUID uuid, UUID parent) {
++        public NodeInfo(int docId, UUID uuid) {
+-            this.parent = parent;
+
+INS26 INS26 INS26 INS40 INS40 INS40 INS42 INS23 INS23 INS31 INS55 INS55 INS29 INS83 INS83 INS83 INS43 INS59 MOV29 INS83 INS43 INS59 INS44 INS29 INS83 INS39 INS42 INS43 INS8 INS29 INS83 INS42 INS43 INS23 INS23 INS23 INS31 INS31 INS31 MOV31 INS31 INS29 INS83 INS42 INS31 INS65 INS42 INS42 INS14 INS42 INS42 INS65 INS39 INS42 INS21 INS25 INS65 INS42 INS54 INS21 INS65 INS42 INS29 INS83 INS83 INS43 INS59 INS29 INS83 INS39 INS59 INS29 INS83 INS83 INS39 INS59 INS29 INS83 INS42 INS44 INS8 INS29 INS83 INS39 INS42 INS8 INS29 INS83 INS39 INS42 INS43 INS8 INS29 INS29 INS83 INS39 INS42 INS44 INS44 INS44 INS43 INS8 INS65 INS29 INS39 INS42 INS44 INS44 INS43 INS66 INS65 INS66 INS43 INS14 INS34 INS1 UPD66 INS42 INS66 INS65 INS66 INS66 INS66 INS7 INS42 INS8 INS8 INS65 INS8 INS12 INS48 INS66 INS65 INS66 INS65 INS42 INS42 INS65 INS42 INS9 INS65 INS42 INS9 INS65 INS65 INS43 INS42 INS21 INS65 INS51 INS54 INS65 INS65 INS42 INS21 INS51 INS65 MOV65 MOV65 INS21 INS21 INS25 INS65 INS65 INS65 INS65 INS65 INS43 INS42 INS43 INS42 INS43 INS42 INS42 INS60 INS54 INS66 INS65 INS65 INS65 INS65 INS43 INS42 INS43 INS42 INS42 INS67 INS42 INS43 INS28 INS67 INS22 INS22 INS14 MOV21 INS54 INS21 INS44 INS8 INS42 INS67 INS66 INS66 INS66 INS66 INS42 INS66 INS42 INS7 INS66 INS52 INS8 INS8 INS12 INS8 INS66 INS42 INS66 INS7 INS52 INS8 INS66 INS65 INS66 INS66 INS83 INS32 INS32 INS42 INS8 INS66 INS66 INS42 INS66 INS42 INS66 INS42 INS66 INS42 INS66 INS42 INS42 INS42 INS43 INS59 INS8 INS8 INS66 INS42 INS66 INS42 INS66 INS42 INS66 INS42 INS42 INS42 INS42 INS8 INS42 INS52 INS42 INS52 INS42 INS43 INS42 INS8 INS12 INS32 INS43 INS42 INS42 INS42 INS22 INS42 INS21 INS25 INS21 INS44 INS8 INS51 INS42 INS9 INS61 INS67 INS42 MOV42 INS14 INS14 INS42 INS42 INS14 INS14 INS41 INS42 INS42 INS32 INS60 INS54 INS21 INS21 INS42 UPD42 UPD42 INS21 INS44 INS8 INS42 INS42 INS42 INS52 INS42 INS7 INS42 INS8 INS32 INS43 INS42 INS25 INS52 INS8 INS42 INS8 INS42 INS42 INS43 INS40 INS45 INS43 INS1 INS43 INS40 INS45 INS43 INS1 INS42 INS42 INS43 INS59 INS8 INS8 INS32 INS32 INS32 INS43 INS42 INS42 INS9 INS41 INS42 INS42 INS42 INS38 INS8 INS21 INS21 INS21 INS42 INS42 INS31 INS42 INS42 INS31 INS42 INS42 INS32 INS60 INS19 INS21 INS42 INS42 INS42 INS34 INS42 INS42 INS42 INS42 INS42 INS21 INS7 INS32 INS32 INS83 INS39 INS42 INS44 INS44 INS43 INS8 INS83 INS39 INS42 INS44 INS44 INS43 INS8 INS42 INS42 INS42 INS39 INS59 INS8 INS32 INS32 INS32 INS42 INS9 INS42 INS42 INS43 INS42 INS43 INS42 INS42 MOV60 INS25 INS43 INS42 INS43 INS42 INS42 INS61 INS42 INS34 INS60 INS25 INS25 INS42 INS42 INS42 INS42 INS42 INS42 INS45 INS42 INS42 UPD42 MOV42 INS32 INS8 INS42 INS42 INS32 INS8 INS43 INS59 INS27 INS8 INS8 INS27 INS8 MOV42 INS42 INS42 MOV60 INS21 INS42 INS42 INS60 INS60 MOV60 INS21 INS21 MOV21 INS42 INS42 INS32 INS27 INS27 INS21 INS21 INS10 INS27 INS34 INS25 MOV43 INS32 MOV43 INS59 INS43 INS59 INS43 INS7 INS32 INS42 INS42 INS42 INS33 INS32 INS32 INS32 INS32 INS38 INS34 INS42 INS8 UPD42 UPD42 UPD42 INS14 INS42 INS42 INS14 INS42 INS42 INS32 UPD42 MOV42 INS42 INS14 INS42 INS11 INS40 INS42 INS42 INS42 INS42 INS40 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS10 MOV43 INS32 INS42 INS43 INS40 MOV42 MOV42 MOV32 INS43 INS32 INS43 INS32 INS42 INS42 INS42 UPD42 UPD42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 DEL42 DEL42 DEL40 DEL33 DEL40 DEL42 DEL42 DEL42 DEL14 DEL42 DEL39 DEL42 DEL34 DEL59 DEL58 DEL42 DEL42 DEL32 DEL27 DEL42 DEL37 DEL42 DEL42 DEL42 DEL32 DEL38 DEL43 DEL42 DEL42 DEL42 DEL42 DEL40 DEL32 DEL59 DEL60 DEL42 DEL32 DEL7 DEL21 DEL8 DEL43 DEL42 DEL44 DEL8 DEL12 DEL54 DEL8 DEL25 DEL8 DEL24 DEL83 DEL42 DEL44 DEL52 DEL42 DEL22 DEL42 DEL7 DEL21

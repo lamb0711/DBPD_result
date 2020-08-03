@@ -1,0 +1,201 @@
+MAPREDUCE-6197. Cache MapOutputLocations in ShuffleHandler. Contributed by Junping Du
+
++import java.util.concurrent.ExecutionException;
++import com.google.common.cache.CacheBuilder;
++import com.google.common.cache.CacheLoader;
++import com.google.common.cache.LoadingCache;
++import com.google.common.cache.RemovalListener;
++import com.google.common.cache.RemovalNotification;
++import com.google.common.cache.Weigher;
++  private static final String DATA_FILE_NAME = "file.out";
++  private static final String INDEX_FILE_NAME = "file.out.index";
++
+-    private String outputBasePathStr;
++    private String jobId;
+-                         String outputBasePath) {
++                         String jobId) {
+-      this.outputBasePathStr = outputBasePath;
++      this.jobId = jobId;
+-    public String getOutputBasePathStr() {
+-      return outputBasePathStr;
++    public String getJobId() {
++      return jobId;
++    private static final int MAX_WEIGHT = 10 * 1024 * 1024;
++    private static final int EXPIRE_AFTER_ACCESS_MINUTES = 5;
++    private static final int ALLOWED_CONCURRENCY = 16;
++    private final LoadingCache<AttemptPathIdentifier, AttemptPathInfo> pathCache =
++      CacheBuilder.newBuilder().expireAfterAccess(EXPIRE_AFTER_ACCESS_MINUTES,
++      TimeUnit.MINUTES).softValues().concurrencyLevel(ALLOWED_CONCURRENCY).
++      removalListener(
++          new RemovalListener<AttemptPathIdentifier, AttemptPathInfo>() {
++            @Override
++            public void onRemoval(RemovalNotification<AttemptPathIdentifier,
++                AttemptPathInfo> notification) {
++              if (LOG.isDebugEnabled()) {
++                LOG.debug("PathCache Eviction: " + notification.getKey() +
++                    ", Reason=" + notification.getCause());
++              }
++            }
++          }
++      ).maximumWeight(MAX_WEIGHT).weigher(
++          new Weigher<AttemptPathIdentifier, AttemptPathInfo>() {
++            @Override
++            public int weigh(AttemptPathIdentifier key,
++                AttemptPathInfo value) {
++              return key.jobId.length() + key.user.length() +
++                  key.attemptId.length()+
++                  value.indexPath.toString().length() +
++                  value.dataPath.toString().length();
++            }
++          }
++      ).build(new CacheLoader<AttemptPathIdentifier, AttemptPathInfo>() {
++        @Override
++        public AttemptPathInfo load(AttemptPathIdentifier key) throws
++            Exception {
++          String base = getBaseLocation(key.jobId, key.user);
++          String attemptBase = base + key.attemptId;
++          Path indexFileName = lDirAlloc.getLocalPathToRead(
++              attemptBase + "/" + INDEX_FILE_NAME, conf);
++          Path mapOutputFileName = lDirAlloc.getLocalPathToRead(
++              attemptBase + "/" + DATA_FILE_NAME, conf);
++
++          if (LOG.isDebugEnabled()) {
++            LOG.debug("Loaded : " + key + " via loader");
++          }
++          return new AttemptPathInfo(indexFileName, mapOutputFileName);
++        }
++      });
+-    
++
+-      // $x/$user/appcache/$appId/output/$mapId
+-      // TODO: Once Shuffle is out of NM, this can use MR APIs to convert
+-      // between App and Job
+-      String outputBasePathStr = getBaseLocation(jobId, user);
+-
+-        populateHeaders(mapIds, outputBasePathStr, user, reduceId, request,
++        populateHeaders(mapIds, jobId, user, reduceId, request,
+-          user, mapOutputInfoMap, outputBasePathStr);
++          user, mapOutputInfoMap, jobId);
+-            info = getMapOutputInfo(reduceContext.getOutputBasePathStr() +
+-                       mapId, mapId, reduceContext.getReduceId(),
+-                       reduceContext.getUser());
++            info = getMapOutputInfo(mapId, reduceContext.getReduceId(),
++                reduceContext.getJobId(), reduceContext.getUser());
+-    protected MapOutputInfo getMapOutputInfo(String base, String mapId,
+-        int reduce, String user) throws IOException {
+-      // Index file
+-      Path indexFileName =
+-          lDirAlloc.getLocalPathToRead(base + "/file.out.index", conf);
+-      IndexRecord info =
+-          indexCache.getIndexInformation(mapId, reduce, indexFileName, user);
+-
+-      Path mapOutputFileName =
+-          lDirAlloc.getLocalPathToRead(base + "/file.out", conf);
+-      if (LOG.isDebugEnabled()) {
+-        LOG.debug(base + " : " + mapOutputFileName + " : " + indexFileName);
++    protected MapOutputInfo getMapOutputInfo(String mapId, int reduce,
++        String jobId, String user) throws IOException {
++      AttemptPathInfo pathInfo;
++      try {
++        AttemptPathIdentifier identifier = new AttemptPathIdentifier(
++            jobId, user, mapId);
++        pathInfo = pathCache.get(identifier);
++        if (LOG.isDebugEnabled()) {
++          LOG.debug("Retrieved pathInfo for " + identifier +
++              " check for corresponding loaded messages to determine whether" +
++              " it was loaded or cached");
++        }
++      } catch (ExecutionException e) {
++        if (e.getCause() instanceof IOException) {
++          throw (IOException) e.getCause();
++        } else {
++          throw new RuntimeException(e.getCause());
++        }
+-      MapOutputInfo outputInfo = new MapOutputInfo(mapOutputFileName, info);
++
++      IndexRecord info =
++        indexCache.getIndexInformation(mapId, reduce, pathInfo.indexPath, user);
++
++      if (LOG.isDebugEnabled()) {
++        LOG.debug("getMapOutputInfo: jobId=" + jobId + ", mapId=" + mapId +
++            ",dataFile=" + pathInfo.dataPath + ", indexFile=" +
++            pathInfo.indexPath);
++      }
++
++      MapOutputInfo outputInfo = new MapOutputInfo(pathInfo.dataPath, info);
+-    protected void populateHeaders(List<String> mapIds, String outputBaseStr,
++    protected void populateHeaders(List<String> mapIds, String jobId,
+-        String base = outputBaseStr + mapId;
+-        MapOutputInfo outputInfo = getMapOutputInfo(base, mapId, reduce, user);
++        MapOutputInfo outputInfo = getMapOutputInfo(mapId, reduce, jobId, user);
+-        // Index file
+-        Path indexFileName =
+-            lDirAlloc.getLocalPathToRead(base + "/file.out.index", conf);
+-        IndexRecord info =
+-            indexCache.getIndexInformation(mapId, reduce, indexFileName, user);
++
+-            new ShuffleHeader(mapId, info.partLength, info.rawLength, reduce);
++            new ShuffleHeader(mapId, outputInfo.indexRecord.partLength,
++            outputInfo.indexRecord.rawLength, reduce);
+-        contentLength += info.partLength;
++        contentLength += outputInfo.indexRecord.partLength;
++  
++  static class AttemptPathInfo {
++    // TODO Change this over to just store local dir indices, instead of the
++    // entire path. Far more efficient.
++    private final Path indexPath;
++    private final Path dataPath;
++
++    public AttemptPathInfo(Path indexPath, Path dataPath) {
++      this.indexPath = indexPath;
++      this.dataPath = dataPath;
++    }
++  }
++
++  static class AttemptPathIdentifier {
++    private final String jobId;
++    private final String user;
++    private final String attemptId;
++
++    public AttemptPathIdentifier(String jobId, String user, String attemptId) {
++      this.jobId = jobId;
++      this.user = user;
++      this.attemptId = attemptId;
++    }
++
++    @Override
++    public boolean equals(Object o) {
++      if (this == o) {
++        return true;
++      }
++      if (o == null || getClass() != o.getClass()) {
++        return false;
++      }
++
++      AttemptPathIdentifier that = (AttemptPathIdentifier) o;
++
++      if (!attemptId.equals(that.attemptId)) {
++        return false;
++      }
++      if (!jobId.equals(that.jobId)) {
++        return false;
++      }
++
++      return true;
++    }
++
++    @Override
++    public int hashCode() {
++      int result = jobId.hashCode();
++      result = 31 * result + attemptId.hashCode();
++      return result;
++    }
++
++    @Override
++    public String toString() {
++      return "AttemptPathIdentifier{" +
++          "attemptId='" + attemptId + '\'' +
++          ", jobId='" + jobId + '\'' +
++          '}';
++    }
++  }

@@ -1,0 +1,388 @@
+Merge branch 'trunk' into HDDS-1535
++import com.amazonaws.SdkBaseException;
++import com.amazonaws.services.s3.transfer.model.CopyResult;
++import org.apache.hadoop.fs.s3a.impl.CopyOutcome;
++import org.apache.hadoop.fs.s3a.impl.ChangeTracker;
+-      int maxThreads = conf.getInt(MAX_THREADS, DEFAULT_MAX_THREADS);
+-      if (maxThreads < 2) {
+-        LOG.warn(MAX_THREADS + " must be at least 2: forcing to 2.");
+-        maxThreads = 2;
+-      }
+-      int totalTasks = intOption(conf,
+-          MAX_TOTAL_TASKS, DEFAULT_MAX_TOTAL_TASKS, 1);
+-      long keepAliveTime = longOption(conf, KEEPALIVE_TIME,
+-          DEFAULT_KEEPALIVE_TIME, 0);
+-      boundedThreadPool = BlockingThreadPoolExecutorService.newInstance(
+-          maxThreads,
+-          maxThreads + totalTasks,
+-          keepAliveTime, TimeUnit.SECONDS,
+-          "s3a-transfer-shared");
+-      unboundedThreadPool = new ThreadPoolExecutor(
+-          maxThreads, Integer.MAX_VALUE,
+-          keepAliveTime, TimeUnit.SECONDS,
+-          new LinkedBlockingQueue<Runnable>(),
+-          BlockingThreadPoolExecutorService.newDaemonThreadFactory(
+-              "s3a-transfer-unbounded"));
++      initThreadPools(conf);
++  private void initThreadPools(Configuration conf) {
++    int maxThreads = conf.getInt(MAX_THREADS, DEFAULT_MAX_THREADS);
++    if (maxThreads < 2) {
++      LOG.warn(MAX_THREADS + " must be at least 2: forcing to 2.");
++      maxThreads = 2;
++    }
++    int totalTasks = intOption(conf,
++        MAX_TOTAL_TASKS, DEFAULT_MAX_TOTAL_TASKS, 1);
++    long keepAliveTime = longOption(conf, KEEPALIVE_TIME,
++        DEFAULT_KEEPALIVE_TIME, 0);
++    boundedThreadPool = BlockingThreadPoolExecutorService.newInstance(
++        maxThreads,
++        maxThreads + totalTasks,
++        keepAliveTime, TimeUnit.SECONDS,
++        "s3a-transfer-shared");
++    unboundedThreadPool = new ThreadPoolExecutor(
++        maxThreads, Integer.MAX_VALUE,
++        keepAliveTime, TimeUnit.SECONDS,
++        new LinkedBlockingQueue<Runnable>(),
++        BlockingThreadPoolExecutorService.newDaemonThreadFactory(
++            "s3a-transfer-unbounded"));
++  }
++
++
++    // Need to use a new TransferManager that uses the new client.
++    // Also, using a new TransferManager requires a new threadpool as the old
++    // TransferManager will shut the thread pool down when it is garbage
++    // collected.
++    initThreadPools(getConf());
++    initTransferManager();
++   * Only public to allow access in tests in other packages.
+-  ChangeDetectionPolicy getChangeDetectionPolicy() {
++  public ChangeDetectionPolicy getChangeDetectionPolicy() {
+-    final FileStatus fileStatus = getFileStatus(path);
++    final S3AFileStatus fileStatus = (S3AFileStatus) getFileStatus(path);
+-            createObjectAttributes(path),
++            createObjectAttributes(
++                path,
++                fileStatus.getETag(),
++                fileStatus.getVersionId()),
++   * @param eTag the eTag of the S3 object
++   * @param versionId S3 object version ID
+-  private S3ObjectAttributes createObjectAttributes(final Path f) {
++  private S3ObjectAttributes createObjectAttributes(
++      final Path f,
++      final String eTag,
++      final String versionId) {
+-        encryptionSecrets.getEncryptionKey());
++        encryptionSecrets.getEncryptionKey(),
++        eTag,
++        versionId);
++      S3ObjectAttributes objectAttributes =
++          createObjectAttributes(srcStatus.getPath(),
++              srcStatus.getETag(), srcStatus.getVersionId());
++      S3AReadOpContext readContext = createReadContext(srcStatus, inputPolicy,
++          changeDetectionPolicy, readAhead);
+-        copyFile(srcKey, newDstKey, length);
++        CopyResult copyResult = copyFile(srcKey, newDstKey, length,
++            objectAttributes, readContext);
+-            username);
++            username, copyResult.getETag(), copyResult.getVersionId());
+-        copyFile(srcKey, dstKey, srcStatus.getLen());
++        CopyResult copyResult = copyFile(srcKey, dstKey, srcStatus.getLen(),
++            objectAttributes, readContext);
+-            length, getDefaultBlockSize(dst), username);
++            length, getDefaultBlockSize(dst), username,
++            copyResult.getETag(), copyResult.getVersionId());
+-      RemoteIterator<LocatedFileStatus> iterator = listFilesAndEmptyDirectories(
+-          parentPath, true);
++      RemoteIterator<S3ALocatedFileStatus> iterator =
++          listFilesAndEmptyDirectories(parentPath, true);
+-        LocatedFileStatus status = iterator.next();
++        S3ALocatedFileStatus status = iterator.next();
+-        copyFile(key, newDstKey, length);
++        S3ObjectAttributes objectAttributes =
++            createObjectAttributes(status.getPath(),
++                status.getETag(), status.getVersionId());
++        S3AReadOpContext readContext = createReadContext(status, inputPolicy,
++            changeDetectionPolicy, readAhead);
++        CopyResult copyResult = copyFile(key, newDstKey, length,
++            objectAttributes, readContext);
+-                childDst, length, getDefaultBlockSize(childDst), username);
++                childDst, length, getDefaultBlockSize(childDst), username,
++                copyResult.getETag(), copyResult.getVersionId());
++    return getObjectMetadata(path, null, invoker, null);
++  }
++
++  /**
++   * Low-level call to get at the object metadata.
++   * @param path path to the object
++   * @param changeTracker the change tracker to detect version inconsistencies
++   * @param changeInvoker the invoker providing the retry policy
++   * @param operation the operation being performed (e.g. "read" or "copy")
++   * @return metadata
++   * @throws IOException IO and object access problems.
++   */
++  @VisibleForTesting
++  @Retries.RetryTranslated
++  public ObjectMetadata getObjectMetadata(Path path,
++      ChangeTracker changeTracker, Invoker changeInvoker, String operation)
++      throws IOException {
+-          // this always does a full HEAD to the object
+-          getObjectMetadata(pathToKey(path)));
++            // this always does a full HEAD to the object
++            getObjectMetadata(
++                pathToKey(path), changeTracker, changeInvoker, operation));
++    return getObjectMetadata(key, null, invoker,null);
++  }
++
++  /**
++   * Request object metadata; increments counters in the process.
++   * Retry policy: retry untranslated.
++   * Uses changeTracker to detect an unexpected file version (eTag or versionId)
++   * @param key key
++   * @param changeTracker the change tracker to detect unexpected object version
++   * @param changeInvoker the invoker providing the retry policy
++   * @param operation the operation (e.g. "read" or "copy") triggering this call
++   * @return the metadata
++   * @throws IOException if the retry invocation raises one (it shouldn't).
++   * @throws RemoteFileChangedException if an unexpected version is detected
++   */
++  @Retries.RetryRaw
++  protected ObjectMetadata getObjectMetadata(String key,
++      ChangeTracker changeTracker,
++      Invoker changeInvoker,
++      String operation) throws IOException {
+-    ObjectMetadata meta = invoker.retryUntranslated("GET " + key, true,
++    ObjectMetadata meta = changeInvoker.retryUntranslated("GET " + key, true,
+-          return s3.getObjectMetadata(request);
++          if (changeTracker != null) {
++            changeTracker.maybeApplyConstraint(request);
++          }
++          ObjectMetadata objectMetadata = s3.getObjectMetadata(request);
++          if (changeTracker != null) {
++            changeTracker.processMetadata(objectMetadata, operation);
++          }
++          return objectMetadata;
+-      finishedWrite(putObjectRequest.getKey(), len);
++      finishedWrite(putObjectRequest.getKey(), len,
++          result.getETag(), result.getVersionId());
+-    List<FileStatus> result;
++    List<S3AFileStatus> result;
+-      FileStatus msStatus = pm.getFileStatus();
++      S3AFileStatus msStatus = pm.getFileStatus();
+-          return S3AFileStatus.fromFileStatus(msStatus, pm.isEmptyDirectory());
++          return msStatus;
+-        return S3AFileStatus.fromFileStatus(msStatus, pm.isEmptyDirectory());
++        return msStatus;
+-        return S3AFileStatus.fromFileStatus(msStatus, Tristate.TRUE);
++        return S3AFileStatus.fromFileStatus(msStatus, Tristate.TRUE,
++            null, null);
+-              username);
++              username,
++              meta.getETag(),
++              meta.getVersionId());
+-                    username);
++                    username,
++                    meta.getETag(),
++                    meta.getVersionId());
+-    finishedWrite(key, info.getLength());
++    finishedWrite(key, info.getLength(),
++        result.getETag(), result.getVersionId());
+-   * @throws AmazonClientException on failures inside the AWS SDK
++   * @param srcAttributes S3 attributes of the source object
++   * @param readContext the read context
++   * @return the result of the copy
+-  @Retries.RetryMixed
+-  private void copyFile(String srcKey, String dstKey, long size)
++  @Retries.RetryTranslated
++  private CopyResult copyFile(String srcKey, String dstKey, long size,
++      S3ObjectAttributes srcAttributes, S3AReadOpContext readContext)
+-    once("copyFile(" + srcKey + ", " + dstKey + ")", srcKey,
++    ChangeTracker changeTracker = new ChangeTracker(
++        keyToQualifiedPath(srcKey).toString(),
++        changeDetectionPolicy,
++        readContext.instrumentation.newInputStreamStatistics()
++            .getVersionMismatchCounter(),
++        srcAttributes);
++
++    String action = "copyFile(" + srcKey + ", " + dstKey + ")";
++    Invoker readInvoker = readContext.getReadInvoker();
++
++    ObjectMetadata srcom =
++        once(action, srcKey,
++            () ->
++                getObjectMetadata(srcKey, changeTracker, readInvoker, "copy"));
++    ObjectMetadata dstom = cloneObjectMetadata(srcom);
++    setOptionalObjectMetadata(dstom);
++
++    return readInvoker.retry(
++        action, srcKey,
++        true,
+-          ObjectMetadata srcom = getObjectMetadata(srcKey);
+-          ObjectMetadata dstom = cloneObjectMetadata(srcom);
+-          setOptionalObjectMetadata(dstom);
++          changeTracker.maybeApplyConstraint(copyObjectRequest);
++
++          Optional.ofNullable(srcom.getStorageClass())
++              .ifPresent(copyObjectRequest::setStorageClass);
+-          try {
+-            copy.waitForCopyResult();
+-            incrementWriteOperations();
+-            instrumentation.filesCopied(1, size);
+-          } catch (InterruptedException e) {
+-            throw new InterruptedIOException("Interrupted copying " + srcKey
+-                + " to " + dstKey + ", cancelling");
++          CopyOutcome copyOutcome = CopyOutcome.waitForCopy(copy);
++          InterruptedException interruptedException =
++              copyOutcome.getInterruptedException();
++          if (interruptedException != null) {
++            // copy interrupted: convert to an IOException.
++            throw (IOException)new InterruptedIOException(
++                "Interrupted copying " + srcKey
++                    + " to " + dstKey + ", cancelling")
++                .initCause(interruptedException);
++          SdkBaseException awsException = copyOutcome.getAwsException();
++          if (awsException != null) {
++            changeTracker.processException(awsException, "copy");
++            throw awsException;
++          }
++          CopyResult result = copyOutcome.getCopyResult();
++          changeTracker.processResponse(result);
++          incrementWriteOperations();
++          instrumentation.filesCopied(1, size);
++          return result;
++   * @param eTag eTag of the written object
++   * @param versionId S3 object versionId of the written object
+-  void finishedWrite(String key, long length)
++  void finishedWrite(String key, long length, String eTag, String versionId)
+-            getDefaultBlockSize(p), username);
++            getDefaultBlockSize(p), username, eTag, versionId);
+-    return innerListFiles(f, recursive,
+-        new Listing.AcceptFilesOnly(qualify(f)));
++    return toLocatedFileStatusIterator(innerListFiles(f, recursive,
++        new Listing.AcceptFilesOnly(qualify(f))));
++  }
++
++  private static RemoteIterator<LocatedFileStatus> toLocatedFileStatusIterator(
++      RemoteIterator<? extends LocatedFileStatus> iterator) {
++    return new RemoteIterator<LocatedFileStatus>() {
++      @Override
++      public boolean hasNext() throws IOException {
++        return iterator.hasNext();
++      }
++
++      @Override
++      public LocatedFileStatus next() throws IOException {
++        return iterator.next();
++      }
++    };
+-  public RemoteIterator<LocatedFileStatus> listFilesAndEmptyDirectories(Path f,
+-      boolean recursive) throws IOException {
++  public RemoteIterator<S3ALocatedFileStatus> listFilesAndEmptyDirectories(
++      Path f, boolean recursive) throws IOException {
+-  private RemoteIterator<LocatedFileStatus> innerListFiles(Path f, boolean
++  private RemoteIterator<S3ALocatedFileStatus> innerListFiles(Path f, boolean
+-      final FileStatus fileStatus = getFileStatus(path);
++      final S3AFileStatus fileStatus = (S3AFileStatus) getFileStatus(path);
+-        final RemoteIterator<FileStatus> cachedFilesIterator;
++        final RemoteIterator<S3AFileStatus> cachedFilesIterator;
+-    return once("listLocatedStatus", path.toString(),
+-        () -> {
+-          // lookup dir triggers existence check
+-          final FileStatus fileStatus = getFileStatus(path);
+-          if (fileStatus.isFile()) {
+-            // simple case: File
+-            LOG.debug("Path is a file");
+-            return new Listing.SingleStatusRemoteIterator(
+-                filter.accept(path) ? toLocatedFileStatus(fileStatus) : null);
+-          } else {
+-            // directory: trigger a lookup
+-            final String key = maybeAddTrailingSlash(pathToKey(path));
+-            final Listing.FileStatusAcceptor acceptor =
+-                new Listing.AcceptAllButSelfAndS3nDirs(path);
+-            DirListingMetadata meta =
+-                S3Guard.listChildrenWithTtl(metadataStore, path,
+-                    ttlTimeProvider);
+-            final RemoteIterator<FileStatus> cachedFileStatusIterator =
+-                listing.createProvidedFileStatusIterator(
+-                    S3Guard.dirMetaToStatuses(meta), filter, acceptor);
+-            return (allowAuthoritative && meta != null
+-                && meta.isAuthoritative())
+-                ? listing.createLocatedFileStatusIterator(
+-                cachedFileStatusIterator)
+-                : listing.createLocatedFileStatusIterator(
+-                    listing.createFileStatusListingIterator(path,
+-                        createListObjectsRequest(key, "/"),
+-                        filter,
+-                        acceptor,
+-                        cachedFileStatusIterator));
+-          }
+-        });
++    RemoteIterator<? extends LocatedFileStatus> iterator =
++        once("listLocatedStatus", path.toString(),
++          () -> {
++            // lookup dir triggers existence check
++            final S3AFileStatus fileStatus =
++                (S3AFileStatus) getFileStatus(path);
++            if (fileStatus.isFile()) {
++              // simple case: File
++              LOG.debug("Path is a file");
++              return new Listing.SingleStatusRemoteIterator(
++                  filter.accept(path) ? toLocatedFileStatus(fileStatus) : null);
++            } else {
++              // directory: trigger a lookup
++              final String key = maybeAddTrailingSlash(pathToKey(path));
++              final Listing.FileStatusAcceptor acceptor =
++                  new Listing.AcceptAllButSelfAndS3nDirs(path);
++              DirListingMetadata meta =
++                  S3Guard.listChildrenWithTtl(metadataStore, path,
++                      ttlTimeProvider);
++              final RemoteIterator<S3AFileStatus> cachedFileStatusIterator =
++                  listing.createProvidedFileStatusIterator(
++                      S3Guard.dirMetaToStatuses(meta), filter, acceptor);
++              return (allowAuthoritative && meta != null
++                  && meta.isAuthoritative())
++                  ? listing.createLocatedFileStatusIterator(
++                  cachedFileStatusIterator)
++                  : listing.createLocatedFileStatusIterator(
++                      listing.createFileStatusListingIterator(path,
++                          createListObjectsRequest(key, "/"),
++                          filter,
++                          acceptor,
++                          cachedFileStatusIterator));
++            }
++          });
++    return toLocatedFileStatusIterator(iterator);
+-   * Build a {@link LocatedFileStatus} from a {@link FileStatus} instance.
++   * Build a {@link S3ALocatedFileStatus} from a {@link FileStatus} instance.
+-  LocatedFileStatus toLocatedFileStatus(FileStatus status)
++  S3ALocatedFileStatus toLocatedFileStatus(S3AFileStatus status)
+-    return new LocatedFileStatus(status,
++    return new S3ALocatedFileStatus(status,
+-          : null);
++          : null, status.getETag(), status.getVersionId());
+-    final FileStatus fileStatus = getFileStatus(path);
++    final S3AFileStatus fileStatus = (S3AFileStatus) getFileStatus(path);
++    S3ObjectAttributes objectAttributes = createObjectAttributes(
++        path, fileStatus.getETag(), fileStatus.getVersionId());
++    S3AReadOpContext readContext = createReadContext(fileStatus, inputPolicy,
++        changeDetectionPolicy, ra);
++
++    if (!fileStatus.isDirectory()) {
++      // check that the object metadata lines up with what is expected
++      // based on the object attributes (which may contain an eTag or
++      // versionId) from S3Guard
++      ChangeTracker changeTracker =
++          new ChangeTracker(uri.toString(),
++              changeDetectionPolicy,
++              readContext.instrumentation.newInputStreamStatistics()
++                  .getVersionMismatchCounter(),
++              objectAttributes);
++
++      // will retry internally if wrong version detected
++      Invoker readInvoker = readContext.getReadInvoker();
++      getObjectMetadata(path, changeTracker, readInvoker, "select");
++    }
++
+-        createReadContext(fileStatus, inputPolicy, changeDetectionPolicy, ra),
++        readContext,
+-        createObjectAttributes(path));
++        objectAttributes);

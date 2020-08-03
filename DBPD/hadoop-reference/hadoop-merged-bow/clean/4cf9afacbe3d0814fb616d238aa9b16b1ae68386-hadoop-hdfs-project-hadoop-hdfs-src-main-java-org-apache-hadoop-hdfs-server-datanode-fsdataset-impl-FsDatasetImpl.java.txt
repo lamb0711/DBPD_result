@@ -1,0 +1,133 @@
+HDFS-6960. Bugfix in LazyWriter, fix test case and some refactoring. (Arpit Agarwal)
+
++import org.apache.hadoop.hdfs.server.datanode.DatanodeUtil;
+-  static File copyBlockFiles(Block b, File srcfile, File destdir)
++  /**
++   * Copy the block and meta files for the given block from the given
++   * @return the new meta file.
++   * @throws IOException
++   */
++  static File copyBlockFiles(ReplicaInfo replicaInfo, File destRoot)
+-    final File dstfile = new File(destdir, b.getBlockName());
+-    final File srcmeta = FsDatasetUtil.getMetaFile(srcfile, b.getGenerationStamp());
+-    final File dstmeta = FsDatasetUtil.getMetaFile(dstfile, b.getGenerationStamp());
++    final File destDir = DatanodeUtil.idToBlockDir(destRoot, replicaInfo.getBlockId());
++    final File dstFile = new File(destDir, replicaInfo.getBlockName());
++    final File dstMeta = FsDatasetUtil.getMetaFile(dstFile, replicaInfo.getGenerationStamp());
++    final File srcMeta = replicaInfo.getMetaFile();
++    final File srcFile = replicaInfo.getBlockFile();
+-      FileUtils.copyFile(srcmeta, dstmeta);
++      FileUtils.copyFile(srcMeta, dstMeta);
+-      throw new IOException("Failed to copy meta file for " + b
+-          + " from " + srcmeta + " to " + dstmeta, e);
++      throw new IOException("Failed to copy " + srcMeta + " to " + dstMeta, e);
+-      FileUtils.copyFile(srcfile, dstfile);
++      FileUtils.copyFile(srcFile, dstFile);
+-      throw new IOException("Failed to copy block file for " + b
+-          + " from " + srcfile + " to " + dstfile.getAbsolutePath(), e);
++      throw new IOException("Failed to copy " + srcFile + " to " + dstFile, e);
+-      LOG.debug("addBlock: Moved " + srcmeta + " to " + dstmeta
+-          + " and " + srcfile + " to " + dstfile);
++      LOG.debug("addBlock: Moved " + srcMeta + " to " + dstMeta);
++      LOG.debug("addBlock: Moved " + srcFile + " to " + dstFile);
+-    return dstfile;
++    return dstMeta;
+-
+-        // Schedule a checkpoint.
+-        ((LazyWriter) lazyWriter.getRunnable())
+-            .addReplicaToLazyWriteQueue(bpid, replicaInfo.getBlockId());
+-  private static class BlockIdPair {
+-    final String bpid;
+-    final long blockId;
+-
+-    BlockIdPair(final String bpid, final long blockId) {
+-      this.bpid = bpid;
+-      this.blockId = blockId;
+-    }
+-  }
+-
+-  private class LazyWriter implements Runnable {
++  class LazyWriter implements Runnable {
+-    final private Queue<BlockIdPair> blocksPendingCheckpoint;
+-
+-      blocksPendingCheckpoint = new LinkedList<BlockIdPair>();
+-    }
+-
+-    // Schedule a replica for writing to persistent storage.
+-    public synchronized void addReplicaToLazyWriteQueue(
+-        String bpid, long blockId) {
+-      LOG.info("Block with blockId=" + blockId + "; bpid=" + bpid + " added to lazy writer queue");
+-      blocksPendingCheckpoint.add(new BlockIdPair(bpid, blockId));
+-      FsVolumeImpl targetVolume = null;
+-      Block block = null;
+-      File blockFile = null;
++      FsVolumeImpl targetVolume;
++      ReplicaInfo replicaInfo;
+-        block = getStoredBlock(bpid, blockId);
+-        blockFile = getFile(bpid, blockId);
++        replicaInfo = volumeMap.get(bpid, blockId);
+-        if (block == null) {
+-          // The block was deleted before it could be checkpointed.
++        if (replicaInfo == null || !replicaInfo.getVolume().isTransientStorage()) {
++          // The block was either deleted before it could be checkpointed or
++          // it is already on persistent storage. This can occur if a second
++          // replica on persistent storage was found after the lazy write was
++          // scheduled.
+-            StorageType.DEFAULT, block.getNumBytes());
++            StorageType.DEFAULT, replicaInfo.getNumBytes());
+-      LOG.info("LazyWriter starting to save blockId=" + blockId + "; bpid=" + bpid);
++      if (LOG.isDebugEnabled()) {
++        LOG.debug("LazyWriter starting to save blockId=" + blockId + "; bpid=" + bpid);
++      }
++
+-                                        .lazyPersistReplica(block, blockFile);
++                                        .lazyPersistReplica(replicaInfo);
+-      LOG.info("LazyWriter finished saving blockId=" + blockId + "; bpid=" + bpid +
+-          " to file " + savedBlockFile);
++
++      if (LOG.isDebugEnabled()) {
++        LOG.debug("LazyWriter finished saving blockId=" + blockId + "; bpid=" + bpid +
++                 " to file " + savedBlockFile);
++      }
++     * If we fail then move the replica to the end of the queue.
+-      BlockIdPair blockIdPair = null;
+-      int moreWorkThreshold = 0;
++      LazyWriteReplicaTracker.ReplicaState replicaState = null;
++      boolean succeeded = false;
+-          // Dequeue the next replica waiting to be checkpointed.
+-          blockIdPair = blocksPendingCheckpoint.poll();
+-          if (blockIdPair == null) {
+-            LOG.info("LazyWriter has no blocks to persist. " +
+-                "Thread going to sleep.");
++          replicaState = lazyWriteReplicaTracker.dequeueNextReplicaToPersist();
++          if (replicaState == null) {
+-        moveReplicaToNewVolume(blockIdPair.bpid, blockIdPair.blockId);
+-
++        moveReplicaToNewVolume(replicaState.bpid, replicaState.blockId);
++        succeeded = true;
+-        // If we failed, put the block on the queue and let a retry
+-        // interval elapse before we try again so we don't try to keep
+-        // checkpointing the same block in a tight loop.
+-        synchronized (this) {
+-          blocksPendingCheckpoint.add(blockIdPair);
+-          ++moreWorkThreshold;
++        LOG.warn("Exception saving replica " + replicaState, ioe);
++      } finally {
++        if (!succeeded && replicaState != null) {
++          lazyWriteReplicaTracker.reenqueueReplica(replicaState);
+-      synchronized (this) {
+-        return blocksPendingCheckpoint.size() > moreWorkThreshold;
+-      }
++      return succeeded;
++      int numSuccessiveFailures = 0;
++
+-          if (!saveNextReplica()) {
++          numSuccessiveFailures = saveNextReplica() ? 0 : (numSuccessiveFailures + 1);
++
++          // Sleep if we have no more work to do or if it looks like we are not
++          // making any forward progress. This is to ensure that if all persist
++          // operations are failing we don't keep retrying them in a tight loop.
++          if (numSuccessiveFailures == lazyWriteReplicaTracker.numReplicasNotPersisted()) {
++            numSuccessiveFailures = 0;
+
+INS26 INS40 INS29 MOV43 INS8 INS65 INS65 INS65 UPD43 UPD42 UPD42 INS60 MOV60 MOV60 INS60 INS60 MOV54 MOV54 MOV25 MOV41 INS66 INS66 INS42 UPD42 INS83 MOV43 INS59 MOV43 MOV43 MOV83 MOV43 INS59 INS83 MOV43 INS59 UPD42 INS25 INS25 INS54 INS41 INS60 INS42 INS32 UPD42 UPD42 UPD42 MOV42 INS32 INS42 INS32 MOV44 MOV44 INS21 INS21 UPD43 INS32 INS8 INS32 INS8 INS66 UPD43 UPD39 MOV8 INS12 INS8 INS42 INS39 INS59 INS42 INS42 INS42 MOV32 UPD42 UPD42 UPD42 MOV42 MOV42 UPD42 MOV42 UPD42 MOV42 INS32 INS32 UPD42 UPD42 INS42 INS42 MOV21 INS42 INS42 MOV21 INS40 UPD42 UPD42 INS9 INS21 MOV44 INS8 INS25 INS42 INS34 UPD42 UPD42 UPD42 UPD42 UPD42 UPD42 MOV42 MOV42 INS27 INS42 INS42 INS27 INS27 UPD42 INS7 MOV21 INS27 INS8 MOV43 MOV43 MOV45 UPD42 MOV42 MOV45 UPD42 MOV42 UPD45 MOV45 UPD42 MOV42 MOV45 UPD42 MOV42 UPD42 INS27 INS38 UPD42 UPD42 UPD40 UPD40 INS42 INS9 INS38 INS27 INS21 INS21 UPD45 UPD42 UPD42 UPD45 UPD42 INS42 INS42 UPD42 UPD42 MOV42 MOV33 INS32 UPD42 UPD42 INS27 INS42 UPD42 MOV42 INS42 INS33 INS32 INS7 INS27 INS32 INS42 UPD42 UPD42 UPD42 INS45 INS42 UPD42 MOV42 INS42 UPD42 MOV42 INS42 INS16 INS42 INS32 INS21 INS42 INS42 UPD42 UPD42 MOV32 INS34 INS36 INS42 INS42 INS7 INS27 INS42 INS34 INS42 INS34 DEL42 DEL44 DEL42 DEL45 DEL42 DEL45 DEL42 DEL42 DEL32 DEL27 DEL32 DEL21 DEL42 DEL32 DEL32 DEL59 DEL60 DEL8 DEL42 DEL43 DEL42 DEL42 DEL32 DEL11 DEL36 DEL42 DEL42 DEL32 DEL21 DEL83 DEL83 DEL42 DEL83 DEL42 DEL43 DEL42 DEL59 DEL23 DEL83 DEL39 DEL42 DEL59 DEL23 DEL42 DEL83 DEL42 DEL43 DEL42 DEL44 DEL83 DEL39 DEL42 DEL44 DEL52 DEL42 DEL22 DEL42 DEL7 DEL21 DEL52 DEL42 DEL22 DEL42 DEL7 DEL21 DEL8 DEL31 DEL55 DEL83 DEL83 DEL83 DEL42 DEL43 DEL42 DEL43 DEL74 DEL42 DEL59 DEL23 DEL42 DEL42 DEL43 DEL42 DEL43 DEL74 DEL14 DEL7 DEL21 DEL83 DEL83 DEL39 DEL42 DEL42 DEL43 DEL42 DEL44 DEL39 DEL42 DEL44 DEL42 DEL42 DEL45 DEL42 DEL45 DEL42 DEL45 DEL27 DEL32 DEL21 DEL42 DEL42 DEL42 DEL43 DEL42 DEL42 DEL14 DEL32 DEL21 DEL8 DEL31 DEL33 DEL33 DEL42 DEL33 DEL59 DEL60 DEL42 DEL42 DEL42 DEL42 DEL32 DEL7 DEL21 DEL27 DEL42 DEL42 DEL34 DEL42 DEL42 DEL45 DEL45 DEL27 DEL32 DEL21 DEL42 DEL52 DEL38 DEL21 DEL8 DEL51 DEL8 DEL12 DEL54 DEL52 DEL32 DEL42 DEL27 DEL41 DEL8 DEL51 DEL38

@@ -1,0 +1,300 @@
+svn merge --reintegrate https://svn.apache.org/repos/asf/hadoop/common/branches/HDFS-2832 for merging Heterogeneous Storage feature branch
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/trunk@1550363 13f79535-47bb-0310-9956-ffa450edef68
+
+-import java.net.URI;
++import org.apache.hadoop.hdfs.StorageType;
+-import org.apache.hadoop.util.StringUtils;
+-  private final Map<Long, ReceivedDeletedBlockInfo> pendingIncrementalBR 
+-    = Maps.newHashMap();
+-  
++  private final Map<String, PerStoragePendingIncrementalBR>
++      pendingIncrementalBRperStorage = Maps.newHashMap();
++
+-  void reportBadBlocks(ExtendedBlock block) {
++  void reportBadBlocks(ExtendedBlock block,
++      String storageUuid, StorageType storageType) {
+-    LocatedBlock[] blocks = { new LocatedBlock(block, dnArr) }; 
++    String[] uuids = { storageUuid };
++    StorageType[] types = { storageType };
++    LocatedBlock[] blocks = { new LocatedBlock(block, dnArr, uuids, types) };
+-   * Report received blocks and delete hints to the Namenode
+-   * 
++   * Report received blocks and delete hints to the Namenode for each
++   * storage.
++   *
+-    // check if there are newly received blocks
+-    ReceivedDeletedBlockInfo[] receivedAndDeletedBlockArray = null;
+-    synchronized (pendingIncrementalBR) {
+-      int numBlocks = pendingIncrementalBR.size();
+-      if (numBlocks > 0) {
+-        //
+-        // Send newly-received and deleted blockids to namenode
+-        //
+-        receivedAndDeletedBlockArray = pendingIncrementalBR
+-            .values().toArray(new ReceivedDeletedBlockInfo[numBlocks]);
+-      }
+-      pendingIncrementalBR.clear();
+-    }
+-    if (receivedAndDeletedBlockArray != null) {
+-      StorageReceivedDeletedBlocks[] report = { new StorageReceivedDeletedBlocks(
+-          bpRegistration.getStorageID(), receivedAndDeletedBlockArray) };
+-      boolean success = false;
+-      try {
+-        bpNamenode.blockReceivedAndDeleted(bpRegistration, bpos.getBlockPoolId(),
+-            report);
+-        success = true;
+-      } finally {
+-        synchronized (pendingIncrementalBR) {
+-          if (!success) {
+-            // If we didn't succeed in sending the report, put all of the
+-            // blocks back onto our queue, but only in the case where we didn't
+-            // put something newer in the meantime.
+-            for (ReceivedDeletedBlockInfo rdbi : receivedAndDeletedBlockArray) {
+-              if (!pendingIncrementalBR.containsKey(rdbi.getBlock().getBlockId())) {
+-                pendingIncrementalBR.put(rdbi.getBlock().getBlockId(), rdbi);
+-              }
+-            }
+-          }
+-          pendingReceivedRequests = pendingIncrementalBR.size();
++    // Generate a list of the pending reports for each storage under the lock
++    Map<String, ReceivedDeletedBlockInfo[]> blockArrays = Maps.newHashMap();
++    synchronized (pendingIncrementalBRperStorage) {
++      for (Map.Entry<String, PerStoragePendingIncrementalBR> entry :
++           pendingIncrementalBRperStorage.entrySet()) {
++        final String storageUuid = entry.getKey();
++        final PerStoragePendingIncrementalBR perStorageMap = entry.getValue();
++
++        if (perStorageMap.getBlockInfoCount() > 0) {
++          // Send newly-received and deleted blockids to namenode
++          ReceivedDeletedBlockInfo[] rdbi = perStorageMap.dequeueBlockInfos();
++          pendingReceivedRequests =
++              (pendingReceivedRequests > rdbi.length ?
++                  (pendingReceivedRequests - rdbi.length) : 0);
++          blockArrays.put(storageUuid, rdbi);
++
++    // Send incremental block reports to the Namenode outside the lock
++    for (Map.Entry<String, ReceivedDeletedBlockInfo[]> entry :
++         blockArrays.entrySet()) {
++      final String storageUuid = entry.getKey();
++      final ReceivedDeletedBlockInfo[] rdbi = entry.getValue();
++
++      StorageReceivedDeletedBlocks[] report = { new StorageReceivedDeletedBlocks(
++          storageUuid, rdbi) };
++      boolean success = false;
++      try {
++        bpNamenode.blockReceivedAndDeleted(bpRegistration,
++            bpos.getBlockPoolId(), report);
++        success = true;
++      } finally {
++        if (!success) {
++          synchronized (pendingIncrementalBRperStorage) {
++            // If we didn't succeed in sending the report, put all of the
++            // blocks back onto our queue, but only in the case where we
++            // didn't put something newer in the meantime.
++            PerStoragePendingIncrementalBR perStorageMap =
++                pendingIncrementalBRperStorage.get(storageUuid);
++            pendingReceivedRequests += perStorageMap.putMissingBlockInfos(rdbi);
++          }
++        }
++      }
++    }
++  }
++
++  /**
++   * Retrieve the incremental BR state for a given storage UUID
++   * @param storageUuid
++   * @return
++   */
++  private PerStoragePendingIncrementalBR getIncrementalBRMapForStorage(
++      String storageUuid) {
++    PerStoragePendingIncrementalBR mapForStorage =
++        pendingIncrementalBRperStorage.get(storageUuid);
++
++    if (mapForStorage == null) {
++      // This is the first time we are adding incremental BR state for
++      // this storage so create a new map. This is required once per
++      // storage, per service actor.
++      mapForStorage = new PerStoragePendingIncrementalBR();
++      pendingIncrementalBRperStorage.put(storageUuid, mapForStorage);
++    }
++
++    return mapForStorage;
++  }
++
++  /**
++   * Add a blockInfo for notification to NameNode. If another entry
++   * exists for the same block it is removed.
++   *
++   * Caller must synchronize access using pendingIncrementalBRperStorage.
++   * @param bInfo
++   * @param storageUuid
++   */
++  void addPendingReplicationBlockInfo(ReceivedDeletedBlockInfo bInfo,
++      String storageUuid) {
++    // Make sure another entry for the same block is first removed.
++    // There may only be one such entry.
++    for (Map.Entry<String, PerStoragePendingIncrementalBR> entry :
++          pendingIncrementalBRperStorage.entrySet()) {
++      if (entry.getValue().removeBlockInfo(bInfo)) {
++        break;
++      }
++    }
++    getIncrementalBRMapForStorage(storageUuid).putBlockInfo(bInfo);
+-  void notifyNamenodeBlockImmediately(ReceivedDeletedBlockInfo bInfo) {
+-    synchronized (pendingIncrementalBR) {
+-      pendingIncrementalBR.put(
+-          bInfo.getBlock().getBlockId(), bInfo);
++  void notifyNamenodeBlockImmediately(
++      ReceivedDeletedBlockInfo bInfo, String storageUuid) {
++    synchronized (pendingIncrementalBRperStorage) {
++      addPendingReplicationBlockInfo(bInfo, storageUuid);
+-      pendingIncrementalBR.notifyAll();
++      pendingIncrementalBRperStorage.notifyAll();
+-  void notifyNamenodeDeletedBlock(ReceivedDeletedBlockInfo bInfo) {
+-    synchronized (pendingIncrementalBR) {
+-      pendingIncrementalBR.put(
+-          bInfo.getBlock().getBlockId(), bInfo);
++  void notifyNamenodeDeletedBlock(
++      ReceivedDeletedBlockInfo bInfo, String storageUuid) {
++    synchronized (pendingIncrementalBRperStorage) {
++      addPendingReplicationBlockInfo(bInfo, storageUuid);
+-    synchronized (pendingIncrementalBR) {
++    synchronized (pendingIncrementalBRperStorage) {
+-      pendingIncrementalBR.notifyAll();
++      pendingIncrementalBRperStorage.notifyAll();
+-          pendingIncrementalBR.wait(100);
++          pendingIncrementalBRperStorage.wait(100);
+-    synchronized (pendingIncrementalBR) {
++    synchronized (pendingIncrementalBRperStorage) {
+-      pendingIncrementalBR.notifyAll();
++      pendingIncrementalBRperStorage.notifyAll();
+-          pendingIncrementalBR.wait(100);
++          pendingIncrementalBRperStorage.wait(100);
+-    synchronized (pendingIncrementalBR) {
++    synchronized (pendingIncrementalBRperStorage) {
+-      pendingIncrementalBR.notifyAll();
++      pendingIncrementalBRperStorage.notifyAll();
+-          pendingIncrementalBR.wait(100);
++          pendingIncrementalBRperStorage.wait(100);
++      // Send one block report per known storage.
++
+-      BlockListAsLongs bReport = dn.getFSDataset().getBlockReport(
+-          bpos.getBlockPoolId());
++      long totalBlockCount = 0;
++
++      Map<DatanodeStorage, BlockListAsLongs> perVolumeBlockLists =
++          dn.getFSDataset().getBlockReports(bpos.getBlockPoolId());
+-      StorageBlockReport[] report = { new StorageBlockReport(
+-          new DatanodeStorage(bpRegistration.getStorageID()),
+-          bReport.getBlockListAsLongs()) };
+-      cmd = bpNamenode.blockReport(bpRegistration, bpos.getBlockPoolId(), report);
++      StorageBlockReport[] reports =
++          new StorageBlockReport[perVolumeBlockLists.size()];
++
++      int i = 0;
++      for(Map.Entry<DatanodeStorage, BlockListAsLongs> kvPair : perVolumeBlockLists.entrySet()) {
++        DatanodeStorage dnStorage = kvPair.getKey();
++        BlockListAsLongs blockList = kvPair.getValue();
++        totalBlockCount += blockList.getNumberOfBlocks();
++
++        reports[i++] =
++            new StorageBlockReport(
++              dnStorage, blockList.getBlockListAsLongs());
++      }
++
++      cmd = bpNamenode.blockReport(bpRegistration, bpos.getBlockPoolId(), reports);
+-      LOG.info("BlockReport of " + bReport.getNumberOfBlocks()
++      LOG.info("BlockReport of " + totalBlockCount
++    StorageReport[] reports =
++        dn.getFSDataset().getStorageReports(bpos.getBlockPoolId());
+-      LOG.debug("Sending heartbeat from service actor: " + this);
++      LOG.debug("Sending heartbeat with " + reports.length +
++                " storage reports from service actor: " + this);
+-    // reports number of failed volumes
+-    StorageReport[] report = { new StorageReport(bpRegistration.getStorageID(),
+-        false,
+-        dn.getFSDataset().getCapacity(),
+-        dn.getFSDataset().getDfsUsed(),
+-        dn.getFSDataset().getRemaining(),
+-        dn.getFSDataset().getBlockPoolUsed(bpos.getBlockPoolId())) };
+-    return bpNamenode.sendHeartbeat(bpRegistration, report,
++
++    return bpNamenode.sendHeartbeat(bpRegistration,
++        reports,
+-    Collection<URI> dataDirs = DataNode.getStorageDirs(dn.getConf());
+-    return "DataNode: [" +
+-      StringUtils.uriToString(dataDirs.toArray(new URI[0])) + "] " +
++    Collection<StorageLocation> dataDirs =
++        DataNode.getStorageLocations(dn.getConf());
++    return "DataNode: [" + dataDirs.toString() + "] " +
+-        synchronized(pendingIncrementalBR) {
++        synchronized(pendingIncrementalBRperStorage) {
+-              pendingIncrementalBR.wait(waitTime);
++              pendingIncrementalBRperStorage.wait(waitTime);
++  private static class PerStoragePendingIncrementalBR {
++    private Map<Long, ReceivedDeletedBlockInfo> pendingIncrementalBR =
++        Maps.newHashMap();
++
++    /**
++     * Return the number of blocks on this storage that have pending
++     * incremental block reports.
++     * @return
++     */
++    int getBlockInfoCount() {
++      return pendingIncrementalBR.size();
++    }
++
++    /**
++     * Dequeue and return all pending incremental block report state.
++     * @return
++     */
++    ReceivedDeletedBlockInfo[] dequeueBlockInfos() {
++      ReceivedDeletedBlockInfo[] blockInfos =
++          pendingIncrementalBR.values().toArray(
++              new ReceivedDeletedBlockInfo[getBlockInfoCount()]);
++
++      pendingIncrementalBR.clear();
++      return blockInfos;
++    }
++
++    /**
++     * Add blocks from blockArray to pendingIncrementalBR, unless the
++     * block already exists in pendingIncrementalBR.
++     * @param blockArray list of blocks to add.
++     * @return the number of missing blocks that we added.
++     */
++    int putMissingBlockInfos(ReceivedDeletedBlockInfo[] blockArray) {
++      int blocksPut = 0;
++      for (ReceivedDeletedBlockInfo rdbi : blockArray) {
++        if (!pendingIncrementalBR.containsKey(rdbi.getBlock().getBlockId())) {
++          pendingIncrementalBR.put(rdbi.getBlock().getBlockId(), rdbi);
++          ++blocksPut;
++        }
++      }
++      return blocksPut;
++    }
++
++    /**
++     * Add pending incremental block report for a single block.
++     * @param blockID
++     * @param blockInfo
++     */
++    void putBlockInfo(ReceivedDeletedBlockInfo blockInfo) {
++      pendingIncrementalBR.put(blockInfo.getBlock().getBlockId(), blockInfo);
++    }
++
++    /**
++     * Remove pending incremental block report for a single block if it
++     * exists.
++     *
++     * @param blockInfo
++     * @return true if a report was removed, false if no report existed for
++     *         the given block.
++     */
++    boolean removeBlockInfo(ReceivedDeletedBlockInfo blockInfo) {
++      return (pendingIncrementalBR.remove(blockInfo.getBlock().getBlockId()) != null);
++    }
++  }
+
+MOV26 MOV31 MOV31 UPD40 INS23 INS31 INS31 INS31 INS55 MOV29 INS83 INS83 INS74 INS59 INS44 INS44 INS29 INS83 INS43 INS42 INS44 INS8 INS29 INS39 INS42 INS44 INS44 INS8 INS44 MOV39 MOV42 MOV44 INS44 INS8 MOV29 MOV78 UPD42 MOV78 UPD42 INS83 INS83 INS42 MOV23 INS31 INS31 INS31 INS31 INS31 INS43 INS43 INS43 INS42 INS32 INS43 INS42 INS43 INS42 INS60 INS60 INS70 INS65 INS65 INS65 INS42 INS43 INS42 INS60 INS25 INS41 INS65 INS65 INS65 INS43 INS42 INS43 INS42 INS70 INS21 INS43 INS42 INS43 INS42 INS51 INS60 INS29 INS39 INS42 INS8 INS29 INS5 INS42 INS8 INS29 INS39 INS42 INS44 MOV8 INS29 INS39 INS42 INS44 INS8 INS29 INS39 INS42 INS44 INS8 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS5 INS59 INS5 INS59 UPD66 INS66 INS74 UPD42 INS8 INS44 INS32 INS8 INS66 INS42 INS42 INS43 INS59 INS27 INS8 INS42 INS66 INS66 INS66 INS42 INS42 INS42 INS42 INS44 INS32 INS8 INS32 INS42 UPD42 INS42 UPD42 MOV42 INS8 UPD42 UPD42 UPD42 MOV5 INS59 UPD74 INS65 INS65 INS41 INS65 INS65 INS43 INS85 INS60 MOV21 INS41 INS65 INS65 INS65 INS5 INS42 INS60 INS41 INS65 INS65 INS65 INS43 INS42 MOV21 INS65 INS65 INS65 INS43 INS42 INS41 INS43 INS85 INS42 INS4 INS43 INS85 INS42 INS4 INS43 INS43 INS5 UPD42 INS32 INS70 INS74 INS42 INS42 INS42 INS60 INS60 MOV60 MOV60 MOV54 INS42 INS42 INS32 INS42 INS33 INS21 INS21 INS74 INS42 INS42 INS42 INS25 INS32 INS42 INS42 INS21 MOV21 MOV21 MOV21 INS60 INS60 INS60 INS70 INS42 INS32 UPD42 UPD43 INS32 INS66 INS66 MOV32 INS66 INS42 MOV5 INS59 INS42 INS66 INS66 INS42 INS66 INS66 INS43 INS85 INS39 INS59 UPD42 INS42 INS66 INS42 INS42 INS42 INS66 INS66 INS42 INS66 INS66 INS42 INS36 INS42 INS42 INS42 INS42 INS42 INS42 INS43 INS85 INS42 INS42 INS44 INS32 INS8 INS43 INS43 INS5 INS83 INS43 INS59 INS83 INS5 INS59 INS8 INS42 INS42 INS42 INS7 INS32 INS43 INS43 INS43 INS32 INS8 INS42 INS42 INS32 MOV27 MOV27 INS39 INS59 INS74 MOV5 INS59 INS39 INS59 INS44 INS32 INS8 MOV32 INS42 MOV32 UPD42 UPD42 MOV42 UPD42 MOV42 INS42 INS32 INS42 INS42 INS34 UPD42 INS27 INS42 INS42 INS42 INS74 INS42 INS42 INS42 INS60 MOV60 MOV25 INS40 INS42 INS43 INS85 INS42 INS42 INS32 INS43 INS85 INS42 INS32 INS25 INS42 INS14 INS42 INS42 INS42 INS42 INS40 INS42 INS42 INS32 INS42 INS42 INS10 UPD42 MOV42 UPD42 MOV42 UPD42 INS42 INS42 INS42 UPD42 UPD42 UPD42 INS42 INS34 INS43 INS43 INS43 UPD42 UPD42 MOV42 INS3 INS42 INS34 INS74 INS42 INS42 INS42 INS60 INS60 INS21 INS21 MOV32 INS42 INS3 INS32 INS33 INS43 INS43 INS43 INS83 INS43 INS59 INS83 INS43 INS42 INS42 INS42 INS42 INS42 INS42 MOV38 INS8 INS43 INS42 INS42 INS42 INS42 INS42 MOV32 UPD42 MOV32 INS5 INS32 INS43 INS43 INS43 MOV43 INS59 MOV43 INS59 INS7 INS7 UPD42 INS42 UPD45 INS40 INS45 UPD42 INS5 INS32 INS21 UPD42 INS42 INS42 INS32 INS40 INS42 INS42 INS42 INS42 INS32 INS42 UPD42 INS32 INS60 INS21 INS42 UPD42 MOV51 INS42 MOV42 INS43 INS85 INS42 INS42 INS40 INS42 INS42 INS42 INS32 INS42 INS32 INS42 INS32 INS2 INS14 INS43 INS85 INS42 INS38 INS32 INS42 INS42 INS42 UPD42 UPD42 INS42 INS42 MOV5 INS59 INS32 UPD42 INS42 INS42 INS42 INS42 INS42 UPD42 MOV42 UPD42 MOV42 INS42 INS37 MOV43 INS42 MOV32 INS42 INS42 INS42 INS42 INS42 INS32 UPD42 INS36 INS42 INS42 INS42 INS42 INS60 UPD42 UPD42 UPD42 INS42 UPD42 INS42 INS42 INS16 INS43 INS59 UPD7 INS27 INS36 INS34 INS42 INS42 INS32 INS32 INS42 INS40 INS27 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS40 UPD42 DEL40 DEL26 DEL33 DEL39 DEL42 DEL42 DEL42 DEL3 DEL32 DEL8 DEL42 DEL42 DEL32 DEL25 DEL8 DEL42 DEL33 DEL27 DEL8 DEL25 DEL42 DEL42 DEL32 DEL32 DEL42 DEL8 DEL51 DEL8 DEL31 DEL32 DEL14 DEL14 DEL4 DEL59 DEL60 DEL42 DEL42 DEL32 DEL42 DEL42 DEL43 DEL42 DEL42 DEL32 DEL9 DEL42 DEL32 DEL42 DEL42 DEL32 DEL42 DEL32 DEL42 DEL42 DEL32 DEL42 DEL32 DEL42 DEL32 DEL14 DEL4 DEL59 DEL60 DEL42 DEL42 DEL42 DEL43 DEL85 DEL5 DEL34 DEL3 DEL32 DEL32 DEL83

@@ -1,0 +1,333 @@
+MAPREDUCE-434. LocalJobRunner limited to single reducer (Sandy Ryza and Aaron Kimball via Sandy Ryza)
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/trunk@1510866 13f79535-47bb-0310-9956-ffa450edef68
+
++  /** The maximum number of reduce tasks to run in parallel in LocalJobRunner */
++  public static final String LOCAL_MAX_REDUCES =
++    "mapreduce.local.reduce.tasks.maximum";
++
+-  private int reduce_tasks = 0;
++  private AtomicInteger reduce_tasks = new AtomicInteger(0);
++    private int numReduceTasks;
++    private float [] partialReduceProgress;
+-    private Counters reduceCounters;
++    private Counters [] reduceCounters;
++    protected abstract class RunnableWithThrowable implements Runnable {
++      public volatile Throwable storedException;
++    }
++
+-    protected class MapTaskRunnable implements Runnable {
++    protected class MapTaskRunnable extends RunnableWithThrowable {
+-      public volatile Throwable storedException;
+-
+-    protected List<MapTaskRunnable> getMapTaskRunnables(
++    protected List<RunnableWithThrowable> getMapTaskRunnables(
+-      ArrayList<MapTaskRunnable> list = new ArrayList<MapTaskRunnable>();
++      ArrayList<RunnableWithThrowable> list =
++          new ArrayList<RunnableWithThrowable>();
++    protected class ReduceTaskRunnable extends RunnableWithThrowable {
++      private final int taskId;
++      private final JobID jobId;
++      private final JobConf localConf;
++
++      // This is a reference to a shared object passed in by the
++      // external context; this delivers state to the reducers regarding
++      // where to fetch mapper outputs.
++      private final Map<TaskAttemptID, MapOutputFile> mapOutputFiles;
++
++      public ReduceTaskRunnable(int taskId, JobID jobId,
++          Map<TaskAttemptID, MapOutputFile> mapOutputFiles) {
++        this.taskId = taskId;
++        this.jobId = jobId;
++        this.mapOutputFiles = mapOutputFiles;
++        this.localConf = new JobConf(job);
++        this.localConf.set("mapreduce.jobtracker.address", "local");
++      }
++
++      public void run() {
++        try {
++          TaskAttemptID reduceId = new TaskAttemptID(new TaskID(
++              jobId, TaskType.REDUCE, taskId), 0);
++          LOG.info("Starting task: " + reduceId);
++
++          ReduceTask reduce = new ReduceTask(systemJobFile.toString(),
++              reduceId, taskId, mapIds.size(), 1);
++          reduce.setUser(UserGroupInformation.getCurrentUser().
++              getShortUserName());
++          setupChildMapredLocalDirs(localJobDir, reduce, localConf);
++          reduce.setLocalMapFiles(mapOutputFiles);
++
++          if (!Job.this.isInterrupted()) {
++            reduce.setJobFile(localJobFile.toString());
++            localConf.setUser(reduce.getUser());
++            reduce.localizeConfiguration(localConf);
++            reduce.setConf(localConf);
++            try {
++              reduce_tasks.getAndIncrement();
++              myMetrics.launchReduce(reduce.getTaskID());
++              reduce.run(localConf, Job.this);
++              myMetrics.completeReduce(reduce.getTaskID());
++            } finally {
++              reduce_tasks.getAndDecrement();
++            }
++
++            LOG.info("Finishing task: " + reduceId);
++          } else {
++            throw new InterruptedException();
++          }
++        } catch (Throwable t) {
++          // store this to be rethrown in the initial thread context.
++          this.storedException = t;
++        }
++      }
++    }
++
++    /**
++     * Create Runnables to encapsulate reduce tasks for use by the executor
++     * service.
++     * @param jobId the job id
++     * @param mapOutputFiles a mapping from task attempts to output files
++     * @return a List of Runnables, one per reduce task.
++     */
++    protected List<RunnableWithThrowable> getReduceTaskRunnables(
++        JobID jobId, Map<TaskAttemptID, MapOutputFile> mapOutputFiles) {
++
++      int taskId = 0;
++      ArrayList<RunnableWithThrowable> list =
++          new ArrayList<RunnableWithThrowable>();
++      for (int i = 0; i < this.numReduceTasks; i++) {
++        list.add(new ReduceTaskRunnable(taskId++, jobId, mapOutputFiles));
++      }
++
++      return list;
++    }
++
+-    private synchronized void initCounters(int numMaps) {
++    private synchronized void initCounters(int numMaps, int numReduces) {
+-      this.reduceCounters = new Counters();
++      this.partialReduceProgress = new float[numReduces];
++      this.reduceCounters = new Counters[numReduces];
++      for (int i = 0; i < numReduces; i++) {
++        this.reduceCounters[i] = new Counters();
++      }
++
++      this.numMapTasks = numMaps;
++      this.numReduceTasks = numReduces;
+-     * @param numMapTasks the total number of map tasks to be run
+-    protected ExecutorService createMapExecutor(int numMapTasks) {
++    protected synchronized ExecutorService createMapExecutor() {
+-      this.numMapTasks = numMapTasks;
+-      initCounters(this.numMapTasks);
+-
+-      LOG.debug("Starting thread pool executor.");
++      LOG.debug("Starting mapper thread pool executor.");
++    
++    /**
++     * Creates the executor service used to run reduce tasks.
++     *
++     * @return an ExecutorService instance that handles reduce tasks
++     */
++    protected synchronized ExecutorService createReduceExecutor() {
++
++      // Determine the size of the thread pool to use
++      int maxReduceThreads = job.getInt(LOCAL_MAX_REDUCES, 1);
++      if (maxReduceThreads < 1) {
++        throw new IllegalArgumentException(
++            "Configured " + LOCAL_MAX_REDUCES + " must be >= 1");
++      }
++      maxReduceThreads = Math.min(maxReduceThreads, this.numReduceTasks);
++      maxReduceThreads = Math.max(maxReduceThreads, 1); // In case of no tasks.
++
++      LOG.debug("Starting reduce thread pool executor.");
++      LOG.debug("Max local threads: " + maxReduceThreads);
++      LOG.debug("Reduce tasks to process: " + this.numReduceTasks);
++
++      // Create a new executor service to drain the work queue.
++      ExecutorService executor = Executors.newFixedThreadPool(maxReduceThreads);
++
++      return executor;
++    }
++
++    /** Run a set of tasks and waits for them to complete. */
++    private void runTasks(List<RunnableWithThrowable> runnables,
++        ExecutorService service, String taskType) throws Exception {
++      // Start populating the executor with work units.
++      // They may begin running immediately (in other threads).
++      for (Runnable r : runnables) {
++        service.submit(r);
++      }
++
++      try {
++        service.shutdown(); // Instructs queue to drain.
++
++        // Wait for tasks to finish; do not use a time-based timeout.
++        // (See http://bugs.sun.com/bugdatabase/view_bug.do?bug_id=6179024)
++        LOG.info("Waiting for " + taskType + " tasks");
++        service.awaitTermination(Long.MAX_VALUE, TimeUnit.NANOSECONDS);
++      } catch (InterruptedException ie) {
++        // Cancel all threads.
++        service.shutdownNow();
++        throw ie;
++      }
++
++      LOG.info(taskType + " task executor complete.");
++
++      // After waiting for the tasks to complete, if any of these
++      // have thrown an exception, rethrow it now in the main thread context.
++      for (RunnableWithThrowable r : runnables) {
++        if (r.storedException != null) {
++          throw new Exception(r.storedException);
++        }
++      }
++    }
+-        if (numReduceTasks > 1 || numReduceTasks < 0) {
+-          // we only allow 0 or 1 reducer in local mode
+-          numReduceTasks = 1;
+-          job.setNumReduceTasks(1);
+-        }
++        
++        List<RunnableWithThrowable> mapRunnables = getMapTaskRunnables(
++            taskSplitMetaInfos, jobId, mapOutputFiles);
++              
++        initCounters(mapRunnables.size(), numReduceTasks);
++        ExecutorService mapService = createMapExecutor();
++        runTasks(mapRunnables, mapService, "map");
+-        List<MapTaskRunnable> taskRunnables = getMapTaskRunnables(taskSplitMetaInfos,
+-            jobId, mapOutputFiles);
+-        ExecutorService mapService = createMapExecutor(taskRunnables.size());
+-
+-        // Start populating the executor with work units.
+-        // They may begin running immediately (in other threads).
+-        for (Runnable r : taskRunnables) {
+-          mapService.submit(r);
+-        }
+-
+-        try {
+-          mapService.shutdown(); // Instructs queue to drain.
+-
+-          // Wait for tasks to finish; do not use a time-based timeout.
+-          // (See http://bugs.sun.com/bugdatabase/view_bug.do?bug_id=6179024)
+-          LOG.info("Waiting for map tasks");
+-          mapService.awaitTermination(Long.MAX_VALUE, TimeUnit.NANOSECONDS);
+-        } catch (InterruptedException ie) {
+-          // Cancel all threads.
+-          mapService.shutdownNow();
+-          throw ie;
+-        }
+-
+-        LOG.info("Map task executor complete.");
+-
+-        // After waiting for the map tasks to complete, if any of these
+-        // have thrown an exception, rethrow it now in the main thread context.
+-        for (MapTaskRunnable r : taskRunnables) {
+-          if (r.storedException != null) {
+-            throw new Exception(r.storedException);
+-          }
+-        }
+-
+-        TaskAttemptID reduceId =
+-          new TaskAttemptID(new TaskID(jobId, TaskType.REDUCE, 0), 0);
+-            ReduceTask reduce = new ReduceTask(systemJobFile.toString(), 
+-                reduceId, 0, mapIds.size(), 1);
+-            reduce.setUser(UserGroupInformation.getCurrentUser().
+-                getShortUserName());
+-            JobConf localConf = new JobConf(job);
+-            localConf.set("mapreduce.jobtracker.address", "local");
+-            setupChildMapredLocalDirs(localJobDir, reduce, localConf);
+-            // move map output to reduce input  
+-            for (int i = 0; i < mapIds.size(); i++) {
+-              if (!this.isInterrupted()) {
+-                TaskAttemptID mapId = mapIds.get(i);
+-                Path mapOut = mapOutputFiles.get(mapId).getOutputFile();
+-                MapOutputFile localOutputFile = new MROutputFiles();
+-                localOutputFile.setConf(localConf);
+-                Path reduceIn =
+-                  localOutputFile.getInputFileForWrite(mapId.getTaskID(),
+-                        localFs.getFileStatus(mapOut).getLen());
+-                if (!localFs.mkdirs(reduceIn.getParent())) {
+-                  throw new IOException("Mkdirs failed to create "
+-                      + reduceIn.getParent().toString());
+-                }
+-                if (!localFs.rename(mapOut, reduceIn))
+-                  throw new IOException("Couldn't rename " + mapOut);
+-              } else {
+-                throw new InterruptedException();
+-              }
+-            }
+-            if (!this.isInterrupted()) {
+-              reduce.setJobFile(localJobFile.toString());
+-              localConf.setUser(reduce.getUser());
+-              reduce.localizeConfiguration(localConf);
+-              reduce.setConf(localConf);
+-              reduce_tasks += 1;
+-              myMetrics.launchReduce(reduce.getTaskID());
+-              reduce.run(localConf, this);
+-              myMetrics.completeReduce(reduce.getTaskID());
+-              reduce_tasks -= 1;
+-            } else {
+-              throw new InterruptedException();
+-            }
++            List<RunnableWithThrowable> reduceRunnables = getReduceTaskRunnables(
++                jobId, mapOutputFiles);
++            ExecutorService reduceService = createReduceExecutor();
++            runTasks(reduceRunnables, reduceService, "reduce");
+-
+-      int taskIndex = mapIds.indexOf(taskId);
+-      if (taskIndex >= 0) {                       // mapping
++      int mapTaskIndex = mapIds.indexOf(taskId);
++      if (mapTaskIndex >= 0) {
++        // mapping
+-        partialMapProgress[taskIndex] = taskStatus.getProgress();
+-        mapCounters[taskIndex] = taskStatus.getCounters();
++        partialMapProgress[mapTaskIndex] = taskStatus.getProgress();
++        mapCounters[mapTaskIndex] = taskStatus.getCounters();
+-        reduceCounters = taskStatus.getCounters();
+-        status.setReduceProgress(taskStatus.getProgress());
++        // reducing
++        int reduceTaskIndex = taskId.getTaskID().getId();
++        float numTasks = (float) this.numReduceTasks;
++
++        partialReduceProgress[reduceTaskIndex] = taskStatus.getProgress();
++        reduceCounters[reduceTaskIndex] = taskStatus.getCounters();
++
++        float partialProgress = 0.0f;
++        for (float f : partialReduceProgress) {
++          partialProgress += f;
++        }
++        status.setReduceProgress(partialProgress / numTasks);
+-      current = Counters.sum(current, reduceCounters);
++
++      if (null != reduceCounters && reduceCounters.length > 0) {
++        for (Counters c : reduceCounters) {
++          current = Counters.sum(current, c);
++        }
++      }
++
+-    return new ClusterMetrics(numMapTasks, reduce_tasks, numMapTasks,
+-        reduce_tasks, 0, 0, 1, 1, jobs.size(), 1, 0, 0);
++    int numReduceTasks = reduce_tasks.get();
++    return new ClusterMetrics(numMapTasks, numReduceTasks, numMapTasks,
++        numReduceTasks, 0, 0, 1, 1, jobs.size(), 1, 0, 0);
++
++  /**
++   * Set the max number of reduce tasks to run concurrently in the LocalJobRunner.
++   * @param job the job to configure
++   * @param maxReduces the maximum number of reduce tasks to allow.
++   */
++  public static void setLocalMaxRunningReduces(
++      org.apache.hadoop.mapreduce.JobContext job,
++      int maxReduces) {
++    job.getConfiguration().setInt(LOCAL_MAX_REDUCES, maxReduces);
++  }
++
++  /**
++   * @return the max number of reduce tasks to run concurrently in the
++   * LocalJobRunner.
++   */
++  public static int getLocalMaxRunningReduces(
++      org.apache.hadoop.mapreduce.JobContext job) {
++    return job.getConfiguration().getInt(LOCAL_MAX_REDUCES, 1);
++  }
++
+
+INS23 INS31 INS31 INS29 INS83 INS83 INS83 INS43 INS59 INS43 INS23 INS23 INS55 INS55 INS31 INS31 INS31 INS29 INS83 INS83 INS39 INS42 INS44 INS44 INS8 INS29 INS83 INS83 INS39 INS42 INS44 INS8 INS65 INS42 INS42 INS45 INS42 INS14 INS83 INS39 INS59 INS83 INS5 INS59 INS5 INS83 INS83 INS42 MOV43 MOV23 INS43 UPD74 INS83 INS42 INS43 INS23 INS23 INS23 INS23 INS31 INS31 INS29 INS83 UPD74 MOV74 INS42 INS44 INS44 INS8 INS44 INS83 INS29 INS83 INS83 INS43 INS42 INS8 INS29 INS83 INS39 INS42 INS44 INS44 INS44 INS43 INS8 INS60 INS65 INS65 INS65 INS43 INS42 INS39 INS42 INS21 INS65 INS43 INS42 INS41 INS66 INS43 INS34 INS42 INS39 INS85 INS42 MOV43 INS85 INS42 UPD43 INS42 INS83 INS83 INS39 INS59 INS83 INS83 INS43 INS59 INS83 INS83 INS43 INS59 INS83 INS83 INS74 INS59 INS83 INS42 INS44 INS44 INS44 INS8 INS83 INS39 INS42 MOV8 INS65 INS65 INS65 INS65 UPD43 INS43 INS42 INS74 INS42 INS60 INS60 INS24 INS41 INS39 INS42 INS21 INS21 INS24 INS21 INS21 INS65 INS65 INS42 INS60 INS25 INS21 INS21 INS21 INS21 INS21 INS60 INS41 INS65 INS74 INS42 INS43 INS42 INS43 INS42 INS42 INS70 INS54 INS21 MOV70 INS25 INS39 INS59 INS66 INS42 INS66 INS42 INS66 INS40 INS32 INS66 INS66 INS40 INS32 INS42 UPD42 UPD74 MOV74 INS42 INS42 INS42 INS42 INS42 INS43 INS43 INS43 INS42 INS39 INS42 INS43 INS42 INS74 INS42 INS21 INS21 INS21 INS21 INS21 INS54 INS66 INS66 INS42 INS66 INS42 INS66 INS66 UPD42 INS42 INS43 INS43 INS43 INS39 INS59 INS74 INS59 INS58 INS27 INS37 INS8 INS42 INS7 INS7 MOV58 INS27 MOV37 INS8 INS7 INS7 INS66 INS66 INS39 INS59 INS27 INS8 INS7 INS7 INS32 INS32 INS32 MOV43 INS59 INS42 INS66 INS43 INS43 INS42 INS42 MOV44 INS42 INS8 INS8 MOV12 INS32 UPD42 INS27 INS8 INS42 INS32 UPD42 UPD42 INS32 INS42 INS42 INS42 INS32 INS42 INS42 INS34 UPD43 INS42 INS42 INS42 INS42 INS43 INS43 INS43 INS7 INS7 INS7 INS7 INS32 MOV8 INS12 INS42 INS42 INS42 INS42 INS34 INS43 INS43 INS42 INS14 INS39 INS59 INS42 INS22 INS42 INS21 INS22 INS3 MOV22 INS3 INS42 INS42 MOV21 MOV22 INS42 INS22 INS42 UPD45 INS42 INS32 INS42 INS34 INS53 INS42 INS32 INS42 INS32 INS42 INS42 INS45 INS42 INS42 INS27 INS42 INS42 INS27 INS42 INS32 INS42 INS42 INS21 INS21 INS21 INS21 INS42 INS42 INS27 UPD43 INS21 INS21 INS54 UPD42 UPD42 INS21 INS60 INS60 MOV21 INS60 INS70 INS21 INS27 INS27 INS70 INS42 INS42 INS42 INS42 INS42 INS42 UPD42 UPD74 MOV74 INS42 INS42 INS42 INS22 INS42 INS22 INS42 INS22 INS42 INS22 MOV14 INS22 INS42 INS45 INS45 MOV60 INS21 INS21 INS44 INS8 INS42 INS42 INS74 INS42 INS34 INS52 INS42 INS32 INS52 INS42 INS5 INS42 INS5 INS42 INS52 INS42 INS42 INS42 INS42 INS34 INS14 INS42 INS42 INS42 INS22 INS42 INS42 INS42 INS34 INS45 INS42 INS45 INS22 INS42 INS42 INS42 INS32 INS32 INS32 INS32 INS42 INS45 UPD42 INS74 INS32 INS43 INS32 INS8 MOV8 INS7 INS39 INS59 INS39 INS59 INS7 INS39 INS59 INS44 INS42 INS8 INS32 INS33 INS42 INS40 INS34 INS44 INS42 INS8 UPD43 INS52 INS42 INS52 INS42 INS52 INS42 INS52 INS42 INS52 INS42 MOV43 INS32 INS32 INS43 INS42 INS21 INS43 INS43 INS42 INS42 INS14 INS39 INS85 INS43 INS85 INS2 INS43 INS27 INS52 INS42 INS52 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS27 INS42 INS42 INS40 INS40 INS43 INS43 UPD42 INS42 INS32 UPD42 MOV42 INS42 INS42 INS42 MOV42 INS45 INS25 INS2 MOV32 INS42 INS32 INS42 INS11 INS2 MOV32 INS42 INS34 INS39 INS42 INS21 INS42 INS42 INS27 INS43 INS42 MOV21 UPD42 UPD42 INS14 UPD42 MOV42 UPD42 MOV42 INS27 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 INS54 INS21 INS42 INS7 INS42 INS42 INS43 INS37 INS42 INS42 INS42 INS22 INS42 INS42 INS45 INS42 INS45 INS45 INS42 INS45 UPD42 INS42 INS42 INS42 INS42 MOV27 INS8 UPD42 INS42 INS42 INS42 INS42 INS32 UPD42 MOV42 INS39 INS22 INS42 INS42 UPD42 UPD42 INS7 INS42 INS42 INS42 MOV43 INS14 INS34 UPD45 MOV45 INS42 INS42 INS8 INS8 INS32 INS22 INS42 INS42 INS42 INS52 INS42 INS60 INS60 MOV21 UPD42 MOV42 INS42 INS52 INS42 INS42 INS42 MOV43 INS42 INS40 INS42 INS42 MOV21 MOV21 MOV21 MOV21 MOV21 INS42 INS42 INS27 INS52 INS42 INS74 INS59 INS43 INS59 UPD42 INS32 INS32 INS45 INS42 INS43 INS43 INS42 INS32 INS42 INS42 INS32 UPD42 UPD42 INS42 UPD45 INS42 INS42 INS42 INS42 INS42 INS42 UPD42 MOV42 UPD42 MOV42 INS42 UPD42 MOV42 INS42 DEL39 DEL34 DEL42 DEL43 DEL42 DEL42 DEL42 DEL42 DEL32 DEL42 DEL42 DEL42 DEL32 DEL42 DEL32 DEL32 DEL34 DEL42 DEL43 DEL42 DEL59 DEL60 DEL42 DEL42 DEL45 DEL45 DEL32 DEL21 DEL42 DEL42 DEL42 DEL32 DEL27 DEL52 DEL42 DEL32 DEL38 DEL42 DEL43 DEL42 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL43 DEL42 DEL42 DEL42 DEL42 DEL32 DEL42 DEL32 DEL59 DEL60 DEL42 DEL43 DEL42 DEL42 DEL43 DEL14 DEL59 DEL60 DEL42 DEL42 DEL42 DEL32 DEL21 DEL42 DEL42 DEL32 DEL32 DEL38 DEL42 DEL43 DEL42 DEL42 DEL32 DEL42 DEL32 DEL27 DEL14 DEL53 DEL8 DEL25 DEL42 DEL32 DEL38 DEL42 DEL43 DEL45 DEL42 DEL27 DEL14 DEL53 DEL25 DEL8 DEL42 DEL43 DEL14 DEL53 DEL8 DEL25 DEL8 DEL24 DEL42 DEL34 DEL7 DEL42 DEL34 DEL7 DEL25 DEL42 DEL66 DEL65 DEL39 DEL42 DEL44 DEL42 DEL7 DEL21 DEL42 DEL52 DEL42 DEL22 DEL32 DEL21 DEL42 DEL34 DEL27 DEL42 DEL34 DEL27 DEL27 DEL42 DEL34 DEL7 DEL21 DEL42 DEL34 DEL32 DEL21 DEL8 DEL25 DEL42 DEL42 DEL32 DEL42 DEL42 DEL42 DEL32 DEL21 DEL8 DEL70 DEL32 DEL21 DEL42 DEL42 DEL45 DEL32 DEL21 DEL42 DEL40 DEL40 DEL32 DEL21 DEL8 DEL54 DEL42 DEL42 DEL40 DEL34 DEL14 DEL34 DEL14 DEL59 DEL60 DEL54 DEL42 DEL7 DEL21 DEL42 DEL42 DEL32

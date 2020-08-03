@@ -1,0 +1,214 @@
+Merge trunk to HDFS-2802 branch. This involves fixing many conflict with HDFS-4434.
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/branches/HDFS-2802@1470225 13f79535-47bb-0310-9956-ffa450edef68
+
++import org.apache.hadoop.HadoopIllegalArgumentException;
++import org.apache.hadoop.hdfs.server.namenode.Content.CountsMap;
++import org.apache.hadoop.hdfs.server.namenode.Quota.Counts;
++import org.apache.hadoop.hdfs.util.GSet;
++import org.apache.hadoop.hdfs.util.LightWeightGSet;
+-        namesystem.allocateNewInodeId(),
++        INodeId.ROOT_INODE_ID,
++  @VisibleForTesting
++  static boolean CHECK_RESERVED_FILE_NAMES = true;
++  public final static String DOT_RESERVED_STRING = ".reserved";
++  public final static String DOT_RESERVED_PATH_PREFIX = Path.SEPARATOR
++      + DOT_RESERVED_STRING;
++  public final static byte[] DOT_RESERVED = 
++      DFSUtil.string2Bytes(DOT_RESERVED_STRING);
++  public final static String DOT_INODES_STRING = ".inodes";
++  public final static byte[] DOT_INODES = 
++      DFSUtil.string2Bytes(DOT_INODES_STRING);
++  private GSet<INode, INode> inodeMap; // Synchronized by dirLock
++    inodeMap = initInodeMap(rootDir);
++  
++  @VisibleForTesting
++  static LightWeightGSet<INode, INode> initInodeMap(INodeDirectory rootDir) {
++    // Compute the map capacity by allocating 1% of total memory
++    int capacity = LightWeightGSet.computeCapacity(1, "INodeMap");
++    LightWeightGSet<INode, INode> map = new LightWeightGSet<INode, INode>(
++        capacity);
++    map.put(rootDir);
++    return map;
++  }
+-    long id = namesystem.allocateNewInodeId();
+-                                 id,
++                                 namesystem.allocateNewInodeId(),
++      remvoedAllFromInodesFromMap(targetNode);
++    inodeMap.put(newnode);
++  private INode getFromINodeMap(INode inode) {
++    readLock();
++    try {
++      return inodeMap.get(inode);
++    } finally {
++      readUnlock();
++    }
++  }
++  
++    // Disallow creation of /.reserved. This may be created when loading
++    // editlog/fsimage during upgrade since /.reserved was a valid name in older
++    // release. This may also be called when a user tries to create a file
++    // or directory /.reserved.
++    if (pos == 1 && inodes[0] == rootDir && isReservedName(child)) {
++      throw new HadoopIllegalArgumentException(
++          "File name \"" + child.getLocalName() + "\" is reserved and cannot "
++              + "be created. If this is during upgrade change the name of the "
++              + "existing file or directory to another name before upgrading "
++              + "to the new release.");
++    }
++      inodeMap.put(child);
+-
++    inodeMap.remove(last);
++      inodeMap.put(last.getParent());
++
++  /** This method is always called with writeLock held */
++  final void addToInodeMapUnprotected(INode inode) {
++    inodeMap.put(inode);
++  }
++  
++  /* This method is always called with writeLock held */
++  private final void removeFromInodeMap(INode inode) {
++    inodeMap.remove(inode);
++  }
++  
++  /** Remove all the inodes under given inode from the map */
++  private void remvoedAllFromInodesFromMap(INode inode) {
++    removeFromInodeMap(inode);
++    if (!inode.isDirectory()) {
++      return;
++    }
++    INodeDirectory dir = (INodeDirectory) inode;
++    for (INode child : dir.getChildrenList(null)) {
++      remvoedAllFromInodesFromMap(child);
++    }
++    dir.clearChildren();
++  }
+-      status = unprotectedSetTimes(src, inode, mtime, atime, force, latest);
++      status = unprotectedSetTimes(inode, mtime, atime, force, latest);
+-    return unprotectedSetTimes(src, i.getLastINode(), mtime, atime, force,
++    return unprotectedSetTimes(i.getLastINode(), mtime, atime, force,
+-  private boolean unprotectedSetTimes(String src, INode inode, long mtime,
++  private boolean unprotectedSetTimes(INode inode, long mtime,
++    inodeMap.clear();
++    inodeMap = null;
++  }
++  
++  @VisibleForTesting
++  INode getInode(long id) {
++    INode inode = new INodeWithAdditionalFields(id, null, new PermissionStatus(
++        "", "", new FsPermission((short) 0)), 0, 0) {
++      
++      @Override
++      INode recordModification(Snapshot latest) throws QuotaExceededException {
++        return null;
++      }
++      
++      @Override
++      public void destroyAndCollectBlocks(BlocksMapUpdateInfo collectedBlocks) {
++        // Nothing to do
++      }
++      
++      @Override
++      public Counts computeQuotaUsage(Counts counts, boolean useCache) {
++        return null;
++      }
++      
++      @Override
++      public Content.Counts computeContentSummary(Content.Counts counts) {
++        return null;
++      }
++      
++      @Override
++      public CountsMap computeContentSummary(CountsMap countsMap) {
++        return null;
++      }
++      
++      @Override
++      public Counts cleanSubtree(Snapshot snapshot, Snapshot prior,
++          BlocksMapUpdateInfo collectedBlocks) throws QuotaExceededException {
++        return null;
++      }
++    };
++      
++    return getFromINodeMap(inode);
++  }
++  
++  /**
++   * Given an INode get all the path complents leading to it from the root.
++   * If an Inode corresponding to C is given in /A/B/C, the returned
++   * patch components will be {root, A, B, C}
++   */
++  static byte[][] getPathComponents(INode inode) {
++    List<byte[]> components = new ArrayList<byte[]>();
++    components.add(0, inode.getLocalNameBytes());
++    while(inode.getParent() != null) {
++      components.add(0, inode.getParent().getLocalNameBytes());
++      inode = inode.getParent();
++    }
++    return components.toArray(new byte[components.size()][]);
++  }
++  
++  /**
++   * @return path components for reserved path, else null.
++   */
++  static byte[][] getPathComponentsForReservedPath(String src) {
++    return !isReservedName(src) ? null : INode.getPathComponents(src);
++  }
++  
++  /**
++   * Resolve the path of /.reserved/.inodes/<inodeid>/... to a regular path
++   * 
++   * @param src path that is being processed
++   * @param pathComponents path components corresponding to the path
++   * @param fsd FSDirectory
++   * @return if the path indicates an inode, return path after replacing upto
++   *         <inodeid> with the corresponding path of the inode, else the path
++   *         in {@code src} as is.
++   * @throws FileNotFoundException if inodeid is invalid
++   */
++  static String resolvePath(String src, byte[][] pathComponents, FSDirectory fsd)
++      throws FileNotFoundException {
++    if (pathComponents == null || pathComponents.length <= 3) {
++      return src;
++    }
++    // Not /.reserved/.inodes
++    if (!Arrays.equals(DOT_RESERVED, pathComponents[1])
++        || !Arrays.equals(DOT_INODES, pathComponents[2])) { // Not .inodes path
++      return src;
++    }
++    final String inodeId = DFSUtil.bytes2String(pathComponents[3]);
++    long id = 0;
++    try {
++      id = Long.valueOf(inodeId);
++    } catch (NumberFormatException e) {
++      throw new FileNotFoundException(
++          "File for given inode path does not exist: " + src);
++    }
++    if (id == INodeId.ROOT_INODE_ID && pathComponents.length == 4) {
++      return Path.SEPARATOR;
++    }
++    StringBuilder path = id == INodeId.ROOT_INODE_ID ? new StringBuilder()
++        : new StringBuilder(fsd.getInode(id).getFullPathName());
++    for (int i = 4; i < pathComponents.length; i++) {
++      path.append(Path.SEPARATOR).append(DFSUtil.bytes2String(pathComponents[i]));
++    }
++    if (NameNode.LOG.isDebugEnabled()) {
++      NameNode.LOG.debug("Resolved path is " + path);
++    }
++    return path.toString();
++  }
++  
++  @VisibleForTesting
++  int getInodeMapSize() {
++    return inodeMap.size();
++  }
++  
++  /** Check if a given inode name is reserved */
++  public static boolean isReservedName(INode inode) {
++    return CHECK_RESERVED_FILE_NAMES
++        && Arrays.equals(inode.getLocalNameBytes(), DOT_RESERVED);
++  }
++  
++  /** Check if a given path is reserved */
++  public static boolean isReservedName(String src) {
++    return src.startsWith(DOT_RESERVED_PATH_PREFIX);

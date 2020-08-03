@@ -1,0 +1,601 @@
+YARN-2496. Enhanced Capacity Scheduler to have basic support for allocating resources based on node-labels. Contributed by Wangda Tan.
+YARN-2500. Ehnaced ResourceManager to support schedulers allocating resources based on node-labels. Contributed by Wangda Tan.
+
++import java.util.HashSet;
++import org.apache.commons.lang.StringUtils;
++import org.apache.hadoop.yarn.nodelabels.CommonNodeLabelsManager;
++import org.apache.hadoop.yarn.server.resourcemanager.nodelabels.RMNodeLabelsManager;
+-import org.apache.hadoop.yarn.server.resourcemanager.scheduler.QueueMetrics;
+-import org.apache.hadoop.yarn.server.resourcemanager.scheduler.SchedulerUtils;
++import org.apache.hadoop.yarn.server.resourcemanager.scheduler.SchedulerUtils;
+-import org.apache.hadoop.yarn.util.resource.ResourceCalculator;
++import com.google.common.collect.Sets;
+-public class LeafQueue implements CSQueue {
++public class LeafQueue extends AbstractCSQueue {
+-  private final String queueName;
+-  private CSQueue parent;
+-  private float capacity;
+-  private float absoluteCapacity;
+-  private float maximumCapacity;
+-  private float absoluteMaxCapacity;
+-  
+-  private Resource usedResources = Resources.createResource(0, 0);
+-  private float usedCapacity = 0.0f;
+-  private volatile int numContainers;
+-  private final Resource minimumAllocation;
+-  private final Resource maximumAllocation;
+-  
+-  private final QueueMetrics metrics;
+-
+-  private QueueInfo queueInfo; 
+-
+-  private QueueState state;
+-
+-  private Map<QueueACL, AccessControlList> acls = 
+-    new HashMap<QueueACL, AccessControlList>();
+-  
+-  private final ResourceCalculator resourceCalculator;
+-  
+-  private boolean reservationsContinueLooking;
++
++  // cache last cluster resource to compute actual capacity
++  private Resource lastClusterResource = Resources.none();
+-      String queueName, CSQueue parent, CSQueue old) {
++      String queueName, CSQueue parent, CSQueue old) throws IOException {
++    super(cs, queueName, parent, old);
+-    this.queueName = queueName;
+-    this.parent = parent;
+-    
+-    this.resourceCalculator = cs.getResourceCalculator();
+-    // must be after parent and queueName are initialized
+-    this.metrics = old != null ? old.getMetrics() :
+-        QueueMetrics.forQueue(getQueuePath(), parent,
+-			      cs.getConfiguration().getEnableUserMetrics(),
+-			      cs.getConf());
+-    this.minimumAllocation = cs.getMinimumResourceCapability();
+-    this.maximumAllocation = cs.getMaximumResourceCapability();
+-    int maxApplications = cs.getConfiguration().getMaximumApplicationsPerQueue(getQueuePath());
++    int maxApplications =
++        cs.getConfiguration().getMaximumApplicationsPerQueue(getQueuePath());
+-    int maxActiveApplicationsPerUser = 
+-        CSQueueUtils.computeMaxActiveApplicationsPerUser(maxActiveAppsUsingAbsCap, userLimit, 
+-            userLimitFactor);
++    int maxActiveApplicationsPerUser =
++        CSQueueUtils.computeMaxActiveApplicationsPerUser(
++            maxActiveAppsUsingAbsCap, userLimit, userLimitFactor);
+-    this.queueInfo = recordFactory.newRecordInstance(QueueInfo.class);
+-    this.queueInfo.setQueueName(queueName);
+-    setupQueueConfigs(
+-        cs.getClusterResource(),
+-        capacity, absoluteCapacity, 
+-        maximumCapacity, absoluteMaxCapacity, 
+-        userLimit, userLimitFactor, 
++    setupQueueConfigs(cs.getClusterResource(), capacity, absoluteCapacity,
++        maximumCapacity, absoluteMaxCapacity, userLimit, userLimitFactor,
+-        maxActiveApplications, maxActiveApplicationsPerUser, state, acls, 
+-        cs.getConfiguration().getNodeLocalityDelay(), 
++        maxActiveApplications, maxActiveApplicationsPerUser, state, acls, cs
++            .getConfiguration().getNodeLocalityDelay(), accessibleLabels,
++        defaultLabelExpression, this.capacitiyByNodeLabels,
++        this.maxCapacityByNodeLabels,
+-
++  
+-      boolean continueLooking)
+-  {
++      Set<String> labels, String defaultLabelExpression,
++      Map<String, Float> capacitieByLabel,
++      Map<String, Float> maximumCapacitiesByLabel, 
++      boolean revervationContinueLooking) throws IOException {
++    super.setupQueueConfigs(clusterResource, capacity, absoluteCapacity,
++        maximumCapacity, absoluteMaxCapacity, state, acls, labels,
++        defaultLabelExpression, capacitieByLabel, maximumCapacitiesByLabel,
++        revervationContinueLooking);
+-    CSQueueUtils.checkAbsoluteCapacities(getQueueName(), absCapacity, absoluteMaxCapacity);
++    CSQueueUtils.checkAbsoluteCapacity(getQueueName(), absCapacity,
++        absoluteMaxCapacity);
+-    this.capacity = capacity; 
+-    this.maximumCapacity = maximumCapacity;
+-    this.absoluteMaxCapacity = absoluteMaxCapacity;
+-
+-    
+-    this.state = state;
+-    this.acls = acls;
+-
+-    this.queueInfo.setCapacity(this.capacity);
+-    this.queueInfo.setMaximumCapacity(this.maximumCapacity);
+-    this.queueInfo.setQueueState(this.state);
++    if (!SchedulerUtils.checkQueueLabelExpression(this.accessibleLabels,
++        this.defaultLabelExpression)) {
++      throw new IOException("Invalid default label expression of "
++          + " queue="
++          + queueInfo.getQueueName()
++          + " doesn't have permission to access all labels "
++          + "in default label expression. labelExpression of resource request="
++          + (this.defaultLabelExpression == null ? ""
++              : this.defaultLabelExpression)
++          + ". Queue labels="
++          + (queueInfo.getAccessibleNodeLabels() == null ? "" : StringUtils.join(queueInfo
++              .getAccessibleNodeLabels().iterator(), ',')));
++    }
+-    this.reservationsContinueLooking = continueLooking;
+-    
+-    // Update metrics
+-    CSQueueUtils.updateQueueStatistics(
+-        resourceCalculator, this, getParent(), clusterResource, 
+-        minimumAllocation);
++
++    StringBuilder labelStrBuilder = new StringBuilder(); 
++    if (labels != null) {
++      for (String s : labels) {
++        labelStrBuilder.append(s);
++        labelStrBuilder.append(",");
++      }
++    }
++        "nodeLocalityDelay = " + nodeLocalityDelay + "\n" +
++        "labels=" + labelStrBuilder.toString() + "\n" +
+-  
+-  @Override
+-  public synchronized float getCapacity() {
+-    return capacity;
+-  }
+-
+-  @Override
+-  public synchronized float getAbsoluteCapacity() {
+-    return absoluteCapacity;
+-  }
+-
+-  @Override
+-  public synchronized float getMaximumCapacity() {
+-    return maximumCapacity;
+-  }
+-
+-  @Override
+-  public synchronized float getAbsoluteMaximumCapacity() {
+-    return absoluteMaxCapacity;
+-  }
+-
+-  @Override
+-  public synchronized float getAbsoluteUsedCapacity() {
+-    return absoluteUsedCapacity;
+-  }
+-
+-  @Override
+-  public synchronized CSQueue getParent() {
+-    return parent;
+-  }
+-  
+-  @Override
+-  public synchronized void setParent(CSQueue newParentQueue) {
+-    this.parent = (ParentQueue)newParentQueue;
+-  }
+-  
+-  @Override
+-  public String getQueueName() {
+-    return queueName;
+-  }
+-  public Resource getMinimumAllocation() {
+-    return minimumAllocation;
+-  }
+-
+-  /**
+-   * Used only by tests.
+-   */
+-  @Private
+-  public Resource getMaximumAllocation() {
+-    return maximumAllocation;
+-  }
+-
+-  /**
+-   * Used only by tests.
+-   */
+-  @Private
+-  public synchronized float getUsedCapacity() {
+-    return usedCapacity;
+-  }
+-
+-  @Override
+-  public synchronized Resource getUsedResources() {
+-    return usedResources;
+-  }
+-
+-  @Override
+-
+-  @Override
+-  public synchronized void setUsedCapacity(float usedCapacity) {
+-    this.usedCapacity = usedCapacity;
+-  }
+-
+-  @Override
+-  public synchronized void setAbsoluteUsedCapacity(float absUsedCapacity) {
+-    this.absoluteUsedCapacity = absUsedCapacity;
+-  }
+-
+-  /**
+-   * Set maximum capacity - used only for testing.
+-   * @param maximumCapacity new max capacity
+-   */
+-  synchronized void setMaxCapacity(float maximumCapacity) {
+-    // Sanity check
+-    CSQueueUtils.checkMaxCapacity(getQueueName(), capacity, maximumCapacity);
+-    float absMaxCapacity = 
+-        CSQueueUtils.computeAbsoluteMaximumCapacity(
+-            maximumCapacity, getParent());
+-    CSQueueUtils.checkAbsoluteCapacities(getQueueName(), absoluteCapacity, absMaxCapacity);
+-    
+-    this.maximumCapacity = maximumCapacity;
+-    this.absoluteMaxCapacity = absMaxCapacity;
+-  }
+-  @Private
+-  boolean getReservationContinueLooking() {
+-    return reservationsContinueLooking;
+-  }
+-  
++  
++  @VisibleForTesting
++  public synchronized void setNodeLabelManager(RMNodeLabelsManager mgr) {
++    this.labelManager = mgr;
++  }
++        newlyParsedLeafQueue.accessibleLabels,
++        newlyParsedLeafQueue.defaultLabelExpression,
++        newlyParsedLeafQueue.capacitiyByNodeLabels,
++        newlyParsedLeafQueue.maxCapacityByNodeLabels,
+-  public boolean hasAccess(QueueACL acl, UserGroupInformation user) {
+-    // Check if the leaf-queue allows access
+-    synchronized (this) {
+-      if (acls.get(acl).isUserAllowed(user)) {
+-        return true;
+-      }
+-    }
+-
+-    // Check if parent-queue allows access
+-    return getParent().hasAccess(acl, user);
+-  }
+-
+-  @Override
+-  private synchronized void addApplicationAttempt(FiCaSchedulerApp application, User user) {
++  private synchronized void addApplicationAttempt(FiCaSchedulerApp application,
++      User user) {
+-  public synchronized void removeApplicationAttempt(FiCaSchedulerApp application, User user) {
++  public synchronized void removeApplicationAttempt(
++      FiCaSchedulerApp application, User user) {
++  private static Set<String> getRequestLabelSetByExpression(
++      String labelExpression) {
++    Set<String> labels = new HashSet<String>();
++    if (null == labelExpression) {
++      return labels;
++    }
++    for (String l : labelExpression.split("&&")) {
++      if (l.trim().isEmpty()) {
++        continue;
++      }
++      labels.add(l.trim());
++    }
++    return labels;
++  }
++  
++    // if our queue cannot access this node, just return
++    if (!SchedulerUtils.checkQueueAccessToNode(accessibleLabels,
++        labelManager.getLabelsOnNode(node.getNodeID()))) {
++      return NULL_ASSIGNMENT;
++    }
++    
++          
++          Set<String> requestedNodeLabels =
++              getRequestLabelSetByExpression(anyRequest
++                  .getNodeLabelExpression());
+-                  required);          
++                  required, requestedNodeLabels);          
+-          if (!assignToQueue(clusterResource, required, application, true)) {
++          if (!canAssignToThisQueue(clusterResource, required,
++              labelManager.getLabelsOnNode(node.getNodeID()), application, true)) {
+-              application, true)) {
++              application, true, requestedNodeLabels)) {
+-            allocateResource(clusterResource, application, assigned);
++            allocateResource(clusterResource, application, assigned,
++                labelManager.getLabelsOnNode(node.getNodeID()));
+-	  computeUserLimit(application, clusterResource, required, user));
++	  computeUserLimit(application, clusterResource, required, user, null));
+-        Resources.subtract(userLimit, user.getConsumedResources()),
++        Resources.subtract(userLimit, user.getTotalConsumedResources()),
+-
+-  @Private
+-  protected synchronized boolean assignToQueue(Resource clusterResource, 
+-      Resource required, FiCaSchedulerApp application, 
++  synchronized boolean canAssignToThisQueue(Resource clusterResource,
++      Resource required, Set<String> nodeLabels, FiCaSchedulerApp application, 
+-
+-    Resource potentialTotalResource = Resources.add(usedResources, required);
+-    // Check how of the cluster's absolute capacity we are currently using...
+-    float potentialNewCapacity = Resources.divide(resourceCalculator,
+-        clusterResource, potentialTotalResource, clusterResource);
+-    if (potentialNewCapacity > absoluteMaxCapacity) {
++    // Get label of this queue can access, it's (nodeLabel AND queueLabel)
++    Set<String> labelCanAccess;
++    if (null == nodeLabels || nodeLabels.isEmpty()) {
++      labelCanAccess = new HashSet<String>();
++      // Any queue can always access any node without label
++      labelCanAccess.add(RMNodeLabelsManager.NO_LABEL);
++    } else {
++      labelCanAccess = new HashSet<String>(Sets.intersection(accessibleLabels, nodeLabels));
++    }
++    
++    boolean canAssign = true;
++    for (String label : labelCanAccess) {
++      if (!usedResourcesByNodeLabels.containsKey(label)) {
++        usedResourcesByNodeLabels.put(label, Resources.createResource(0));
++      }
++      
++      Resource potentialTotalCapacity =
++          Resources.add(usedResourcesByNodeLabels.get(label), required);
++      
++      float potentialNewCapacity =
++          Resources.divide(resourceCalculator, clusterResource,
++              potentialTotalCapacity,
++              labelManager.getResourceByLabel(label, clusterResource));
+-      if (this.reservationsContinueLooking && checkReservations) {
+-
++      // TODO, now only consider reservation cases when the node has no label
++      if (this.reservationsContinueLooking && checkReservations
++          && label.equals(RMNodeLabelsManager.NO_LABEL)) {
+-            Resources.subtract(potentialTotalResource,
+-                application.getCurrentReservation()),
+-             clusterResource);
++            Resources.subtract(potentialTotalCapacity,
++               application.getCurrentReservation()),
++            labelManager.getResourceByLabel(label, clusterResource));
+-
++      
++      // Otherwise, if any of the label of this node beyond queue limit, we
++      // cannot allocate on this node. Consider a small epsilon here.
++      if (potentialNewCapacity > getAbsoluteMaximumCapacityByNodeLabel(label) + 1e-4) {
++        canAssign = false;
++        break;
++      }
++
+-            + " usedResources: " + usedResources
++            + "Check assign to queue, label=" + label
++            + " usedResources: " + usedResourcesByNodeLabels.get(label)
+-              usedResources, clusterResource) + " required " + required
++                usedResourcesByNodeLabels.get(label),
++                labelManager.getResourceByLabel(label, clusterResource))
+-      return false;
+-    return true;
++    
++    return canAssign;
+-
+-
+-  Resource computeUserLimitAndSetHeadroom(
+-      FiCaSchedulerApp application, Resource clusterResource, Resource required) {
+-    
++  Resource computeUserLimitAndSetHeadroom(FiCaSchedulerApp application,
++      Resource clusterResource, Resource required, Set<String> requestedLabels) {
+-    
+-    Resource userLimit =                          // User limit
+-        computeUserLimit(application, clusterResource, required, queueUser);
++    // Compute user limit respect requested labels,
++    // TODO, need consider headroom respect labels also
++    Resource userLimit =
++        computeUserLimit(application, clusterResource, required,
++            queueUser, requestedLabels);
+-    Resource headroom = getHeadroom(queueUser, queueMaxCap, clusterResource, userLimit);
++    Resource headroom =
++        getHeadroom(queueUser, queueMaxCap, clusterResource, userLimit);
+-          " consumed=" + queueUser.getConsumedResources() + 
++          " consumed=" + queueUser.getTotalConsumedResources() + 
+-  private Resource computeUserLimit(FiCaSchedulerApp application, 
+-      Resource clusterResource, Resource required, User user) {
++  private Resource computeUserLimit(FiCaSchedulerApp application,
++      Resource clusterResource, Resource required, User user,
++      Set<String> requestedLabels) {
++    Resource queueCapacity = Resource.newInstance(0, 0);
++    if (requestedLabels != null && !requestedLabels.isEmpty()) {
++      // if we have multiple labels to request, we will choose to use the first
++      // label
++      String firstLabel = requestedLabels.iterator().next();
++      queueCapacity =
++          Resources
++              .max(resourceCalculator, clusterResource, queueCapacity,
++                  Resources.multiplyAndNormalizeUp(resourceCalculator,
++                      labelManager.getResourceByLabel(firstLabel,
++                          clusterResource),
++                      getAbsoluteCapacityByNodeLabel(firstLabel),
++                      minimumAllocation));
++    } else {
++      // else there's no label on request, just to use absolute capacity as
++      // capacity for nodes without label
++      queueCapacity =
++          Resources.multiplyAndNormalizeUp(resourceCalculator, labelManager
++                .getResourceByLabel(CommonNodeLabelsManager.NO_LABEL, clusterResource),
++              absoluteCapacity, minimumAllocation);
++    }
+-    final Resource queueCapacity =
++    queueCapacity =
+-            Resources.multiplyAndNormalizeUp(
+-                resourceCalculator, 
+-                clusterResource, 
+-                absoluteCapacity, 
+-                minimumAllocation), 
++            queueCapacity, 
+-          " consumed: " + user.getConsumedResources() + 
++          " consumed: " + user.getTotalConsumedResources() + 
+-      boolean checkReservations) {
+-
++      boolean checkReservations, Set<String> requestLabels) {
++    
++    String label = CommonNodeLabelsManager.NO_LABEL;
++    if (requestLabels != null && !requestLabels.isEmpty()) {
++      label = requestLabels.iterator().next();
++    }
+-    if (Resources.greaterThan(resourceCalculator, clusterResource,
+-        user.getConsumedResources(), limit)) {
+-
++    if (Resources
++        .greaterThan(resourceCalculator, clusterResource,
++            user.getConsumedResourceByLabel(label),
++            limit)) {
+-            Resources.subtract(user.getConsumedResources(),
++            Resources.subtract(user.getTotalConsumedResources(),
+-                + user.getConsumedResources() + " reserved: "
++                + user.getTotalConsumedResources() + " reserved: "
+-            + user.getConsumedResources() + " limit: " + limit);
++            + user.getTotalConsumedResources() + " limit: " + limit);
+-  boolean needContainers(FiCaSchedulerApp application, Priority priority, Resource required) {
++  boolean needContainers(FiCaSchedulerApp application, Priority priority,
++      Resource required) {
+-  private CSAssignment assignContainersOnNode(Resource clusterResource, 
+-      FiCaSchedulerNode node, FiCaSchedulerApp application, 
+-      Priority priority, RMContainer reservedContainer, boolean needToUnreserve) {
+-
++  private CSAssignment assignContainersOnNode(Resource clusterResource,
++      FiCaSchedulerNode node, FiCaSchedulerApp application, Priority priority,
++      RMContainer reservedContainer, boolean needToUnreserve) {
+-        clusterResource, capability);
++        clusterResource, capability, null);
+-    // Check queue max-capacity limit
+-    if (!assignToQueue(clusterResource, capability, application, false)) {
++    // Check queue max-capacity limit,
++    // TODO: Consider reservation on labels
++    if (!canAssignToThisQueue(clusterResource, capability, null, application, false)) {
+-        application, false)) {
++        application, false, null)) {
++    
++    // check if the resource request can access the label
++    if (!SchedulerUtils.checkNodeLabelExpression(
++        labelManager.getLabelsOnNode(node.getNodeID()),
++        request.getNodeLabelExpression())) {
++      // this is a reserved container, but we cannot allocate it now according
++      // to label not match. This can be caused by node label changed
++      // We should un-reserve this container.
++      if (rmContainer != null) {
++        unreserve(application, priority, node, rmContainer);
++      }
++      return Resources.none();
++    }
++    
+-          releaseResource(clusterResource,
+-              application, container.getResource());
++          releaseResource(clusterResource, application,
++              container.getResource(),
++              labelManager.getLabelsOnNode(node.getNodeID()));
+-  synchronized void allocateResource(Resource clusterResource, 
+-      SchedulerApplicationAttempt application, Resource resource) {
+-    // Update queue metrics
+-    Resources.addTo(usedResources, resource);
+-    CSQueueUtils.updateQueueStatistics(
+-        resourceCalculator, this, getParent(), clusterResource, minimumAllocation);
+-    ++numContainers;
+-
++  synchronized void allocateResource(Resource clusterResource,
++      SchedulerApplicationAttempt application, Resource resource,
++      Set<String> nodeLabels) {
++    super.allocateResource(clusterResource, resource, nodeLabels);
++    
+-    user.assignContainer(resource);
++    user.assignContainer(resource, nodeLabels);
++    // Note this is a bit unconventional since it gets the object and modifies
++    // it here, rather then using set routine
++    Resources.subtractFrom(application.getHeadroom(), resource); // headroom
+-          " user-resources=" + user.getConsumedResources()
++          " user-resources=" + user.getTotalConsumedResources()
+-      FiCaSchedulerApp application, Resource resource) {
+-    // Update queue metrics
+-    Resources.subtractFrom(usedResources, resource);
+-    CSQueueUtils.updateQueueStatistics(
+-        resourceCalculator, this, getParent(), clusterResource, 
+-        minimumAllocation);
+-    --numContainers;
+-
++      FiCaSchedulerApp application, Resource resource, Set<String> nodeLabels) {
++    super.releaseResource(clusterResource, resource, nodeLabels);
++    
+-    user.releaseContainer(resource);
++    user.releaseContainer(resource, nodeLabels);
+-        " user=" + userName + " user-resources=" + user.getConsumedResources());
++        " user=" + userName + " user-resources=" + user.getTotalConsumedResources());
++    lastClusterResource = clusterResource;
++    
+-            Resources.none());
++            Resources.none(), null);
+-  
+-  @Override
+-  public QueueMetrics getMetrics() {
+-    return metrics;
+-  }
++    Map<String, Resource> consumedByLabel = new HashMap<String, Resource>();
+-    public Resource getConsumedResources() {
++    public Resource getTotalConsumedResources() {
++    
++    public Resource getConsumedResourceByLabel(String label) {
++      Resource r = consumedByLabel.get(label);
++      if (null != r) {
++        return r;
++      }
++      return Resources.none();
++    }
+-    public synchronized void assignContainer(Resource resource) {
++    public synchronized void assignContainer(Resource resource,
++        Set<String> nodeLabels) {
++      
++      if (nodeLabels == null || nodeLabels.isEmpty()) {
++        if (!consumedByLabel.containsKey(RMNodeLabelsManager.NO_LABEL)) {
++          consumedByLabel.put(RMNodeLabelsManager.NO_LABEL,
++              Resources.createResource(0));
++        }
++        Resources.addTo(consumedByLabel.get(RMNodeLabelsManager.NO_LABEL),
++            resource);
++      } else {
++        for (String label : nodeLabels) {
++          if (!consumedByLabel.containsKey(label)) {
++            consumedByLabel.put(label, Resources.createResource(0));
++          }
++          Resources.addTo(consumedByLabel.get(label), resource);
++        }
++      }
+-    public synchronized void releaseContainer(Resource resource) {
++    public synchronized void releaseContainer(Resource resource, Set<String> nodeLabels) {
++      
++      // Update usedResources by labels
++      if (nodeLabels == null || nodeLabels.isEmpty()) {
++        if (!consumedByLabel.containsKey(RMNodeLabelsManager.NO_LABEL)) {
++          consumedByLabel.put(RMNodeLabelsManager.NO_LABEL,
++              Resources.createResource(0));
++        }
++        Resources.subtractFrom(
++            consumedByLabel.get(RMNodeLabelsManager.NO_LABEL), resource);
++      } else {
++        for (String label : nodeLabels) {
++          if (!consumedByLabel.containsKey(label)) {
++            consumedByLabel.put(label, Resources.createResource(0));
++          }
++          Resources.subtractFrom(consumedByLabel.get(label), resource);
++        }
++      }
+-        .getResource());
++          .getResource(), labelManager.getLabelsOnNode(rmContainer
++          .getContainer().getNodeId()));
+-          .getResource());
++          .getResource(), labelManager.getLabelsOnNode(rmContainer
++          .getContainer().getNodeId()));
+-          .getResource());
++          .getResource(), labelManager.getLabelsOnNode(rmContainer.getContainer()
++          .getNodeId()));
++  @Override
++  public float getAbsActualCapacity() {
++    if (Resources.lessThanOrEqual(resourceCalculator, lastClusterResource,
++        lastClusterResource, Resources.none())) {
++      return absoluteCapacity;
++    }
++
++    Resource resourceRespectLabels =
++        labelManager == null ? lastClusterResource : labelManager
++            .getQueueResource(queueName, accessibleLabels, lastClusterResource);
++    float absActualCapacity =
++        Resources.divide(resourceCalculator, lastClusterResource,
++            resourceRespectLabels, lastClusterResource);
++    
++    return absActualCapacity > absoluteCapacity ? absoluteCapacity
++        : absActualCapacity;
++  }
++  
+
+MOV26 MOV26 MOV26 INS26 INS26 INS26 MOV23 MOV31 MOV31 INS40 INS40 UPD40 UPD40 INS40 UPD43 INS31 INS31 INS31 UPD42 INS43 INS83 INS83 INS39 INS42 MOV44 MOV44 MOV44 MOV44 MOV44 MOV44 MOV44 MOV44 MOV44 MOV44 MOV44 MOV44 MOV44 MOV44 MOV44 INS44 INS44 INS44 INS44 INS44 INS43 INS8 UPD42 UPD83 MOV83 UPD83 MOV83 INS74 INS42 INS44 INS8 UPD42 INS44 INS44 INS44 MOV78 UPD83 MOV83 INS83 MOV39 UPD42 MOV42 MOV44 MOV44 MOV44 MOV44 MOV44 MOV44 INS8 INS44 MOV21 INS44 INS8 INS23 INS31 MOV78 INS39 INS42 INS8 UPD42 INS42 INS46 INS74 INS42 INS43 INS42 INS74 INS42 INS74 INS42 INS39 INS42 INS42 INS21 MOV21 MOV60 MOV21 MOV21 MOV21 MOV21 MOV21 MOV21 MOV21 MOV21 MOV21 INS25 MOV21 MOV60 MOV70 INS60 INS25 MOV21 UPD42 UPD43 UPD42 INS43 INS43 INS43 INS42 INS60 INS25 INS70 MOV41 INS25 INS74 INS42 INS60 INS25 INS60 INS70 INS41 INS74 INS42 INS74 INS42 INS60 INS25 INS21 INS74 INS42 MOV60 INS60 INS25 MOV25 MOV41 INS25 INS74 INS42 INS74 INS42 MOV21 MOV60 MOV60 MOV21 MOV21 MOV21 INS21 INS74 INS59 UPD42 INS83 MOV43 INS42 INS44 INS8 INS44 INS8 INS44 INS8 INS25 INS60 INS60 MOV41 UPD42 INS42 INS42 INS42 INS42 INS43 MOV43 UPD42 MOV42 MOV43 UPD43 MOV43 UPD43 MOV43 UPD43 MOV43 MOV43 UPD43 MOV43 INS48 INS32 INS38 INS8 INS43 INS59 INS27 INS8 UPD42 INS42 INS42 INS42 INS74 INS59 INS27 INS8 INS44 INS32 INS8 UPD42 INS38 INS8 INS43 INS43 INS74 INS59 INS27 INS8 INS8 INS39 INS59 INS44 INS42 MOV8 INS42 INS43 INS43 MOV43 MOV32 INS43 INS43 MOV43 INS59 INS27 INS8 INS8 INS7 INS43 INS43 INS43 INS59 INS27 INS8 INS38 INS8 INS43 INS43 INS48 INS43 INS43 INS48 INS7 INS43 INS43 MOV43 INS42 INS14 INS43 INS42 INS60 INS25 INS41 INS74 INS42 MOV21 INS25 INS74 INS42 MOV21 INS25 INS32 MOV8 MOV43 INS59 INS39 INS59 INS16 INS42 INS42 INS22 INS22 UPD42 MOV42 UPD42 UPD42 UPD42 UPD42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 MOV32 INS42 INS42 INS32 INS53 INS42 INS42 INS14 INS42 INS33 INS70 INS42 INS40 INS40 INS40 INS40 INS43 INS43 INS42 INS14 INS33 INS42 MOV41 INS43 INS42 INS42 INS42 INS45 INS25 MOV21 INS32 INS41 INS42 INS42 INS43 INS43 INS42 INS27 INS32 INS21 INS21 INS21 INS42 INS9 INS43 INS42 INS25 INS60 INS60 INS25 INS42 INS42 INS42 INS42 MOV42 INS32 INS27 INS38 INS60 INS21 INS21 INS42 INS32 UPD42 MOV42 INS42 UPD42 MOV42 INS42 INS40 INS27 INS38 INS21 INS32 INS25 INS41 INS42 INS42 INS42 INS42 INS42 INS42 UPD42 UPD42 UPD42 UPD42 UPD42 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS74 INS42 MOV43 INS59 INS27 INS8 INS32 INS43 INS43 INS27 INS8 INS8 INS43 INS43 INS27 INS8 INS8 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS16 INS42 INS32 INS27 INS42 INS42 INS52 INS42 INS52 INS42 INS42 INS42 INS22 INS22 INS14 INS43 INS44 INS42 INS8 INS45 INS32 INS45 INS45 INS42 INS45 UPD42 INS42 INS42 INS74 UPD42 INS42 INS32 INS8 INS42 INS42 INS42 INS32 INS42 INS33 INS42 INS42 INS33 INS42 INS42 INS42 INS7 INS32 INS7 INS42 INS38 INS8 MOV43 INS59 INS39 INS59 INS27 INS8 MOV32 INS42 INS42 INS42 INS34 INS34 INS42 INS33 INS32 INS43 INS59 INS7 INS7 INS42 INS42 INS42 INS42 INS42 MOV42 INS42 INS33 INS32 INS7 UPD42 INS42 MOV32 INS33 UPD42 INS33 INS33 INS42 INS42 INS32 INS32 INS27 INS8 INS32 UPD42 MOV42 INS42 MOV43 INS43 MOV43 INS42 INS32 INS33 INS42 INS41 INS42 INS42 INS42 INS42 INS27 INS32 INS25 INS21 INS70 INS42 INS42 INS27 INS32 INS25 INS21 INS70 INS42 INS42 INS27 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 MOV52 UPD42 MOV42 MOV52 UPD42 MOV42 INS43 INS27 INS42 INS43 INS42 INS21 INS21 INS42 INS42 INS43 INS43 INS32 UPD42 MOV42 INS18 UPD42 UPD42 INS42 INS42 INS32 INS42 INS14 INS42 MOV42 INS40 INS42 INS14 INS32 INS21 INS42 INS32 INS42 INS32 MOV22 INS42 INS32 INS42 INS27 INS21 INS10 INS42 INS42 INS42 INS42 INS32 INS42 INS32 INS42 INS32 UPD42 MOV42 UPD42 MOV42 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS42 INS33 INS21 INS42 INS42 UPD42 INS42 INS42 INS42 INS42 INS42 INS42 INS33 INS42 INS42 INS38 INS8 INS32 INS44 INS42 INS8 INS42 INS33 INS42 INS42 INS38 INS8 INS32 INS44 INS42 INS8 INS32 INS32 INS32 MOV32 INS32 INS42 INS33 INS42 INS42 INS42 INS42 INS42 INS42 INS27 INS32 INS45 INS45 INS36 INS45 INS36 INS42 INS32 INS32 INS42 INS42 UPD42 MOV42 UPD42 MOV42 UPD42 INS42 INS42 INS42 UPD42 INS74 INS74 INS32 INS42 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS40 INS32 INS34 INS7 INS32 INS42 MOV42 MOV42 MOV42 MOV42 INS42 INS32 MOV42 MOV42 MOV42 INS32 MOV42 MOV42 INS32 INS42 INS42 INS42 INS32 INS32 INS21 INS42 INS42 INS32 INS42 INS43 INS42 INS25 INS21 INS32 INS21 INS42 INS42 INS32 INS42 INS43 INS42 INS25 INS21 INS32 INS42 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS42 MOV32 INS45 INS45 INS42 UPD42 MOV42 INS16 INS16 UPD42 MOV42 INS42 INS42 UPD42 MOV42 UPD42 MOV42 INS45 INS60 INS43 INS43 INS43 INS43 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS9 UPD42 INS42 INS42 INS42 INS42 INS42 INS32 INS32 INS42 INS42 INS42 INS40 MOV42 UPD42 UPD42 MOV42 UPD42 MOV42 INS42 INS42 INS42 INS42 INS42 UPD42 INS33 INS42 INS42 INS40 INS32 INS42 INS42 INS40 INS42 INS38 INS8 INS32 INS42 INS42 INS40 INS32 INS42 INS42 INS40 INS42 INS38 INS8 INS32 INS42 INS42 INS32 INS42 INS32 INS42 UPD42 INS27 INS45 INS22 INS27 INS45 INS32 INS74 INS59 MOV43 INS42 INS42 INS42 INS42 INS42 INS42 INS34 INS32 INS45 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS42 MOV32 MOV32 INS42 INS42 INS40 INS32 INS32 INS21 INS42 INS42 INS32 INS42 INS42 INS42 INS40 INS32 INS32 INS21 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS22 INS33 MOV52 UPD42 MOV42 INS32 INS33 INS42 INS42 INS32 INS13 INS43 INS43 INS42 INS32 UPD42 INS42 INS42 INS42 MOV42 INS42 INS42 INS42 INS32 INS32 UPD42 UPD42 INS32 INS42 INS42 INS34 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS34 INS42 INS42 INS42 INS32 INS42 INS42 INS42 MOV52 UPD42 MOV42 UPD42 MOV42 INS42 INS32 INS42 INS42 INS42 INS42 INS32 INS42 UPD42 INS32 INS42 UPD42 MOV42 INS42 INS42 INS42 INS42 INS42 MOV42 INS42 INS42 INS32 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS32 INS42 UPD42 MOV42 INS42 INS42 INS42 INS42 INS32 INS32 INS42 INS42 INS42 INS42 INS34 INS42 INS42 INS34 INS42 INS42 INS42 INS42 INS32 MOV32 INS42 INS42 UPD42 DEL83 DEL83 DEL42 DEL59 DEL23 DEL83 DEL42 DEL43 DEL42 DEL59 DEL23 DEL83 DEL39 DEL42 DEL59 DEL23 DEL83 DEL39 DEL42 DEL59 DEL23 DEL83 DEL39 DEL42 DEL59 DEL23 DEL83 DEL39 DEL42 DEL59 DEL23 DEL83 DEL39 DEL42 DEL34 DEL59 DEL23 DEL83 DEL83 DEL39 DEL42 DEL59 DEL23 DEL83 DEL83 DEL42 DEL59 DEL23 DEL83 DEL83 DEL42 DEL59 DEL23 DEL83 DEL83 DEL42 DEL43 DEL42 DEL59 DEL23 DEL83 DEL43 DEL42 DEL59 DEL23 DEL83 DEL43 DEL42 DEL59 DEL23 DEL83 DEL74 DEL42 DEL74 DEL14 DEL59 DEL23 DEL34 DEL34 DEL83 DEL83 DEL42 DEL43 DEL42 DEL59 DEL23 DEL83 DEL39 DEL42 DEL59 DEL23 DEL52 DEL42 DEL22 DEL42 DEL7 DEL21 DEL52 DEL42 DEL22 DEL42 DEL7 DEL21 DEL52 DEL42 DEL22 DEL42 DEL42 DEL32 DEL7 DEL21 DEL52 DEL42 DEL22 DEL42 DEL33 DEL27 DEL42 DEL42 DEL32 DEL42 DEL42 DEL42 DEL32 DEL42 DEL42 DEL42 DEL32 DEL42 DEL32 DEL42 DEL42 DEL32 DEL32 DEL16 DEL7 DEL21 DEL52 DEL42 DEL22 DEL42 DEL42 DEL32 DEL7 DEL21 DEL52 DEL42 DEL22 DEL42 DEL42 DEL32 DEL7 DEL21 DEL52 DEL42 DEL22 DEL42 DEL42 DEL42 DEL43 DEL57 DEL32 DEL7 DEL21 DEL52 DEL42 DEL22 DEL42 DEL42 DEL32 DEL21 DEL52 DEL42 DEL22 DEL42 DEL7 DEL83 DEL83 DEL39 DEL42 DEL39 DEL42 DEL44 DEL42 DEL42 DEL42 DEL42 DEL32 DEL21 DEL52 DEL42 DEL22 DEL42 DEL7 DEL21 DEL52 DEL42 DEL22 DEL42 DEL7 DEL21 DEL22 DEL42 DEL7 DEL21 DEL22 DEL42 DEL7 DEL21 DEL52 DEL42 DEL22 DEL22 DEL32 DEL21 DEL22 DEL52 DEL42 DEL22 DEL32 DEL21 DEL52 DEL42 DEL22 DEL52 DEL42 DEL22 DEL32 DEL21 DEL42 DEL7 DEL21 DEL42 DEL42 DEL42 DEL52 DEL32 DEL32 DEL21 DEL8 DEL31 DEL42 DEL78 DEL83 DEL83 DEL39 DEL42 DEL42 DEL41 DEL8 DEL31 DEL83 DEL83 DEL39 DEL42 DEL31 DEL42 DEL78 DEL83 DEL83 DEL39 DEL42 DEL42 DEL41 DEL8 DEL31 DEL42 DEL78 DEL83 DEL83 DEL39 DEL42 DEL42 DEL41 DEL8 DEL31 DEL42 DEL78 DEL83 DEL83 DEL39 DEL42 DEL42 DEL41 DEL8 DEL31 DEL42 DEL78 DEL83 DEL83 DEL42 DEL43 DEL42 DEL42 DEL41 DEL8 DEL31 DEL42 DEL78 DEL42 DEL42 DEL41 DEL8 DEL31 DEL66 DEL65 DEL29 DEL42 DEL78 DEL42 DEL42 DEL41 DEL8 DEL31 DEL66 DEL65 DEL29 DEL42 DEL78 DEL83 DEL42 DEL42 DEL41 DEL8 DEL31 DEL42 DEL78 DEL83 DEL83 DEL39 DEL42 DEL42 DEL41 DEL8 DEL31 DEL42 DEL78 DEL83 DEL83 DEL42 DEL8 DEL31 DEL42 DEL78 DEL83 DEL83 DEL39 DEL42 DEL39 DEL42 DEL44 DEL52 DEL42 DEL22 DEL42 DEL7 DEL21 DEL8 DEL31 DEL42 DEL78 DEL83 DEL83 DEL39 DEL42 DEL39 DEL42 DEL44 DEL52 DEL42 DEL22 DEL42 DEL7 DEL21 DEL8 DEL31 DEL66 DEL65 DEL42 DEL66 DEL65 DEL29 DEL83 DEL39 DEL42 DEL39 DEL42 DEL44 DEL42 DEL32 DEL42 DEL32 DEL21 DEL39 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL32 DEL59 DEL60 DEL52 DEL42 DEL22 DEL42 DEL7 DEL21 DEL52 DEL42 DEL22 DEL42 DEL7 DEL21 DEL8 DEL31 DEL42 DEL78 DEL39 DEL42 DEL8 DEL31 DEL42 DEL43 DEL42 DEL11 DEL42 DEL78 DEL43 DEL42 DEL44 DEL52 DEL42 DEL42 DEL32 DEL42 DEL32 DEL9 DEL41 DEL8 DEL25 DEL8 DEL51 DEL42 DEL32 DEL42 DEL32 DEL41 DEL8 DEL31 DEL42 DEL42 DEL42 DEL78 DEL83 DEL52 DEL42 DEL22 DEL42 DEL42 DEL45 DEL42 DEL9 DEL41 DEL42 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL39 DEL42 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL42 DEL27 DEL25 DEL83 DEL32 DEL32 DEL59 DEL60 DEL43 DEL42 DEL83 DEL83 DEL39 DEL42 DEL9 DEL41 DEL8 DEL31 DEL42 DEL42 DEL42 DEL42 DEL32 DEL42 DEL38 DEL21 DEL42 DEL52 DEL42 DEL32 DEL42 DEL42 DEL42 DEL52 DEL42 DEL32 DEL42 DEL42 DEL32 DEL42 DEL42 DEL42 DEL42 DEL32 DEL21 DEL42 DEL38 DEL21 DEL8 DEL8 DEL8 DEL42 DEL78 DEL42 DEL42 DEL43 DEL42 DEL8

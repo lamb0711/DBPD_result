@@ -1,0 +1,544 @@
+YARN-6255. Refactor yarn-native-services framework. Contributed by Jian He
+
++import org.apache.hadoop.metrics2.MetricsSystem;
++import org.apache.hadoop.metrics2.lib.DefaultMetricsSystem;
++import org.apache.hadoop.yarn.client.api.YarnClient;
+-import org.apache.slider.api.ClusterDescription;
+-import org.apache.slider.api.StatusKeys;
++import org.apache.slider.api.proto.Messages;
+-import org.apache.slider.client.SliderYarnClientImpl;
++import org.apache.slider.api.resource.Application;
+-import org.apache.slider.core.buildutils.InstanceIO;
+-import org.apache.slider.core.conf.ConfTree;
+-import org.apache.slider.core.conf.ConfTreeOperations;
++import org.apache.slider.core.persist.JsonSerDeser;
+-import org.apache.slider.providers.slideram.SliderAMClientProvider;
+-import org.apache.slider.providers.slideram.SliderAMProviderService;
+-import org.apache.slider.server.appmaster.operations.ProviderNotifyingOperationHandler;
++import org.apache.slider.server.appmaster.state.MostRecentContainerReleaseSelector;
++import org.codehaus.jackson.map.PropertyNamingStrategy;
+-import java.net.URI;
++import java.util.Collections;
++import java.util.Date;
+-  
+-  private RMOperationHandler providerRMOperationHandler;
+-  private Credentials containerCredentials;
++  private Credentials containerCredentials = new Credentials();
+-  /**
+-   * Flag to set if the process exit code was set before shutdown started
+-   */
+-  @SuppressWarnings("FieldAccessedSynchronizedAndUnsynchronized")
+-  private boolean spawnedProcessExitedBeforeShutdownTriggered;
+-
+-
+-  private SliderAMProviderService sliderAMProvider;
++  private static final JsonSerDeser<Application> jsonSerDeser =
++      new JsonSerDeser<Application>(Application.class,
++          PropertyNamingStrategy.CAMEL_CASE_TO_LOWER_CASE_WITH_UNDERSCORES);
+-
++  private Application application;
+-   * @param clustername cluster name
++   * @param appName cluster name
+-  private int createAndRunCluster(String clustername) throws Throwable {
+-
+-    //load the cluster description from the cd argument
+-    String sliderClusterDir = serviceArgs.getSliderClusterURI();
+-    URI sliderClusterURI = new URI(sliderClusterDir);
+-    Path clusterDirPath = new Path(sliderClusterURI);
+-    log.info("Application defined at {}", sliderClusterURI);
++  private int createAndRunCluster(String appName) throws Throwable {
++    Path appDir = new Path((serviceArgs.getAppDefDir()));
+-
+-    // build up information about the running application -this
+-    // will be passed down to the cluster status
+-    MapOperations appInformation = new MapOperations(); 
+-
+-    AggregateConf instanceDefinition =
+-      InstanceIO.loadInstanceDefinitionUnresolved(fs, clusterDirPath);
+-    instanceDefinition.setName(clustername);
+-
+-    log.info("Deploying cluster {}:", instanceDefinition);
+-
+-    // and resolve it
+-    AggregateConf resolvedInstance = new AggregateConf( instanceDefinition);
+-    resolvedInstance.resolve();
+-
+-    stateForProviders.setApplicationName(clustername);
+-
++    fs.setAppDir(appDir);
++    Path appJson = new Path(appDir, appName + ".json");
++    log.info("Loading application definition from " + appJson);
++    application = jsonSerDeser.load(fs.getFileSystem(), appJson);
++    log.info("Application Json: " + application);
++    stateForProviders.setApplicationName(appName);
+-    // extend AM configuration with component resource
+-    MapOperations amConfiguration = resolvedInstance
+-      .getAppConfOperations().getComponent(COMPONENT_AM);
+-    // and patch configuration with prefix
+-    if (amConfiguration != null) {
+-      Map<String, String> sliderAppConfKeys = amConfiguration.prefixedWith("slider.");
+-      for (Map.Entry<String, String> entry : sliderAppConfKeys.entrySet()) {
+-        String k = entry.getKey();
+-        String v = entry.getValue();
+-        boolean exists = serviceConf.get(k) != null;
+-        log.info("{} {} to {}", (exists ? "Overwriting" : "Setting"), k, v);
+-        serviceConf.set(k, v);
+-      }
+-    }
+-
+-    securityConfiguration = new SecurityConfiguration(serviceConf, resolvedInstance, clustername);
+-    securityEnabled = securityConfiguration.isSecurityEnabled();
+-    instanceDefinition.getAppConfOperations().set(KEY_SECURITY_ENABLED, securityEnabled);
+-    // triggers resolution and snapshotting for agent
+-    appState.setInitialInstanceDefinition(instanceDefinition);
+-
+-    File confDir = getLocalConfDir();
+-    if (!confDir.exists() || !confDir.isDirectory()) {
+-      log.info("Conf dir {} does not exist.", confDir);
+-      File parentFile = confDir.getParentFile();
+-      log.info("Parent dir {}:\n{}", parentFile, SliderUtils.listDir(parentFile));
+-    }
+-    
+-    MapOperations globalInternalOptions = getGlobalInternalOptions();
+-    String providerType = globalInternalOptions.getMandatoryOption(
+-      InternalKeys.INTERNAL_PROVIDER_NAME);
+-    log.info("Cluster provider type is {}", providerType);
+-      SliderProviderFactory.createSliderProviderFactory(providerType);
++      SliderProviderFactory.createSliderProviderFactory("docker");
+-    providerRMOperationHandler = new ProviderNotifyingOperationHandler(providerService);
+-    
+-    // create a slider AM provider
+-    sliderAMProvider = new SliderAMProviderService();
+-    initAndAddService(sliderAMProvider);
+-    
++
+-    appInformation.put(StatusKeys.INFO_AM_CONTAINER_ID, appMasterContainerID.toString());
+-    appInformation.put(StatusKeys.INFO_AM_APP_ID, appid.toString());
+-    appInformation.put(StatusKeys.INFO_AM_ATTEMPT_ID, appAttemptID.toString());
+-
+-      buildPortScanner(instanceDefinition);
+-      startSliderRPCServer(instanceDefinition);
++      buildPortScanner();
++      startSliderRPCServer();
+-      appInformation.put(StatusKeys.INFO_AM_HOSTNAME, appMasterHostname);
+-      appInformation.set(StatusKeys.INFO_AM_RPC_PORT, appMasterRpcPort);
+-      List<ProviderRole> providerRoles = new ArrayList<>(providerService.getRoles());
+-      providerRoles.addAll(SliderAMClientProvider.ROLES);
+-
++      List<ProviderRole> providerRoles = Collections.EMPTY_LIST;
+-      MapOperations component = instanceDefinition.getAppConfOperations()
+-          .getComponent(SliderKeys.COMPONENT_AM);
+-              actionQueues,
+-              this,
+-              contentCache);
++              actionQueues);
+-      appInformation.put(StatusKeys.INFO_AM_WEB_URL, appMasterTrackingUrl + "/");
+-      appInformation.set(StatusKeys.INFO_AM_WEB_PORT, webAppPort);
+-
++      //TODO should not read local configs !!!
+-      // set the RM-defined maximum cluster values
+-      appInformation.put(ResourceKeys.YARN_CORES, Integer.toString(maxCores));
+-      appInformation.put(ResourceKeys.YARN_MEMORY, Integer.toString(maxMemory));
+-
+-      processAMCredentials(securityConfiguration);
++//      processAMCredentials(securityConfiguration);
+-          File localKeytabFile = securityConfiguration.getKeytabFile(instanceDefinition);
++          //TODO read key tab file from slider-am.xml
++          File localKeytabFile =
++              securityConfiguration.getKeytabFile(new AggregateConf());
+-      SliderYarnClientImpl yarnClient = null;
++      YarnClient yarnClient = null;
+-        yarnClient = new SliderYarnClientImpl();
++        yarnClient = YarnClient.createYarnClient();
+-
+-      //now validate the installation
+-      Configuration providerConf =
+-        providerService.loadProviderConfigurationInformation(confDir);
+-
+-      providerService.initializeApplicationConfiguration(instanceDefinition,
+-          fs, null);
+-
+-      providerService.validateApplicationConfiguration(instanceDefinition,
+-          confDir,
+-          securityEnabled);
++      DefaultMetricsSystem.initialize("SliderAppMaster");
+-      Path historyDir = new Path(clusterDirPath, HISTORY_DIR_NAME);
++      Path historyDir = new Path(appDir, HISTORY_DIR_NAME);
+-      binding.instanceDefinition = instanceDefinition;
+-      binding.publishedProviderConf = providerConf;
+-      binding.applicationInfo = appInformation;
+-      binding.releaseSelector = providerService.createContainerReleaseSelector();
++      binding.releaseSelector =  new MostRecentContainerReleaseSelector();
++      binding.application = application;
+-      providerService.rebuildContainerDetails(liveContainers,
+-          instanceDefinition.getName(), appState.getRolePriorityMap());
+-
+-      // add the AM to the list of nodes in the cluster
+-
+-      appState.buildAppMasterNode(appMasterContainerID,
+-          appMasterHostname,
+-          webAppPort,
+-          appMasterHostname + ":" + webAppPort);
+-
+-    String amTmpDir = globalInternalOptions.getMandatoryOption(InternalKeys.INTERNAL_AM_TMP_DIR);
+-
++    String amTmpDir = "/tmp";
++    //TODO read tmpDir from slider-am.xml
+-                                          fs,
+-                                          new Path(getGeneratedConfDir()),
+-                                          envVars,
+-                                          launcherTmpDirPath);
++                                          fs, envVars);
+-    appState.noteAMLaunched();
+-
+-
+-    providerService.bind(stateForProviders, actionQueues, liveContainers);
+-    sliderAMProvider.bind(stateForProviders, actionQueues, liveContainers);
++    providerService.setAMState(stateForProviders);
+-    maybeStartMonkey();
+-
+-    // setup token renewal and expiry handling for long lived apps
+-//    if (!securityConfiguration.isKeytabProvided() &&
+-//        SliderUtils.isHadoopClusterSecure(getConfig())) {
+-//      fsDelegationTokenManager = new FsDelegationTokenManager(actionQueues);
+-//      fsDelegationTokenManager.acquireDelegationToken(getConfig());
+-//    }
++//    maybeStartMonkey();
+-    scheduleFailureWindowResets(instanceDefinition.getResources());
+-    scheduleEscalation(instanceDefinition.getInternal());
++    scheduleFailureWindowResets(application.getConfiguration());
++    scheduleEscalation(application.getConfiguration());
+-      queue(new ActionRegisterServiceInstance(clustername, appid));
++      queue(new ActionRegisterServiceInstance(appName, appid, application));
+-
+-      // Start the Slider AM provider
+-      sliderAMProvider.start();
+-
+-      launchProviderService(instanceDefinition, confDir);
++      launchProviderService();
+-    final SliderYarnClientImpl yarnClient)
++    final YarnClient yarnClient)
+-   * List the node reports: uses {@link SliderYarnClientImpl} as the login user
++   * List the node reports: uses {@link YarnClient} as the login user
+-  private List<NodeReport> getNodeReports(final SliderYarnClientImpl yarnClient)
++  private List<NodeReport> getNodeReports(final YarnClient yarnClient)
+-   * @param webAppApi web app API instance
++   * @param webAppApi web application API instance
+-  private void buildPortScanner(AggregateConf instanceDefinition)
++  private void buildPortScanner()
+-    String portRange = instanceDefinition.
+-        getAppConfOperations().getGlobalOptions().
+-          getOption(SliderKeys.KEY_ALLOWED_PORT_RANGE, "0");
++    String portRange = "0";
++    //TODO read from slider-am.xml
++//    String portRange = instanceDefinition.
++//        getAppConfOperations().getGlobalOptions().
++//          getOption(SliderKeys.KEY_ALLOWED_PORT_RANGE, "0");
+-      ApplicationId appId) throws IOException {
+-    
+-    
+-    // the registry is running, so register services
+-    URL amWebURI = new URL(appMasterProxiedUrl);
++      ApplicationId appId, Application application) throws IOException {
+-    sliderAMProvider.bindToYarnRegistry(yarnRegistryOperations);
+-            
+-    // internal services
+-    sliderAMProvider.applyInitialRegistryDefinitions(amWebURI,
+-        serviceRecord);
+-
+-    // provider service dynamic definitions.
+-    providerService.applyInitialRegistryDefinitions(amWebURI, serviceRecord);
+-
+-    setProvidedServiceRecordAttributes(
+-        getInstanceDefinition().getAppConfOperations().getComponent(
+-            SliderKeys.COMPONENT_AM), serviceRecord);
++    setUserProvidedServiceRecordAttributes(application.getConfiguration(),
++        serviceRecord);
+-   * Register/re-register an ephemeral container that is already in the app state
++   * Register/re-register an ephemeral container that is already in the application state
+-    ServiceRecord container = new ServiceRecord();
+-    container.set(YarnRegistryAttributes.YARN_ID, cid);
+-    container.description = description;
+-    container.set(YarnRegistryAttributes.YARN_PERSISTENCE,
++    ServiceRecord record = new ServiceRecord();
++    record.set(YarnRegistryAttributes.YARN_ID, cid);
++    record.description = description;
++    record.set(YarnRegistryAttributes.YARN_PERSISTENCE,
+-    MapOperations compOps = getInstanceDefinition().getAppConfOperations().
+-        getComponent(type);
+-    setProvidedServiceRecordAttributes(compOps, container);
++    setUserProvidedServiceRecordAttributes(
++        instance.providerRole.component.getConfiguration(), record);
+-      yarnRegistryOperations.putComponent(cid, container);
++      yarnRegistryOperations.putComponent(cid, record);
++    org.apache.slider.api.resource.Container container =
++        new org.apache.slider.api.resource.Container();
++    container.setId(id.toString());
++    container.setLaunchTime(new Date());
++    container.setState(org.apache.slider.api.resource.ContainerState.INIT);
++    container.setBareHost(instance.host);
++    instance.providerRole.component.addContainer(container);
+-  protected void setProvidedServiceRecordAttributes(MapOperations ops,
+-                                                  ServiceRecord record) {
++  protected void setUserProvidedServiceRecordAttributes(
++      org.apache.slider.api.resource.Configuration conf, ServiceRecord record) {
+-    for (Map.Entry<String, String> entry : ops.entrySet()) {
+-      if (entry.getKey().startsWith(
+-          prefix)) {
+-        String key = entry.getKey().substring(
+-            prefix.length() + 1);
++    for (Map.Entry<String, String> entry : conf.getProperties().entrySet()) {
++      if (entry.getKey().startsWith(prefix)) {
++        String key = entry.getKey().substring(prefix.length() + 1);
+-   * Build the configuration directory passed in or of the target FS
+-   * @return the file
+-   */
+-  public File getLocalConfDir() {
+-    File confdir =
+-      new File(SliderKeys.PROPAGATED_CONF_DIR_NAME).getAbsoluteFile();
+-    return confdir;
+-  }
+-
+-  /**
+-   * Get the path to the DFS configuration that is defined in the cluster specification 
+-   * @return the generated configuration dir
+-   */
+-  public String getGeneratedConfDir() {
+-    return getGlobalInternalOptions().get(
+-        InternalKeys.INTERNAL_GENERATED_CONF_PATH);
+-  }
+-
+-  /**
+-   * Get the global internal options for the AM
+-   * @return a map to access the internals
+-   */
+-  public MapOperations getGlobalInternalOptions() {
+-    return getInstanceDefinition()
+-      .getInternalOperations().
+-      getGlobalOptions();
+-  }
+-
+-  /**
+-    if (!spawnedProcessExitedBeforeShutdownTriggered) {
+-      //stopped the forked process but don't worry about its exit code
+-      int forkedExitCode = stopForkedProcess();
+-      log.debug("Stopped forked process: exit code={}", forkedExitCode);
+-    }
+-    releaseAllContainers();
++    releaseAllContainers(application);
++    DefaultMetricsSystem.shutdown();
+-  private void startSliderRPCServer(AggregateConf instanceDefinition)
++  private void startSliderRPCServer()
+-      try {
+-        launchService.launchRole(assignment, getInstanceDefinition(),
+-            buildContainerCredentials());
+-      } catch (IOException e) {
+-        // Can be caused by failure to renew credentials with the remote
+-        // service. If so, don't launch the application. Container is retained,
+-        // though YARN will take it away after a timeout.
+-        log.error("Failed to build credentials to launch container: {}", e, e);
+-
+-      }
++      //TODO Do we need to pass credentials to containers?
++      launchService.launchRole(assignment, application, null);
+-      AppState.NodeCompletionResult result = appState.onCompletedNode(status);
++      AppState.NodeCompletionResult result = appState.onCompletedContainer(status);
+-        getProviderService().notifyContainerCompleted(containerId);
+-   * @param resources the resource tree
+-  public void flexCluster(ConfTree resources)
++  public void flexCluster(Messages.FlexComponentRequestProto request)
+-
+-    AggregateConf newConf =
+-        new AggregateConf(appState.getInstanceDefinitionSnapshot());
+-    newConf.setResources(resources);
+-    // verify the new definition is valid
+-    sliderAMProvider.validateInstanceDefinition(newConf);
+-    providerService.validateInstanceDefinition(newConf);
+-
+-    appState.updateResourceDefinitions(resources);
+-
++    if (request != null) {
++      appState.updateComponents(request);
++    }
+-   * @param resources the resource tree
+-  private void scheduleFailureWindowResets(ConfTree resources) throws
+-      BadConfigException {
++  private void scheduleFailureWindowResets(
++      org.apache.slider.api.resource.Configuration conf) {
++
+-    ConfTreeOperations ops = new ConfTreeOperations(resources);
+-    MapOperations globals = ops.getGlobalOptions();
+-    long seconds = globals.getTimeRange(ResourceKeys.CONTAINER_FAILURE_WINDOW,
+-        ResourceKeys.DEFAULT_CONTAINER_FAILURE_WINDOW_DAYS,
+-        ResourceKeys.DEFAULT_CONTAINER_FAILURE_WINDOW_HOURS,
+-        ResourceKeys.DEFAULT_CONTAINER_FAILURE_WINDOW_MINUTES, 0);
+-    if (seconds > 0) {
+-      log.info(
+-          "Scheduling the failure window reset interval to every {} seconds",
+-          seconds);
+-      RenewingAction<ResetFailureWindow> renew = new RenewingAction<>(
+-          reset, seconds, seconds, TimeUnit.SECONDS, 0);
++
++    long days =
++        conf.getPropertyLong(ResourceKeys.CONTAINER_FAILURE_WINDOW + ".days",
++            ResourceKeys.DEFAULT_CONTAINER_FAILURE_WINDOW_DAYS);
++    long hours =
++        conf.getPropertyLong(ResourceKeys.CONTAINER_FAILURE_WINDOW + ".hours",
++            ResourceKeys.DEFAULT_CONTAINER_FAILURE_WINDOW_HOURS);
++    long minutes =
++        conf.getPropertyLong(ResourceKeys.CONTAINER_FAILURE_WINDOW + ".minutes",
++            ResourceKeys.DEFAULT_CONTAINER_FAILURE_WINDOW_MINUTES);
++    long seconds =
++        conf.getPropertyLong(ResourceKeys.CONTAINER_FAILURE_WINDOW + ".seconds",
++            0);
++    Preconditions
++        .checkState(days >= 0 && hours >= 0 && minutes >= 0 && seconds >= 0,
++            "Time range for has negative time component %s:%s:%s:%s", days,
++            hours, minutes, seconds);
++    long totalMinutes = days * 24 * 60 + hours * 24 + minutes;
++    long totalSeconds = totalMinutes * 60 + seconds;
++    if (totalSeconds > 0) {
++      log.info("Scheduling the failure window reset interval to every {}"
++              + " seconds", totalSeconds);
++      RenewingAction<ResetFailureWindow> renew =
++          new RenewingAction<>(reset, totalSeconds, totalSeconds,
++              TimeUnit.SECONDS, 0);
+-   * @param internal
+-  private void scheduleEscalation(ConfTree internal) throws BadConfigException {
++  private void scheduleEscalation(
++      org.apache.slider.api.resource.Configuration conf) {
+-    ConfTreeOperations ops = new ConfTreeOperations(internal);
+-    int seconds = ops.getGlobalOptions().getOptionInt(InternalKeys.ESCALATION_CHECK_INTERVAL,
++    long seconds = conf.getPropertyLong(InternalKeys.ESCALATION_CHECK_INTERVAL,
+-    RenewingAction<EscalateOutstandingRequests> renew = new RenewingAction<>(
+-        escalate, seconds, seconds, TimeUnit.SECONDS, 0);
++    RenewingAction<EscalateOutstandingRequests> renew =
++        new RenewingAction<>(escalate, seconds, seconds, TimeUnit.SECONDS, 0);
+-    log.debug("reviewRequestAndReleaseNodes({})", reason);
++    log.info("reviewRequestAndReleaseNodes({})", reason);
++      //TODO Loop all actions to check duplicate ？？
+-    log.debug("in executeNodeReview({})", reason);
++    log.info("in executeNodeReview({})", reason);
+-      // tell the provider
+-      providerRMOperationHandler.execute(allOperations);
+-    providerRMOperationHandler.execute(operations);
+-  private void releaseAllContainers() {
++  private void releaseAllContainers(Application application) {
+-      long timeout = getContainerReleaseTimeout();
++      long timeout = getContainerReleaseTimeout(application);
+-      providerRMOperationHandler.execute(operations);
+-  private long getContainerReleaseTimeout() {
++  private long getContainerReleaseTimeout(Application application) {
+-    // If non-zero then add the agent heartbeat delay time, since it can take up
+-    // to that much time for agents to receive the stop command.
+-    int timeout = getInstanceDefinition().getAppConfOperations()
+-        .getGlobalOptions()
+-        .getOptionInt(SliderKeys.APP_CONTAINER_RELEASE_TIMEOUT, 0);
+-    if (timeout > 0) {
+-      timeout += SliderKeys.APP_CONTAINER_HEARTBEAT_INTERVAL_SEC;
+-    }
++    long timeout = application.getConfiguration()
++        .getPropertyLong(SliderKeys.APP_CONTAINER_RELEASE_TIMEOUT, 0);
++
+-   *
+-   * @param instanceDefinition definition of the service
+-   * @param confDir directory of config data
+-  protected synchronized void launchProviderService(AggregateConf instanceDefinition,
+-                                                    File confDir)
+-    throws IOException, SliderException {
+-    Map<String, String> env = new HashMap<>();
+-    boolean execStarted = providerService.exec(instanceDefinition, confDir, env,
+-        this);
+-    if (execStarted) {
+-      providerService.registerServiceListener(this);
+-      providerService.start();
+-    } else {
+-      // didn't start, so don't register
+-      providerService.start();
+-      // and send the started event ourselves
+-      eventCallbackEvent(null);
+-    }
++  protected synchronized void launchProviderService()
++      throws IOException, SliderException {
++    // didn't start, so don't register
++    providerService.start();
++    // and send the started event ourselves
++    eventCallbackEvent(null);
+-    // signalled that the child process is up.
+-    appState.noteAMLive();
+-      flexCluster(getInstanceDefinition().getResources());
++      flexCluster(null);
+-  /* =================================================================== */
+-  /* ServiceStateChangeListener */
+-  /* =================================================================== */
+-
+-  /**
+-   * Received on listening service termination.
+-   * @param service the service that has changed.
+-   */
+-  @Override //ServiceStateChangeListener
+-  public void stateChanged(Service service) {
+-    if (service == providerService && service.isInState(STATE.STOPPED)) {
+-      //its the current master process in play
+-      int exitCode = providerService.getExitCode();
+-      int mappedProcessExitCode = exitCode;
+-
+-      boolean shouldTriggerFailure = !amCompletionFlag.get()
+-         && (mappedProcessExitCode != 0);
+-
+-      if (shouldTriggerFailure) {
+-        String reason =
+-            "Spawned process failed with raw " + exitCode + " mapped to " +
+-            mappedProcessExitCode;
+-        ActionStopSlider stop = new ActionStopSlider("stop",
+-            mappedProcessExitCode,
+-            FinalApplicationStatus.FAILED,
+-            reason);
+-        //this wasn't expected: the process finished early
+-        spawnedProcessExitedBeforeShutdownTriggered = true;
+-        log.info(
+-          "Process has exited with exit code {} mapped to {} -triggering termination",
+-          exitCode,
+-          mappedProcessExitCode);
+-
+-        //tell the AM the cluster is complete 
+-        signalAMComplete(stop);
+-      } else {
+-        //we don't care
+-        log.info(
+-          "Process has exited with exit code {} mapped to {} -ignoring",
+-          exitCode,
+-          mappedProcessExitCode);
+-      }
+-    } else {
+-      super.stateChanged(service);
+-    }
+-  }
+-
+-  /**
+-   * stop forked process if it the running process var is not null
+-   * @return the process exit code
+-   */
+-  protected synchronized Integer stopForkedProcess() {
+-    providerService.stop();
+-    return providerService.getExitCode();
+-  }
+-
+-  public AggregateConf getInstanceDefinition() {
+-    return appState.getInstanceDefinition();
+-  }
+-
+-  /**
+-   * This is the status, the live model
+-   */
+-  public ClusterDescription getClusterDescription() {
+-    return appState.getClusterStatus();
+-  }
+-   * Start the chaos monkey
++   * TODO Start the chaos monkey
+-    MapOperations internals = getGlobalInternalOptions();
+-
++//    MapOperations internals = getGlobalInternalOptions();
++    MapOperations internals = new MapOperations();
+
+MOV26 MOV26 MOV26 MOV26 MOV26 MOV26 MOV26 MOV26 MOV26 MOV26 MOV31 UPD40 UPD40 UPD40 UPD40 UPD40 UPD40 UPD40 UPD40 UPD40 UPD40 INS23 INS23 INS31 MOV83 UPD83 MOV83 UPD83 MOV83 INS74 INS59 INS83 INS43 INS59 MOV60 INS44 MOV21 UPD42 MOV29 MOV83 MOV39 MOV42 MOV44 INS8 INS44 INS44 MOV29 INS39 INS42 MOV43 MOV43 MOV8 INS14 INS43 INS43 INS42 INS14 UPD42 MOV42 INS42 MOV43 UPD42 MOV60 MOV21 MOV21 MOV21 UPD43 UPD43 INS43 INS42 INS21 INS60 INS21 INS21 INS21 INS21 UPD43 UPD42 MOV21 UPD43 UPD42 INS25 UPD43 UPD42 MOV60 MOV60 MOV60 MOV60 MOV60 INS21 MOV60 MOV60 MOV25 UPD43 UPD42 INS43 INS42 INS43 INS42 MOV60 INS43 UPD42 MOV42 UPD42 MOV42 INS74 INS57 INS40 UPD42 UPD43 MOV43 INS32 MOV21 MOV21 MOV21 MOV43 UPD42 UPD42 UPD66 MOV43 INS42 UPD66 INS32 INS43 INS59 INS32 INS32 INS32 INS32 INS40 INS8 INS40 INS27 INS8 INS40 INS39 INS39 UPD39 INS32 UPD39 INS39 INS40 UPD39 INS42 INS42 UPD39 UPD66 INS42 INS43 INS43 INS43 UPD42 UPD42 UPD42 UPD42 UPD42 UPD42 INS14 INS27 UPD42 INS32 INS27 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 INS45 UPD42 UPD42 INS45 UPD42 MOV32 UPD42 UPD42 UPD40 UPD42 INS42 INS32 INS42 INS40 UPD42 MOV42 INS14 INS42 UPD42 MOV42 INS32 UPD42 MOV42 INS42 INS14 INS42 INS42 INS40 INS42 INS42 INS40 INS40 UPD42 INS32 UPD42 UPD42 UPD42 INS42 MOV21 INS42 INS33 MOV21 UPD42 INS32 UPD42 UPD42 UPD42 INS42 INS42 INS27 INS45 UPD42 MOV42 UPD42 MOV42 INS42 INS42 UPD42 INS27 UPD42 UPD42 UPD42 UPD42 UPD42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 MOV43 INS36 MOV43 INS42 INS27 INS45 INS42 INS42 INS42 INS32 INS42 INS45 INS42 INS45 MOV74 MOV43 UPD43 MOV43 UPD42 UPD42 UPD42 UPD42 UPD42 MOV42 UPD42 INS40 INS42 INS43 UPD42 MOV42 INS42 INS43 INS42 UPD42 MOV42 INS42 INS42 INS27 INS40 UPD42 UPD42 INS27 INS40 UPD42 UPD42 INS27 UPD42 UPD42 INS27 INS34 INS27 INS27 INS27 INS42 INS27 UPD42 UPD42 MOV42 UPD42 MOV32 UPD42 INS32 INS42 INS45 INS42 INS42 INS42 INS40 UPD42 UPD42 UPD42 INS45 UPD40 INS14 UPD40 UPD42 UPD42 INS40 INS42 UPD42 MOV42 INS33 UPD42 UPD42 INS40 INS45 INS40 INS45 INS40 INS45 INS40 INS45 INS27 INS27 INS42 INS34 INS27 INS27 UPD42 MOV42 INS34 INS27 UPD42 UPD42 MOV42 UPD42 INS33 INS42 INS42 MOV43 MOV43 UPD42 INS43 UPD42 INS42 UPD42 UPD27 MOV27 INS27 INS42 INS34 INS42 INS34 INS34 UPD42 MOV42 UPD34 MOV34 INS45 INS45 UPD42 UPD42 INS42 INS32 INS42 UPD42 INS34 INS42 INS34 MOV43 MOV59 INS42 INS42 INS42 INS32 INS42 INS42 MOV14 DEL42 DEL43 DEL42 DEL59 DEL23 DEL66 DEL65 DEL29 DEL42 DEL45 DEL79 DEL39 DEL42 DEL59 DEL23 DEL43 DEL42 DEL59 DEL23 DEL42 DEL43 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL43 DEL42 DEL42 DEL42 DEL14 DEL59 DEL60 DEL42 DEL42 DEL45 DEL42 DEL32 DEL21 DEL42 DEL43 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL42 DEL42 DEL32 DEL21 DEL42 DEL42 DEL45 DEL42 DEL32 DEL21 DEL42 DEL43 DEL60 DEL42 DEL42 DEL32 DEL21 DEL42 DEL43 DEL42 DEL43 DEL42 DEL43 DEL74 DEL42 DEL42 DEL45 DEL32 DEL45 DEL42 DEL45 DEL45 DEL16 DEL36 DEL42 DEL42 DEL42 DEL43 DEL42 DEL42 DEL42 DEL32 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL33 DEL27 DEL40 DEL43 DEL42 DEL43 DEL42 DEL43 DEL74 DEL42 DEL44 DEL42 DEL42 DEL32 DEL42 DEL43 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL43 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL39 DEL42 DEL42 DEL42 DEL42 DEL32 DEL33 DEL27 DEL59 DEL60 DEL42 DEL42 DEL42 DEL42 DEL32 DEL21 DEL8 DEL70 DEL8 DEL25 DEL42 DEL43 DEL42 DEL42 DEL42 DEL14 DEL45 DEL42 DEL42 DEL42 DEL45 DEL42 DEL32 DEL32 DEL42 DEL42 DEL42 DEL32 DEL7 DEL21 DEL42 DEL42 DEL32 DEL42 DEL42 DEL42 DEL32 DEL21 DEL42 DEL42 DEL42 DEL32 DEL21 DEL42 DEL43 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL42 DEL32 DEL38 DEL42 DEL42 DEL32 DEL38 DEL27 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL8 DEL25 DEL42 DEL43 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL42 DEL42 DEL40 DEL32 DEL59 DEL60 DEL42 DEL42 DEL45 DEL42 DEL32 DEL21 DEL42 DEL42 DEL42 DEL43 DEL42 DEL14 DEL7 DEL21 DEL42 DEL42 DEL43 DEL14 DEL7 DEL21 DEL42 DEL42 DEL32 DEL21 DEL42 DEL42 DEL40 DEL42 DEL42 DEL32 DEL32 DEL21 DEL42 DEL42 DEL40 DEL42 DEL42 DEL32 DEL32 DEL21 DEL42 DEL42 DEL40 DEL42 DEL42 DEL32 DEL32 DEL21 DEL42 DEL42 DEL42 DEL42 DEL40 DEL42 DEL32 DEL21 DEL42 DEL42 DEL40 DEL42 DEL32 DEL21 DEL42 DEL42 DEL43 DEL74 DEL42 DEL42 DEL32 DEL14 DEL59 DEL60 DEL42 DEL42 DEL40 DEL32 DEL21 DEL42 DEL43 DEL42 DEL42 DEL42 DEL32 DEL42 DEL40 DEL32 DEL52 DEL42 DEL42 DEL42 DEL40 DEL42 DEL32 DEL21 DEL42 DEL42 DEL40 DEL42 DEL42 DEL42 DEL32 DEL32 DEL21 DEL42 DEL42 DEL40 DEL42 DEL42 DEL42 DEL32 DEL32 DEL21 DEL42 DEL42 DEL32 DEL21 DEL42 DEL42 DEL42 DEL43 DEL42 DEL42 DEL42 DEL42 DEL32 DEL59 DEL42 DEL43 DEL14 DEL40 DEL42 DEL45 DEL27 DEL42 DEL43 DEL42 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL42 DEL42 DEL42 DEL33 DEL32 DEL21 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL21 DEL40 DEL42 DEL7 DEL21 DEL42 DEL40 DEL42 DEL42 DEL32 DEL7 DEL21 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL42 DEL42 DEL32 DEL32 DEL21 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL45 DEL42 DEL27 DEL32 DEL21 DEL42 DEL42 DEL40 DEL32 DEL42 DEL32 DEL14 DEL42 DEL42 DEL42 DEL32 DEL21 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL21 DEL42 DEL32 DEL21 DEL42 DEL42 DEL32 DEL21 DEL42 DEL42 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL42 DEL32 DEL42 DEL32 DEL42 DEL40 DEL45 DEL32 DEL42 DEL43 DEL42 DEL42 DEL43 DEL42 DEL14 DEL59 DEL60 DEL42 DEL42 DEL42 DEL32 DEL21 DEL42 DEL42 DEL42 DEL42 DEL32 DEL21 DEL42 DEL42 DEL42 DEL42 DEL32 DEL21 DEL32 DEL42 DEL40 DEL32 DEL42 DEL43 DEL32 DEL32 DEL42 DEL32 DEL59 DEL60 DEL42 DEL42 DEL66 DEL65 DEL66 DEL65 DEL29 DEL83 DEL43 DEL42 DEL43 DEL42 DEL43 DEL40 DEL14 DEL42 DEL32 DEL59 DEL60 DEL42 DEL41 DEL8 DEL31 DEL66 DEL65 DEL66 DEL65 DEL29 DEL83 DEL43 DEL42 DEL42 DEL32 DEL42 DEL40 DEL32 DEL41 DEL8 DEL31 DEL66 DEL65 DEL66 DEL65 DEL29 DEL83 DEL43 DEL42 DEL42 DEL32 DEL42 DEL32 DEL42 DEL32 DEL41 DEL8 DEL31 DEL42 DEL38 DEL39 DEL42 DEL42 DEL32 DEL59 DEL60 DEL8 DEL25 DEL45 DEL42 DEL42 DEL43 DEL42 DEL44 DEL32 DEL42 DEL32 DEL8 DEL42 DEL43 DEL42 DEL44 DEL42 DEL42 DEL45 DEL42 DEL42 DEL32 DEL21 DEL8 DEL12 DEL54 DEL8 DEL42 DEL32 DEL42 DEL42 DEL32 DEL21 DEL42 DEL66 DEL65 DEL42 DEL42 DEL43 DEL42 DEL42 DEL43 DEL42 DEL42 DEL32 DEL14 DEL59 DEL60 DEL42 DEL42 DEL42 DEL32 DEL21 DEL42 DEL42 DEL42 DEL32 DEL21 DEL42 DEL42 DEL42 DEL32 DEL21 DEL42 DEL66 DEL65 DEL42 DEL42 DEL43 DEL42 DEL43 DEL42 DEL14 DEL42 DEL43 DEL40 DEL40 DEL40 DEL34 DEL42 DEL42 DEL42 DEL52 DEL42 DEL42 DEL42 DEL32 DEL38 DEL27 DEL36 DEL27 DEL42 DEL43 DEL45 DEL45 DEL45 DEL42 DEL43 DEL8 DEL31 DEL42 DEL65 DEL42 DEL42 DEL43 DEL42 DEL43 DEL42 DEL42 DEL43 DEL42 DEL14 DEL59 DEL60 DEL42 DEL32 DEL42 DEL42 DEL42 DEL32 DEL21 DEL42 DEL42 DEL42 DEL32 DEL21 DEL42 DEL42 DEL42 DEL32 DEL21 DEL32 DEL42 DEL32 DEL42 DEL34 DEL27 DEL42 DEL40 DEL7 DEL21 DEL8 DEL25 DEL42 DEL66 DEL65 DEL42 DEL66 DEL65 DEL66 DEL65 DEL66 DEL65 DEL29 DEL42 DEL43 DEL42 DEL42 DEL42 DEL32 DEL21 DEL42 DEL42 DEL32 DEL41 DEL8 DEL83 DEL83 DEL39 DEL42 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL43 DEL42 DEL43 DEL74 DEL42 DEL42 DEL43 DEL74 DEL14 DEL59 DEL60 DEL42 DEL42 DEL42 DEL52 DEL32 DEL21 DEL42 DEL42 DEL32 DEL21 DEL8 DEL25 DEL8 DEL31 DEL42 DEL42 DEL32 DEL21 DEL42 DEL32 DEL42 DEL32 DEL66 DEL65 DEL42 DEL66 DEL65 DEL29 DEL42 DEL78 DEL83 DEL39 DEL42 DEL42 DEL43 DEL42 DEL44 DEL42 DEL42 DEL40 DEL32 DEL27 DEL39 DEL42 DEL32 DEL59 DEL60 DEL39 DEL42 DEL42 DEL59 DEL60 DEL42 DEL42 DEL43 DEL42 DEL42 DEL43 DEL45 DEL42 DEL40 DEL42 DEL14 DEL59 DEL60 DEL42 DEL9 DEL7 DEL21 DEL42 DEL42 DEL45 DEL42 DEL42 DEL32 DEL21 DEL42 DEL42 DEL32 DEL21 DEL8 DEL42 DEL42 DEL45 DEL42 DEL42 DEL32 DEL21 DEL8 DEL25 DEL8 DEL42 DEL42 DEL48 DEL21 DEL8 DEL25 DEL8 DEL31 DEL83 DEL42 DEL43 DEL42 DEL42 DEL42 DEL32 DEL41 DEL8 DEL31 DEL66 DEL65 DEL29 DEL83 DEL42 DEL43 DEL42 DEL42 DEL42 DEL32 DEL41 DEL8 DEL31 DEL42 DEL43 DEL42 DEL42 DEL32 DEL59 DEL60

@@ -1,0 +1,440 @@
+HDDS-1300. Optimize non-recursive ozone filesystem apis. Contributed by Lokesh Jain.
+
++import java.nio.file.Path;
++import java.nio.file.Paths;
+-    String volumeKey = metadataManager.getVolumeKey(volumeName);
+-
+-    //Check if the volume exists
+-    if (metadataManager.getVolumeTable().get(volumeKey) == null) {
+-      LOG.error("volume not found: {}", volumeName);
+-      throw new OMException("Volume not found",
+-          OMException.ResultCodes.VOLUME_NOT_FOUND);
+-    }
+-    //Check if bucket already exists
++    // Check if bucket exists
++      String volumeKey = metadataManager.getVolumeKey(volumeName);
++      // If the volume also does not exist, we should throw volume not found
++      // exception
++      if (metadataManager.getVolumeTable().get(volumeKey) == null) {
++        LOG.error("volume not found: {}", volumeName);
++        throw new OMException("Volume not found",
++            OMException.ResultCodes.VOLUME_NOT_FOUND);
++      }
++
++      // if the volume exists but bucket does not exist, throw bucket not found
++      // exception
+-  @SuppressWarnings("checkstyle:methodlength")
++    String keyName = args.getKeyName();
+-    metadataManager.getLock().acquireBucketLock(volumeName, bucketName);
+-    String keyName = args.getKeyName();
+-    ReplicationFactor factor = args.getFactor();
+-    ReplicationType type = args.getType();
+-    FileEncryptionInfo encInfo = null;
+-    OmBucketInfo bucketInfo = getBucketInfo(volumeName, bucketName);
+-    BucketEncryptionKeyInfo ezInfo = bucketInfo.getEncryptionKeyInfo();
+-    if (ezInfo != null) {
+-      if (getKMSProvider() == null) {
+-        throw new OMException("Invalid KMS provider, check configuration " +
+-            CommonConfigurationKeys.HADOOP_SECURITY_KEY_PROVIDER_PATH,
+-            OMException.ResultCodes.INVALID_KMS_PROVIDER);
+-      }
+-
+-      final String ezKeyName = ezInfo.getKeyName();
+-      EncryptedKeyVersion edek = generateEDEK(ezKeyName);
+-      encInfo = new FileEncryptionInfo(ezInfo.getSuite(), ezInfo.getVersion(),
+-            edek.getEncryptedKeyVersion().getMaterial(),
+-            edek.getEncryptedKeyIv(),
+-            ezKeyName, edek.getEncryptionKeyVersionName());
+-    }
++    FileEncryptionInfo encInfo;
+-      if (args.getIsMultipartKey()) {
+-        Preconditions.checkArgument(args.getMultipartUploadPartNumber() > 0,
+-            "PartNumber Should be greater than zero");
+-        // When key is multipart upload part key, we should take replication
+-        // type and replication factor from original key which has done
+-        // initiate multipart upload. If we have not found any such, we throw
+-        // error no such multipart upload.
+-        String uploadID = args.getMultipartUploadID();
+-        Preconditions.checkNotNull(uploadID);
+-        String multipartKey = metadataManager.getMultipartKey(volumeName,
+-            bucketName, keyName, uploadID);
+-        OmKeyInfo partKeyInfo = metadataManager.getOpenKeyTable().get(
+-            multipartKey);
+-        if (partKeyInfo == null) {
+-          throw new OMException("No such Multipart upload is with specified " +
+-              "uploadId " + uploadID,
+-              ResultCodes.NO_SUCH_MULTIPART_UPLOAD_ERROR);
+-        } else {
+-          factor = partKeyInfo.getFactor();
+-          type = partKeyInfo.getType();
+-        }
+-      } else {
+-        // If user does not specify a replication strategy or
+-        // replication factor, OM will use defaults.
+-        if (factor == null) {
+-          factor = useRatis ? ReplicationFactor.THREE : ReplicationFactor.ONE;
+-        }
+-        if (type == null) {
+-          type = useRatis ? ReplicationType.RATIS : ReplicationType.STAND_ALONE;
+-        }
+-      }
+-      List<OmKeyLocationInfo> locations = new ArrayList<>();
+-      String objectKey = metadataManager.getOzoneKey(
+-          volumeName, bucketName, keyName);
++      metadataManager.getLock().acquireBucketLock(volumeName, bucketName);
++      OmBucketInfo bucketInfo = getBucketInfo(volumeName, bucketName);
++      encInfo = getFileEncryptionInfo(bucketInfo);
+-      // client should expect, in terms of current size of key. If client sets a
+-      // value, then this value is used, otherwise, we allocate a single block
+-      // which is the current size, if read by the client.
++      // client should expect, in terms of current size of key. If client sets
++      // a value, then this value is used, otherwise, we allocate a single
++      // block which is the current size, if read by the client.
+-
++      List<OmKeyLocationInfo> locations = new ArrayList<>();
+-        // For this upload part we don't need to check in KeyTable. As this
+-        // is not an actual key, it is a part of the key.
+-        keyInfo = createKeyInfo(args, locations, factor, type, size, encInfo);
++        keyInfo = prepareMultipartKeyInfo(args, size, locations, encInfo);
+-        openVersion = 0;
+-        keyInfo = metadataManager.getKeyTable().get(objectKey);
+-        if (keyInfo != null) {
+-          // the key already exist, the new blocks will be added as new version
+-          // when locations.size = 0, the new version will have identical blocks
+-          // as its previous version
+-          openVersion = keyInfo.addNewVersion(locations);
+-          keyInfo.setDataSize(size + keyInfo.getDataSize());
+-        } else {
+-          // the key does not exist, create a new object, the new blocks are the
+-          // version 0
+-          keyInfo = createKeyInfo(args, locations, factor, type, size, encInfo);
+-          openVersion = 0;
+-        }
++        keyInfo = prepareKeyInfo(args, size, locations, encInfo);
++
++      openVersion = keyInfo.getLatestVersionLocations().getVersion();
+-      throw new OMException(ex.getMessage(),
+-          ResultCodes.KEY_ALLOCATION_ERROR);
++      throw new OMException(ex.getMessage(), ResultCodes.KEY_ALLOCATION_ERROR);
++    allocateBlockInKey(keyInfo, args.getDataSize(), currentTime);
++    return new OpenKeySession(currentTime, keyInfo, openVersion);
++  }
++
++  private void allocateBlockInKey(OmKeyInfo keyInfo, long size, long sessionId)
++      throws IOException {
++    String openKey = metadataManager
++        .getOpenKey(keyInfo.getVolumeName(), keyInfo.getBucketName(),
++            keyInfo.getKeyName(), sessionId);
+-    if (args.getDataSize() > 0) {
++    if (size > 0) {
+-          allocateBlock(keyInfo, new ExcludeList(), args.getDataSize());
++          allocateBlock(keyInfo, new ExcludeList(), size);
+-    return new OpenKeySession(currentTime, keyInfo, openVersion);
++  }
++
++  private OmKeyInfo prepareKeyInfo(OmKeyArgs args, long size,
++      List<OmKeyLocationInfo> locations, FileEncryptionInfo encInfo)
++      throws IOException {
++    ReplicationFactor factor = args.getFactor();
++    ReplicationType type = args.getType();
++    OmKeyInfo keyInfo;
++    // If user does not specify a replication strategy or
++    // replication factor, OM will use defaults.
++    if (factor == null) {
++      factor = useRatis ? ReplicationFactor.THREE : ReplicationFactor.ONE;
++    }
++    if (type == null) {
++      type = useRatis ? ReplicationType.RATIS : ReplicationType.STAND_ALONE;
++    }
++    String objectKey = metadataManager.getOzoneKey(
++        args.getVolumeName(), args.getBucketName(), args.getKeyName());
++    keyInfo = metadataManager.getKeyTable().get(objectKey);
++    if (keyInfo != null) {
++      // the key already exist, the new blocks will be added as new version
++      // when locations.size = 0, the new version will have identical blocks
++      // as its previous version
++      keyInfo.addNewVersion(locations);
++      keyInfo.setDataSize(size + keyInfo.getDataSize());
++    } else {
++      // the key does not exist, create a new object, the new blocks are the
++      // version 0
++      keyInfo = createKeyInfo(args, locations, factor, type, size, encInfo);
++    }
++    return keyInfo;
++  }
++
++  private OmKeyInfo prepareMultipartKeyInfo(OmKeyArgs args, long size,
++      List<OmKeyLocationInfo> locations, FileEncryptionInfo encInfo)
++      throws IOException {
++    ReplicationFactor factor;
++    ReplicationType type;
++
++    Preconditions.checkArgument(args.getMultipartUploadPartNumber() > 0,
++        "PartNumber Should be greater than zero");
++    // When key is multipart upload part key, we should take replication
++    // type and replication factor from original key which has done
++    // initiate multipart upload. If we have not found any such, we throw
++    // error no such multipart upload.
++    String uploadID = args.getMultipartUploadID();
++    Preconditions.checkNotNull(uploadID);
++    String multipartKey = metadataManager
++        .getMultipartKey(args.getVolumeName(), args.getBucketName(),
++            args.getKeyName(), uploadID);
++    OmKeyInfo partKeyInfo = metadataManager.getOpenKeyTable().get(
++        multipartKey);
++    if (partKeyInfo == null) {
++      throw new OMException("No such Multipart upload is with specified " +
++          "uploadId " + uploadID,
++          ResultCodes.NO_SUCH_MULTIPART_UPLOAD_ERROR);
++    } else {
++      factor = partKeyInfo.getFactor();
++      type = partKeyInfo.getType();
++    }
++    // For this upload part we don't need to check in KeyTable. As this
++    // is not an actual key, it is a part of the key.
++    return createKeyInfo(args, locations, factor, type, size, encInfo);
+-  public OzoneFileStatus getFileStatus(String volumeName, String bucketName,
+-                                       String keyName) throws IOException {
+-    Preconditions.checkNotNull(volumeName);
+-    Preconditions.checkNotNull(bucketName);
+-    Preconditions.checkNotNull(keyName);
++  /**
++   * OzoneFS api to get file status for an entry.
++   *
++   * @param args Key args
++   * @throws OMException if file does not exist
++   *                     if bucket does not exist
++   * @throws IOException if there is error in the db
++   *                     invalid arguments
++   */
++  public OzoneFileStatus getFileStatus(OmKeyArgs args) throws IOException {
++    Preconditions.checkNotNull(args, "Key args can not be null");
++    String volumeName = args.getVolumeName();
++    String bucketName = args.getBucketName();
++    String keyName = args.getKeyName();
+-        return new OzoneFileStatus(3, scmBlockSize, keyName);
++        return new OzoneFileStatus(keyName);
+-        return new OzoneFileStatus(3, scmBlockSize, keyName);
++        return new OzoneFileStatus(keyName);
++  /**
++   * Ozone FS api to create a directory. Parent directories if do not exist
++   * are created for the input directory.
++   *
++   * @param args Key args
++   * @throws OMException if any entry in the path exists as a file
++   *                     if bucket does not exist
++   * @throws IOException if there is error in the db
++   *                     invalid arguments
++   */
++  public void createDirectory(OmKeyArgs args) throws IOException {
++    Preconditions.checkNotNull(args, "Key args can not be null");
++    String volumeName = args.getVolumeName();
++    String bucketName = args.getBucketName();
++    String keyName = args.getKeyName();
++
++    try {
++      metadataManager.getLock().acquireBucketLock(volumeName, bucketName);
++
++      // verify bucket exists
++      OmBucketInfo bucketInfo = getBucketInfo(volumeName, bucketName);
++
++      // Check if this is the root of the filesystem.
++      if (keyName.length() == 0) {
++        return;
++      }
++
++      verifyNoFilesInPath(volumeName, bucketName, Paths.get(keyName), false);
++      String dir = addTrailingSlashIfNeeded(keyName);
++      String dirDbKey =
++          metadataManager.getOzoneKey(volumeName, bucketName, dir);
++      FileEncryptionInfo encInfo = getFileEncryptionInfo(bucketInfo);
++      OmKeyInfo dirDbKeyInfo =
++          createDirectoryKeyInfo(volumeName, bucketName, dir, new ArrayList<>(),
++              ReplicationFactor.ONE, ReplicationType.RATIS, encInfo);
++      metadataManager.getKeyTable().put(dirDbKey, dirDbKeyInfo);
++
++    } finally {
++      metadataManager.getLock().releaseBucketLock(volumeName, bucketName);
++    }
++  }
++
++  private OmKeyInfo createDirectoryKeyInfo(String volumeName, String bucketName,
++      String keyName, List<OmKeyLocationInfo> locations,
++      ReplicationFactor factor, ReplicationType type,
++      FileEncryptionInfo encInfo) {
++    return new OmKeyInfo.Builder()
++        .setVolumeName(volumeName)
++        .setBucketName(bucketName)
++        .setKeyName(keyName)
++        .setOmKeyLocationInfos(Collections.singletonList(
++            new OmKeyLocationInfoGroup(0, locations)))
++        .setCreationTime(Time.now())
++        .setModificationTime(Time.now())
++        .setDataSize(0)
++        .setReplicationType(type)
++        .setReplicationFactor(factor)
++        .setFileEncryptionInfo(encInfo)
++        .build();
++  }
++
++  /**
++   * OzoneFS api to creates an output stream for a file.
++   *
++   * @param args        Key args
++   * @param isOverWrite if true existing file at the location will be
++   *                    overwritten
++   * @param isRecursive if true file would be created even if parent
++   *                    directories do not exist
++   * @throws OMException if given key is a directory
++   *                     if file exists and isOverwrite flag is false
++   *                     if an ancestor exists as a file
++   *                     if bucket does not exist
++   * @throws IOException if there is error in the db
++   *                     invalid arguments
++   */
++  @Override
++  public OpenKeySession createFile(OmKeyArgs args, boolean isOverWrite,
++      boolean isRecursive) throws IOException {
++    Preconditions.checkNotNull(args, "Key args can not be null");
++    String volumeName = args.getVolumeName();
++    String bucketName = args.getBucketName();
++    String keyName = args.getKeyName();
++    OpenKeySession keySession;
++
++    try {
++      metadataManager.getLock().acquireBucketLock(volumeName, bucketName);
++
++      OzoneFileStatus fileStatus;
++      try {
++        fileStatus = getFileStatus(args);
++        if (fileStatus.isDirectory()) {
++          throw new OMException("Can not write to directory: " + keyName,
++              ResultCodes.NOT_A_FILE);
++        } else if (fileStatus.isFile()) {
++          if (!isOverWrite) {
++            throw new OMException("File " + keyName + " already exists",
++                ResultCodes.FILE_ALREADY_EXISTS);
++          }
++        }
++      } catch (OMException ex) {
++        if (ex.getResult() != ResultCodes.FILE_NOT_FOUND) {
++          throw ex;
++        }
++      }
++
++      verifyNoFilesInPath(volumeName, bucketName,
++          Paths.get(keyName).getParent(), !isRecursive);
++      // TODO: Optimize call to openKey as keyInfo is already available in the
++      // filestatus. We can avoid some operations in openKey call.
++      keySession = openKey(args);
++    } finally {
++      metadataManager.getLock().releaseBucketLock(volumeName, bucketName);
++    }
++
++    return keySession;
++  }
++
++  /**
++   * OzoneFS api to lookup for a file.
++   *
++   * @param args Key args
++   * @throws OMException if given key is not found or it is not a file
++   *                     if bucket does not exist
++   * @throws IOException if there is error in the db
++   *                     invalid arguments
++   */
++  @Override
++  public OmKeyInfo lookupFile(OmKeyArgs args) throws IOException {
++    Preconditions.checkNotNull(args, "Key args can not be null");
++    String volumeName = args.getVolumeName();
++    String bucketName = args.getBucketName();
++    String keyName = args.getKeyName();
++
++    try {
++      metadataManager.getLock().acquireBucketLock(volumeName, bucketName);
++      OzoneFileStatus fileStatus = getFileStatus(args);
++      if (fileStatus.isFile()) {
++        return fileStatus.getKeyInfo();
++      }
++      //if key is not of type file or if key is not found we throw an exception
++    } finally {
++      metadataManager.getLock().releaseBucketLock(volumeName, bucketName);
++    }
++
++    throw new OMException("Can not write to directory: " + keyName,
++        ResultCodes.NOT_A_FILE);
++  }
++
++  /**
++   * Verify that none of the parent path exists as file in the filesystem.
++   *
++   * @param volumeName         Volume name
++   * @param bucketName         Bucket name
++   * @param path               Directory path. This is the absolute path of the
++   *                           directory for the ozone filesystem.
++   * @param directoryMustExist throws exception if true and given path does not
++   *                           exist as directory
++   * @throws OMException if ancestor exists as file in the filesystem
++   *                     if directoryMustExist flag is true and parent does
++   *                     not exist
++   *                     if bucket does not exist
++   * @throws IOException if there is error in the db
++   *                     invalid arguments
++   */
++  private void verifyNoFilesInPath(String volumeName, String bucketName,
++      Path path, boolean directoryMustExist) throws IOException {
++    OmKeyArgs.Builder argsBuilder = new OmKeyArgs.Builder()
++        .setVolumeName(volumeName)
++        .setBucketName(bucketName);
++    while (path != null) {
++      String keyName = path.toString();
++      try {
++        OzoneFileStatus fileStatus =
++            getFileStatus(argsBuilder.setKeyName(keyName).build());
++        if (fileStatus.isFile()) {
++          LOG.error("Unable to create directory (File already exists): volume: "
++              + volumeName + "bucket: " + bucketName + "key: " + keyName);
++          throw new OMException(
++              "Unable to create directory at : volume: " + volumeName
++                  + "bucket: " + bucketName + "key: " + keyName,
++              ResultCodes.FILE_ALREADY_EXISTS);
++        } else if (fileStatus.isDirectory()) {
++          break;
++        }
++      } catch (OMException ex) {
++        if (ex.getResult() != ResultCodes.FILE_NOT_FOUND) {
++          throw ex;
++        } else if (ex.getResult() == ResultCodes.FILE_NOT_FOUND) {
++          if (directoryMustExist) {
++            throw new OMException("Parent directory does not exist",
++                ex.getCause(), ResultCodes.DIRECTORY_NOT_FOUND);
++          }
++        }
++      }
++      path = path.getParent();
++    }
++  }
++
++  private FileEncryptionInfo getFileEncryptionInfo(OmBucketInfo bucketInfo)
++      throws IOException {
++    FileEncryptionInfo encInfo = null;
++    BucketEncryptionKeyInfo ezInfo = bucketInfo.getEncryptionKeyInfo();
++    if (ezInfo != null) {
++      if (getKMSProvider() == null) {
++        throw new OMException("Invalid KMS provider, check configuration " +
++            CommonConfigurationKeys.HADOOP_SECURITY_KEY_PROVIDER_PATH,
++            OMException.ResultCodes.INVALID_KMS_PROVIDER);
++      }
++
++      final String ezKeyName = ezInfo.getKeyName();
++      EncryptedKeyVersion edek = generateEDEK(ezKeyName);
++      encInfo = new FileEncryptionInfo(ezInfo.getSuite(), ezInfo.getVersion(),
++          edek.getEncryptedKeyVersion().getMaterial(),
++          edek.getEncryptedKeyIv(),
++          ezKeyName, edek.getEncryptionKeyVersionName());
++    }
++    return encInfo;
++  }
++
+
+INS26 INS26 INS40 INS40 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS31 MOV21 INS83 INS39 INS42 INS44 INS44 INS44 INS43 INS8 INS83 INS43 INS42 INS44 INS44 INS44 INS44 INS43 MOV8 INS83 INS43 INS42 INS44 INS44 INS44 INS44 INS43 MOV8 INS29 INS44 INS29 INS83 INS39 INS42 INS44 INS43 INS8 INS83 INS43 INS42 MOV44 MOV44 MOV44 INS44 INS44 INS44 INS44 INS8 INS29 INS78 INS83 INS43 INS42 INS44 INS44 INS44 INS43 INS8 INS29 INS78 INS83 INS43 INS42 INS44 INS43 INS8 INS29 INS83 INS39 INS42 INS44 INS44 INS44 INS44 INS43 INS8 INS83 INS43 INS42 INS44 INS43 INS8 INS60 INS21 INS43 INS42 INS39 INS42 INS39 INS42 INS42 INS60 MOV25 MOV25 INS42 INS43 INS42 INS39 INS42 INS74 INS42 INS43 INS42 INS42 MOV60 MOV60 INS60 MOV25 MOV25 INS60 INS41 INS42 INS43 INS42 INS39 INS42 INS74 INS42 INS43 INS42 INS42 INS60 INS60 INS41 INS65 INS65 INS65 INS65 INS43 INS42 INS60 INS60 INS60 INS65 INS65 INS65 INS65 INS43 INS42 INS42 INS21 INS60 INS60 INS60 INS54 INS42 INS74 INS42 INS43 INS42 INS43 INS42 INS43 INS42 INS41 INS65 INS65 INS65 INS65 INS65 INS65 INS42 INS42 INS43 INS42 INS39 INS42 INS39 INS42 INS42 INS21 INS60 INS60 INS60 INS60 INS54 INS41 INS65 INS65 INS65 INS65 INS42 INS42 INS43 INS42 INS42 INS21 INS60 INS60 INS60 INS54 INS53 INS65 INS65 INS65 INS65 INS65 INS65 INS65 INS43 INS42 INS43 INS42 INS43 INS42 INS39 INS42 INS42 INS60 INS61 INS42 INS43 INS42 INS42 MOV60 MOV60 MOV25 INS41 INS43 INS59 MOV60 INS32 INS42 MOV43 INS59 INS42 INS43 INS43 INS42 INS43 INS59 MOV43 INS59 INS42 INS42 INS43 INS43 INS42 INS43 INS59 INS43 INS59 INS43 INS32 INS66 INS42 INS66 INS42 INS66 INS66 INS42 INS66 INS66 INS42 INS43 INS59 INS43 INS59 INS43 INS59 INS66 INS66 INS42 INS66 INS42 INS66 INS66 INS42 INS66 INS66 INS42 INS32 INS43 INS59 INS43 INS59 INS43 INS59 INS8 INS8 INS43 INS43 INS42 INS42 INS42 INS32 INS66 INS42 INS66 INS42 INS66 INS66 INS42 INS66 INS66 INS42 INS66 INS66 INS66 INS66 INS42 INS66 INS66 INS42 INS32 INS43 INS59 INS43 INS59 INS43 INS59 INS43 INS59 INS8 INS8 INS42 INS66 INS42 INS66 INS42 INS66 INS66 INS42 INS66 INS66 INS42 INS32 INS43 INS59 INS43 INS59 INS43 INS59 INS8 INS8 INS14 INS66 INS42 INS66 INS42 INS66 INS42 INS66 INS66 INS42 INS66 INS66 INS42 INS66 INS66 INS66 INS66 INS42 INS66 INS66 INS42 INS42 INS42 INS43 INS59 INS27 INS8 INS42 INS42 MOV60 MOV25 INS42 INS42 MOV21 MOV60 INS21 INS25 MOV21 INS42 INS42 MOV32 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 UPD42 INS45 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS42 INS45 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS32 INS21 INS60 INS25 INS21 INS60 INS60 INS60 INS60 INS21 INS21 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS45 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS21 INS60 INS54 INS21 INS21 INS21 INS42 INS42 INS42 INS45 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS32 INS21 INS60 INS25 INS21 INS43 INS27 INS40 INS40 INS42 INS32 INS42 INS33 INS60 INS54 INS21 INS7 MOV32 INS8 INS8 INS42 INS42 INS32 INS32 INS32 INS42 INS42 INS42 INS32 INS32 INS32 MOV32 INS32 INS32 INS32 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 INS42 INS42 INS8 MOV8 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS43 INS59 INS27 INS8 INS32 INS43 INS59 INS43 INS59 INS43 INS59 INS43 INS59 INS32 INS32 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS43 INS59 INS8 INS12 INS32 INS7 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS43 INS59 INS32 INS8 INS32 INS42 INS45 INS42 INS32 INS42 INS42 INS43 INS59 INS8 INS12 INS7 INS42 INS32 INS21 MOV21 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 UPD42 MOV42 INS42 UPD42 MOV42 INS42 UPD42 MOV42 MOV21 INS41 INS32 INS42 INS42 INS42 INS42 INS42 INS32 INS32 INS34 INS41 INS42 INS42 INS42 INS32 INS9 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS32 INS32 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS21 INS25 INS44 INS8 INS42 INS42 INS42 INS32 INS38 INS42 INS32 INS32 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS41 INS32 INS42 INS42 INS42 INS14 INS42 INS42 INS42 INS42 INS32 INS60 INS25 INS44 INS8 INS42 INS32 UPD42 MOV42 UPD42 MOV42 INS7 INS32 INS42 INS42 INS14 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS14 INS40 INS40 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS7 INS32 INS8 INS25 INS43 INS42 INS25 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS43 INS42 INS42 INS43 INS59 INS32 INS8 INS25 INS43 INS42 INS25 INS42 INS42 INS42 INS32 INS42 INS42 MOV43 INS42 INS74 INS32 INS42 INS34 INS42 INS32 INS42 INS42 INS53 INS32 INS8 INS42 INS27 INS8 INS42 INS42 INS42 INS42 INS42 INS40 INS42 INS42 INS32 INS42 INS42 INS21 INS53 INS32 INS8 INS42 INS27 INS8 INS25 INS42 MOV42 UPD42 MOV42 INS42 INS42 UPD42 UPD42 UPD42 INS43 INS32 INS42 INS32 INS42 INS42 INS14 INS42 INS42 INS25 INS32 INS40 INS53 INS42 INS32 INS32 INS14 INS42 INS42 INS10 INS32 INS40 INS53 INS27 INS8 INS42 INS32 INS42 INS32 INS42 INS42 INS43 INS27 INS40 INS38 INS8 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS27 INS43 INS27 INS40 INS42 INS42 INS42 INS32 INS40 INS25 INS32 INS42 INS32 INS42 INS42 INS42 INS45 INS42 INS42 INS53 INS42 INS42 INS42 INS45 INS42 INS45 INS42 INS45 INS42 INS42 INS45 INS42 INS45 INS42 INS45 INS42 INS42 INS42 INS42 INS8 INS32 INS42 INS42 INS42 INS42 INS14 INS14 INS53 INS32 INS42 INS42 INS43 INS34 INS42 INS43 INS27 INS40 INS14 INS14 INS42 INS42 INS42 INS42 INS45 INS42 INS45 INS43 INS45 INS32 INS40 INS43 INS42 INS42 INS42 INS40 DEL42 DEL45 DEL79 DEL8 DEL25 DEL42 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL42 DEL34 DEL32 DEL8 DEL25 DEL42 DEL42 DEL32 DEL42 DEL7 DEL42 DEL34 DEL7 DEL21 DEL42 DEL32 DEL21 DEL42 DEL32 DEL21 DEL34 DEL42 DEL34 DEL42 DEL42 DEL14 DEL41 DEL8

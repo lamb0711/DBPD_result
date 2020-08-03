@@ -1,0 +1,212 @@
+JCR-1104 - JSR 283 support
+- shareble nodes (work in progress)
+- simplify HierarchyManager.resolvePath
+
+git-svn-id: https://svn.apache.org/repos/asf/jackrabbit/trunk@650774 13f79535-47bb-0310-9956-ffa450edef68
+
+-import java.util.HashSet;
+-import java.util.Set;
+-     * Set of items that were moved
+-     */
+-    private final Set movedIds = new HashSet();
+-
+-    /**
++
+-     * <p/>
+-     * Cache the intermediate item inside our cache.
+-    protected void beforeResolvePath(Path path, ItemState state, int next) {
++    protected ItemId resolvePath(Path path, int typesAllowed)
++            throws RepositoryException {
+-        if (state.isNode() && !isCached(state.getId())) {
+-            try {
+-                PathBuilder builder = new PathBuilder();
+-                Path.Element[] elements = path.getElements();
+-                for (int i = 0; i < next; i++) {
+-                    builder.addLast(elements[i]);
+-                }
+-                Path parentPath = builder.getPath();
+-                cache(((NodeState) state).getNodeId(), parentPath);
+-            } catch (MalformedPathException mpe) {
+-                log.warn("Failed to build path of " + state.getId(), mpe);
++        Path pathToNode = path;
++        if ((typesAllowed & RETURN_NODE) == 0) {
++            // if we must not return a node, pass parent path
++            // (since we only cache nodes)
++            pathToNode = path.getAncestor(1);
++        }
++
++        PathMap.Element element = map(pathToNode);
++        if (element == null) {
++            // not even intermediate match: call base class
++            return super.resolvePath(path, typesAllowed);
++        }
++
++        LRUEntry entry = (LRUEntry) element.get();
++        if (element.hasPath(path)) {
++            // exact match: return answer
++            synchronized (cacheMonitor) {
++                entry.touch();
++            return entry.getId();
++        }
++        Path.Element[] elements = path.getElements();
++        try {
++            return resolvePath(elements, element.getDepth() + 1, entry.getId(), typesAllowed);
++        } catch (ItemStateException e) {
++            String msg = "failed to retrieve state of intermediary node";
++            log.debug(msg);
++            throw new RepositoryException(msg, e);
++        }
++    }
++
++    /**
++     * {@inheritDoc}
++     */
++    protected void pathResolved(ItemId id, PathBuilder builder)
++            throws MalformedPathException {
++
++        if (id.denotesNode() && !isCached(id)) {
++            cache((NodeId) id, builder.getPath());
+-    /**
+-     * {@inheritDoc}
+-     * <p/>
+-     * Check the path indicated inside our cache first.
+-     */
+-    public ItemId resolvePath(Path path) throws RepositoryException {
+-        // Run base class shortcut and sanity checks first
+-        if (path.denotesRoot()) {
+-            return rootNodeId;
+-        } else if (!path.isCanonical()) {
+-            String msg = "path is not canonical";
+-            log.debug(msg);
+-            throw new RepositoryException(msg);
+-        }
+-
+-        ItemId id;
+-        PathMap.Element element = map(path);
+-        if (element == null) {
+-            id = super.resolvePath(path);
+-        } else {
+-            LRUEntry entry = (LRUEntry) element.get();
+-            if (element.hasPath(path)) {
+-                synchronized (cacheMonitor) {
+-                    entry.touch();
+-                }
+-                return entry.getId();
+-            }
+-            // first try to resolve node path, then property path
+-            id = super.resolvePath(path, entry.getId(), element.getDepth() + 1, true);
+-            if (id == null) {
+-                id = super.resolvePath(path, entry.getId(), element.getDepth() + 1, false);
+-            }
+-        }
+-
+-        if (id != null && id.denotesNode() && !isCached(id)) {
+-            // cache result
+-            cache((NodeId) id, path);
+-        }
+-
+-        return id;
+-    }
+-
+-    /**
+-     * {@inheritDoc}
+-     * <p/>
+-     * Check the path indicated inside our cache first.
+-     */
+-    public NodeId resolveNodePath(Path path) throws RepositoryException {
+-        ItemId id = resolvePath(path);
+-        return id != null && id.denotesNode() ? (NodeId) id : null;
+-    }
+-
+-    /**
+-     * {@inheritDoc}
+-     * <p/>
+-     * Check the path indicated inside our cache first.
+-     */
+-    public PropertyId resolvePropertyPath(Path path) throws RepositoryException {
+-        // Run base class shortcut and sanity checks first
+-        if (path.denotesRoot()) {
+-            return null;
+-        } else if (!path.isCanonical()) {
+-            String msg = "path is not canonical";
+-            log.debug(msg);
+-            throw new RepositoryException(msg);
+-        }
+-
+-        // check cache for parent path
+-        PathMap.Element element = map(path.getAncestor(1));
+-        if (element == null) {
+-            return super.resolvePropertyPath(path);
+-        } else {
+-            LRUEntry entry = (LRUEntry) element.get();
+-            return (PropertyId) super.resolvePath(path, entry.getId(), element.getDepth() + 1, false);
+-        }
+-    }
+-     * Evict moved or renamed items from the cache.
++     * If path information is cached for <code>modified</code>, this iterates
++     * over all child nodes in the path map, evicting the ones that do not
++     * (longer) exist in the underlying <code>NodeState</code>.
+-                    insert(path, id);
++                    nodeAdded(state, path, id);
++                } catch (ItemStateException e) {
++                    log.warn("Unable to find item " + id, e);
+-                    remove(path, id);
++                    nodeRemoved(state, path, id);
+-
+-    private boolean isCached(ItemId id) {
++    boolean isCached(ItemId id) {
++     * If <code>removeFromPathCache</code> is <code>true</code>, the path map
++     * element associated with <code>entry</code> is deleted recursively and
++     * every associated element is removed.
++     * If <code>removeFromPathCache</code> is <code>false</code>, only the
++     * LRU entry is removed from the cache.
+-     * Insert a node into the cache. This will automatically shift
+-     * all indexes of sibling nodes having index greater or equal.
++     * Invoked when a notification about a child node addition has been received.
+-     * @param path child path
+-     * @param id   node id
++     * @param state node state
++     * @param path  node path
++     * @param id    node id
+-    private void insert(Path path, ItemId id) throws PathNotFoundException {
++    private void nodeAdded(NodeState state, Path path, NodeId id)
++            throws PathNotFoundException, ItemStateException {
++
+-                element.remove();
++
++                NodeState child = (NodeState) getItemState(id);
++                if (!child.isShareable()) {
++                    element.remove();
++                } else {
++                    element = null;
++                }
+-
+-                /* Remember this as a move */
+-                movedIds.add(id);
+-     * Remove an item from the cache in order to shift the indexes
+-     * of items following this item.
++     * Invoked when a notification about a child node removal has been received.
+-     * @param path child path
+-     * @param id   node id
++     * @param state node state
++     * @param path  node path
++     * @param id    node id
+-    private void remove(Path path, ItemId id) throws PathNotFoundException {
++    private void nodeRemoved(NodeState state, Path path, NodeId id)
++            throws PathNotFoundException {
++
+-            /* If we remembered this as a move, ignore this event */
+-            if (movedIds.remove(id)) {
+-                return;
+-            }
++                // with SNS, this might evict a child that is NOT the one
++                // having <code>id</code>, check first whether item has
++                // the id passed as argument
++                PathMap.Element child = parent.getDescendant(PathFactoryImpl.getInstance().create(
++                        new Path.Element[] { path.getNameElement() }), true);
++                if (child != null) {
++                    LRUEntry entry = (LRUEntry) child.get();
++                    if (entry != null && !entry.getId().equals(id)) {
++                        return;
++                    }
++                }

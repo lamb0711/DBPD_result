@@ -1,0 +1,309 @@
+[MNG-4052] import scope dependencies prefer to download pom rather than find it in the current project
+
+git-svn-id: https://svn.apache.org/repos/asf/maven/components/trunk@798221 13f79535-47bb-0310-9956-ffa450edef68
+
++import java.io.IOException;
++import org.apache.maven.Maven;
+-import org.apache.maven.artifact.InvalidRepositoryException;
++import org.codehaus.plexus.util.Os;
+-        ModelBuildingRequest request = getModelBuildingRequest( configuration );
++        ModelBuildingRequest request = getModelBuildingRequest( configuration, null );
+-            File parentPomFile = result.getRawModel( result.getModelIds().get( 1 ) ).getPomFile();
+-            MavenProject project = fromModelToMavenProject( model, parentPomFile, configuration, model.getPomFile() );
+-
+-            project.setOriginalModel( result.getRawModel() );
+-
+-            project.setRemoteArtifactRepositories( listener.getRemoteRepositories() );
+-            project.setPluginArtifactRepositories( listener.getPluginRepositories() );
+-
+-            project.setClassRealm( listener.getProjectRealm() );
+-
+-            try
+-            {
+-                if ( configuration.isProcessPlugins() )
+-                {
+-                    lifecycle.populateDefaultConfigurationForPlugins( model.getBuild().getPlugins(),
+-                                                                      configuration.getLocalRepository(),
+-                                                                      project.getPluginArtifactRepositories() );
+-                }
+-            }
+-            catch ( LifecycleExecutionException e )
+-            {
+-                throw new ProjectBuildingException( project.getId(), e.getMessage(), e );
+-            }
+-
+-            Build build = project.getBuild();
+-            // NOTE: setting this script-source root before path translation, because
+-            // the plugin tools compose basedir and scriptSourceRoot into a single file.
+-            project.addScriptSourceRoot( build.getScriptSourceDirectory() );
+-            project.addCompileSourceRoot( build.getSourceDirectory() );
+-            project.addTestCompileSourceRoot( build.getTestSourceDirectory() );
+-            project.setFile( pomFile );
+-
+-            List<Profile> activeProfiles = new ArrayList<Profile>();
+-            activeProfiles.addAll( result.getActivePomProfiles( result.getModelIds().get( 0 ) ) );
+-            activeProfiles.addAll( result.getActiveExternalProfiles() );
+-            project.setActiveProfiles( activeProfiles );
+-
+-            project.setInjectedProfileIds( "external", getProfileIds( result.getActiveExternalProfiles() ) );
+-            for ( String modelId : result.getModelIds() )
+-            {
+-                project.setInjectedProfileIds( modelId, getProfileIds( result.getActivePomProfiles( modelId ) ) );
+-            }
++            MavenProject project = toProject( result, configuration, listener );
+-    private ModelBuildingRequest getModelBuildingRequest( ProjectBuildingRequest configuration )
++    private ModelBuildingRequest getModelBuildingRequest( ProjectBuildingRequest configuration,
++                                                          ReactorModelPool reactorModelPool )
+-                                         configuration.getRemoteRepositories() );
++                                         configuration.getRemoteRepositories(), reactorModelPool );
+-        ModelBuildingRequest request = getModelBuildingRequest( config );
++        ModelBuildingRequest request = getModelBuildingRequest( config, null );
+-        MavenProject standaloneProject;
+-
+-        try
+-        {
+-            standaloneProject = new MavenProject( result.getEffectiveModel(), repositorySystem, this, config );
+-        }
+-        catch ( InvalidRepositoryException e )
+-        {
+-            throw new IllegalStateException( e );
+-        }
++        MavenProject standaloneProject = new MavenProject( result.getEffectiveModel(), repositorySystem, this, config );
+-    private MavenProject fromModelToMavenProject( Model model, File parentFile, ProjectBuildingRequest config, File projectDescriptor )
+-        throws InvalidProjectModelException
++    public List<ProjectBuildingResult> build( List<File> pomFiles, boolean recursive, ProjectBuildingRequest config )
++        throws ProjectBuildingException
+-        MavenProject project;
++        List<ProjectBuildingResult> results = new ArrayList<ProjectBuildingResult>();
++
++        List<InterimResult> interimResults = new ArrayList<InterimResult>();
++
++        ReactorModelPool reactorModelPool = new ReactorModelPool();
++
++        boolean errors = build( results, interimResults, pomFiles, recursive, config, reactorModelPool );
++
++        for ( InterimResult interimResult : interimResults )
++        {
++            Model model = interimResult.result.getEffectiveModel();
++            reactorModelPool.put( model.getGroupId(), model.getArtifactId(), model.getVersion(), model.getPomFile() );
++        }
++
++        for ( InterimResult interimResult : interimResults )
++        {
++            try
++            {
++                ModelBuildingResult result = modelBuilder.build( interimResult.request, interimResult.result );
++
++                MavenProject project = toProject( result, config, interimResult.listener );
++
++                results.add( new DefaultProjectBuildingResult( project, result.getProblems() ) );
++            }
++            catch ( ModelBuildingException e )
++            {
++                results.add( new DefaultProjectBuildingResult( interimResult.pomFile, e.getProblems() ) );
++
++                errors = true;
++            }
++        }
++
++        if ( errors )
++        {
++            throw new ProjectBuildingException( results );
++        }
++
++        return results;
++    }
++
++    private boolean build( List<ProjectBuildingResult> results, List<InterimResult> interimResults, List<File> pomFiles,
++                        boolean recursive, ProjectBuildingRequest config, ReactorModelPool reactorModelPool )
++    {
++        boolean errors = false;
++        
++        for ( File pomFile : pomFiles )
++        {
++            ModelBuildingRequest request = getModelBuildingRequest( config, reactorModelPool );
++
++            request.setPomFile( pomFile );
++            request.setTwoPhaseBuilding( true );
++
++            DefaultModelBuildingListener listener = new DefaultModelBuildingListener( projectBuildingHelper, config );
++            request.setModelBuildingListeners( Arrays.asList( listener ) );
++
++            try
++            {
++                ModelBuildingResult result = modelBuilder.build( request );
++
++                Model model = result.getEffectiveModel();
++
++                interimResults.add( new InterimResult( pomFile, request, result, listener ) );
++
++                if ( recursive && !model.getModules().isEmpty() )
++                {
++                    File basedir = pomFile.getParentFile();
++
++                    List<File> moduleFiles = new ArrayList<File>();
++
++                    for ( String module : model.getModules() )
++                    {
++                        if ( StringUtils.isEmpty( module ) )
++                        {
++                            continue;
++                        }
++
++                        File moduleFile = new File( basedir, module );
++
++                        if ( moduleFile.isDirectory() )
++                        {
++                            moduleFile = new File( moduleFile, Maven.POMv4 );
++                        }
++
++                        if ( !moduleFile.isFile() )
++                        {
++                            String source = toSourceHint( model );
++                            ModelProblem problem =
++                                new ModelProblem( "Child module " + moduleFile + " of " + source + " does not exist",
++                                                  ModelProblem.Severity.ERROR, source );
++                            result.getProblems().add( problem );
++
++                            errors = true;
++
++                            continue;
++                        }
++
++                        if ( Os.isFamily( Os.FAMILY_WINDOWS ) )
++                        {
++                            // we don't canonicalize on unix to avoid interfering with symlinks
++                            try
++                            {
++                                moduleFile = moduleFile.getCanonicalFile();
++                            }
++                            catch ( IOException e )
++                            {
++                                moduleFile = moduleFile.getAbsoluteFile();
++                            }
++                        }
++                        else
++                        {
++                            moduleFile = new File( moduleFile.toURI().normalize() );
++                        }
++
++                        moduleFiles.add( moduleFile );
++                    }
++
++                    errors =
++                        build( results, interimResults, moduleFiles, recursive, config, reactorModelPool ) || errors;
++                }
++            }
++            catch ( ModelBuildingException e )
++            {
++                results.add( new DefaultProjectBuildingResult( pomFile, e.getProblems() ) );
++
++                errors = true;
++            }
++        }
++
++        return errors;
++    }
++
++    static class InterimResult
++    {
++
++        File pomFile;
++
++        ModelBuildingRequest request;
++
++        ModelBuildingResult result;
++
++        DefaultModelBuildingListener listener;
++
++        InterimResult( File pomFile, ModelBuildingRequest request, ModelBuildingResult result,
++                       DefaultModelBuildingListener listener )
++        {
++            this.pomFile = pomFile;
++            this.request = request;
++            this.result = result;
++            this.listener = listener;
++        }
++
++    }
++
++    private MavenProject toProject( ModelBuildingResult result, ProjectBuildingRequest configuration,
++                                    DefaultModelBuildingListener listener )
++        throws ProjectBuildingException
++    {
++        Model model = result.getEffectiveModel();
++
++        MavenProject project = new MavenProject( model, repositorySystem, this, configuration );
++
++        project.setFile( model.getPomFile() );
++
++        File parentPomFile = result.getRawModel( result.getModelIds().get( 1 ) ).getPomFile();
++        project.setParentFile( parentPomFile );
++
++        Artifact projectArtifact =
++            repositorySystem.createArtifact( project.getGroupId(), project.getArtifactId(), project.getVersion(), null,
++                                             project.getPackaging() );
++        project.setArtifact( projectArtifact );
++
++        project.setOriginalModel( result.getRawModel() );
++
++        project.setRemoteArtifactRepositories( listener.getRemoteRepositories() );
++        project.setPluginArtifactRepositories( listener.getPluginRepositories() );
++
++        project.setClassRealm( listener.getProjectRealm() );
+-            project = new MavenProject( model, repositorySystem, this, config );
+-
+-            Artifact projectArtifact = repositorySystem.createArtifact( project.getGroupId(), project.getArtifactId(), project.getVersion(), null, project.getPackaging() );
+-            project.setArtifact( projectArtifact );
+-
+-            project.setParentFile( parentFile );
++            if ( configuration.isProcessPlugins() )
++            {
++                lifecycle.populateDefaultConfigurationForPlugins( model.getBuild().getPlugins(),
++                                                                  configuration.getLocalRepository(),
++                                                                  project.getPluginArtifactRepositories() );
++            }
+-        catch ( InvalidRepositoryException e )
++        catch ( LifecycleExecutionException e )
+-            String projectId = safeVersionlessKey( model.getGroupId(), model.getArtifactId() );
+-            throw new InvalidProjectModelException( projectId, e.getMessage(), projectDescriptor, e );
++            throw new ProjectBuildingException( project.getId(), e.getMessage(), e );
++        }
++
++        Build build = project.getBuild();
++        project.addScriptSourceRoot( build.getScriptSourceDirectory() );
++        project.addCompileSourceRoot( build.getSourceDirectory() );
++        project.addTestCompileSourceRoot( build.getTestSourceDirectory() );
++
++        List<Profile> activeProfiles = new ArrayList<Profile>();
++        activeProfiles.addAll( result.getActivePomProfiles( result.getModelIds().get( 0 ) ) );
++        activeProfiles.addAll( result.getActiveExternalProfiles() );
++        project.setActiveProfiles( activeProfiles );
++
++        project.setInjectedProfileIds( "external", getProfileIds( result.getActiveExternalProfiles() ) );
++        for ( String modelId : result.getModelIds() )
++        {
++            project.setInjectedProfileIds( modelId, getProfileIds( result.getActivePomProfiles( modelId ) ) );
+-}
++    private String toSourceHint( Model model )
++    {
++        StringBuilder buffer = new StringBuilder( 192 );
++
++        buffer.append( model.getGroupId() );
++        buffer.append( ':' );
++        buffer.append( model.getArtifactId() );
++        buffer.append( ':' );
++        buffer.append( model.getVersion() );
++
++        File pomFile = model.getPomFile();
++        if ( pomFile != null )
++        {
++            buffer.append( " (" ).append( pomFile ).append( ")" );
++        }
++
++        return buffer.toString();
++    }
++
++}
+
+MOV26 INS26 INS26 MOV31 INS40 UPD40 INS40 INS31 INS31 INS55 INS31 INS83 MOV43 INS42 MOV44 MOV44 INS44 INS43 MOV8 INS44 INS83 INS74 INS42 INS44 INS44 MOV44 INS43 INS8 INS39 INS42 INS44 INS44 INS44 INS44 INS83 INS42 INS23 INS23 INS23 INS23 INS31 INS42 INS44 INS44 MOV8 MOV60 MOV21 INS83 INS43 INS42 MOV44 INS8 INS43 INS42 INS42 INS43 INS42 INS43 INS43 INS74 INS42 INS39 INS42 INS42 INS60 INS60 INS60 INS60 INS70 INS70 INS25 INS41 INS74 INS42 INS74 INS42 INS74 INS42 INS39 INS42 INS43 INS42 INS43 INS42 INS60 INS70 INS43 INS59 INS43 INS59 INS43 INS59 INS43 INS59 INS42 INS44 INS44 INS44 INS44 INS8 INS43 INS42 INS43 INS42 INS21 MOV60 INS21 INS42 INS60 INS21 INS21 INS21 INS21 INS21 INS60 INS25 INS41 INS42 INS8 INS42 INS42 INS42 INS43 INS43 INS74 INS59 INS74 INS59 INS43 INS59 INS39 INS59 INS44 INS42 INS8 INS44 INS42 INS8 INS42 INS8 INS42 INS43 INS43 INS43 INS43 INS43 INS43 INS42 UPD42 MOV42 INS39 INS59 INS44 INS42 INS8 UPD42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS43 INS42 INS43 INS42 INS43 INS42 INS43 INS42 INS21 INS21 INS21 INS21 INS42 INS42 INS43 INS32 MOV32 INS43 INS59 INS32 INS32 MOV32 INS32 INS32 INS43 INS59 INS27 INS8 INS32 MOV60 MOV54 INS60 MOV25 INS60 INS41 MOV14 INS42 INS42 INS43 INS43 INS42 INS14 INS43 INS43 INS42 INS14 INS42 INS42 INS14 INS42 INS32 INS43 INS42 INS60 INS21 INS43 INS42 INS54 INS53 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS9 INS43 INS42 INS60 INS21 INS21 MOV60 INS21 MOV54 INS42 INS42 INS42 INS42 INS7 INS7 INS7 INS7 INS42 INS14 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS14 INS42 INS42 INS32 INS42 INS42 INS13 UPD42 INS42 INS42 INS42 INS13 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS33 INS21 INS42 INS42 INS33 INS43 INS59 MOV43 INS59 INS42 INS42 INS33 INS42 INS42 INS74 INS42 INS42 INS74 INS43 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS43 INS59 INS32 INS42 INS8 INS12 INS14 INS42 INS43 INS59 INS32 INS32 INS43 INS32 INS22 INS42 INS22 INS42 INS22 INS42 INS22 INS42 INS43 INS42 INS42 INS52 INS42 INS42 UPD42 MOV42 INS32 INS43 INS34 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS32 INS43 INS43 INS43 INS43 INS42 INS42 INS42 INS32 INS42 INS42 MOV32 INS32 INS32 MOV32 INS60 INS60 INS21 INS44 INS8 INS43 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS9 INS42 INS42 INS14 INS42 INS42 INS32 INS60 INS60 INS25 INS52 INS42 INS52 INS42 INS52 INS42 INS52 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS45 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS40 INS42 INS42 INS42 INS42 INS42 INS43 INS59 MOV43 INS59 INS32 INS43 INS42 INS21 INS21 INS42 INS42 INS42 INS42 INS43 INS42 INS42 INS42 INS42 INS42 INS43 INS59 INS43 INS59 INS32 INS27 INS8 UPD43 INS21 INS21 INS32 INS42 INS42 INS42 INS42 INS32 INS42 INS32 INS42 INS42 INS14 INS42 INS32 INS7 INS42 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS14 INS42 INS38 INS60 INS60 INS70 INS21 UPD42 INS32 INS7 INS42 INS42 INS45 INS42 INS42 INS40 INS40 INS42 INS42 INS42 INS40 INS43 INS42 INS32 INS42 INS42 INS14 INS42 INS9 INS42 INS42 INS42 INS42 INS42 UPD43 MOV43 UPD42 MOV42 INS42 UPD42 MOV42 UPD42 MOV42 INS32 MOV43 INS59 INS74 INS59 INS44 INS32 INS8 INS7 INS42 INS42 INS14 INS42 INS9 INS42 INS42 INS42 INS43 INS40 INS32 UPD42 INS32 INS42 INS42 INS32 INS43 INS43 INS42 INS14 MOV43 INS42 INS42 INS42 INS25 INS60 INS25 INS25 INS25 MOV21 INS42 INS27 UPD43 MOV43 UPD42 MOV42 MOV32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS74 INS32 INS8 MOV43 INS59 INS32 INS8 INS38 INS8 INS32 INS8 INS8 INS32 INS42 UPD42 UPD42 INS43 INS43 INS42 INS42 INS42 INS18 INS42 INS14 INS42 INS42 INS21 INS32 INS60 INS60 INS21 INS21 INS18 UPD42 MOV42 UPD42 MOV42 INS40 INS54 MOV21 UPD42 UPD42 UPD42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 UPD42 MOV42 INS42 INS43 INS42 INS42 INS7 INS42 INS42 INS43 INS59 INS43 INS59 INS32 INS7 INS8 INS12 INS7 INS42 INS42 INS14 INS42 INS42 INS32 INS42 UPD42 MOV42 INS14 MOV32 INS42 INS42 INS42 INS9 INS21 INS44 INS8 INS42 INS14 INS43 INS42 INS40 INS42 INS42 INS43 INS27 INS40 INS42 UPD42 UPD42 INS7 INS43 INS42 INS21 INS43 INS32 INS42 INS42 INS45 INS42 INS45 INS42 INS45 INS42 INS32 INS42 INS7 INS42 INS32 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 INS42 INS32 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 DEL42 DEL7 DEL21 DEL8 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL14 DEL53 DEL8 DEL12 DEL54 DEL42 DEL42 DEL42 DEL43 DEL42 DEL42 DEL52 DEL14 DEL7 DEL42 DEL59 DEL60 DEL42 DEL42 DEL14 DEL53 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32

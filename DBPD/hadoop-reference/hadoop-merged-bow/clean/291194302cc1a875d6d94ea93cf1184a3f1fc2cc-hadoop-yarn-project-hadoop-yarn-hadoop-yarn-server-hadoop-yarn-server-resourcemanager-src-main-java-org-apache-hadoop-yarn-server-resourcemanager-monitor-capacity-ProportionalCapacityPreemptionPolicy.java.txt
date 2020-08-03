@@ -1,0 +1,131 @@
+YARN-8379. Improve balancing resources in already satisfied queues by using Capacity Scheduler preemption. Contributed by Zian Chen.
+
++  Map<PreemptionCandidatesSelector, Map<ApplicationAttemptId,
++      Set<RMContainer>>> pcsMap;
+-        additionalPreemptionBasedOnReservedResource));
++        additionalPreemptionBasedOnReservedResource, false));
++
++    // Do we need to do preemption to balance queue even after queues get satisfied?
++    boolean isPreemptionToBalanceRequired = config.getBoolean(
++        CapacitySchedulerConfiguration.PREEMPTION_TO_BALANCE_QUEUES_BEYOND_GUARANTEED,
++        CapacitySchedulerConfiguration.DEFAULT_PREEMPTION_TO_BALANCE_QUEUES_BEYOND_GUARANTEED);
++    long maximumKillWaitTimeForPreemptionToQueueBalance = config.getLong(
++        CapacitySchedulerConfiguration.MAX_WAIT_BEFORE_KILL_FOR_QUEUE_BALANCE_PREEMPTION,
++        CapacitySchedulerConfiguration.DEFAULT_MAX_WAIT_BEFORE_KILL_FOR_QUEUE_BALANCE_PREEMPTION);
++    if (isPreemptionToBalanceRequired) {
++      PreemptionCandidatesSelector selector = new FifoCandidatesSelector(this,
++          false, true);
++      selector.setMaximumKillWaitTime(maximumKillWaitTimeForPreemptionToQueueBalance);
++      candidatesSelectionPolicies.add(selector);
++    }
+-          additionalPreemptionBasedOnReservedResource);
++          additionalPreemptionBasedOnReservedResource + "\n" +
++        "Preemption-to-balance-queue-enabled = " + isPreemptionToBalanceRequired);
+-      Map<ApplicationAttemptId, Set<RMContainer>> selectedCandidates,
+-      long currentTime) {
++      Map<PreemptionCandidatesSelector, Map<ApplicationAttemptId,
++          Set<RMContainer>>> toPreemptPerSelector, long currentTime) {
++    int toPreemptCount = 0;
++    for (Map<ApplicationAttemptId, Set<RMContainer>> containers :
++        toPreemptPerSelector.values()) {
++      toPreemptCount += containers.size();
++    }
+-              + selectedCandidates.size());
++              + toPreemptCount);
+-    for (Map.Entry<ApplicationAttemptId, Set<RMContainer>> e : selectedCandidates
++    // We need toPreemptPerSelector here to match list of containers to
++    // its selector so that we can get custom timeout per selector when
++    // checking if current container should be killed or not
++    for (Map.Entry<PreemptionCandidatesSelector, Map<ApplicationAttemptId,
++        Set<RMContainer>>> pc : toPreemptPerSelector
+-      ApplicationAttemptId appAttemptId = e.getKey();
+-      if (LOG.isDebugEnabled()) {
+-        LOG.debug("Send to scheduler: in app=" + appAttemptId
+-            + " #containers-to-be-preemptionCandidates=" + e.getValue().size());
+-      }
+-      for (RMContainer container : e.getValue()) {
+-        // if we tried to preempt this for more than maxWaitTime
+-        if (preemptionCandidates.get(container) != null
+-            && preemptionCandidates.get(container)
+-                + maxWaitTime <= currentTime) {
+-          // kill it
+-          rmContext.getDispatcher().getEventHandler().handle(
+-              new ContainerPreemptEvent(appAttemptId, container,
+-                  SchedulerEventType.MARK_CONTAINER_FOR_KILLABLE));
+-          preemptionCandidates.remove(container);
+-        } else {
+-          if (preemptionCandidates.get(container) != null) {
+-            // We already updated the information to scheduler earlier, we need
+-            // not have to raise another event.
+-            continue;
++      Map<ApplicationAttemptId, Set<RMContainer>> cMap = pc.getValue();
++      if (cMap.size() > 0) {
++        for (Map.Entry<ApplicationAttemptId,
++            Set<RMContainer>> e : cMap.entrySet()) {
++          ApplicationAttemptId appAttemptId = e.getKey();
++          if (LOG.isDebugEnabled()) {
++            LOG.debug("Send to scheduler: in app=" + appAttemptId
++                + " #containers-to-be-preemptionCandidates=" + e.getValue().size());
++          for (RMContainer container : e.getValue()) {
++            // if we tried to preempt this for more than maxWaitTime, this
++            // should be based on custom timeout per container per selector
++            if (preemptionCandidates.get(container) != null
++                && preemptionCandidates.get(container)
++                + pc.getKey().getMaximumKillWaitTimeMs() <= currentTime) {
++              // kill it
++              rmContext.getDispatcher().getEventHandler().handle(
++                  new ContainerPreemptEvent(appAttemptId, container,
++                      SchedulerEventType.MARK_CONTAINER_FOR_KILLABLE));
++              preemptionCandidates.remove(container);
++            } else {
++              if (preemptionCandidates.get(container) != null) {
++                // We already updated the information to scheduler earlier, we need
++                // not have to raise another event.
++                continue;
++              }
+-          //otherwise just send preemption events
+-          rmContext.getDispatcher().getEventHandler().handle(
+-              new ContainerPreemptEvent(appAttemptId, container,
+-                  SchedulerEventType.MARK_CONTAINER_FOR_PREEMPTION));
+-          preemptionCandidates.put(container, currentTime);
++              //otherwise just send preemption events
++              rmContext.getDispatcher().getEventHandler().handle(
++                  new ContainerPreemptEvent(appAttemptId, container,
++                      SchedulerEventType.MARK_CONTAINER_FOR_PREEMPTION));
++              preemptionCandidates.put(container, currentTime);
++            }
++          }
++    Map<PreemptionCandidatesSelector, Map<ApplicationAttemptId,
++        Set<RMContainer>>> toPreemptPerSelector =  new HashMap<>();;
+-      toPreempt = selector.selectCandidates(toPreempt,
+-          clusterResources, totalPreemptionAllowed);
++      Map<ApplicationAttemptId, Set<RMContainer>> curCandidates =
++          selector.selectCandidates(toPreempt, clusterResources,
++              totalPreemptionAllowed);
++      toPreemptPerSelector.putIfAbsent(selector, curCandidates);
++        int curSelected = 0;
++        for (Set<RMContainer> set : curCandidates.values()) {
++          curSelected += set.size();
++        }
+-            .format("So far, total {0} containers selected to be preempted",
+-                totalSelected));
++            .format("So far, total {0} containers selected to be preempted, {1}"
++                    + " containers selected this round\n",
++                totalSelected, curSelected));
++    pcsMap = toPreemptPerSelector;
++
+-    preemptOrkillSelectedContainerAfterWait(toPreempt, currentTime);
++    preemptOrkillSelectedContainerAfterWait(toPreemptPerSelector, currentTime);
++  @VisibleForTesting
++  Map<PreemptionCandidatesSelector, Map<ApplicationAttemptId,
++      Set<RMContainer>>> getToPreemptCandidatesPerSelector() {
++    return pcsMap;
++  }
++
++
++  @Override
++  public long getDefaultMaximumKillWaitTimeout() {
++    return maxWaitTime;
++  }
+
+INS23 INS31 INS31 INS74 INS59 INS44 INS8 INS78 INS74 INS42 INS8 INS78 INS83 INS39 INS42 INS8 INS43 INS43 INS74 INS42 INS60 INS60 INS25 INS74 INS42 INS60 INS70 INS25 INS70 INS60 INS20 INS21 INS42 INS43 INS43 INS74 INS41 INS42 INS41 INS42 INS42 INS43 INS43 INS74 INS39 INS59 INS39 INS59 INS42 INS8 INS43 INS43 INS74 INS39 INS59 MOV44 INS32 INS8 MOV32 INS8 INS44 INS32 INS8 INS74 INS59 INS7 INS42 INS42 INS43 INS43 INS74 INS42 INS42 INS42 INS42 INS43 INS43 INS42 INS32 INS42 INS32 INS60 INS21 INS21 INS42 INS42 INS43 INS43 INS74 INS42 INS34 UPD42 INS42 INS42 INS21 INS21 INS74 INS42 INS42 INS42 INS60 INS25 INS43 INS43 INS74 INS42 INS14 INS60 INS42 INS42 UPD42 INS42 INS42 INS43 INS43 INS42 INS42 INS9 INS42 INS42 INS40 INS40 INS42 INS42 INS40 INS40 INS43 INS59 INS32 INS32 INS45 INS45 INS42 INS42 INS42 INS43 INS43 INS7 INS32 INS43 INS43 INS74 INS74 INS59 INS27 MOV8 INS42 INS42 INS43 INS43 INS74 INS74 INS74 INS59 INS32 INS42 INS42 INS42 INS42 INS14 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS27 INS40 INS42 INS43 INS43 INS74 INS43 INS43 INS74 INS42 INS32 INS32 INS34 INS42 INS42 INS43 INS43 INS43 INS43 INS43 INS74 INS42 MOV32 INS42 INS42 INS42 INS42 INS60 INS70 INS43 INS52 INS9 INS9 INS42 INS42 INS45 INS42 INS42 INS42 INS43 INS43 INS42 INS42 INS43 INS43 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS43 INS43 INS39 INS59 INS44 INS32 INS8 INS42 INS42 INS42 INS42 INS42 UPD42 INS42 INS42 INS42 INS34 INS74 INS42 INS42 INS42 INS21 INS43 INS43 INS7 INS27 INS42 INS42 INS42 INS42 INS32 INS45 INS45 INS42 INS42 INS32 INS32 INS42 INS42 INS42 DEL42 DEL42 DEL45 DEL42 DEL42 DEL32 DEL27 DEL32 DEL21 DEL8 DEL25 DEL42 DEL42 DEL7 DEL45

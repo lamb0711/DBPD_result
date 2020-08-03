@@ -1,0 +1,157 @@
+HDFS-8446. Separate safemode related operations in GetBlockLocations(). Contributed by Haohui Mai.
+
+-import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_NAMENODE_ACCESSTIME_PRECISION_DEFAULT;
+-import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_NAMENODE_ACCESSTIME_PRECISION_KEY;
+-import static org.apache.hadoop.hdfs.server.common.HdfsServerConstants.SECURITY_XATTR_UNREADABLE_BY_SUPERUSER;
++import static org.apache.hadoop.hdfs.server.namenode.FSDirStatAndListingOp.*;
+-import org.apache.hadoop.hdfs.XAttrHelper;
+-  // precision of access times.
+-  private final long accessTimePrecision;
+-
+-      this.accessTimePrecision = conf.getLong(DFS_NAMENODE_ACCESSTIME_PRECISION_KEY,
+-          DFS_NAMENODE_ACCESSTIME_PRECISION_DEFAULT);
+-  long getAccessTimePrecision() {
+-    return accessTimePrecision;
+-  }
+-
+-  private boolean isAccessTimeSupported() {
+-    return accessTimePrecision > 0;
+-  }
+-
+-  static class GetBlockLocationsResult {
+-    final boolean updateAccessTime;
+-    final LocatedBlocks blocks;
+-    boolean updateAccessTime() {
+-      return updateAccessTime;
+-    }
+-    private GetBlockLocationsResult(
+-        boolean updateAccessTime, LocatedBlocks blocks) {
+-      this.updateAccessTime = updateAccessTime;
+-      this.blocks = blocks;
+-    }
+-  }
+-
+-      res = getBlockLocations(pc, srcArg, offset, length, true, true);
++      res = FSDirStatAndListingOp.getBlockLocations(
++          dir, pc, srcArg, offset, length, true);
++      if (isInSafeMode()) {
++        for (LocatedBlock b : res.blocks.getLocatedBlocks()) {
++          // if safemode & no block locations yet then throw safemodeException
++          if ((b.getLocations() == null) || (b.getLocations().length == 0)) {
++            SafeModeException se = newSafemodeException(
++                "Zero blocklocations for " + srcArg);
++            if (haEnabled && haContext != null &&
++                haContext.getState().getServiceState() == HAServiceState.ACTIVE) {
++              throw new RetriableException(se);
++            } else {
++              throw se;
++            }
++          }
++        }
++      }
+-    if (res.updateAccessTime()) {
++    if (!isInSafeMode() && res.updateAccessTime()) {
+-            now > inode.getAccessTime() + getAccessTimePrecision();
++            now > inode.getAccessTime() + dir.getAccessTimePrecision();
+-   * Get block locations within the specified range.
+-   * @see ClientProtocol#getBlockLocations(String, long, long)
+-   * @throws IOException
+-   */
+-  GetBlockLocationsResult getBlockLocations(
+-      FSPermissionChecker pc, String src, long offset, long length,
+-      boolean needBlockToken, boolean checkSafeMode) throws IOException {
+-    if (offset < 0) {
+-      throw new HadoopIllegalArgumentException(
+-          "Negative offset is not supported. File: " + src);
+-    }
+-    if (length < 0) {
+-      throw new HadoopIllegalArgumentException(
+-          "Negative length is not supported. File: " + src);
+-    }
+-    final GetBlockLocationsResult ret = getBlockLocationsInt(
+-        pc, src, offset, length, needBlockToken);
+-
+-    if (checkSafeMode && isInSafeMode()) {
+-      for (LocatedBlock b : ret.blocks.getLocatedBlocks()) {
+-        // if safemode & no block locations yet then throw safemodeException
+-        if ((b.getLocations() == null) || (b.getLocations().length == 0)) {
+-          SafeModeException se = newSafemodeException(
+-              "Zero blocklocations for " + src);
+-          if (haEnabled && haContext != null &&
+-              haContext.getState().getServiceState() == HAServiceState.ACTIVE) {
+-            throw new RetriableException(se);
+-          } else {
+-            throw se;
+-          }
+-        }
+-      }
+-    }
+-    return ret;
+-  }
+-
+-  private GetBlockLocationsResult getBlockLocationsInt(
+-      FSPermissionChecker pc, final String srcArg, long offset, long length,
+-      boolean needBlockToken)
+-      throws IOException {
+-    String src = srcArg;
+-    byte[][] pathComponents = FSDirectory.getPathComponentsForReservedPath(src);
+-    src = dir.resolvePath(pc, srcArg, pathComponents);
+-    final INodesInPath iip = dir.getINodesInPath(src, true);
+-    final INodeFile inode = INodeFile.valueOf(iip.getLastINode(), src);
+-    if (isPermissionEnabled) {
+-      dir.checkPathAccess(pc, iip, FsAction.READ);
+-      checkUnreadableBySuperuser(pc, inode, iip.getPathSnapshotId());
+-    }
+-
+-    final long fileSize = iip.isSnapshot()
+-        ? inode.computeFileSize(iip.getPathSnapshotId())
+-        : inode.computeFileSizeNotIncludingLastUcBlock();
+-    boolean isUc = inode.isUnderConstruction();
+-    if (iip.isSnapshot()) {
+-      // if src indicates a snapshot file, we need to make sure the returned
+-      // blocks do not exceed the size of the snapshot file.
+-      length = Math.min(length, fileSize - offset);
+-      isUc = false;
+-    }
+-
+-    final FileEncryptionInfo feInfo =
+-        FSDirectory.isReservedRawName(srcArg) ? null
+-            : dir.getFileEncryptionInfo(inode, iip.getPathSnapshotId(), iip);
+-
+-    final LocatedBlocks blocks = blockManager.createLocatedBlocks(
+-        inode.getBlocks(iip.getPathSnapshotId()), fileSize, isUc, offset,
+-        length, needBlockToken, iip.isSnapshot(), feInfo);
+-
+-    // Set caching information for the located blocks.
+-    for (LocatedBlock lb : blocks.getLocatedBlocks()) {
+-      cacheManager.setCachedLocations(lb);
+-    }
+-
+-    final long now = now();
+-    boolean updateAccessTime = isAccessTimeSupported() && !isInSafeMode()
+-        && !iip.isSnapshot()
+-        && now > inode.getAccessTime() + getAccessTimePrecision();
+-    return new GetBlockLocationsResult(updateAccessTime, blocks);
+-  }
+-
+-  /**
+-      dl = FSDirStatAndListingOp.getListingInt(dir, src, startAfter,
+-          needLocation);
++      dl = getListingInt(dir, src, startAfter, needLocation);
+-  private void checkUnreadableBySuperuser(FSPermissionChecker pc,
+-      INode inode, int snapshotId)
+-      throws IOException {
+-    if (pc.isSuperUser()) {
+-      for (XAttr xattr : FSDirXAttrOp.getXAttrs(dir, inode, snapshotId)) {
+-        if (XAttrHelper.getPrefixName(xattr).
+-            equals(SECURITY_XATTR_UNREADABLE_BY_SUPERUSER)) {
+-          throw new AccessControlException("Access is denied for " +
+-              pc.getUser() + " since the superuser is not allowed to " +
+-              "perform this operation.");
+-        }
+-      }
+-    }
+-  }
+-
+
+MOV26 UPD40 INS27 INS25 MOV38 MOV32 MOV32 INS8 INS70 INS42 INS42 MOV44 INS32 INS8 INS40 INS42 INS25 MOV27 INS8 INS60 MOV25 MOV43 INS59 INS42 INS32 INS42 INS42 INS27 INS45 INS42 DEL40 DEL26 DEL40 DEL26 DEL40 DEL26 DEL83 DEL83 DEL39 DEL42 DEL59 DEL23 DEL52 DEL42 DEL22 DEL42 DEL42 DEL42 DEL42 DEL32 DEL7 DEL21 DEL39 DEL42 DEL42 DEL41 DEL8 DEL31 DEL83 DEL39 DEL42 DEL42 DEL34 DEL27 DEL41 DEL8 DEL31 DEL83 DEL42 DEL83 DEL39 DEL42 DEL59 DEL23 DEL83 DEL42 DEL43 DEL42 DEL59 DEL23 DEL39 DEL42 DEL42 DEL41 DEL8 DEL31 DEL83 DEL42 DEL39 DEL42 DEL44 DEL42 DEL43 DEL42 DEL44 DEL52 DEL42 DEL22 DEL42 DEL7 DEL21 DEL52 DEL42 DEL22 DEL42 DEL7 DEL21 DEL8 DEL31 DEL55 DEL9 DEL66 DEL65 DEL42 DEL42 DEL42 DEL43 DEL69 DEL39 DEL69 DEL39 DEL69 DEL68 DEL65 DEL42 DEL65 DEL29 DEL42 DEL43 DEL42 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL44 DEL39 DEL42 DEL44 DEL39 DEL42 DEL44 DEL39 DEL42 DEL44 DEL39 DEL42 DEL44 DEL42 DEL43 DEL42 DEL34 DEL27 DEL42 DEL43 DEL45 DEL42 DEL27 DEL14 DEL53 DEL8 DEL25 DEL42 DEL34 DEL27 DEL42 DEL43 DEL45 DEL42 DEL27 DEL14 DEL53 DEL8 DEL25 DEL83 DEL42 DEL43 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL27 DEL40 DEL42 DEL32 DEL42 DEL42 DEL45 DEL42 DEL27 DEL32 DEL59 DEL60 DEL8 DEL25 DEL8 DEL70 DEL8 DEL25 DEL42 DEL41 DEL8 DEL31 DEL83 DEL42 DEL43 DEL42 DEL42 DEL43 DEL42 DEL44 DEL83 DEL42 DEL43 DEL42 DEL44 DEL39 DEL42 DEL44 DEL39 DEL42 DEL44 DEL39 DEL42 DEL44 DEL42 DEL43 DEL42 DEL43 DEL42 DEL42 DEL59 DEL60 DEL39 DEL85 DEL85 DEL5 DEL42 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL7 DEL21 DEL83 DEL42 DEL43 DEL42 DEL42 DEL42 DEL42 DEL9 DEL32 DEL59 DEL60 DEL83 DEL42 DEL43 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL42 DEL32 DEL59 DEL60 DEL42 DEL42 DEL42 DEL42 DEL42 DEL40 DEL32 DEL21 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL32 DEL21 DEL8 DEL25 DEL83 DEL39 DEL42 DEL42 DEL42 DEL32 DEL42 DEL42 DEL42 DEL42 DEL32 DEL32 DEL42 DEL42 DEL32 DEL16 DEL59 DEL60 DEL39 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL42 DEL32 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL27 DEL32 DEL7 DEL21 DEL42 DEL9 DEL7 DEL21 DEL8 DEL25 DEL83 DEL42 DEL43 DEL42 DEL42 DEL42 DEL42 DEL32 DEL33 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL42 DEL32 DEL16 DEL59 DEL60 DEL83 DEL42 DEL43 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL32 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL42 DEL32 DEL59 DEL60 DEL42 DEL43 DEL42 DEL44 DEL42 DEL42 DEL32 DEL42 DEL42 DEL42 DEL32 DEL21 DEL8 DEL70 DEL83 DEL39 DEL42 DEL42 DEL32 DEL59 DEL60 DEL39 DEL42 DEL42 DEL32 DEL42 DEL42 DEL32 DEL38 DEL42 DEL42 DEL42 DEL32 DEL42 DEL32 DEL27 DEL27 DEL27 DEL59 DEL60 DEL42 DEL43 DEL42 DEL42 DEL14 DEL41 DEL8 DEL31 DEL42 DEL83 DEL39 DEL42 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL44 DEL39 DEL42 DEL44 DEL42 DEL43 DEL42 DEL42 DEL32 DEL42 DEL43 DEL42 DEL44 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL42 DEL42 DEL42 DEL32 DEL42 DEL42 DEL32 DEL42 DEL43 DEL45 DEL42 DEL42 DEL32 DEL45 DEL45 DEL27 DEL14 DEL53 DEL8 DEL25 DEL8 DEL70 DEL8 DEL25 DEL8 DEL31

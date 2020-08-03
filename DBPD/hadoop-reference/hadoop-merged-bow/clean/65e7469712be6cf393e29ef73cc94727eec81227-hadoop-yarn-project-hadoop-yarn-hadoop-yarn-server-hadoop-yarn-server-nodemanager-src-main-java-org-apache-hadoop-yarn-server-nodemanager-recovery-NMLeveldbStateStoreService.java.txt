@@ -1,0 +1,436 @@
+YARN-8242. YARN NM: OOM error while reading back the state store on recovery. Contributed by Pradeep Ambati and Kanwaljeet Sachdev
+
++import java.util.AbstractMap;
++import java.util.NoSuchElementException;
+-  @Override
+-  public List<RecoveredContainerState> loadContainersState()
++  // LeveldbIterator starting at startkey
++  private LeveldbIterator getLevelDBIterator(String startKey)
+-    ArrayList<RecoveredContainerState> containers =
+-        new ArrayList<RecoveredContainerState>();
+-    ArrayList<ContainerId> containersToRemove =
+-              new ArrayList<ContainerId>();
+-    LeveldbIterator iter = null;
+-      iter = new LeveldbIterator(db);
+-      iter.seek(bytes(CONTAINERS_KEY_PREFIX));
++      LeveldbIterator it = new LeveldbIterator(db);
++      it.seek(bytes(startKey));
++      return it;
++    } catch (DBException e) {
++      throw new IOException(e);
++    }
++  }
+-      while (iter.hasNext()) {
+-        Entry<byte[], byte[]> entry = iter.peekNext();
++  // Base Recovery Iterator
++  private abstract class BaseRecoveryIterator<T> implements
++      RecoveryIterator<T> {
++    LeveldbIterator it;
++    T nextItem;
++
++    BaseRecoveryIterator(String dbKey) throws IOException {
++      this.it = getLevelDBIterator(dbKey);
++      this.nextItem = null;
++    }
++
++    protected abstract T getNextItem(LeveldbIterator it) throws IOException;
++
++    @Override
++    public boolean hasNext() throws IOException {
++      if (nextItem == null) {
++        nextItem = getNextItem(it);
++      }
++      return (nextItem != null);
++    }
++
++    @Override
++    public T next() throws IOException, NoSuchElementException {
++      T tmp = nextItem;
++      if (tmp != null) {
++        nextItem = null;
++        return tmp;
++      } else {
++        tmp = getNextItem(it);
++        if (tmp == null) {
++          throw new NoSuchElementException();
++        }
++        return tmp;
++      }
++    }
++
++    @Override
++    public void close() throws IOException {
++      if (it != null) {
++        it.close();
++      }
++    }
++  }
++
++  //  Container Recovery Iterator
++  private class ContainerStateIterator extends
++      BaseRecoveryIterator<RecoveredContainerState> {
++    ContainerStateIterator() throws IOException {
++      super(CONTAINERS_KEY_PREFIX);
++    }
++
++    @Override
++    protected RecoveredContainerState getNextItem(LeveldbIterator it)
++        throws IOException {
++      return getNextRecoveredContainer(it);
++    }
++  }
++
++  private RecoveredContainerState getNextRecoveredContainer(LeveldbIterator it)
++      throws IOException {
++    RecoveredContainerState rcs = null;
++    try {
++      while (it.hasNext()) {
++        Entry<byte[], byte[]> entry = it.peekNext();
+-          break;
++          return null;
+-        ContainerId containerId = ContainerId.fromString(
+-            key.substring(CONTAINERS_KEY_PREFIX.length(), idEndPos));
+-        String keyPrefix = key.substring(0, idEndPos+1);
+-        RecoveredContainerState rcs = loadContainerState(containerId,
+-            iter, keyPrefix);
+-        // Don't load container without StartContainerRequest
++        String keyPrefix = key.substring(0, idEndPos + 1);
++        rcs = loadContainerState(it, keyPrefix);
+-          containers.add(rcs);
++          break;
+-          containersToRemove.add(containerId);
++          removeContainer(rcs.getContainerId());
++          rcs = null;
+-    } finally {
+-      if (iter != null) {
+-        iter.close();
+-      }
+-
+-    // remove container without StartContainerRequest
+-    for (ContainerId containerId : containersToRemove) {
+-      LOG.warn("Remove container " + containerId +
+-          " with incomplete records");
+-      try {
+-        removeContainer(containerId);
+-        // TODO: kill and cleanup the leaked container
+-      } catch (IOException e) {
+-        LOG.error("Unable to remove container " + containerId +
+-            " in store", e);
+-      }
+-    }
+-
+-    return containers;
++    return rcs;
+-  private RecoveredContainerState loadContainerState(ContainerId containerId,
+-      LeveldbIterator iter, String keyPrefix) throws IOException {
+-    RecoveredContainerState rcs = new RecoveredContainerState();
++
++  @Override
++  public RecoveryIterator<RecoveredContainerState> getContainerStateIterator()
++      throws IOException {
++    return new ContainerStateIterator();
++  }
++
++  private RecoveredContainerState loadContainerState(LeveldbIterator iter,
++       String keyPrefix) throws IOException {
++    ContainerId containerId = ContainerId.fromString(
++        keyPrefix.substring(CONTAINERS_KEY_PREFIX.length(),
++            keyPrefix.length()-1));
++    RecoveredContainerState rcs = new RecoveredContainerState(containerId);
++  // Application Recovery Iterator
++  private class ApplicationStateIterator extends
++      BaseRecoveryIterator<ContainerManagerApplicationProto> {
++    ApplicationStateIterator() throws IOException {
++      super(APPLICATIONS_KEY_PREFIX);
++    }
++
++    @Override
++    protected ContainerManagerApplicationProto getNextItem(LeveldbIterator it)
++        throws IOException {
++      return getNextRecoveredApplication(it);
++    }
++  }
++
++  private ContainerManagerApplicationProto getNextRecoveredApplication(
++      LeveldbIterator it) throws IOException {
++    ContainerManagerApplicationProto applicationProto = null;
++    try {
++      if (it.hasNext()) {
++        Entry<byte[], byte[]> entry = it.next();
++        String key = asString(entry.getKey());
++        if (!key.startsWith(APPLICATIONS_KEY_PREFIX)) {
++          return null;
++        }
++        applicationProto = ContainerManagerApplicationProto.parseFrom(
++            entry.getValue());
++      }
++    } catch (DBException e) {
++      throw new IOException(e);
++    }
++    return applicationProto;
++  }
++
+-    state.applications = new ArrayList<ContainerManagerApplicationProto>();
+-    String keyPrefix = APPLICATIONS_KEY_PREFIX;
+-    LeveldbIterator iter = null;
+-    try {
+-      iter = new LeveldbIterator(db);
+-      iter.seek(bytes(keyPrefix));
+-      while (iter.hasNext()) {
+-        Entry<byte[], byte[]> entry = iter.next();
+-        String key = asString(entry.getKey());
+-        if (!key.startsWith(keyPrefix)) {
+-          break;
+-        }
+-        state.applications.add(
+-            ContainerManagerApplicationProto.parseFrom(entry.getValue()));
+-      }
+-    } catch (DBException e) {
+-      throw new IOException(e);
+-    } finally {
+-      if (iter != null) {
+-        iter.close();
+-      }
+-    }
+-
++    state.it = new ApplicationStateIterator();
+-
+-  @Override
+-  public RecoveredLocalizationState loadLocalizationState()
+-      throws IOException {
+-    RecoveredLocalizationState state = new RecoveredLocalizationState();
++  // User Resource Recovery Iterator.
++  private class UserResourcesIterator extends
++      BaseRecoveryIterator<Entry<String, RecoveredUserResources>> {
++    UserResourcesIterator() throws IOException {
++      super(LOCALIZATION_PRIVATE_KEY_PREFIX);
++    }
+-    LeveldbIterator iter = null;
++    @Override
++    protected Entry<String, RecoveredUserResources> getNextItem(
++        LeveldbIterator it) throws IOException {
++      return getNextRecoveredPrivateLocalizationEntry(it);
++    }
++  }
++
++  private Entry<String, RecoveredUserResources> getNextRecoveredPrivateLocalizationEntry(
++      LeveldbIterator it) throws IOException {
++    Entry<String, RecoveredUserResources> localEntry = null;
+-      iter = new LeveldbIterator(db);
+-      iter.seek(bytes(LOCALIZATION_PUBLIC_KEY_PREFIX));
+-      state.publicTrackerState = loadResourceTrackerState(iter,
+-          LOCALIZATION_PUBLIC_KEY_PREFIX);
+-
+-      iter.seek(bytes(LOCALIZATION_PRIVATE_KEY_PREFIX));
+-      while (iter.hasNext()) {
+-        Entry<byte[],byte[]> entry = iter.peekNext();
++      if (it.hasNext()) {
++        Entry<byte[], byte[]> entry = it.peekNext();
+-          break;
++          return null;
+-        state.userResources.put(user, loadUserLocalizedResources(iter,
+-            key.substring(0, userEndPos+1)));
++        RecoveredUserResources val = loadUserLocalizedResources(it,
++            key.substring(0, userEndPos+1));
++        localEntry = new AbstractMap.SimpleEntry<>(user, val);
+-    } finally {
+-      if (iter != null) {
+-        iter.close();
+-      }
++    return localEntry;
++  }
++  @Override
++  public RecoveredLocalizationState loadLocalizationState()
++      throws IOException {
++    RecoveredLocalizationState state = new RecoveredLocalizationState();
++    LeveldbIterator it = getLevelDBIterator(LOCALIZATION_PUBLIC_KEY_PREFIX);
++    state.publicTrackerState = loadResourceTrackerState(it,
++        LOCALIZATION_PUBLIC_KEY_PREFIX);
++    state.it = new UserResourcesIterator();
+-      Entry<byte[],byte[]> entry = iter.peekNext();
++      Entry<byte[], byte[]> entry = iter.peekNext();
++  // Deletion State Recovery Iterator.
++  private class DeletionStateIterator extends
++      BaseRecoveryIterator<DeletionServiceDeleteTaskProto> {
++    DeletionStateIterator() throws IOException {
++      super(DELETION_TASK_KEY_PREFIX);
++    }
++
++    @Override
++    protected DeletionServiceDeleteTaskProto getNextItem(LeveldbIterator it)
++        throws IOException {
++      return getNextRecoveredDeletionService(it);
++    }
++  }
++
++  private DeletionServiceDeleteTaskProto getNextRecoveredDeletionService(
++      LeveldbIterator it) throws IOException {
++    DeletionServiceDeleteTaskProto deleteProto = null;
++    try {
++      if (it.hasNext()) {
++        Entry<byte[], byte[]> entry = it.next();
++        String key = asString(entry.getKey());
++        if (!key.startsWith(DELETION_TASK_KEY_PREFIX)) {
++          return null;
++        }
++        deleteProto = DeletionServiceDeleteTaskProto.parseFrom(
++            entry.getValue());
++      }
++    } catch (DBException e) {
++      throw new IOException(e);
++    }
++    return deleteProto;
++  }
+-    state.tasks = new ArrayList<DeletionServiceDeleteTaskProto>();
+-    LeveldbIterator iter = null;
+-    try {
+-      iter = new LeveldbIterator(db);
+-      iter.seek(bytes(DELETION_TASK_KEY_PREFIX));
+-      while (iter.hasNext()) {
+-        Entry<byte[], byte[]> entry = iter.next();
+-        String key = asString(entry.getKey());
+-        if (!key.startsWith(DELETION_TASK_KEY_PREFIX)) {
+-          break;
+-        }
+-        state.tasks.add(
+-            DeletionServiceDeleteTaskProto.parseFrom(entry.getValue()));
+-      }
+-    } catch (DBException e) {
+-      throw new IOException(e);
+-    } finally {
+-      if (iter != null) {
+-        iter.close();
+-      }
+-    }
++    state.it = new DeletionStateIterator();
++  private MasterKey getMasterKey(String dbKey) throws IOException {
++    try{
++      byte[] data = db.get(bytes(dbKey));
++      if (data == null || data.length == 0) {
++        return null;
++      }
++      return parseMasterKey(data);
++    } catch (DBException e) {
++      throw new IOException(e);
++    }
++  }
+-  @Override
+-  public RecoveredNMTokensState loadNMTokensState() throws IOException {
+-    RecoveredNMTokensState state = new RecoveredNMTokensState();
+-    state.applicationMasterKeys =
+-        new HashMap<ApplicationAttemptId, MasterKey>();
+-    LeveldbIterator iter = null;
++  // Recover NMTokens Iterator
++  private class NMTokensStateIterator extends
++      BaseRecoveryIterator<Entry<ApplicationAttemptId, MasterKey>> {
++    NMTokensStateIterator() throws IOException {
++      super(NM_TOKENS_KEY_PREFIX);
++    }
++
++    @Override
++    protected Entry<ApplicationAttemptId, MasterKey> getNextItem(
++        LeveldbIterator it) throws IOException {
++      return getNextMasterKeyEntry(it);
++    }
++  }
++
++  private Entry<ApplicationAttemptId, MasterKey> getNextMasterKeyEntry(
++      LeveldbIterator it) throws IOException {
++    Entry<ApplicationAttemptId, MasterKey> masterKeyentry = null;
+-      iter = new LeveldbIterator(db);
+-      iter.seek(bytes(NM_TOKENS_KEY_PREFIX));
+-      while (iter.hasNext()) {
+-        Entry<byte[], byte[]> entry = iter.next();
++      while (it.hasNext()) {
++        Entry<byte[], byte[]> entry = it.next();
+-        if (key.equals(CURRENT_MASTER_KEY_SUFFIX)) {
+-          state.currentMasterKey = parseMasterKey(entry.getValue());
+-        } else if (key.equals(PREV_MASTER_KEY_SUFFIX)) {
+-          state.previousMasterKey = parseMasterKey(entry.getValue());
+-        } else if (key.startsWith(
+-            ApplicationAttemptId.appAttemptIdStrPrefix)) {
++        if (key.startsWith(ApplicationAttemptId.appAttemptIdStrPrefix)) {
+-          state.applicationMasterKeys.put(attempt,
++          masterKeyentry = new AbstractMap.SimpleEntry<>(attempt,
++          break;
+-    } finally {
+-      if (iter != null) {
+-        iter.close();
+-      }
++    return masterKeyentry;
++  }
++
++  @Override
++  public RecoveredNMTokensState loadNMTokensState() throws IOException {
++    RecoveredNMTokensState state = new RecoveredNMTokensState();
++    state.currentMasterKey = getMasterKey(NM_TOKENS_KEY_PREFIX
++                                          + CURRENT_MASTER_KEY_SUFFIX);
++    state.previousMasterKey = getMasterKey(NM_TOKENS_KEY_PREFIX
++                                            + PREV_MASTER_KEY_SUFFIX);
++    state.it = new NMTokensStateIterator();
++  // Recover ContainersToken Iterator.
++  private class ContainerTokensStateIterator extends
++      BaseRecoveryIterator<Entry<ContainerId, Long>> {
++    ContainerTokensStateIterator() throws IOException {
++      super(CONTAINER_TOKENS_KEY_PREFIX);
++    }
+-  @Override
+-  public RecoveredContainerTokensState loadContainerTokensState()
++    @Override
++    protected Entry<ContainerId, Long> getNextItem(LeveldbIterator it)
++        throws IOException {
++      return getNextContainerToken(it);
++    }
++  }
++
++  private Entry<ContainerId, Long> getNextContainerToken(LeveldbIterator it)
+-    RecoveredContainerTokensState state = new RecoveredContainerTokensState();
+-    state.activeTokens = new HashMap<ContainerId, Long>();
+-    LeveldbIterator iter = null;
++    Entry<ContainerId, Long> containerTokenEntry = null;
+-      iter = new LeveldbIterator(db);
+-      iter.seek(bytes(CONTAINER_TOKENS_KEY_PREFIX));
+-      final int containerTokensKeyPrefixLength =
+-          CONTAINER_TOKENS_KEY_PREFIX.length();
+-      while (iter.hasNext()) {
+-        Entry<byte[], byte[]> entry = iter.next();
++      while (it.hasNext()) {
++        Entry<byte[], byte[]> entry = it.next();
+-        String key = fullKey.substring(containerTokensKeyPrefixLength);
+-        if (key.equals(CURRENT_MASTER_KEY_SUFFIX)) {
+-          state.currentMasterKey = parseMasterKey(entry.getValue());
+-        } else if (key.equals(PREV_MASTER_KEY_SUFFIX)) {
+-          state.previousMasterKey = parseMasterKey(entry.getValue());
+-        } else if (key.startsWith(ConverterUtils.CONTAINER_PREFIX)) {
+-          loadContainerToken(state, fullKey, key, entry.getValue());
++        String key = fullKey.substring(CONTAINER_TOKENS_KEY_PREFIX.length());
++        if (key.startsWith(ConverterUtils.CONTAINER_PREFIX)) {
++          containerTokenEntry = loadContainerToken(fullKey, key,
++              entry.getValue());
++          break;
+-    } finally {
+-      if (iter != null) {
+-        iter.close();
+-      }
+-    return state;
++    return containerTokenEntry;
+-  private static void loadContainerToken(RecoveredContainerTokensState state,
+-      String key, String containerIdStr, byte[] value) throws IOException {
++  private static Entry<ContainerId, Long> loadContainerToken(String key,
++      String containerIdStr, byte[] value) throws IOException {
+-    state.activeTokens.put(containerId, expTime);
++    return new AbstractMap.SimpleEntry<>(containerId, expTime);
++  }
++
++  @Override
++  public RecoveredContainerTokensState loadContainerTokensState()
++      throws IOException {
++    RecoveredContainerTokensState state = new RecoveredContainerTokensState();
++    state.currentMasterKey = getMasterKey(CONTAINER_TOKENS_KEY_PREFIX
++        + CURRENT_MASTER_KEY_SUFFIX);
++    state.previousMasterKey = getMasterKey(CONTAINER_TOKENS_KEY_PREFIX
++        + PREV_MASTER_KEY_SUFFIX);
++    state.it = new ContainerTokensStateIterator();
++    return state;
+
+INS26 INS26 INS40 INS40 INS31 INS55 INS55 INS31 INS55 INS31 INS31 INS55 INS31 INS55 INS31 INS31 INS31 INS55 INS31 INS55 INS31 INS31 UPD83 MOV83 INS43 INS42 INS44 INS43 INS8 INS83 INS83 INS42 INS73 INS74 INS23 INS23 INS31 INS31 INS31 INS31 INS31 INS83 INS42 UPD74 MOV74 INS31 INS31 UPD83 MOV43 UPD42 INS44 INS78 MOV83 UPD74 MOV74 INS42 INS43 INS8 INS83 INS42 UPD74 MOV74 INS31 INS31 INS83 INS43 INS42 INS44 INS43 MOV8 MOV78 MOV83 MOV43 UPD42 MOV42 MOV43 INS8 INS83 INS42 INS74 INS31 INS31 UPD83 INS74 UPD42 INS44 MOV78 INS83 MOV43 INS42 INS43 INS8 INS83 INS42 UPD74 MOV74 INS31 INS31 INS83 INS43 INS42 INS44 INS43 INS8 MOV78 INS83 MOV43 INS42 MOV43 INS8 INS83 INS43 INS42 INS44 INS43 INS8 INS83 INS42 INS74 INS31 INS31 UPD83 INS74 INS42 INS44 MOV78 INS83 MOV43 INS42 INS43 INS8 INS83 INS42 INS74 INS31 INS31 INS83 INS74 INS42 INS44 MOV43 INS8 INS74 INS42 MOV78 INS83 MOV43 INS42 INS43 INS8 INS42 INS43 INS42 INS42 INS54 INS42 INS43 INS43 MOV43 INS59 INS43 INS59 INS42 INS44 INS43 INS8 INS83 INS83 INS43 INS42 INS44 INS43 MOV78 INS83 INS39 INS42 INS43 INS8 INS78 INS83 INS43 INS42 INS43 INS43 INS8 INS78 INS83 INS39 INS42 INS43 INS8 UPD43 INS42 MOV43 INS8 INS78 INS83 INS43 INS42 INS44 INS43 INS8 INS43 INS42 INS42 UPD43 INS42 INS41 INS60 INS60 UPD43 INS42 INS43 INS8 INS78 INS83 INS43 INS42 INS44 INS43 INS8 INS42 MOV43 INS42 INS42 INS54 INS41 MOV60 MOV21 MOV21 MOV41 INS43 INS74 INS42 INS43 INS8 INS78 INS83 INS74 INS42 INS44 INS43 INS8 INS43 INS43 INS43 INS43 INS42 INS41 INS42 MOV60 MOV60 INS21 MOV21 MOV41 UPD43 INS42 INS43 INS8 INS78 INS83 INS43 INS42 INS44 INS43 INS8 INS42 MOV43 INS42 INS42 INS60 MOV54 INS41 MOV60 INS21 MOV41 UPD42 MOV42 MOV43 INS42 INS42 INS54 INS43 UPD74 MOV74 INS42 INS43 INS8 INS78 INS83 INS74 INS42 INS44 INS43 INS8 INS43 INS43 INS43 INS43 INS42 INS41 INS42 MOV60 MOV21 INS21 INS21 MOV41 INS43 UPD74 MOV74 INS42 INS43 INS8 INS78 INS83 INS74 INS42 INS44 INS43 INS8 INS43 MOV43 INS43 INS43 INS42 INS60 INS54 INS41 INS43 MOV43 INS43 INS41 INS42 MOV60 MOV21 INS21 MOV21 MOV41 INS42 INS8 INS12 INS42 INS42 INS42 INS42 INS42 MOV43 INS42 INS42 INS21 INS21 INS42 INS43 INS42 INS42 INS42 INS25 INS41 INS42 INS42 INS42 INS42 INS60 MOV25 INS42 INS42 MOV25 UPD42 INS46 INS42 INS42 INS43 INS42 INS42 INS41 INS42 MOV43 UPD42 UPD42 INS14 MOV43 INS59 MOV43 MOV59 UPD42 INS42 INS46 INS42 INS42 MOV43 INS42 INS42 INS41 INS43 INS8 MOV12 INS42 INS42 INS43 INS43 INS43 INS42 INS46 INS42 INS43 INS43 INS43 INS43 INS42 INS42 INS41 INS42 INS42 INS42 INS42 INS74 INS42 INS7 UPD42 INS42 INS46 INS42 INS42 MOV43 INS42 INS42 INS41 INS43 INS59 INS42 INS7 INS8 INS12 INS42 UPD43 INS42 INS46 INS42 INS43 INS43 INS43 INS43 INS42 INS42 INS41 INS42 INS42 INS42 INS42 INS74 INS42 INS7 INS7 INS42 UPD43 INS42 INS46 INS42 INS43 MOV43 INS43 INS43 INS42 INS42 INS41 INS42 INS42 INS42 INS74 INS59 INS8 MOV12 INS42 INS42 UPD42 MOV42 INS14 INS7 INS7 INS60 MOV21 INS41 INS44 INS8 INS7 INS7 INS42 INS27 INS8 INS36 INS43 INS59 INS27 INS8 INS8 INS42 INS42 INS32 UPD42 MOV42 UPD42 INS33 INS43 INS42 INS32 INS42 INS32 INS42 UPD42 INS25 UPD40 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS43 INS43 INS43 UPD42 INS25 UPD42 INS32 INS40 INS32 INS40 INS42 INS32 INS42 INS42 INS33 INS25 INS40 INS14 INS60 INS25 INS41 INS44 INS8 UPD42 INS42 INS42 INS42 INS42 INS42 INS32 INS43 INS43 INS43 UPD42 INS40 INS32 INS40 INS14 UPD42 INS42 INS42 INS42 INS42 INS32 INS43 MOV43 INS43 INS42 INS33 INS61 INS74 INS42 INS42 UPD40 INS40 INS32 INS40 INS14 INS43 INS59 INS42 INS43 INS42 INS53 INS22 INS32 INS22 INS33 INS42 INS33 INS21 INS27 INS42 INS42 INS42 INS42 INS33 INS21 INS41 INS21 INS25 INS41 UPD42 INS42 INS42 INS42 INS42 INS42 INS32 MOV43 INS42 INS42 INS42 INS32 INS8 INS43 INS42 INS42 INS42 INS42 INS42 INS32 MOV8 INS42 INS42 INS42 INS42 INS42 UPD43 UPD42 MOV42 UPD42 MOV42 INS32 MOV8 INS43 INS5 MOV59 INS27 INS8 INS32 INS43 INS42 INS53 INS42 INS42 INS42 INS42 INS42 UPD42 INS27 UPD42 MOV42 INS27 INS43 INS42 INS42 INS42 INS42 INS32 INS8 INS43 UPD42 INS27 INS42 INS27 INS43 MOV42 INS42 MOV14 UPD42 INS42 INS14 INS52 INS42 INS42 INS42 INS52 INS42 INS7 INS42 INS33 INS7 INS42 INS7 INS27 MOV8 INS42 UPD42 INS21 INS42 INS42 MOV32 INS27 INS42 INS42 MOV60 MOV60 INS25 MOV21 INS42 UPD42 MOV42 MOV42 MOV60 INS60 UPD42 UPD42 MOV42 MOV42 INS60 INS42 MOV39 MOV85 UPD42 INS27 INS27 INS41 UPD42 MOV42 UPD42 MOV42 INS42 INS14 UPD42 MOV25 INS42 INS42 INS42 INS42 INS42 INS42 INS42 MOV60 MOV60 MOV25 MOV60 MOV25 INS40 INS42 INS42 UPD42 MOV42 INS42 INS42 UPD42 INS43 INS42 INS42 INS32 INS42 INS33 INS42 INS32 INS42 INS33 INS53 UPD42 INS8 INS7 MOV8 INS8 INS32 INS34 INS38 INS8 INS7 INS43 INS59 INS7 INS74 INS59 INS7 UPD42 UPD42 INS32 INS42 INS33 INS40 INS34 INS33 INS43 INS42 MOV74 INS43 INS42 INS42 INS42 INS42 INS42 INS14 INS41 INS42 INS32 MOV21 MOV21 INS42 INS42 INS32 INS41 INS42 MOV32 INS41 INS42 INS42 MOV32 INS42 INS14 INS43 INS5 INS5 INS42 INS32 INS41 INS42 MOV32 INS42 INS42 INS42 MOV43 MOV5 INS10 INS42 INS42 INS32 INS10 INS43 UPD42 INS33 MOV42 UPD42 MOV42 MOV42 INS7 UPD42 UPD42 INS42 INS42 INS42 INS33 UPD42 UPD42 INS33 UPD42 INS74 INS42 INS42 INS42 INS39 INS85 INS39 INS85 INS42 INS42 INS33 UPD42 INS7 UPD42 INS42 INS42 MOV32 INS7 INS42 UPD42 INS32 INS42 INS33 INS43 INS42 INS14 INS42 MOV32 MOV42 INS42 INS40 INS74 INS42 MOV32 INS43 INS40 DEL10 DEL42 DEL42 DEL42 DEL32 DEL38 DEL43 DEL74 DEL14 DEL42 DEL43 DEL74 DEL42 DEL42 DEL43 DEL74 DEL14 DEL59 DEL60 DEL42 DEL33 DEL59 DEL60 DEL42 DEL7 DEL21 DEL42 DEL42 DEL42 DEL42 DEL32 DEL32 DEL21 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL32 DEL59 DEL60 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL42 DEL42 DEL42 DEL32 DEL8 DEL8 DEL42 DEL33 DEL27 DEL42 DEL42 DEL32 DEL21 DEL8 DEL25 DEL8 DEL42 DEL44 DEL42 DEL42 DEL42 DEL45 DEL42 DEL45 DEL27 DEL32 DEL21 DEL42 DEL42 DEL32 DEL21 DEL8 DEL42 DEL44 DEL42 DEL42 DEL45 DEL42 DEL45 DEL27 DEL42 DEL32 DEL21 DEL8 DEL12 DEL54 DEL8 DEL70 DEL42 DEL44 DEL60 DEL40 DEL14 DEL7 DEL21 DEL40 DEL42 DEL32 DEL42 DEL40 DEL14 DEL7 DEL21 DEL42 DEL42 DEL59 DEL60 DEL42 DEL33 DEL59 DEL60 DEL42 DEL43 DEL42 DEL14 DEL7 DEL21 DEL42 DEL42 DEL32 DEL8 DEL61 DEL8 DEL8 DEL54 DEL8 DEL31 DEL10 DEL40 DEL42 DEL42 DEL32 DEL42 DEL42 DEL43 DEL42 DEL14 DEL7 DEL21 DEL42 DEL42 DEL42 DEL42 DEL32 DEL32 DEL21 DEL40 DEL42 DEL42 DEL42 DEL32 DEL7 DEL21 DEL42 DEL42 DEL42 DEL42 DEL32 DEL32 DEL21 DEL32 DEL61 DEL42 DEL33 DEL27 DEL42 DEL42 DEL32 DEL21 DEL8 DEL25 DEL8 DEL33 DEL42 DEL42 DEL10 DEL40 DEL42 DEL32 DEL42 DEL42 DEL43 DEL42 DEL14 DEL7 DEL21 DEL42 DEL42 DEL42 DEL42 DEL32 DEL32 DEL21 DEL32 DEL61 DEL42 DEL33 DEL27 DEL42 DEL42 DEL32 DEL21 DEL8 DEL25 DEL8 DEL42 DEL31 DEL42 DEL40 DEL14 DEL7 DEL21 DEL42 DEL42 DEL43 DEL42 DEL14 DEL7 DEL21 DEL42 DEL42 DEL42 DEL42 DEL32 DEL32 DEL21 DEL40 DEL42 DEL42 DEL32 DEL42 DEL42 DEL42 DEL32 DEL40 DEL42 DEL42 DEL42 DEL32 DEL32 DEL7 DEL21 DEL8 DEL42 DEL42 DEL42 DEL32 DEL40 DEL42 DEL42 DEL42 DEL32 DEL32 DEL7 DEL21 DEL8 DEL25 DEL25 DEL42 DEL33 DEL27 DEL42 DEL42 DEL32 DEL21 DEL8 DEL25 DEL8 DEL42 DEL42 DEL32 DEL83 DEL39 DEL42 DEL42 DEL42 DEL42 DEL32 DEL32 DEL21 DEL42 DEL42 DEL32 DEL60 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL42 DEL42 DEL32 DEL8 DEL42 DEL42 DEL32 DEL8 DEL25 DEL25 DEL8 DEL61 DEL8 DEL33 DEL27 DEL8 DEL25 DEL8 DEL54 DEL8 DEL31 DEL39 DEL42 DEL43 DEL42 DEL44 DEL40 DEL42 DEL42 DEL42 DEL32 DEL21 DEL42 DEL42 DEL32 DEL42 DEL42 DEL32

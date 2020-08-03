@@ -1,0 +1,93 @@
+HDFS-3875. Issue handling checksum errors in write pipeline. Contributed by Kihwal Lee.
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/trunk@1484808 13f79535-47bb-0310-9956-ffa450edef68
+
+-      if (srcDataNode != null) {
++      // No need to report to namenode when client is writing.
++      if (srcDataNode != null && isDatanode) {
++  /** 
++   * Check whether checksum needs to be verified.
++   * Skip verifying checksum iff this is not the last one in the 
++   * pipeline and clientName is non-null. i.e. Checksum is verified
++   * on all the datanodes when the data is being written by a 
++   * datanode rather than a client. Whe client is writing the data, 
++   * protocol includes acks and only the last datanode needs to verify 
++   * checksum.
++   * @return true if checksum verification is needed, otherwise false.
++   */
++  private boolean shouldVerifyChecksum() {
++    return (mirrorOut == null || isDatanode || needsChecksumTranslation);
++  }
+-    if (responder != null && !syncBlock) {
++    if (responder != null && !syncBlock && !shouldVerifyChecksum()) {
+-          lastPacketInBlock, offsetInBlock);
++          lastPacketInBlock, offsetInBlock, Status.SUCCESS);
+-     }
++      }
+-      /* skip verifying checksum iff this is not the last one in the 
+-       * pipeline and clientName is non-null. i.e. Checksum is verified
+-       * on all the datanodes when the data is being written by a 
+-       * datanode rather than a client. Whe client is writing the data, 
+-       * protocol includes acks and only the last datanode needs to verify 
+-       * checksum.
+-       */
+-      if (mirrorOut == null || isDatanode || needsChecksumTranslation) {
+-        verifyChunks(dataBuf, checksumBuf);
++      if (shouldVerifyChecksum()) {
++        try {
++          verifyChunks(dataBuf, checksumBuf);
++        } catch (IOException ioe) {
++          // checksum error detected locally. there is no reason to continue.
++          if (responder != null) {
++            try {
++              ((PacketResponder) responder.getRunnable()).enqueue(seqno,
++                  lastPacketInBlock, offsetInBlock,
++                  Status.ERROR_CHECKSUM);
++              // Wait until the responder sends back the response
++              // and interrupt this thread.
++              Thread.sleep(3000);
++            } catch (InterruptedException e) { }
++          }
++          throw new IOException("Terminating due to a checksum error." + ioe);
++        }
++ 
+-    if (responder != null && syncBlock) {
++    if (responder != null && (syncBlock || shouldVerifyChecksum())) {
+-          lastPacketInBlock, offsetInBlock);
++          lastPacketInBlock, offsetInBlock, Status.SUCCESS);
+-   * Processed responses from downstream datanodes in the pipeline
++   * Processes responses from downstream datanodes in the pipeline
+-        final long offsetInBlock) {
++        final long offsetInBlock, final Status ackStatus) {
+-          System.nanoTime());
++          System.nanoTime(), ackStatus);
+-              (pkt != null ? pkt.offsetInBlock : 0));
++              (pkt != null ? pkt.offsetInBlock : 0), 
++              (pkt != null ? pkt.ackStatus : Status.SUCCESS));
+-        long totalAckTimeNanos, long offsetInBlock) throws IOException {
++        long totalAckTimeNanos, long offsetInBlock,
++        Status myStatus) throws IOException {
+-        replies[0] = Status.SUCCESS;
++        replies[0] = myStatus;
++        // If the mirror has reported that it received a corrupt packet,
++        // do self-destruct to mark myself bad, instead of making the 
++        // mirror node bad. The mirror is guaranteed to be good without
++        // corrupt data on disk.
++        if (ackLen > 0 && replies[1] == Status.ERROR_CHECKSUM) {
++          throw new IOException("Shutting down writer and responder "
++              + "since the down streams reported the data sent by this "
++              + "thread is corrupt");
++        }
++
++      // If a corruption was detected in the received data, terminate after
++      // sending ERROR_CHECKSUM back. 
++      if (myStatus == Status.ERROR_CHECKSUM) {
++        throw new IOException("Shutting down writer and responder "
++            + "due to a checksum error in received data. The error "
++            + "response has been sent upstream.");
++      }
++    final Status ackStatus;
+-        long ackEnqueueNanoTime) {
++        long ackEnqueueNanoTime, Status ackStatus) {
++      this.ackStatus = ackStatus;
++        + ", ackStatus=" + ackStatus

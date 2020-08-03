@@ -1,0 +1,468 @@
+HDFS-6440. Support more than 2 NameNodes. Contributed by Jesse Yates.
+
++import com.google.common.collect.ArrayListMultimap;
++import com.google.common.collect.Multimap;
+-    nameNodes = new NameNodeInfo[numNameNodes];
++
+-  private NameNodeInfo[] nameNodes;
++  private Multimap<String, NameNodeInfo> namenodes = ArrayListMultimap.create();
+-    final NameNode nameNode;
+-    final Configuration conf;
+-    final String nameserviceId;
+-    final String nnId;
++    public NameNode nameNode;
++    Configuration conf;
++    String nameserviceId;
++    String nnId;
+-    nameNodes = new NameNodeInfo[0]; // No namenode in the cluster
+-    this.nameNodes = new NameNodeInfo[1]; // Single namenode in the cluster
+-            format, startOpt, clusterId, conf);
++            format, startOpt, clusterId);
++      StartupOption operation, String clusterId) throws IOException {
++    // do the basic namenode configuration
++    configureNameNodes(nnTopology, federation, conf);
++
++    int nnCounter = 0;
++    int nsCounter = 0;
++    // configure each NS independently
++    for (MiniDFSNNTopology.NSConf nameservice : nnTopology.getNameservices()) {
++      configureNameService(nameservice, nsCounter++, manageNameDfsSharedDirs,
++          manageNameDfsDirs, enableManagedDfsDirsRedundancy,
++          format, operation, clusterId, nnCounter);
++      nnCounter += nameservice.getNNs().size();
++    }
++  }
++
++  /**
++   * Do the rest of the NN configuration for things like shared edits,
++   * as well as directory formatting, etc. for a single nameservice
++   * @param nnCounter the count of the number of namenodes already configured/started. Also,
++   *                  acts as the <i>index</i> to the next NN to start (since indicies start at 0).
++   * @throws IOException
++   */
++  private void configureNameService(MiniDFSNNTopology.NSConf nameservice, int nsCounter,
++      boolean manageNameDfsSharedDirs, boolean manageNameDfsDirs, boolean
++      enableManagedDfsDirsRedundancy, boolean format,
++      final int nnCounter) throws IOException{
++    String nsId = nameservice.getId();
++    String lastDefaultFileSystem = null;
++
++    // If HA is enabled on this nameservice, enumerate all the namenodes
++    // in the configuration. Also need to set a shared edits dir
++    int numNNs = nameservice.getNNs().size();
++    if (numNNs > 1 && manageNameDfsSharedDirs) {
++      URI sharedEditsUri = getSharedEditsDir(nnCounter, nnCounter + numNNs - 1);
++      conf.set(DFS_NAMENODE_SHARED_EDITS_DIR_KEY, sharedEditsUri.toString());
++      // Clean out the shared edits dir completely, including all subdirectories.
++      FileUtil.fullyDelete(new File(sharedEditsUri));
++    }
++
++    // Now format first NN and copy the storage directory from that node to the others.
++    int nnIndex = nnCounter;
++    Collection<URI> prevNNDirs = null;
++    for (NNConf nn : nameservice.getNNs()) {
++      initNameNodeConf(conf, nsId, nsCounter, nn.getNnId(), manageNameDfsDirs,
++          manageNameDfsDirs,  nnIndex);
++      Collection<URI> namespaceDirs = FSNamesystem.getNamespaceDirs(conf);
++      if (format) {
++        // delete the existing namespaces
++        for (URI nameDirUri : namespaceDirs) {
++          File nameDir = new File(nameDirUri);
++          if (nameDir.exists() && !FileUtil.fullyDelete(nameDir)) {
++            throw new IOException("Could not fully delete " + nameDir);
++          }
++        }
++
++        // delete the checkpoint directories, if they exist
++        Collection<URI> checkpointDirs = Util.stringCollectionAsURIs(conf
++            .getTrimmedStringCollection(DFS_NAMENODE_CHECKPOINT_DIR_KEY));
++        for (URI checkpointDirUri : checkpointDirs) {
++          File checkpointDir = new File(checkpointDirUri);
++          if (checkpointDir.exists() && !FileUtil.fullyDelete(checkpointDir)) {
++            throw new IOException("Could not fully delete " + checkpointDir);
++          }
++        }
++      }
++
++      boolean formatThisOne = format;
++      // if we are looking at not the first NN
++      if (nnIndex++ > nnCounter && format) {
++        // Don't format the second, third, etc NN in an HA setup - that
++        // would result in it having a different clusterID,
++        // block pool ID, etc. Instead, copy the name dirs
++        // from the previous one.
++        formatThisOne = false;
++        assert (null != prevNNDirs);
++        copyNameDirs(prevNNDirs, namespaceDirs, conf);
++      }
++
++      if (formatThisOne) {
++        // Allow overriding clusterID for specific NNs to test
++        // misconfiguration.
++        if (nn.getClusterId() == null) {
++          StartupOption.FORMAT.setClusterId(clusterId);
++        } else {
++          StartupOption.FORMAT.setClusterId(nn.getClusterId());
++        }
++        DFSTestUtil.formatNameNode(conf);
++      }
++      prevNNDirs = namespaceDirs;
++    }
++
++    // create all the namenodes in the namespace
++    nnIndex = nnCounter;
++    for (NNConf nn : nameservice.getNNs()) {
++      initNameNodeConf(conf, nsId, nsCounter, nn.getNnId(), manageNameDfsDirs,
++          enableManagedDfsDirsRedundancy, nnIndex++);
++      NameNodeInfo info = createNameNode(conf, false, operation,
++          clusterId, nsId, nn.getNnId());
++
++      // Record the last namenode uri
++      if (info != null && info.conf != null) {
++        lastDefaultFileSystem =
++            info.conf.get(FS_DEFAULT_NAME_KEY);
++      }
++    }
++    if (!federation && lastDefaultFileSystem != null) {
++      // Set the default file system to the actual bind address of NN.
++      conf.set(FS_DEFAULT_NAME_KEY, lastDefaultFileSystem);
++    }
++  }
++
++  /**
++   * Do the basic NN configuration for the topology. Does not configure things like the shared
++   * edits directories
++   * @param nnTopology
++   * @param federation
++   * @param conf
++   * @throws IOException
++   */
++  public static void configureNameNodes(MiniDFSNNTopology nnTopology, boolean federation,
+-    
++
++
+-    
+-    int nnCounter = 0;
++
+-      String lastDefaultFileSystem = null;
+-      
++
+-        conf.set(DFSUtil.addKeySuffixes(DFS_HA_NAMENODES_KEY_PREFIX, nameservice.getId()),
+-            Joiner.on(",").join(nnIds));
+-        if (manageNameDfsSharedDirs) {
+-          URI sharedEditsUri = getSharedEditsDir(nnCounter, nnCounter+nnIds.size()-1); 
+-          conf.set(DFS_NAMENODE_SHARED_EDITS_DIR_KEY, sharedEditsUri.toString());
+-          // Clean out the shared edits dir completely, including all subdirectories.
+-          FileUtil.fullyDelete(new File(sharedEditsUri));
+-        }
+-      }
+-
+-      // Now format first NN and copy the storage directory from that node to the others.
+-      int i = 0;
+-      Collection<URI> prevNNDirs = null;
+-      int nnCounterForFormat = nnCounter;
+-      for (NNConf nn : nameservice.getNNs()) {
+-        initNameNodeConf(conf, nsId, nn.getNnId(), manageNameDfsDirs, manageNameDfsDirs,
+-            nnCounterForFormat);
+-        Collection<URI> namespaceDirs = FSNamesystem.getNamespaceDirs(conf);
+-        if (format) {
+-          for (URI nameDirUri : namespaceDirs) {
+-            File nameDir = new File(nameDirUri);
+-            if (nameDir.exists() && !FileUtil.fullyDelete(nameDir)) {
+-              throw new IOException("Could not fully delete " + nameDir);
+-            }
+-          }
+-          Collection<URI> checkpointDirs = Util.stringCollectionAsURIs(conf
+-              .getTrimmedStringCollection(DFS_NAMENODE_CHECKPOINT_DIR_KEY));
+-          for (URI checkpointDirUri : checkpointDirs) {
+-            File checkpointDir = new File(checkpointDirUri);
+-            if (checkpointDir.exists() && !FileUtil.fullyDelete(checkpointDir)) {
+-              throw new IOException("Could not fully delete " + checkpointDir);
+-            }
+-          }
+-        }
+-        
+-        boolean formatThisOne = format;
+-        if (format && i++ > 0) {
+-          // Don't format the second NN in an HA setup - that
+-          // would result in it having a different clusterID,
+-          // block pool ID, etc. Instead, copy the name dirs
+-          // from the first one.
+-          formatThisOne = false;
+-          assert (null != prevNNDirs);
+-          copyNameDirs(prevNNDirs, namespaceDirs, conf);
+-        }
+-        
+-        nnCounterForFormat++;
+-        if (formatThisOne) {
+-          // Allow overriding clusterID for specific NNs to test
+-          // misconfiguration.
+-          if (nn.getClusterId() == null) {
+-            StartupOption.FORMAT.setClusterId(clusterId);
+-          } else {
+-            StartupOption.FORMAT.setClusterId(nn.getClusterId());
+-          }
+-          DFSTestUtil.formatNameNode(conf);
+-        }
+-        prevNNDirs = namespaceDirs;
+-      }
+-
+-      // Start all Namenodes
+-      for (NNConf nn : nameservice.getNNs()) {
+-        initNameNodeConf(conf, nsId, nn.getNnId(), manageNameDfsDirs,
+-            enableManagedDfsDirsRedundancy, nnCounter);
+-        createNameNode(nnCounter, conf, numDataNodes, false, operation,
+-            clusterId, nsId, nn.getNnId());
+-        // Record the last namenode uri
+-        if (nameNodes[nnCounter] != null && nameNodes[nnCounter].conf != null) {
+-          lastDefaultFileSystem =
+-              nameNodes[nnCounter].conf.get(FS_DEFAULT_NAME_KEY);
+-        }
+-        nnCounter++;
+-      }
+-      if (!federation && lastDefaultFileSystem != null) {
+-        // Set the default file system to the actual bind address of NN.
+-        conf.set(FS_DEFAULT_NAME_KEY, lastDefaultFileSystem);
++        conf.set(DFSUtil.addKeySuffixes(DFS_HA_NAMENODES_KEY_PREFIX, nameservice.getId()), Joiner
++            .on(",").join(nnIds));
+-
+-    return this.nameNodes;
++    return this.namenodes.values().toArray(new NameNodeInfo[0]);
+-  private void initNameNodeConf(Configuration conf,
+-      String nameserviceId, String nnId,
+-      boolean manageNameDfsDirs, boolean enableManagedDfsDirsRedundancy,
+-      int nnIndex) throws IOException {
++  /**
++   * @param nsIndex index of the namespace id to check
++   * @return all the namenodes bound to the given namespace index
++   */
++  public NameNodeInfo[] getNameNodeInfos(int nsIndex) {
++    int i = 0;
++    for (String ns : this.namenodes.keys()) {
++      if (i++ == nsIndex) {
++        return this.namenodes.get(ns).toArray(new NameNodeInfo[0]);
++      }
++    }
++    return null;
++  }
++
++  /**
++   * @param nameservice id of nameservice to read
++   * @return all the namenodes bound to the given namespace index
++   */
++  public NameNodeInfo[] getNameNodeInfos(String nameservice) {
++    for (String ns : this.namenodes.keys()) {
++      if (nameservice.equals(ns)) {
++        return this.namenodes.get(ns).toArray(new NameNodeInfo[0]);
++      }
++    }
++    return null;
++  }
++
++
++  private void initNameNodeConf(Configuration conf, String nameserviceId, int nsIndex, String nnId,
++      boolean manageNameDfsDirs, boolean enableManagedDfsDirsRedundancy, int nnIndex)
++      throws IOException {
+-    
+-        conf.set(DFS_NAMENODE_NAME_DIR_KEY,
+-            fileAsURI(new File(base_dir, "name" + (2*nnIndex + 1)))+","+
+-            fileAsURI(new File(base_dir, "name" + (2*nnIndex + 2))));
+-        conf.set(DFS_NAMENODE_CHECKPOINT_DIR_KEY,
+-            fileAsURI(new File(base_dir, "namesecondary" + (2*nnIndex + 1)))+","+
+-            fileAsURI(new File(base_dir, "namesecondary" + (2*nnIndex + 2))));
++        File[] files = getNameNodeDirectory(nsIndex, nnIndex);
++        conf.set(DFS_NAMENODE_NAME_DIR_KEY, fileAsURI(files[0]) + "," + fileAsURI(files[1]));
++        files = getCheckpointDirectory(nsIndex, nnIndex);
++        conf.set(DFS_NAMENODE_CHECKPOINT_DIR_KEY, fileAsURI(files[0]) + "," + fileAsURI(files[1]));
+-        conf.set(DFS_NAMENODE_NAME_DIR_KEY,
+-            fileAsURI(new File(base_dir, "name" + (2*nnIndex + 1))).
+-              toString());
+-        conf.set(DFS_NAMENODE_CHECKPOINT_DIR_KEY,
+-            fileAsURI(new File(base_dir, "namesecondary" + (2*nnIndex + 1))).
+-              toString());
++        File[] files = getNameNodeDirectory(nsIndex, nnIndex);
++        conf.set(DFS_NAMENODE_NAME_DIR_KEY, fileAsURI(files[0]).toString());
++        files = getCheckpointDirectory(nsIndex, nnIndex);
++        conf.set(DFS_NAMENODE_CHECKPOINT_DIR_KEY, fileAsURI(files[0]).toString());
++  private File[] getNameNodeDirectory(int nameserviceIndex, int nnIndex) {
++    return getNameNodeDirectory(base_dir, nameserviceIndex, nnIndex);
++  }
++
++  public static File[] getNameNodeDirectory(String base_dir, int nsIndex, int nnIndex) {
++    return getNameNodeDirectory(new File(base_dir), nsIndex, nnIndex);
++  }
++
++  public static File[] getNameNodeDirectory(File base_dir, int nsIndex, int nnIndex) {
++    File[] files = new File[2];
++    files[0] = new File(base_dir, "name-" + nsIndex + "-" + (2 * nnIndex + 1));
++    files[1] = new File(base_dir, "name-" + nsIndex + "-" + (2 * nnIndex + 2));
++    return files;
++  }
++
++  public File[] getCheckpointDirectory(int nsIndex, int nnIndex) {
++    return getCheckpointDirectory(base_dir, nsIndex, nnIndex);
++  }
++
++  public static File[] getCheckpointDirectory(String base_dir, int nsIndex, int nnIndex) {
++    return getCheckpointDirectory(new File(base_dir), nsIndex, nnIndex);
++  }
++
++  public static File[] getCheckpointDirectory(File base_dir, int nsIndex, int nnIndex) {
++    File[] files = new File[2];
++    files[0] = new File(base_dir, "namesecondary-" + nsIndex + "-" + (2 * nnIndex + 1));
++    files[1] = new File(base_dir, "namesecondary-" + nsIndex + "-" + (2 * nnIndex + 2));
++    return files;
++  }
++
++
+-  
+-  private void createNameNode(int nnIndex, Configuration conf,
+-      int numDataNodes, boolean format, StartupOption operation,
+-      String clusterId, String nameserviceId,
+-      String nnId)
+-      throws IOException {
++
++  private NameNodeInfo createNameNode(Configuration conf, boolean format, StartupOption operation,
++      String clusterId, String nameserviceId, String nnId) throws IOException {
+-      return;
++      return null;
+-    nameNodes[nnIndex] = new NameNodeInfo(nn, nameserviceId, nnId,
++    NameNodeInfo info = new NameNodeInfo(nn, nameserviceId, nnId,
++    namenodes.put(nameserviceId, info);
++
++    return info;
+-        nameNodes[nnIndex].nameNode.getNameNodeAddressHostPortString();
++        getNN(nnIndex).nameNode.getNameNodeAddressHostPortString();
+-    return nameNodes[nnIndex].conf;
++    return getNN(nnIndex).conf;
++  private NameNodeInfo getNN(int nnIndex) {
++    int count = 0;
++    for (NameNodeInfo nn : namenodes.values()) {
++      if (count == nnIndex) {
++        return nn;
++      }
++      count++;
++    }
++    return null;
++  }
++
++
+-    finalizeNamenode(nameNodes[nnIndex].nameNode, nameNodes[nnIndex].conf);
++    finalizeNamenode(getNN(nnIndex).nameNode, getNN(nnIndex).conf);
+-    for (NameNodeInfo nnInfo : nameNodes) {
++    for (NameNodeInfo nnInfo : namenodes.values()) {
+-  
++
+-    return nameNodes.length;
++    return namenodes.size();
+-    return nameNodes[nnIndex].nameNode;
++    return getNN(nnIndex).nameNode;
+-    return NameNodeAdapter.getNamesystem(nameNodes[0].nameNode);
++    return NameNodeAdapter.getNamesystem(getNN(0).nameNode);
+-  
++
+-    return NameNodeAdapter.getNamesystem(nameNodes[nnIndex].nameNode);
++    return NameNodeAdapter.getNamesystem(getNN(nnIndex).nameNode);
+-    return nameNodes[nnIndex].nameNode.getNameNodeAddress().getPort();
++    return getNN(nnIndex).nameNode.getNameNodeAddress().getPort();
+-    return nameNodes[nnIndex].nameNode.getServiceRpcAddress().getPort();
++    return getNN(nnIndex).nameNode.getServiceRpcAddress().getPort();
+-    for (NameNodeInfo nnInfo : nameNodes) {
++    for (NameNodeInfo nnInfo : namenodes.values()) {
+-    for (int i = 0; i < nameNodes.length; i++) {
++    for (int i = 0; i < namenodes.size(); i++) {
+-    NameNode nn = nameNodes[nnIndex].nameNode;
++    NameNodeInfo info = getNN(nnIndex);
++    NameNode nn = info.nameNode;
+-      Configuration conf = nameNodes[nnIndex].conf;
+-      nameNodes[nnIndex] = new NameNodeInfo(null, null, null, null, conf);
++      info.nnId = null;
++      info.nameNode = null;
++      info.nameserviceId = null;
+-    for (int i = 0; i < nameNodes.length; i++) {
++    for (int i = 0; i < namenodes.size(); i++) {
+-    String nameserviceId = nameNodes[nnIndex].nameserviceId;
+-    String nnId = nameNodes[nnIndex].nnId;
+-    StartupOption startOpt = nameNodes[nnIndex].startOpt;
+-    Configuration conf = nameNodes[nnIndex].conf;
++    NameNodeInfo info = getNN(nnIndex);
++    StartupOption startOpt = info.startOpt;
++
+-    NameNode nn = NameNode.createNameNode(args, conf);
+-    nameNodes[nnIndex] = new NameNodeInfo(nn, nameserviceId, nnId, startOpt,
+-        conf);
++
++    NameNode nn = NameNode.createNameNode(args, info.conf);
++    info.nameNode = nn;
++    info.setStartOpt(startOpt);
+-    NameNode nameNode = nameNodes[nnIndex].nameNode;
++    NameNode nameNode = getNN(nnIndex).nameNode;
+-    for (int index = 0; index < nameNodes.length; index++) {
++    for (int index = 0; index < namenodes.size(); index++) {
+-  
++
+-    DistributedFileSystem dfs = (DistributedFileSystem) FileSystem.get(
+-        getURI(nnIndex), nameNodes[nnIndex].conf);
+-    fileSystems.add(dfs);
+-    return dfs;
++    return (DistributedFileSystem) addFileSystem(FileSystem.get(getURI(nnIndex),
++        getNN(nnIndex).conf));
+-    FileSystem dfs = FileSystem.newInstance(getURI(nnIndex), nameNodes[nnIndex].conf);
+-    fileSystems.add(dfs);
+-    return dfs;
++    return addFileSystem(FileSystem.newInstance(getURI(nnIndex), getNN(nnIndex).conf));
+-  
++
++  private <T extends FileSystem> T addFileSystem(T fs) {
++    fileSystems.add(fs);
++    return fs;
++  }
++
+-        + nameNodes[nnIndex].conf
++        + getNN(nnIndex).conf
+-    return FSNamesystem.getNamespaceDirs(nameNodes[nnIndex].conf);
++    return FSNamesystem.getNamespaceDirs(getNN(nnIndex).conf);
+-    return FSNamesystem.getNamespaceEditsDirs(nameNodes[nnIndex].conf);
++    return FSNamesystem.getNamespaceEditsDirs(getNN(nnIndex).conf);
+-    if (nameNodes.length == 0 || nameNodes[nnIndex] == null
+-        || nameNodes[nnIndex].nameNode == null) {
++    if (namenodes.size() == 0 || getNN(nnIndex) == null || getNN(nnIndex).nameNode == null) {
+-    InetSocketAddress addr = nameNodes[nnIndex].nameNode.getServiceRpcAddress();
++
++    NameNodeInfo info = getNN(nnIndex);
++    InetSocketAddress addr = info.nameNode.getServiceRpcAddress();
+-    for (int index = 0; index < nameNodes.length; index++) {
++    for (int index = 0; index < namenodes.size(); index++) {
+-  
++
++  public void printNNs() {
++    for (int i = 0; i < namenodes.size(); i++) {
++      LOG.info("Have namenode " + i + ", info:" + getNN(i));
++      LOG.info(" has namenode: " + getNN(i).nameNode);
++    }
++  }
++
+-    if (nameNodes.length != 1) {
++    if (namenodes.size() != 1) {
+-    int nnIndex = nameNodes.length;
+-    int numNameNodes = nameNodes.length + 1;
+-    NameNodeInfo[] newlist = new NameNodeInfo[numNameNodes];
+-    System.arraycopy(nameNodes, 0, newlist, 0, nameNodes.length);
+-    nameNodes = newlist;
+-    String nameserviceId = NAMESERVICE_ID_PREFIX + (nnIndex + 1);
+-    
++    int nameServiceIndex = namenodes.keys().size();
++    String nameserviceId = NAMESERVICE_ID_PREFIX + (namenodes.keys().size() + 1);
++
+-    initNameNodeConf(conf, nameserviceId, nnId, true, true, nnIndex);
+-    createNameNode(nnIndex, conf, numDataNodes, true, null, null,
+-        nameserviceId, nnId);
++    // figure out the current number of NNs
++    NameNodeInfo[] infos = this.getNameNodeInfos(nameserviceId);
++    int nnIndex = infos == null ? 0 : infos.length;
++    initNameNodeConf(conf, nameserviceId, nameServiceIndex, nnId, true, true, nnIndex);
++    NameNodeInfo info = createNameNode(conf, true, null, null, nameserviceId, nnId);
+-    return nameNodes[nnIndex].nameNode;
++    return info.nameNode;
+
+INS26 INS26 INS40 INS40 INS31 MOV44 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS74 INS83 INS39 INS42 INS44 INS44 INS44 INS44 INS44 INS44 INS44 INS43 INS8 INS29 UPD42 MOV44 INS44 INS44 MOV8 MOV60 INS29 INS83 INS83 INS39 INS42 MOV44 INS44 MOV44 INS43 MOV8 INS29 INS83 MOV5 INS42 INS44 INS8 INS29 INS83 MOV5 INS42 INS44 INS8 INS44 INS83 INS5 INS42 INS44 INS44 INS8 INS83 INS83 INS5 INS42 INS44 INS44 INS44 INS8 INS83 INS83 INS5 INS42 INS44 INS44 INS44 INS8 INS83 INS5 INS42 INS44 INS44 INS8 INS83 INS83 INS5 INS42 INS44 INS44 INS44 INS8 INS83 INS83 INS5 INS42 INS44 INS44 INS44 INS8 INS43 INS42 INS83 INS43 INS42 MOV44 INS8 MOV29 MOV83 MOV43 MOV42 MOV44 MOV43 INS8 INS83 INS73 INS43 INS42 INS44 INS8 INS83 INS39 INS42 INS8 MOV60 INS43 INS43 INS43 UPD42 INS32 UPD83 INS43 INS42 INS39 INS42 INS39 INS42 INS39 INS42 INS39 INS42 INS43 INS42 INS43 INS42 INS42 INS21 MOV60 INS60 INS70 INS65 INS65 INS65 INS39 INS42 INS83 INS39 INS42 INS60 MOV25 INS21 INS65 INS65 INS65 INS65 INS65 INS39 INS42 INS42 INS65 INS65 INS39 INS42 MOV60 INS70 INS41 INS65 INS65 INS43 INS42 INS70 INS41 INS39 INS42 MOV43 INS85 INS39 INS42 INS39 INS42 INS41 MOV43 INS85 MOV43 INS42 INS39 INS42 INS39 INS42 INS41 MOV43 INS85 INS43 INS42 INS39 INS42 INS39 INS42 INS60 MOV21 INS21 INS41 INS43 INS85 INS39 INS42 INS39 INS42 INS41 INS43 INS85 MOV43 INS42 INS39 INS42 INS39 INS42 INS41 INS43 INS85 INS43 INS42 INS39 INS42 INS39 INS42 INS60 MOV21 INS21 INS41 INS42 INS60 INS41 INS42 INS60 INS70 INS41 INS60 INS21 INS21 INS41 INS41 INS42 MOV43 INS42 INS43 INS42 MOV21 MOV41 INS60 INS60 INS24 INS60 INS60 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS39 INS59 INS44 INS32 INS8 INS66 INS66 INS42 INS66 INS66 INS42 INS39 INS59 INS27 INS7 INS66 INS66 INS42 INS42 INS42 INS42 INS44 INS8 INS32 INS42 INS66 INS66 INS44 INS32 INS8 INS33 INS42 INS66 INS66 INS42 INS44 INS32 INS8 INS33 INS32 INS32 INS42 INS5 INS59 INS7 INS7 INS42 INS42 INS32 INS42 INS32 INS42 INS42 INS5 INS59 INS7 INS7 INS42 INS43 INS59 INS32 INS42 MOV43 INS39 INS59 INS44 INS32 INS8 INS33 INS32 INS32 INS32 MOV43 MOV43 INS59 MOV43 INS7 INS32 INS11 INS32 INS42 UPD42 INS43 INS59 MOV43 INS59 INS58 INS27 INS37 INS8 MOV43 MOV5 INS39 INS59 INS43 INS59 INS40 INS42 INS42 INS42 INS42 INS42 INS34 INS43 INS42 INS42 INS42 INS21 INS21 INS42 INS32 INS27 INS42 UPD42 INS42 INS42 INS60 INS43 INS42 INS60 MOV21 MOV60 MOV70 MOV25 INS32 INS42 MOV3 INS43 INS42 INS22 INS42 INS25 INS43 INS42 INS22 INS42 INS25 INS42 INS42 INS42 INS42 INS42 INS14 INS42 INS42 INS43 INS85 INS42 INS3 INS2 MOV14 INS2 MOV14 INS42 INS42 INS42 INS42 INS42 INS14 INS42 INS42 INS43 INS85 INS42 INS3 INS2 MOV14 INS2 MOV14 INS42 INS42 MOV14 INS42 INS42 INS42 INS42 INS32 INS42 INS34 INS43 INS42 INS42 INS42 INS25 INS21 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS32 UPD42 INS32 INS42 INS40 INS21 INS21 INS32 UPD42 INS32 INS40 INS40 INS42 INS42 INS42 INS42 INS32 MOV43 INS32 INS42 INS32 UPD42 INS42 INS42 INS32 INS42 INS32 INS32 INS39 INS59 INS42 INS32 INS42 INS21 INS21 INS32 UPD42 INS32 UPD42 INS27 UPD42 INS32 INS42 INS16 INS42 INS42 INS42 INS32 INS40 INS32 INS7 INS32 INS42 INS42 INS34 INS43 INS59 INS40 INS43 INS59 INS22 INS42 INS42 INS52 INS42 UPD27 MOV27 INS8 INS42 INS52 INS42 INS32 INS8 MOV43 INS42 INS42 INS5 INS34 INS42 INS34 INS43 INS42 INS34 INS43 INS43 INS42 INS42 INS5 INS34 INS42 INS34 INS43 INS42 INS34 INS43 INS33 INS42 INS42 INS42 INS27 INS8 INS37 INS32 INS32 INS42 INS42 INS32 INS32 INS42 INS42 INS42 INS42 INS7 INS7 INS42 INS42 INS42 INS42 INS40 INS32 INS42 INS42 INS42 INS32 MOV42 MOV42 MOV32 MOV22 INS32 INS32 INS42 INS42 INS40 MOV42 INS42 INS42 INS42 INS34 INS42 INS42 INS32 INS32 INS42 INS42 INS32 INS42 INS42 INS36 INS52 INS42 INS42 INS27 INS34 INS40 MOV42 MOV42 MOV9 MOV33 MOV33 MOV42 MOV42 INS42 INS42 INS37 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS42 MOV32 UPD42 INS27 UPD42 MOV42 MOV32 INS37 INS42 INS42 INS32 INS42 INS42 INS32 MOV52 UPD42 MOV42 INS42 INS41 INS42 INS42 INS42 INS41 INS60 INS21 INS60 INS21 INS21 INS21 INS43 INS85 INS42 UPD45 INS42 INS45 INS42 UPD45 INS42 INS45 INS42 INS43 INS85 INS42 UPD45 INS42 INS45 INS42 UPD45 INS42 INS45 INS32 INS42 INS42 INS41 INS42 INS42 INS42 INS42 INS42 INS42 INS34 INS42 INS42 INS32 INS32 INS40 INS33 INS40 INS33 INS40 INS33 INS42 INS42 MOV42 MOV42 MOV32 MOV22 INS32 INS32 INS42 INS42 INS42 INS42 INS32 INS32 INS32 INS42 INS42 INS27 INS42 INS42 INS27 INS42 INS42 INS27 INS42 INS33 INS42 INS32 INS42 INS42 INS37 INS42 INS42 MOV42 MOV42 MOV9 MOV42 MOV42 MOV42 MOV32 INS42 INS40 INS42 INS42 INS32 INS32 INS5 INS59 INS7 INS5 INS59 INS32 INS7 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS45 INS42 INS45 INS32 INS45 INS22 INS32 MOV34 INS42 INS42 INS42 INS32 INS42 INS3 INS32 INS42 INS3 MOV43 INS85 INS42 INS32 INS42 INS32 MOV43 INS85 INS42 INS32 INS42 INS42 INS42 INS32 INS42 INS32 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS32 INS42 INS32 INS42 INS42 INS40 INS22 INS42 INS42 INS5 INS34 INS22 INS42 INS42 INS5 INS34 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS52 INS42 INS43 INS85 INS52 INS42 INS43 INS85 INS2 INS2 INS2 INS2 INS42 INS2 INS42 INS2 INS42 INS42 INS42 INS34 INS42 INS34 INS42 INS34 INS42 INS34 INS42 INS34 INS42 INS34 DEL42 DEL42 DEL43 DEL85 DEL5 DEL42 DEL3 DEL7 DEL21 DEL83 DEL83 DEL83 DEL42 DEL7 DEL21 DEL52 DEL42 DEL22 DEL34 DEL3 DEL7 DEL21 DEL42 DEL42 DEL42 DEL42 DEL32 DEL42 DEL37 DEL21 DEL42 DEL42 DEL42 DEL32 DEL21 DEL42 DEL42 DEL2 DEL42 DEL42 DEL2 DEL42 DEL22 DEL42 DEL42 DEL2 DEL42 DEL22 DEL42 DEL37 DEL21 DEL22 DEL34 DEL42 DEL45 DEL34 DEL42 DEL27 DEL34 DEL27 DEL36 DEL27 DEL14 DEL42 DEL45 DEL34 DEL42 DEL27 DEL34 DEL27 DEL36 DEL27 DEL14 DEL42 DEL42 DEL42 DEL42 DEL32 DEL42 DEL32 DEL32 DEL42 DEL42 DEL42 DEL42 DEL32 DEL42 DEL32 DEL32 DEL39 DEL42 DEL39 DEL42 DEL44 DEL42 DEL42 DEL2 DEL7 DEL42 DEL42 DEL2 DEL42 DEL42 DEL2 DEL42 DEL42 DEL2 DEL42 DEL42 DEL2 DEL42 DEL40 DEL42 DEL42 DEL2 DEL42 DEL34 DEL2 DEL42 DEL42 DEL2 DEL42 DEL42 DEL2 DEL42 DEL42 DEL2 DEL42 DEL40 DEL42 DEL42 DEL2 DEL42 DEL22 DEL42 DEL43 DEL42 DEL42 DEL42 DEL2 DEL42 DEL22 DEL59 DEL60 DEL42 DEL42 DEL2 DEL33 DEL33 DEL33 DEL33 DEL42 DEL14 DEL40 DEL42 DEL42 DEL2 DEL42 DEL22 DEL42 DEL42 DEL42 DEL2 DEL42 DEL22 DEL59 DEL60 DEL42 DEL42 DEL2 DEL42 DEL22 DEL42 DEL43 DEL42 DEL42 DEL42 DEL2 DEL42 DEL22 DEL59 DEL60 DEL42 DEL42 DEL42 DEL2 DEL42 DEL42 DEL42 DEL42 DEL42 DEL14 DEL7 DEL21 DEL42 DEL42 DEL2 DEL40 DEL42 DEL42 DEL2 DEL42 DEL43 DEL42 DEL32 DEL11 DEL59 DEL60 DEL42 DEL42 DEL42 DEL32 DEL21 DEL42 DEL41 DEL42 DEL42 DEL2 DEL42 DEL32 DEL59 DEL60 DEL8 DEL31 DEL42 DEL42 DEL2 DEL42 DEL42 DEL2 DEL42 DEL42 DEL2 DEL40 DEL42 DEL42 DEL2 DEL42 DEL42 DEL2 DEL42 DEL42 DEL42 DEL2 DEL42 DEL22 DEL32 DEL59 DEL60 DEL40 DEL40 DEL40 DEL39 DEL40 DEL27 DEL42 DEL42 DEL42 DEL34 DEL42 DEL34 DEL40 DEL32 DEL21 DEL42 DEL42 DEL7 DEL21 DEL42 DEL42 DEL42 DEL34 DEL27 DEL36 DEL27 DEL59 DEL60 DEL42 DEL43 DEL85 DEL5 DEL42 DEL3 DEL42 DEL42 DEL32 DEL21 DEL42 DEL42 DEL2 DEL42 DEL22

@@ -1,0 +1,179 @@
+HDFS-2742. HA: observed dataloss in replication stress test. Contributed by Todd Lipcon
+
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/branches/HDFS-1623@1238940 13f79535-47bb-0310-9956-ffa450edef68
+
++import java.io.StringWriter;
++import java.util.Queue;
++import org.apache.hadoop.hdfs.server.blockmanagement.PendingDataNodeMessages.ReportedBlockInfo;
+-import org.apache.hadoop.hdfs.server.protocol.BlockCommand;
+-import com.google.common.base.Joiner;
++  private static final String QUEUE_REASON_CORRUPT_STATE =
++    "it has the wrong state or generation stamp";
++
++  private static final String QUEUE_REASON_FUTURE_GENSTAMP =
++    "generation stamp is in the future";
++
++  
++  private final PendingDataNodeMessages pendingDNMessages =
++    new PendingDataNodeMessages();
++  /** Used by metrics */
++  public int getPendingDataNodeMessageCount() {
++    return pendingDNMessages.count();
++  }
+-    if (!force && ucBlock.numNodes() < minReplication)
++    int numNodes = ucBlock.numNodes();
++    if (!force && numNodes < minReplication)
++    
++    // Since safe-mode only counts complete blocks, and we now have
++    // one more complete block, we need to adjust the total up, and
++    // also count it as safe, if we have at least the minimum replica
++    // count. (We may not have the minimum replica count yet if this is
++    // a "forced" completion when a file is getting closed by an
++    // OP_CLOSE edit on the standby).
++    namesystem.adjustSafeModeBlockTotals(0, 1);
++    namesystem.incrementSafeBlockCount(
++        Math.min(numNodes, minReplication));
++    
++    
++    // Adjust safe-mode totals, since under-construction blocks don't
++    // count in safe-mode.
++    namesystem.adjustSafeModeBlockTotals(
++        // decrement safe if we had enough
++        targets.length >= minReplication ? -1 : 0,
++        // always decrement total blocks
++        -1);
++    boolean isStandby = namesystem.isInStandbyState();
++    
++      
++      if (isStandby &&
++          namesystem.isGenStampInFuture(iblk.getGenerationStamp())) {
++        queueReportedBlock(node, iblk, reportedState,
++            QUEUE_REASON_FUTURE_GENSTAMP);
++        continue;
++      }
++      
+-        markBlockAsCorrupt(storedBlock, node);
++        if (namesystem.isInStandbyState()) {
++          // In the Standby, we may receive a block report for a file that we
++          // just have an out-of-date gen-stamp or state for, for example.
++          queueReportedBlock(node, iblk, reportedState,
++              QUEUE_REASON_CORRUPT_STATE);
++        } else {
++          markBlockAsCorrupt(storedBlock, node);
++        }
+-   * @return
++   * @return the up-to-date stored block, if it should be kept.
++   *         Otherwise, null.
++    if (namesystem.isInStandbyState() &&
++        namesystem.isGenStampInFuture(block.getGenerationStamp())) {
++      queueReportedBlock(dn, block, reportedState,
++          QUEUE_REASON_FUTURE_GENSTAMP);
++      return null;
++    }
++    
+-      toCorrupt.add(storedBlock);
++      if (namesystem.isInStandbyState()) {
++        // If the block is an out-of-date generation stamp or state,
++        // but we're the standby, we shouldn't treat it as corrupt,
++        // but instead just queue it for later processing.
++        queueReportedBlock(dn, storedBlock, reportedState,
++            QUEUE_REASON_CORRUPT_STATE);
++
++      } else {
++        toCorrupt.add(storedBlock);
++      }
++  /**
++   * Queue the given reported block for later processing in the
++   * standby node. {@see PendingDataNodeMessages}.
++   * @param reason a textual reason to report in the debug logs
++   */
++  private void queueReportedBlock(DatanodeDescriptor dn, Block block,
++      ReplicaState reportedState, String reason) {
++    assert namesystem.isInStandbyState();
++    
++    if (LOG.isDebugEnabled()) {
++      LOG.debug("Queueing reported block " + block +
++          " in state " + reportedState + 
++          " from datanode " + dn + " for later processing " +
++          "because " + reason + ".");
++    }
++    pendingDNMessages.enqueueReportedBlock(dn, block, reportedState);
++  }
++
++  /**
++   * Try to process any messages that were previously queued for the given
++   * block. This is called from FSEditLogLoader whenever a block's state
++   * in the namespace has changed or a new block has been created.
++   */
++  public void processQueuedMessagesForBlock(Block b) throws IOException {
++    Queue<ReportedBlockInfo> queue = pendingDNMessages.takeBlockQueue(b);
++    if (queue == null) {
++      // Nothing to re-process
++      return;
++    }
++    processQueuedMessages(queue);
++  }
++  
++  private void processQueuedMessages(Iterable<ReportedBlockInfo> rbis)
++      throws IOException {
++    for (ReportedBlockInfo rbi : rbis) {
++      if (LOG.isDebugEnabled()) {
++        LOG.debug("Processing previouly queued message " + rbi);
++      }
++      processAndHandleReportedBlock(
++          rbi.getNode(), rbi.getBlock(), rbi.getReportedState(), null);
++    }
++  }
++  
++  /**
++   * Process any remaining queued datanode messages after entering
++   * active state. At this point they will not be re-queued since
++   * we are the definitive master node and thus should be up-to-date
++   * with the namespace information.
++   */
++  public void processAllPendingDNMessages() throws IOException {
++    assert !namesystem.isInStandbyState() :
++      "processAllPendingDNMessages() should be called after exiting " +
++      "standby state!";
++    int count = pendingDNMessages.count();
++    if (count > 0) {
++      LOG.info("Processing " + count + " messages from DataNodes " +
++          "that were previously queued during standby state.");
++    }
++    processQueuedMessages(pendingDNMessages.takeAll());
++    assert pendingDNMessages.count() == 0;
++  }
++
+-        && numCurrentReplica >= minReplication)
++        && numCurrentReplica >= minReplication) {
+-
+-    // check whether safe replication is reached for the block
+-    // only complete blocks are counted towards that
+-    if(storedBlock.isComplete())
++    } else if (storedBlock.isComplete()) {
++      // check whether safe replication is reached for the block
++      // only complete blocks are counted towards that.
++      // In the case that the block just became complete above, completeBlock()
++      // handles the safe block count maintenance.
++    }
+-        numLiveReplicas >= minReplication)
++        numLiveReplicas >= minReplication) {
+-
+-    // check whether safe replication is reached for the block
+-    // only complete blocks are counted towards that
+-    // Is no-op if not in safe mode.
+-    if(storedBlock.isComplete())
++    } else if (storedBlock.isComplete()) {
++      // check whether safe replication is reached for the block
++      // only complete blocks are counted towards that
++      // Is no-op if not in safe mode.
++      // In the case that the block just became complete above, completeBlock()
++      // handles the safe block count maintenance.
+-
++    }
++    
+-    return blocksMap.size() - (int)invalidateBlocks.numBlocks();
++    return blocksMap.size();
+
+MOV26 MOV26 INS26 UPD40 UPD40 INS40 INS23 INS23 INS23 INS31 INS31 INS31 INS31 INS31 INS83 INS83 INS83 INS43 INS59 INS83 INS83 INS83 INS43 INS59 INS83 INS83 INS43 INS59 INS29 INS83 INS39 INS42 INS8 INS29 INS83 INS39 INS42 INS44 INS44 INS44 INS44 INS8 INS29 INS83 INS39 INS42 INS44 INS43 INS8 INS83 INS39 INS42 INS44 INS43 INS8 INS29 INS83 INS39 INS42 INS43 INS8 INS42 INS42 INS45 INS42 INS42 INS45 INS42 INS42 INS14 INS65 INS41 INS60 INS21 INS21 INS21 INS60 INS25 INS65 INS65 INS43 INS42 INS43 INS42 INS43 INS42 INS43 INS42 INS6 INS25 INS21 INS65 INS43 INS42 INS42 INS60 INS25 INS21 INS74 INS42 INS42 INS70 INS65 INS42 INS6 INS60 INS25 INS21 INS6 INS43 INS66 INS32 INS39 INS59 INS32 INS32 INS32 INS39 INS59 INS66 INS66 INS27 INS8 INS8 INS66 INS66 INS65 INS66 INS42 INS66 INS42 INS42 INS42 INS42 INS32 INS32 INS8 INS32 INS66 INS66 INS66 INS42 INS74 INS59 INS27 INS8 INS32 INS43 INS43 INS44 INS42 INS8 INS66 INS66 INS66 INS66 INS38 INS27 INS39 INS59 INS27 INS8 INS32 INS27 INS8 INS25 INS8 MOV25 MOV32 INS42 INS42 INS42 INS42 MOV32 INS42 INS42 INS34 INS34 INS42 INS42 INS32 INS42 INS42 INS16 INS38 INS42 INS32 INS25 INS32 INS32 INS21 INS41 INS25 MOV41 INS66 INS42 INS42 INS42 INS42 INS21 INS42 INS42 INS42 INS42 INS42 INS43 INS43 INS42 INS32 INS42 INS33 INS41 INS42 INS42 INS42 INS42 INS43 INS42 INS25 INS21 INS32 INS45 INS45 INS42 INS32 INS42 INS34 INS21 INS42 INS32 INS32 INS34 MOV21 MOV32 INS8 MOV21 INS8 INS42 INS42 INS42 INS42 INS42 INS27 INS38 INS34 INS34 INS42 INS42 INS27 INS8 INS8 INS42 INS42 INS42 INS42 INS32 INS32 INS33 INS32 INS8 MOV8 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS8 INS32 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS42 MOV21 MOV21 INS40 INS42 INS34 INS42 INS32 INS21 INS18 INS25 INS18 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS21 INS42 INS42 INS27 INS42 INS42 INS21 INS42 INS32 INS32 INS32 INS33 INS42 INS42 INS27 INS42 INS42 INS32 INS32 INS32 INS8 MOV8 INS32 INS45 INS42 INS45 INS42 INS45 INS42 INS45 INS45 INS42 INS45 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS45 INS42 INS45 INS45 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS21 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS27 INS32 INS45 INS42 INS42 INS42 INS42 INS42 INS42 DEL18 DEL25 DEL39 DEL42 DEL42 DEL32 DEL11 DEL27

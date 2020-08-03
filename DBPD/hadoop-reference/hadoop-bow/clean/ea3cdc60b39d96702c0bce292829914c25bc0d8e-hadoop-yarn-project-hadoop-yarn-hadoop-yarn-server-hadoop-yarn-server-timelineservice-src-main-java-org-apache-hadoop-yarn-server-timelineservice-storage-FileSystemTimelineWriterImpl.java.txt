@@ -1,0 +1,219 @@
+YARN-3841 [atsv2 Storage implementation] Adding retry semantics to HDFS backing storage. Contributed by Abhishek Modi.
+
+-import java.io.BufferedWriter;
+-import java.io.FileOutputStream;
+-import java.io.OutputStreamWriter;
+-import java.io.PrintWriter;
++import org.apache.hadoop.fs.FSDataOutputStream;
++import org.apache.hadoop.fs.FileSystem;
++import org.apache.hadoop.fs.Path;
++import org.apache.hadoop.io.IOUtils;
++import org.apache.hadoop.yarn.client.api.impl.FileSystemTimelineWriter;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
+- * This implements a local file based backend for storing application timeline
++ * This implements a FileSystem based backend for storing application timeline
+-  private String outputRoot;
+-
+-  public static final String TIMELINE_SERVICE_STORAGE_DIR_ROOT
+-      = YarnConfiguration.TIMELINE_SERVICE_PREFIX + "fs-writer.root-dir";
++  public static final String TIMELINE_SERVICE_STORAGE_DIR_ROOT =
++      YarnConfiguration.TIMELINE_SERVICE_PREFIX + "fs-writer.root-dir";
++
++  public static final String TIMELINE_FS_WRITER_NUM_RETRIES =
++      YarnConfiguration.TIMELINE_SERVICE_PREFIX + "fs-writer.num-retries";
++  public static final int DEFAULT_TIMELINE_FS_WRITER_NUM_RETRIES = 0;
++
++  public static final String TIMELINE_FS_WRITER_RETRY_INTERVAL_MS =
++       YarnConfiguration.TIMELINE_SERVICE_PREFIX +
++               "fs-writer.retry-interval-ms";
++  public static final long DEFAULT_TIMELINE_FS_WRITER_RETRY_INTERVAL_MS = 1000L;
++  private FileSystem fs;
++  private Path rootPath;
++  private int fsNumRetries;
++  private long fsRetryInterval;
++  private Path entitiesPath;
++
++  private static final Logger LOG =
++          LoggerFactory.getLogger(FileSystemTimelineWriter.class);
++
+-      write(clusterId, userId, flowName, flowVersion, flowRunId, appId, entity,
+-          response);
++      writeInternal(clusterId, userId, flowName, flowVersion,
++              flowRunId, appId, entity, response);
+-  private synchronized void write(String clusterId, String userId,
+-      String flowName, String flowVersion, long flowRun, String appId,
+-      TimelineEntity entity, TimelineWriteResponse response)
+-      throws IOException {
+-    PrintWriter out = null;
++  private synchronized void writeInternal(String clusterId, String userId,
++                                          String flowName, String flowVersion,
++                                          long flowRun, String appId,
++                                          TimelineEntity entity,
++                                          TimelineWriteResponse response)
++                                          throws IOException {
++    Path clusterIdPath = new Path(entitiesPath, clusterId);
++    Path userIdPath = new Path(clusterIdPath, userId);
++    Path flowNamePath = new Path(userIdPath, escape(flowName));
++    Path flowVersionPath = new Path(flowNamePath, escape(flowVersion));
++    Path flowRunPath = new Path(flowVersionPath, String.valueOf(flowRun));
++    Path appIdPath = new Path(flowRunPath, appId);
++    Path entityTypePath = new Path(appIdPath, entity.getType());
+-      String dir = mkdirs(outputRoot, ENTITIES_DIR, clusterId, userId,
+-          escape(flowName), escape(flowVersion), String.valueOf(flowRun), appId,
+-          entity.getType());
+-      String fileName = dir + entity.getId() +
+-          TIMELINE_SERVICE_STORAGE_EXTENSION;
+-      out =
+-          new PrintWriter(new BufferedWriter(new OutputStreamWriter(
+-              new FileOutputStream(fileName, true), "UTF-8")));
+-      out.println(TimelineUtils.dumpTimelineRecordtoJSON(entity));
+-      out.write("\n");
+-    } catch (IOException ioe) {
+-      TimelineWriteError error = new TimelineWriteError();
+-      error.setEntityId(entity.getId());
+-      error.setEntityType(entity.getType());
++      mkdirs(rootPath, entitiesPath, clusterIdPath, userIdPath,
++              flowNamePath, flowVersionPath, flowRunPath, appIdPath,
++              entityTypePath);
++      Path filePath =
++              new Path(entityTypePath,
++                      entity.getId() + TIMELINE_SERVICE_STORAGE_EXTENSION);
++      createFileWithRetries(filePath);
++
++      byte[] record =  new StringBuilder()
++              .append(TimelineUtils.dumpTimelineRecordtoJSON(entity))
++              .append("\n").toString().getBytes("UTF-8");
++      writeFileWithRetries(filePath, record);
++    } catch (Exception ioe) {
++      LOG.warn("Interrupted operation:" + ioe.getMessage());
++      TimelineWriteError error = createTimelineWriteError(entity);
+-    } finally {
+-      if (out != null) {
+-        out.close();
+-      }
++  private TimelineWriteError createTimelineWriteError(TimelineEntity entity) {
++    TimelineWriteError error = new TimelineWriteError();
++    error.setEntityId(entity.getId());
++    error.setEntityType(entity.getType());
++    return error;
++  }
++
+-
+-    return outputRoot;
++    return rootPath.toString();
+-    outputRoot = conf.get(TIMELINE_SERVICE_STORAGE_DIR_ROOT,
++    String outputRoot = conf.get(TIMELINE_SERVICE_STORAGE_DIR_ROOT,
++    rootPath = new Path(outputRoot);
++    entitiesPath = new Path(rootPath, ENTITIES_DIR);
++    fsNumRetries = conf.getInt(TIMELINE_FS_WRITER_NUM_RETRIES,
++            DEFAULT_TIMELINE_FS_WRITER_NUM_RETRIES);
++    fsRetryInterval = conf.getLong(TIMELINE_FS_WRITER_RETRY_INTERVAL_MS,
++            DEFAULT_TIMELINE_FS_WRITER_RETRY_INTERVAL_MS);
++    fs = rootPath.getFileSystem(getConfig());
+-    mkdirs(outputRoot, ENTITIES_DIR);
++    mkdirsWithRetries(rootPath);
++    mkdirsWithRetries(entitiesPath);
+-  private static String mkdirs(String... dirStrs) throws IOException {
+-    StringBuilder path = new StringBuilder();
+-    for (String dirStr : dirStrs) {
+-      path.append(dirStr).append(File.separatorChar);
+-      File dir = new File(path.toString());
+-      if (!dir.exists()) {
+-        if (!dir.mkdirs()) {
+-          throw new IOException("Could not create directories for " + dir);
++  private void mkdirs(Path... paths) throws IOException, InterruptedException {
++    for (Path path: paths) {
++      if (!existsWithRetries(path)) {
++        mkdirsWithRetries(path);
++      }
++    }
++  }
++
++  // Code from FSRMStateStore.
++  private void mkdirsWithRetries(final Path dirPath)
++          throws IOException, InterruptedException {
++    new FSAction<Void>() {
++      @Override
++      public Void run() throws IOException {
++        fs.mkdirs(dirPath);
++        return null;
++      }
++    }.runWithRetries();
++  }
++
++  private void writeFileWithRetries(final Path outputPath, final byte[] data)
++          throws Exception {
++    new FSAction<Void>() {
++      @Override
++      public Void run() throws IOException {
++        writeFile(outputPath, data);
++        return null;
++      }
++    }.runWithRetries();
++  }
++
++  private boolean createFileWithRetries(final Path newFile)
++          throws IOException, InterruptedException {
++    return new FSAction<Boolean>() {
++      @Override
++      public Boolean run() throws IOException {
++        return createFile(newFile);
++      }
++    }.runWithRetries();
++  }
++
++  private boolean existsWithRetries(final Path path)
++          throws IOException, InterruptedException {
++    return new FSAction<Boolean>() {
++      @Override
++      public Boolean run() throws IOException {
++        return fs.exists(path);
++      }
++    }.runWithRetries();
++  }
++
++  private abstract class FSAction<T> {
++    abstract T run() throws IOException;
++
++    T runWithRetries() throws IOException, InterruptedException {
++      int retry = 0;
++      while (true) {
++        try {
++          return run();
++        } catch (IOException e) {
++          LOG.info("Exception while executing a FS operation.", e);
++          if (++retry > fsNumRetries) {
++            LOG.info("Maxed out FS retries. Giving up!");
++            throw e;
++          }
++          LOG.info("Will retry operation on FS. Retry no. " + retry +
++              " after sleeping for " + fsRetryInterval + " seconds");
++          Thread.sleep(fsRetryInterval);
+-    return path.toString();
++  }
++
++  private boolean createFile(Path newFile) throws IOException {
++    return fs.createNewFile(newFile);
++  }
++
++  /**
++   * In order to make this writeInternal atomic as a part of writeInternal
++   * we will first writeInternal data to .tmp file and then rename it.
++   * Here we are assuming that rename is atomic for underlying file system.
++   */
++  protected void writeFile(Path outputPath, byte[] data) throws IOException {
++    Path tempPath =
++            new Path(outputPath.getParent(), outputPath.getName() + ".tmp");
++    FSDataOutputStream fsOut = null;
++    // This file will be overwritten when app/attempt finishes for saving the
++    // final status.
++    try {
++      fsOut = fs.create(tempPath, true);
++      fsOut.write(data);
++      fsOut.close();
++      fsOut = null;
++      fs.rename(tempPath, outputPath);
++    } finally {
++      IOUtils.cleanupWithLogger(LOG, fsOut);
++    }

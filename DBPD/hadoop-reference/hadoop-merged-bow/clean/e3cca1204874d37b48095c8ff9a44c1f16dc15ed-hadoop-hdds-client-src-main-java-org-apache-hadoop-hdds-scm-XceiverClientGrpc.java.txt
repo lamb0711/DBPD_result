@@ -1,0 +1,201 @@
+HDDS-676. Enable Read from open Containers via Standalone Protocol.
+Contributed by Shashikant Banerjee.
+
++import org.apache.hadoop.hdds.protocol.datanode.proto.ContainerProtos;
++import java.util.UUID;
++import java.util.Map;
++import java.util.HashMap;
+-  private XceiverClientProtocolServiceStub asyncStub;
++  private Map<UUID, XceiverClientProtocolServiceStub> asyncStubs;
+-  private ManagedChannel channel;
++  private Map<UUID, ManagedChannel> channels;
++    this.channels = new HashMap<>();
++    this.asyncStubs = new HashMap<>();
+-    DatanodeDetails leader = this.pipeline.getLeader();
++    // leader by default is the 1st datanode in the datanode list of pipleline
++    DatanodeDetails leader = this.pipeline.getLeader();
++    // just make a connection to the 1st datanode at the beginning
++    connectToDatanode(leader);
++  }
++
++  private void connectToDatanode(DatanodeDetails dn) {
+-    int port = leader.getPort(DatanodeDetails.Port.Name.STANDALONE).getValue();
++    int port = dn.getPort(DatanodeDetails.Port.Name.STANDALONE).getValue();
+-    LOG.debug("Connecting to server Port : " + leader.getIpAddress());
+-    channel = NettyChannelBuilder.forAddress(leader.getIpAddress(), port)
+-        .usePlaintext()
+-        .maxInboundMessageSize(OzoneConfigKeys.DFS_CONTAINER_CHUNK_MAX_SIZE)
+-        .build();
+-    asyncStub = XceiverClientProtocolServiceGrpc.newStub(channel);
++    LOG.debug("Connecting to server Port : " + dn.getIpAddress());
++    ManagedChannel channel =
++        NettyChannelBuilder.forAddress(dn.getIpAddress(), port).usePlaintext()
++            .maxInboundMessageSize(OzoneConfigKeys.DFS_CONTAINER_CHUNK_MAX_SIZE)
++            .build();
++    XceiverClientProtocolServiceStub asyncStub =
++        XceiverClientProtocolServiceGrpc.newStub(channel);
++    asyncStubs.put(dn.getUuid(), asyncStub);
++    channels.put(dn.getUuid(), channel);
+-
+-   * Returns if the xceiver client connects to a server.
++   * Returns if the xceiver client connects to all servers in the pipeline.
+-  public boolean isConnected() {
+-    return !channel.isTerminated() && !channel.isShutdown();
++  public boolean isConnected(DatanodeDetails details) {
++    return isConnected(channels.get(details.getUuid()));
++  }
++
++  private boolean isConnected(ManagedChannel channel) {
++    return channel != null && !channel.isTerminated() && !channel.isShutdown();
+-    channel.shutdownNow();
+-    try {
+-      channel.awaitTermination(60, TimeUnit.MINUTES);
+-    } catch (Exception e) {
+-      LOG.error("Unexpected exception while waiting for channel termination",
+-          e);
++    for (ManagedChannel channel : channels.values()) {
++      channel.shutdownNow();
++      try {
++        channel.awaitTermination(60, TimeUnit.MINUTES);
++      } catch (Exception e) {
++        LOG.error("Unexpected exception while waiting for channel termination",
++            e);
++      }
++  @Override
++  public ContainerCommandResponseProto sendCommand(
++      ContainerCommandRequestProto request) throws IOException {
++    return sendCommandWithRetry(request);
++  }
++
++  public ContainerCommandResponseProto sendCommandWithRetry(
++      ContainerCommandRequestProto request) throws IOException {
++    int size = pipeline.getMachines().size();
++    ContainerCommandResponseProto responseProto = null;
++    DatanodeDetails dn = null;
++
++    // In case of an exception or an error, we will try to read from the
++    // datanodes in the pipeline in a round robin fashion.
++
++    // TODO: cache the correct leader info in here, so that any subsequent calls
++    // should first go to leader
++    for (int dnIndex = 0; dnIndex < size; dnIndex++) {
++      try {
++        dn = pipeline.getMachines().get(dnIndex);
++        LOG.debug("Executing command " + request + " on datanode " + dn);
++        // In case the command gets retried on a 2nd datanode,
++        // sendCommandAsyncCall will create a new channel and async stub
++        // in case these don't exist for the specific datanode.
++        responseProto = sendCommandAsync(request, dn).get();
++        if (responseProto.getResult() == ContainerProtos.Result.SUCCESS) {
++          break;
++        }
++      } catch (ExecutionException | InterruptedException e) {
++        LOG.warn("Failed to execute command " + request + " on datanode " + dn
++            .getUuidString(), e);
++      }
++    }
++
++    if (responseProto != null) {
++      return responseProto;
++    } else {
++      throw new IOException(
++          "Failed to execute command " + request + " on the pipeline "
++              + pipeline.getId());
++    }
++  }
++
++  // TODO: for a true async API, once the waitable future while executing
++  // the command on one channel fails, it should be retried asynchronously
++  // on the future Task for all the remaining datanodes.
++
++  // Note: this Async api is not used currently used in any active I/O path.
++  // In case it gets used, the asynchronous retry logic needs to be plugged
++  // in here.
+-  public CompletableFuture<ContainerCommandResponseProto>
+-      sendCommandAsync(ContainerCommandRequestProto request)
++  public CompletableFuture<ContainerCommandResponseProto> sendCommandAsync(
++      ContainerCommandRequestProto request)
+-    if(closed){
++    return sendCommandAsync(request, pipeline.getLeader());
++  }
++
++  private CompletableFuture<ContainerCommandResponseProto> sendCommandAsync(
++      ContainerCommandRequestProto request, DatanodeDetails dn)
++      throws IOException, ExecutionException, InterruptedException {
++    if (closed) {
+-    if(channel == null || !isConnected()) {
+-      reconnect();
++    UUID dnId = dn.getUuid();
++    ManagedChannel channel = channels.get(dnId);
++    // If the channel doesn't exist for this specific datanode or the channel
++    // is closed, just reconnect
++    if (!isConnected(channel)) {
++      reconnect(dn);
+-    final StreamObserver<ContainerCommandRequestProto> requestObserver =
+-        asyncStub.send(new StreamObserver<ContainerCommandResponseProto>() {
+-          @Override
+-          public void onNext(ContainerCommandResponseProto value) {
+-            replyFuture.complete(value);
+-            metrics.decrPendingContainerOpsMetrics(request.getCmdType());
+-            metrics.addContainerOpsLatency(request.getCmdType(),
+-                Time.monotonicNowNanos() - requestTime);
+-            semaphore.release();
+-          }
+-          @Override
+-          public void onError(Throwable t) {
+-            replyFuture.completeExceptionally(t);
+-            metrics.decrPendingContainerOpsMetrics(request.getCmdType());
+-            metrics.addContainerOpsLatency(request.getCmdType(),
+-                Time.monotonicNowNanos() - requestTime);
+-            semaphore.release();
+-          }
+-          @Override
+-          public void onCompleted() {
+-            if (!replyFuture.isDone()) {
+-              replyFuture.completeExceptionally(
+-                  new IOException("Stream completed but no reply for request "
+-                      + request));
+-            }
+-          }
+-        });
++    // TODO: for async calls, we should reuse StreamObserver resources.
++    final StreamObserver<ContainerCommandRequestProto> requestObserver =
++        asyncStubs.get(dnId)
++            .send(new StreamObserver<ContainerCommandResponseProto>() {
++              @Override
++              public void onNext(ContainerCommandResponseProto value) {
++                replyFuture.complete(value);
++                metrics.decrPendingContainerOpsMetrics(request.getCmdType());
++                metrics.addContainerOpsLatency(request.getCmdType(),
++                    Time.monotonicNowNanos() - requestTime);
++                semaphore.release();
++              }
++
++              @Override
++              public void onError(Throwable t) {
++                replyFuture.completeExceptionally(t);
++                metrics.decrPendingContainerOpsMetrics(request.getCmdType());
++                metrics.addContainerOpsLatency(request.getCmdType(),
++                    Time.monotonicNowNanos() - requestTime);
++                semaphore.release();
++              }
++
++              @Override
++              public void onCompleted() {
++                if (!replyFuture.isDone()) {
++                  replyFuture.completeExceptionally(new IOException(
++                      "Stream completed but no reply for request " + request));
++                }
++              }
++            });
+-  private void reconnect() throws IOException {
++  private void reconnect(DatanodeDetails dn)
++      throws IOException {
++    ManagedChannel channel;
+-      connect();
++      connectToDatanode(dn);
++      channel = channels.get(dn.getUuid());
+-    if (channel == null || !isConnected()) {
++    if (channel == null || !isConnected(channel)) {
+
+INS26 INS26 INS26 INS26 INS40 INS40 INS40 INS40 INS31 INS31 INS31 INS31 INS31 INS31 INS74 INS74 INS59 MOV78 MOV83 MOV39 MOV42 MOV43 INS8 INS83 INS39 INS42 INS44 INS8 MOV29 MOV78 INS83 INS39 INS42 INS44 INS8 UPD83 INS44 INS8 INS78 INS83 INS43 INS42 INS44 INS43 INS8 INS83 INS43 INS42 INS44 INS43 INS8 MOV29 MOV78 INS83 INS74 INS42 INS44 INS43 INS43 INS43 INS8 UPD83 INS44 INS44 INS43 INS43 MOV43 UPD42 INS43 INS43 INS43 INS42 INS21 INS21 MOV60 INS21 INS43 INS42 MOV60 MOV25 MOV21 INS60 INS60 INS21 INS21 INS43 INS42 INS41 INS43 INS42 MOV21 INS70 INS42 INS42 INS43 INS42 INS42 INS41 INS42 INS43 INS42 INS42 INS60 INS60 INS60 INS24 INS25 INS43 INS43 INS43 INS42 INS42 INS42 INS42 INS41 INS43 INS42 INS60 INS60 INS25 INS43 INS42 INS60 INS42 INS42 INS42 INS42 INS42 INS7 INS7 INS32 INS42 INS43 INS59 INS43 INS59 INS32 INS32 UPD66 INS42 INS32 INS42 INS44 INS32 MOV8 INS42 INS32 INS42 INS39 INS59 INS43 INS59 INS43 INS59 INS58 INS27 INS37 INS8 INS27 INS8 INS8 INS42 INS42 INS42 INS32 INS42 INS43 INS59 INS43 INS59 INS38 MOV8 INS42 MOV43 MOV59 INS22 INS14 INS22 INS14 INS42 INS42 INS42 INS42 INS32 INS42 INS42 MOV32 INS42 INS42 INS32 INS42 INS42 INS42 INS32 INS42 INS42 INS32 INS27 INS43 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS33 INS42 INS42 INS33 INS39 INS59 INS42 INS42 INS42 INS54 INS42 INS33 INS41 INS53 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS32 MOV32 INS21 INS52 INS42 INS74 INS52 INS42 INS74 MOV32 MOV42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS27 MOV38 INS42 INS32 INS42 INS42 INS34 INS8 INS12 INS42 INS14 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS7 INS43 INS43 UPD42 UPD42 INS42 INS42 INS42 INS33 INS42 INS42 INS21 INS21 MOV21 INS25 INS44 INS8 INS43 INS27 INS42 UPD42 MOV42 INS42 INS42 UPD42 INS42 INS42 INS32 INS42 INS42 INS42 INS7 INS32 INS27 INS8 INS84 INS42 INS21 INS42 INS45 INS42 INS45 INS32 INS42 INS42 INS32 INS42 INS32 INS42 INS42 INS27 INS42 INS32 INS32 INS40 INS10 INS43 INS43 INS32 INS42 INS42 INS42 INS42 UPD42 INS32 INS42 INS42 INS45 INS42 INS45 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS27 INS42 INS42 INS42 INS42 INS42 INS42 INS45 INS42 INS45 INS32 INS42 INS42 DEL42 DEL32 DEL7 DEL21 DEL8 DEL31 DEL42 DEL42 DEL33 DEL27 DEL38 DEL27 DEL25

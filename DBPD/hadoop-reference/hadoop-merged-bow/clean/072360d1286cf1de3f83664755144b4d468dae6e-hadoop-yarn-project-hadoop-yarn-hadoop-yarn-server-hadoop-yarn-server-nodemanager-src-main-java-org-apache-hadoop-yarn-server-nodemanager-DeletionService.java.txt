@@ -1,0 +1,186 @@
+YARN-1339. Recover DeletionService state upon nodemanager restart. (Contributed by Jason Lowe)
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/trunk@1603036 13f79535-47bb-0310-9956-ffa450edef68
+
++import java.util.ArrayList;
++import java.util.HashMap;
++import java.util.Map;
++import org.apache.hadoop.yarn.proto.YarnServerNodemanagerRecoveryProtos.DeletionServiceDeleteTaskProto;
++import org.apache.hadoop.yarn.server.nodemanager.recovery.NMNullStateStoreService;
++import org.apache.hadoop.yarn.server.nodemanager.recovery.NMStateStoreService;
++import org.apache.hadoop.yarn.server.nodemanager.recovery.NMStateStoreService.RecoveredDeletionServiceState;
++  private final NMStateStoreService stateStore;
++  private AtomicInteger nextTaskId = new AtomicInteger(0);
++    this(exec, new NMNullStateStoreService());
++  }
++
++  public DeletionService(ContainerExecutor exec,
++      NMStateStoreService stateStore) {
++    this.stateStore = stateStore;
+-   * 
+-  /**
+-      if (baseDirs == null || baseDirs.length == 0) {
+-        sched.schedule(new FileDeletionTask(this, user, subDir, null),
+-          debugDelay, TimeUnit.SECONDS);
+-      } else {
+-        sched.schedule(
+-          new FileDeletionTask(this, user, subDir, Arrays.asList(baseDirs)),
+-          debugDelay, TimeUnit.SECONDS);
++      List<Path> baseDirList = null;
++      if (baseDirs != null && baseDirs.length != 0) {
++        baseDirList = Arrays.asList(baseDirs);
++      FileDeletionTask task =
++          new FileDeletionTask(this, user, subDir, baseDirList);
++      recordDeletionTaskInStateStore(task);
++      sched.schedule(task, debugDelay, TimeUnit.SECONDS);
++      recordDeletionTaskInStateStore(fileDeletionTask);
++    if (stateStore.canRecover()) {
++      recover(stateStore.loadDeletionServiceState());
++    }
++    public static final int INVALID_TASK_ID = -1;
++    private int taskId;
++      this(INVALID_TASK_ID, delService, user, subDir, baseDirs);
++    }
++
++    private FileDeletionTask(int taskId, DeletionService delService,
++        String user, Path subDir, List<Path> baseDirs) {
++      this.taskId = taskId;
++    public synchronized FileDeletionTask[] getSuccessorTasks() {
++      FileDeletionTask[] successors =
++          new FileDeletionTask[successorTaskSet.size()];
++      return successorTaskSet.toArray(successors);
++    }
++
++      try {
++        delService.stateStore.removeDeletionTask(taskId);
++      } catch (IOException e) {
++        LOG.error("Unable to remove deletion task " + taskId
++            + " from state store", e);
++      }
++
++  private void recover(RecoveredDeletionServiceState state)
++      throws IOException {
++    List<DeletionServiceDeleteTaskProto> taskProtos = state.getTasks();
++    Map<Integer, DeletionTaskRecoveryInfo> idToInfoMap =
++        new HashMap<Integer, DeletionTaskRecoveryInfo>(taskProtos.size());
++    Set<Integer> successorTasks = new HashSet<Integer>();
++    for (DeletionServiceDeleteTaskProto proto : taskProtos) {
++      DeletionTaskRecoveryInfo info = parseTaskProto(proto);
++      idToInfoMap.put(info.task.taskId, info);
++      nextTaskId.set(Math.max(nextTaskId.get(), info.task.taskId));
++      successorTasks.addAll(info.successorTaskIds);
++    }
++
++    // restore the task dependencies and schedule the deletion tasks that
++    // have no predecessors
++    final long now = System.currentTimeMillis();
++    for (DeletionTaskRecoveryInfo info : idToInfoMap.values()) {
++      for (Integer successorId : info.successorTaskIds){
++        DeletionTaskRecoveryInfo successor = idToInfoMap.get(successorId);
++        if (successor != null) {
++          info.task.addFileDeletionTaskDependency(successor.task);
++        } else {
++          LOG.error("Unable to locate dependency task for deletion task "
++              + info.task.taskId + " at " + info.task.getSubDir());
++        }
++      }
++      if (!successorTasks.contains(info.task.taskId)) {
++        long msecTilDeletion = info.deletionTimestamp - now;
++        sched.schedule(info.task, msecTilDeletion, TimeUnit.MILLISECONDS);
++      }
++    }
++  }
++
++  private DeletionTaskRecoveryInfo parseTaskProto(
++      DeletionServiceDeleteTaskProto proto) throws IOException {
++    int taskId = proto.getId();
++    String user = proto.hasUser() ? proto.getUser() : null;
++    Path subdir = null;
++    List<Path> basePaths = null;
++    if (proto.hasSubdir()) {
++      subdir = new Path(proto.getSubdir());
++    }
++    List<String> basedirs = proto.getBasedirsList();
++    if (basedirs != null && basedirs.size() > 0) {
++      basePaths = new ArrayList<Path>(basedirs.size());
++      for (String basedir : basedirs) {
++        basePaths.add(new Path(basedir));
++      }
++    }
++
++    FileDeletionTask task = new FileDeletionTask(taskId, this, user,
++        subdir, basePaths);
++    return new DeletionTaskRecoveryInfo(task,
++        proto.getSuccessorIdsList(),
++        proto.getDeletionTime());
++  }
++
++  private int generateTaskId() {
++    // get the next ID but avoid an invalid ID
++    int taskId = nextTaskId.incrementAndGet();
++    while (taskId == FileDeletionTask.INVALID_TASK_ID) {
++      taskId = nextTaskId.incrementAndGet();
++    }
++    return taskId;
++  }
++
++  private void recordDeletionTaskInStateStore(FileDeletionTask task) {
++    if (!stateStore.canRecover()) {
++      // optimize the case where we aren't really recording
++      return;
++    }
++    if (task.taskId != FileDeletionTask.INVALID_TASK_ID) {
++      return;  // task already recorded
++    }
++
++    task.taskId = generateTaskId();
++
++    FileDeletionTask[] successors = task.getSuccessorTasks();
++
++    // store successors first to ensure task IDs have been generated for them
++    for (FileDeletionTask successor : successors) {
++      recordDeletionTaskInStateStore(successor);
++    }
++
++    DeletionServiceDeleteTaskProto.Builder builder =
++        DeletionServiceDeleteTaskProto.newBuilder();
++    builder.setId(task.taskId);
++    if (task.getUser() != null) {
++      builder.setUser(task.getUser());
++    }
++    if (task.getSubDir() != null) {
++      builder.setSubdir(task.getSubDir().toString());
++    }
++    builder.setDeletionTime(System.currentTimeMillis() +
++        TimeUnit.MILLISECONDS.convert(debugDelay, TimeUnit.SECONDS));
++    if (task.getBaseDirs() != null) {
++      for (Path dir : task.getBaseDirs()) {
++        builder.addBasedirs(dir.toString());
++      }
++    }
++    for (FileDeletionTask successor : successors) {
++      builder.addSuccessorIds(successor.taskId);
++    }
++
++    try {
++      stateStore.storeDeletionTask(task.taskId, builder.build());
++    } catch (IOException e) {
++      LOG.error("Unable to store deletion task " + task.taskId + " for "
++          + task.getSubDir(), e);
++    }
++  }
++
++  private static class DeletionTaskRecoveryInfo {
++    FileDeletionTask task;
++    List<Integer> successorTaskIds;
++    long deletionTimestamp;
++
++    public DeletionTaskRecoveryInfo(FileDeletionTask task,
++        List<Integer> successorTaskIds, long deletionTimestamp) {
++      this.task = task;
++      this.successorTaskIds = successorTaskIds;
++      this.deletionTimestamp = deletionTimestamp;
++    }
++  }
+
+INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS23 INS23 INS31 INS31 INS31 INS31 INS31 INS55 INS83 INS83 INS43 INS59 INS83 INS43 INS59 INS83 INS42 INS44 INS8 INS44 INS23 INS23 INS31 INS31 INS83 INS39 INS42 INS44 INS43 INS8 INS83 INS43 INS42 INS44 INS43 INS8 INS83 INS39 INS42 INS8 INS83 INS39 INS42 INS44 INS8 INS83 INS83 INS42 INS23 INS23 INS23 INS31 INS42 INS42 INS42 INS42 INS14 INS43 INS42 INS17 INS43 INS42 INS21 INS25 INS83 INS83 INS83 INS39 INS59 INS83 INS39 INS59 INS83 INS42 INS44 INS44 INS44 INS44 INS8 INS44 INS83 INS83 INS5 INS42 INS8 INS43 INS42 INS42 INS60 INS60 INS60 INS70 INS60 INS70 INS42 INS43 INS42 INS42 INS60 INS60 INS60 INS60 INS25 INS60 INS25 INS60 INS41 INS60 INS61 INS41 INS43 INS42 INS25 INS25 INS21 INS60 INS70 INS60 INS21 INS25 INS25 INS21 INS25 INS70 INS54 INS43 INS59 INS74 INS59 INS39 INS59 INS83 INS42 INS44 INS44 INS44 INS8 INS43 INS34 INS42 INS42 INS14 INS42 INS7 INS32 INS8 INS42 INS38 INS42 INS43 INS42 INS43 INS42 INS43 INS42 INS74 INS42 INS17 INS39 INS42 INS21 INS43 INS85 INS60 INS41 INS54 INS42 INS74 INS59 INS74 INS59 INS74 INS59 INS44 INS42 INS8 INS83 INS39 INS59 INS44 INS32 INS8 INS42 INS39 INS59 INS43 INS59 INS43 INS59 INS74 INS59 INS32 INS8 INS74 INS59 INS27 INS8 INS43 INS59 INS14 INS39 INS59 INS27 INS8 INS42 INS42 INS38 INS8 INS27 INS8 INS7 INS5 INS59 INS44 INS42 INS8 INS43 INS59 INS32 INS27 INS8 INS27 INS8 INS32 INS27 INS8 INS44 INS42 INS8 INS8 INS12 INS42 INS42 INS43 INS43 INS42 INS42 INS43 INS42 INS74 INS42 INS39 INS42 INS21 INS21 INS21 INS42 INS43 INS22 INS42 INS60 INS25 INS60 INS21 MOV21 INS21 INS42 INS42 INS21 INS34 INS42 INS42 INS42 INS43 INS43 INS42 INS42 INS42 INS42 INS42 INS7 INS42 INS5 INS59 INS32 INS8 INS12 INS43 INS43 INS42 INS32 INS43 INS43 INS43 INS42 INS14 INS43 INS43 INS42 INS14 INS43 INS42 INS60 INS21 INS21 INS21 INS42 INS32 INS43 INS42 INS42 INS42 INS70 INS25 INS42 INS32 INS42 INS42 INS16 INS42 INS42 INS33 INS43 INS43 INS42 INS33 INS42 INS42 INS21 INS43 INS43 INS42 INS32 INS27 INS27 INS21 INS70 INS42 INS42 INS14 INS43 INS42 INS32 INS32 INS42 INS32 INS42 INS40 INS21 INS32 INS41 INS40 INS40 INS41 INS40 INS32 INS43 INS85 INS42 INS32 INS43 INS42 INS21 INS40 INS42 INS32 INS42 INS42 INS40 INS32 INS33 INS21 INS32 INS33 INS21 INS42 INS42 INS27 INS32 INS33 INS70 INS43 INS42 INS21 INS21 INS44 INS8 INS42 INS42 INS42 INS43 INS43 INS7 INS7 INS7 INS42 INS52 INS42 INS74 INS59 UPD27 MOV27 INS8 MOV43 INS59 INS32 INS32 INS32 INS42 INS42 INS22 INS42 INS43 INS85 INS42 INS3 INS42 INS42 INS42 INS21 INS44 INS8 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS74 INS32 INS42 INS42 INS74 INS42 INS43 INS59 INS32 INS32 INS32 INS42 INS42 INS42 INS44 INS40 INS8 INS38 INS8 INS42 INS42 INS32 INS32 INS33 INS42 INS42 INS7 INS42 INS42 INS42 INS42 INS42 INS33 INS32 INS34 INS7 INS44 INS42 INS8 INS43 INS42 INS52 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS7 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS32 INS32 INS32 INS42 INS42 INS44 INS32 INS8 INS42 INS32 INS32 INS43 INS42 INS21 INS42 INS42 INS22 INS42 INS22 INS42 INS22 INS42 INS43 INS43 INS42 INS33 UPD27 UPD27 INS21 INS42 INS14 UPD42 MOV42 INS42 INS42 INS42 INS42 INS42 INS32 INS52 INS42 INS42 INS5 INS32 INS32 INS43 INS42 INS21 INS43 INS43 INS43 INS42 INS42 INS43 INS43 INS42 INS42 INS32 INS42 INS42 INS40 INS42 INS42 INS42 INS32 INS42 INS42 INS40 INS43 INS42 INS60 INS25 INS32 INS60 INS21 INS42 INS42 INS42 INS42 INS42 INS14 INS42 INS42 INS42 INS14 INS43 INS42 INS21 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS40 INS42 INS42 INS40 INS43 INS42 INS42 INS42 INS21 INS42 INS42 INS40 INS42 INS42 INS40 INS32 INS42 INS32 INS52 INS42 INS52 INS42 INS52 INS42 INS42 INS42 INS7 MOV43 MOV52 MOV42 MOV42 INS42 INS42 INS42 INS43 INS85 INS42 INS42 INS40 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS40 INS42 INS43 INS59 INS27 INS8 INS8 INS42 INS42 INS40 INS39 INS59 INS32 INS43 INS32 INS74 INS32 INS42 INS32 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS27 INS42 INS42 MOV32 INS42 INS42 INS42 INS27 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS33 INS21 INS21 INS42 INS27 INS42 INS42 INS40 INS42 INS40 INS42 INS42 INS42 INS43 INS43 INS42 INS42 INS42 INS42 INS14 INS42 INS42 INS42 INS42 INS32 INS45 INS40 INS45 INS32 INS45 INS42 INS45 INS42 INS42 INS42 INS32 INS32 INS40 INS42 INS42 INS42 INS43 INS42 INS42 INS42 INS42 INS42 INS40 INS42 INS40 INS42 INS42 INS27 INS42 INS45 INS40 INS45 INS32 INS40 INS42 DEL66 DEL52 DEL42 DEL42 DEL14 DEL42 DEL42 DEL33 DEL14 DEL40 DEL32 DEL21 DEL8 DEL8 DEL25

@@ -1,0 +1,148 @@
+HDFS-9646. ErasureCodingWorker may fail when recovering data blocks with length less than the first internal block. Contributed by Jing Zhao.
+
++import java.util.HashSet;
++import java.util.Set;
++import org.apache.hadoop.fs.ChecksumException;
+-    if (LOG.isDebugEnabled()) {
+-      LOG.debug("Using striped reads; pool threads=" + num);
+-    }
++    LOG.debug("Using striped reads; pool threads=" + num);
++
+-    if (LOG.isDebugEnabled()) {
+-      LOG.debug("Using striped block recovery; pool threads=" + num);
+-    }
++    LOG.debug("Using striped block recovery; pool threads=" + num);
+-      StripedReader reader = new StripedReader(liveIndices[i]);
++      final ExtendedBlock block = getBlock(blockGroup, liveIndices[i]);
++      StripedReader reader = new StripedReader(liveIndices[i], block, sources[i]);
+-      BlockReader blockReader = newBlockReader(
+-          getBlock(blockGroup, liveIndices[i]), offsetInBlock, sources[i]);
++      BlockReader blockReader = newBlockReader(block, offsetInBlock, sources[i]);
+-        long firstStripedBlockLength = getBlockLen(blockGroup, 0);
+-        while (positionInBlock < firstStripedBlockLength) {
+-          int toRead = Math.min(
+-              bufferSize, (int)(firstStripedBlockLength - positionInBlock));
++        long maxTargetLength = 0;
++        for (short targetIndex : targetIndices) {
++          maxTargetLength = Math.max(maxTargetLength,
++              getBlockLen(blockGroup, targetIndex));
++        }
++        while (positionInBlock < maxTargetLength) {
++          final int toRecover = (int) Math.min(
++              bufferSize, maxTargetLength - positionInBlock);
+-          //   The returned success list is the source DNs we do real read from
+-          success = readMinimumStripedData4Recovery(success);
++          // The returned success list is the source DNs we do real read from
++          Map<ExtendedBlock, Set<DatanodeInfo>> corruptionMap = new HashMap<>();
++          try {
++            success = readMinimumStripedData4Recovery(success, toRecover,
++                corruptionMap);
++          } finally {
++            // report corrupted blocks to NN
++            reportCorruptedBlocks(corruptionMap);
++          }
+-          long remaining = firstStripedBlockLength - positionInBlock;
+-          int toRecoverLen = remaining < bufferSize ? 
+-              (int)remaining : bufferSize;
+-          recoverTargets(success, targetsStatus, toRecoverLen);
++          recoverTargets(success, targetsStatus, toRecover);
+-          positionInBlock += toRead;
++          positionInBlock += toRecover;
+-    private long getReadLength(int index) {
++    /** the reading length should not exceed the length for recovery */
++    private int getReadLength(int index, int recoverLength) {
+-      return remaining > bufferSize ? bufferSize : remaining;
++      return (int) Math.min(remaining, recoverLength);
++     * @param recoverLength the length to recover.
+-    private int[] readMinimumStripedData4Recovery(final int[] success)
++    private int[] readMinimumStripedData4Recovery(final int[] success,
++        int recoverLength, Map<ExtendedBlock, Set<DatanodeInfo>> corruptionMap)
++      Preconditions.checkArgument(recoverLength >= 0 &&
++          recoverLength <= bufferSize);
+-        if (getReadLength(liveIndices[success[i]]) > 0) {
+-          Callable<Void> readCallable = readFromBlock(
+-              reader.blockReader, reader.buffer);
++        final int toRead = getReadLength(liveIndices[success[i]],
++            recoverLength);
++        if (toRead > 0) {
++          Callable<Void> readCallable = readFromBlock(reader, reader.buffer,
++              toRead, corruptionMap);
+-            resultIndex = scheduleNewRead(used);
++            resultIndex = scheduleNewRead(used, recoverLength, corruptionMap);
+-            resultIndex = scheduleNewRead(used);
++            resultIndex = scheduleNewRead(used, recoverLength, corruptionMap);
++      if (len > buffer.limit()) {
++        buffer.limit(len);
++      }
++          targetBuffers[i].limit(toRecoverLen);
+-          outputs[i].limit(toRecoverLen);
+-          if (remaining < 0) {
++          if (remaining <= 0) {
+-    private int scheduleNewRead(BitSet used) {
++    private int scheduleNewRead(BitSet used, int recoverLength,
++        Map<ExtendedBlock, Set<DatanodeInfo>> corruptionMap) {
++      int toRead = 0;
+-        if (getReadLength(liveIndices[m]) > 0) {
++        toRead = getReadLength(liveIndices[m], recoverLength);
++        if (toRead > 0) {
+-          if (getReadLength(liveIndices[i]) > 0) {
++          toRead = getReadLength(liveIndices[i], recoverLength);
++          if (toRead > 0) {
++              r.buffer.position(0);
+-        Callable<Void> readCallable = readFromBlock(
+-            reader.blockReader, reader.buffer);
++        Callable<Void> readCallable = readFromBlock(reader, reader.buffer,
++            toRead, corruptionMap);
+-    private Callable<Void> readFromBlock(final BlockReader reader,
+-        final ByteBuffer buf) {
++    private Callable<Void> readFromBlock(final StripedReader reader,
++        final ByteBuffer buf, final int length,
++        final Map<ExtendedBlock, Set<DatanodeInfo>> corruptionMap) {
+-            actualReadFromBlock(reader, buf);
++            buf.limit(length);
++            actualReadFromBlock(reader.blockReader, buf);
++          } catch (ChecksumException e) {
++            LOG.warn("Found Checksum error for " + reader.block + " from "
++                + reader.source + " at " + e.getPos());
++            addCorruptedBlock(reader.block, reader.source, corruptionMap);
++            throw e;
++    private void reportCorruptedBlocks(
++        Map<ExtendedBlock, Set<DatanodeInfo>> corruptionMap) throws IOException {
++      if (!corruptionMap.isEmpty()) {
++        for (Map.Entry<ExtendedBlock, Set<DatanodeInfo>> entry :
++            corruptionMap.entrySet()) {
++          for (DatanodeInfo dnInfo : entry.getValue()) {
++            datanode.reportRemoteBadBlock(dnInfo, entry.getKey());
++          }
++        }
++      }
++    }
++
++    private void addCorruptedBlock(ExtendedBlock blk, DatanodeInfo node,
++        Map<ExtendedBlock, Set<DatanodeInfo>> corruptionMap) {
++      Set<DatanodeInfo> dnSet = corruptionMap.get(blk);
++      if (dnSet == null) {
++        dnSet = new HashSet<>();
++        corruptionMap.put(blk, dnSet);
++      }
++      if (!dnSet.contains(node)) {
++        dnSet.add(node);
++      }
++    }
++
+-        for (int i = 0; i < zeroStripeBuffers.length; i++) {
+-          zeroStripeBuffers[i].clear();
++        for (ByteBuffer zeroStripeBuffer : zeroStripeBuffers) {
++          zeroStripeBuffer.clear();
+-      for (int i = 0; i < targetBuffers.length; i++) {
+-        if (targetBuffers[i] != null) {
+-          targetBuffers[i].clear();
++      for (ByteBuffer targetBuffer : targetBuffers) {
++        if (targetBuffer != null) {
++          targetBuffer.clear();
++    private final ExtendedBlock block;
++    private final DatanodeInfo source;
+-    private StripedReader(short index) {
++    StripedReader(short index, ExtendedBlock block, DatanodeInfo source) {
++      this.block = block;
++      this.source = source;

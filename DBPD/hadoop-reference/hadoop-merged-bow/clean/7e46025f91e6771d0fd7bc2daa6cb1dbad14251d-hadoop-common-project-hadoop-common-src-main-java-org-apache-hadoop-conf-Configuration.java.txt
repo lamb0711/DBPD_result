@@ -1,0 +1,315 @@
+Merge r1537584 through r1538407 from trunk.
+
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/branches/HDFS-2832@1538408 13f79535-47bb-0310-9956-ffa450edef68
+
++import java.util.concurrent.atomic.AtomicBoolean;
++import java.util.concurrent.atomic.AtomicReference;
++import org.apache.commons.collections.map.UnmodifiableMap;
++
+-    private String[] newKeys;
+-    private String customMessage;
+-    private boolean accessed;
++    private final String[] newKeys;
++    private final String customMessage;
++    private final AtomicBoolean accessed = new AtomicBoolean(false);
++
+-      accessed = false;
+-      accessed = true;
++
++    boolean getAndSetAccessed() {
++      return accessed.getAndSet(true);
++    }
++
++    public void clearAccessed() {
++      accessed.set(false);
++    }
+-   * Stores the deprecated keys, the new keys which replace the deprecated keys
+-   * and custom message(if any provided).
++   * A pending addition to the global set of deprecated keys.
+-  private static Map<String, DeprecatedKeyInfo> deprecatedKeyMap = 
+-      new HashMap<String, DeprecatedKeyInfo>();
+-  
+-  /**
+-   * Stores a mapping from superseding keys to the keys which they deprecate.
+-   */
+-  private static Map<String, String> reverseDeprecatedKeyMap =
+-      new HashMap<String, String>();
++  public static class DeprecationDelta {
++    private final String key;
++    private final String[] newKeys;
++    private final String customMessage;
++
++    DeprecationDelta(String key, String[] newKeys, String customMessage) {
++      Preconditions.checkNotNull(key);
++      Preconditions.checkNotNull(newKeys);
++      Preconditions.checkArgument(newKeys.length > 0);
++      this.key = key;
++      this.newKeys = newKeys;
++      this.customMessage = customMessage;
++    }
++
++    public DeprecationDelta(String key, String newKey, String customMessage) {
++      this(key, new String[] { newKey }, customMessage);
++    }
++
++    public DeprecationDelta(String key, String newKey) {
++      this(key, new String[] { newKey }, null);
++    }
++
++    public String getKey() {
++      return key;
++    }
++
++    public String[] getNewKeys() {
++      return newKeys;
++    }
++
++    public String getCustomMessage() {
++      return customMessage;
++    }
++  }
+-   * Adds the deprecated key to the deprecation map.
++   * The set of all keys which are deprecated.
++   *
++   * DeprecationContext objects are immutable.
++   */
++  private static class DeprecationContext {
++    /**
++     * Stores the deprecated keys, the new keys which replace the deprecated keys
++     * and custom message(if any provided).
++     */
++    private final Map<String, DeprecatedKeyInfo> deprecatedKeyMap;
++
++    /**
++     * Stores a mapping from superseding keys to the keys which they deprecate.
++     */
++    private final Map<String, String> reverseDeprecatedKeyMap;
++
++    /**
++     * Create a new DeprecationContext by copying a previous DeprecationContext
++     * and adding some deltas.
++     *
++     * @param other   The previous deprecation context to copy, or null to start
++     *                from nothing.
++     * @param deltas  The deltas to apply.
++     */
++    @SuppressWarnings("unchecked")
++    DeprecationContext(DeprecationContext other, DeprecationDelta[] deltas) {
++      HashMap<String, DeprecatedKeyInfo> newDeprecatedKeyMap = 
++        new HashMap<String, DeprecatedKeyInfo>();
++      HashMap<String, String> newReverseDeprecatedKeyMap =
++        new HashMap<String, String>();
++      if (other != null) {
++        for (Entry<String, DeprecatedKeyInfo> entry :
++            other.deprecatedKeyMap.entrySet()) {
++          newDeprecatedKeyMap.put(entry.getKey(), entry.getValue());
++        }
++        for (Entry<String, String> entry :
++            other.reverseDeprecatedKeyMap.entrySet()) {
++          newReverseDeprecatedKeyMap.put(entry.getKey(), entry.getValue());
++        }
++      }
++      for (DeprecationDelta delta : deltas) {
++        if (!newDeprecatedKeyMap.containsKey(delta.getKey())) {
++          DeprecatedKeyInfo newKeyInfo =
++            new DeprecatedKeyInfo(delta.getNewKeys(), delta.getCustomMessage());
++          newDeprecatedKeyMap.put(delta.key, newKeyInfo);
++          for (String newKey : delta.getNewKeys()) {
++            newReverseDeprecatedKeyMap.put(newKey, delta.key);
++          }
++        }
++      }
++      this.deprecatedKeyMap =
++        UnmodifiableMap.decorate(newDeprecatedKeyMap);
++      this.reverseDeprecatedKeyMap =
++        UnmodifiableMap.decorate(newReverseDeprecatedKeyMap);
++    }
++
++    Map<String, DeprecatedKeyInfo> getDeprecatedKeyMap() {
++      return deprecatedKeyMap;
++    }
++
++    Map<String, String> getReverseDeprecatedKeyMap() {
++      return reverseDeprecatedKeyMap;
++    }
++  }
++  
++  private static DeprecationDelta[] defaultDeprecations = 
++    new DeprecationDelta[] {
++      new DeprecationDelta("topology.script.file.name", 
++        CommonConfigurationKeys.NET_TOPOLOGY_SCRIPT_FILE_NAME_KEY),
++      new DeprecationDelta("topology.script.number.args", 
++        CommonConfigurationKeys.NET_TOPOLOGY_SCRIPT_NUMBER_ARGS_KEY),
++      new DeprecationDelta("hadoop.configured.node.mapping", 
++        CommonConfigurationKeys.NET_TOPOLOGY_CONFIGURED_NODE_MAPPING_KEY),
++      new DeprecationDelta("topology.node.switch.mapping.impl", 
++        CommonConfigurationKeys.NET_TOPOLOGY_NODE_SWITCH_MAPPING_IMPL_KEY),
++      new DeprecationDelta("dfs.df.interval", 
++        CommonConfigurationKeys.FS_DF_INTERVAL_KEY),
++      new DeprecationDelta("hadoop.native.lib", 
++        CommonConfigurationKeys.IO_NATIVE_LIB_AVAILABLE_KEY),
++      new DeprecationDelta("fs.default.name", 
++        CommonConfigurationKeys.FS_DEFAULT_NAME_KEY),
++      new DeprecationDelta("dfs.umaskmode",
++        CommonConfigurationKeys.FS_PERMISSIONS_UMASK_KEY)
++    };
++
++  /**
++   * The global DeprecationContext.
++   */
++  private static AtomicReference<DeprecationContext> deprecationContext =
++      new AtomicReference<DeprecationContext>(
++          new DeprecationContext(null, defaultDeprecations));
++
++  /**
++   * Adds a set of deprecated keys to the global deprecations.
++   *
++   * This method is lockless.  It works by means of creating a new
++   * DeprecationContext based on the old one, and then atomically swapping in
++   * the new context.  If someone else updated the context in between us reading
++   * the old context and swapping in the new one, we try again until we win the
++   * race.
++   *
++   * @param deltas   The deprecations to add.
++   */
++  public static void addDeprecations(DeprecationDelta[] deltas) {
++    DeprecationContext prev, next;
++    do {
++      prev = deprecationContext.get();
++      next = new DeprecationContext(prev, deltas);
++    } while (!deprecationContext.compareAndSet(prev, next));
++  }
++
++  /**
++   * Adds the deprecated key to the global deprecation map.
++   *
++   * If you have multiple deprecation entries to add, it is more efficient to
++   * use #addDeprecations(DeprecationDelta[] deltas) instead.
+-  public synchronized static void addDeprecation(String key, String[] newKeys,
++  public static void addDeprecation(String key, String[] newKeys,
+-    if (key == null || key.length() == 0 ||
+-        newKeys == null || newKeys.length == 0) {
+-      throw new IllegalArgumentException();
+-    }
+-    if (!isDeprecated(key)) {
+-      DeprecatedKeyInfo newKeyInfo;
+-      newKeyInfo = new DeprecatedKeyInfo(newKeys, customMessage);
+-      deprecatedKeyMap.put(key, newKeyInfo);
+-      for (String newKey : newKeys) {
+-        reverseDeprecatedKeyMap.put(newKey, key);
+-      }
+-    }
++    addDeprecations(new DeprecationDelta[] {
++      new DeprecationDelta(key, newKeys, customMessage)
++    });
+-  
++
+-   * Adds the deprecated key to the deprecation map.
++   * Adds the deprecated key to the global deprecation map.
++   * If you have multiple deprecation entries to add, it is more efficient to
++   * use #addDeprecations(DeprecationDelta[] deltas) instead.
++   *
+-  public synchronized static void addDeprecation(String key, String newKey,
++  public static void addDeprecation(String key, String newKey,
+-   * Adds the deprecated key to the deprecation map when no custom message
+-   * is provided.
++   * Adds the deprecated key to the global deprecation map when no custom
++   * message is provided.
++   * If you have multiple deprecation entries to add, it is more efficient to
++   * use #addDeprecations(DeprecationDelta[] deltas) instead.
++   *
+-  public synchronized static void addDeprecation(String key, String[] newKeys) {
++  public static void addDeprecation(String key, String[] newKeys) {
+-   * Adds the deprecated key to the deprecation map when no custom message
+-   * is provided.
++   * Adds the deprecated key to the global deprecation map when no custom
++   * message is provided.
++   * If you have multiple deprecation entries to add, it is more efficient to
++   * use #addDeprecations(DeprecationDelta[] deltas) instead.
++   *
+-  public synchronized static void addDeprecation(String key, String newKey) {
+-	addDeprecation(key, new String[] {newKey}, null);
++  public static void addDeprecation(String key, String newKey) {
++    addDeprecation(key, new String[] {newKey}, null);
+-    return deprecatedKeyMap.containsKey(key);
++    return deprecationContext.get().getDeprecatedKeyMap().containsKey(key);
+-    DeprecatedKeyInfo keyInfo = deprecatedKeyMap.get(name);
++    DeprecationContext cur = deprecationContext.get();
++    DeprecatedKeyInfo keyInfo = cur.getDeprecatedKeyMap().get(name);
+-      altNames = (reverseDeprecatedKeyMap.get(name) != null ) ? 
+-        new String [] {reverseDeprecatedKeyMap.get(name)} : null;
++      altNames = (cur.getReverseDeprecatedKeyMap().get(name) != null ) ? 
++        new String [] {cur.getReverseDeprecatedKeyMap().get(name)} : null;
+-    	keyInfo = deprecatedKeyMap.get(altNames[0]);
++    	keyInfo = cur.getDeprecatedKeyMap().get(altNames[0]);
+-  private String[] handleDeprecation(String name) {
++  private String[] handleDeprecation(DeprecationContext deprecations,
++      String name) {
+-      DeprecatedKeyInfo keyInfo = deprecatedKeyMap.get(name);
+-      warnOnceIfDeprecated(name);
++      DeprecatedKeyInfo keyInfo = deprecations.getDeprecatedKeyMap().get(name);
++      warnOnceIfDeprecated(deprecations, name);
+-	  String deprecatedKey = reverseDeprecatedKeyMap.get(n);
++	  String deprecatedKey = deprecations.getReverseDeprecatedKeyMap().get(n);
++    DeprecationContext deprecations = deprecationContext.get();
+-      handleDeprecation((String)item);
++      handleDeprecation(deprecations, (String)item);
+-    //Add code for managing deprecated key mapping
+-    //for example
+-    //addDeprecation("oldKey1",new String[]{"newkey1","newkey2"});
+-    //adds deprecation for oldKey1 to two new keys(newkey1, newkey2).
+-    //so get or set of oldKey1 will correctly populate/access values of 
+-    //newkey1 and newkey2
+-    addDeprecatedKeys();
+-    String[] names = handleDeprecation(name);
++    String[] names = handleDeprecation(deprecationContext.get(), name);
+-    String[] names = handleDeprecation(name);
++    String[] names = handleDeprecation(deprecationContext.get(), name);
+-    if (deprecatedKeyMap.isEmpty()) {
++    DeprecationContext deprecations = deprecationContext.get();
++    if (deprecations.getDeprecatedKeyMap().isEmpty()) {
+-    warnOnceIfDeprecated(name);
++    warnOnceIfDeprecated(deprecations, name);
+-  private void warnOnceIfDeprecated(String name) {
+-    DeprecatedKeyInfo keyInfo = deprecatedKeyMap.get(name);
+-    if (keyInfo != null && !keyInfo.accessed) {
++  private void warnOnceIfDeprecated(DeprecationContext deprecations, String name) {
++    DeprecatedKeyInfo keyInfo = deprecations.getDeprecatedKeyMap().get(name);
++    if (keyInfo != null && !keyInfo.getAndSetAccessed()) {
+-    String[] names = handleDeprecation(name);
++    String[] names = handleDeprecation(deprecationContext.get(), name);
++      DeprecationContext deprecations = deprecationContext.get();
+-          if (deprecatedKeyMap.containsKey(attr)) {
+-            DeprecatedKeyInfo keyInfo = deprecatedKeyMap.get(attr);
+-            keyInfo.accessed = false;
++          if (deprecations.getDeprecatedKeyMap().containsKey(attr)) {
++            DeprecatedKeyInfo keyInfo =
++                deprecations.getDeprecatedKeyMap().get(attr);
++            keyInfo.clearAccessed();
+-  //Load deprecated keys in common
+-  private static void addDeprecatedKeys() {
+-    Configuration.addDeprecation("topology.script.file.name", 
+-               new String[]{CommonConfigurationKeys.NET_TOPOLOGY_SCRIPT_FILE_NAME_KEY});
+-    Configuration.addDeprecation("topology.script.number.args", 
+-               new String[]{CommonConfigurationKeys.NET_TOPOLOGY_SCRIPT_NUMBER_ARGS_KEY});
+-    Configuration.addDeprecation("hadoop.configured.node.mapping", 
+-               new String[]{CommonConfigurationKeys.NET_TOPOLOGY_CONFIGURED_NODE_MAPPING_KEY});
+-    Configuration.addDeprecation("topology.node.switch.mapping.impl", 
+-               new String[]{CommonConfigurationKeys.NET_TOPOLOGY_NODE_SWITCH_MAPPING_IMPL_KEY});
+-    Configuration.addDeprecation("dfs.df.interval", 
+-               new String[]{CommonConfigurationKeys.FS_DF_INTERVAL_KEY});
+-    Configuration.addDeprecation("hadoop.native.lib", 
+-               new String[]{CommonConfigurationKeys.IO_NATIVE_LIB_AVAILABLE_KEY});
+-    Configuration.addDeprecation("fs.default.name", 
+-               new String[]{CommonConfigurationKeys.FS_DEFAULT_NAME_KEY});
+-    Configuration.addDeprecation("dfs.umaskmode",
+-        new String[]{CommonConfigurationKeys.FS_PERMISSIONS_UMASK_KEY});
+-  }
+-  
+-    for (Map.Entry<String, DeprecatedKeyInfo> entry : deprecatedKeyMap.entrySet()) {
++    DeprecationContext deprecations = deprecationContext.get();
++    for (Map.Entry<String, DeprecatedKeyInfo> entry :
++        deprecations.getDeprecatedKeyMap().entrySet()) {
+
+INS26 INS26 INS26 INS40 INS40 INS40 INS55 INS55 INS23 INS23 INS31 INS23 INS31 INS31 INS29 INS83 INS83 INS42 INS23 INS23 INS23 INS31 INS31 INS31 INS31 INS31 INS31 INS29 INS83 INS83 INS42 MOV23 MOV23 INS31 INS31 INS31 INS83 INS83 INS5 INS59 INS29 INS83 INS83 INS74 INS59 INS29 INS83 INS83 INS39 INS42 INS44 INS8 INS44 INS44 INS83 MOV5 INS83 INS43 MOV83 INS83 INS43 INS59 INS39 INS42 INS8 INS83 INS39 INS42 INS8 INS65 INS83 INS83 INS43 INS59 INS83 INS83 MOV5 INS59 INS83 INS83 INS43 INS59 INS42 INS44 INS44 INS44 INS8 INS83 INS42 INS44 INS44 INS44 INS8 INS83 INS42 INS44 INS44 INS8 INS83 MOV43 INS42 INS8 INS83 MOV5 INS42 INS8 INS83 INS43 INS42 INS8 INS65 UPD83 INS59 UPD83 INS59 INS29 INS79 INS42 INS44 INS44 INS8 INS74 INS42 INS8 INS74 INS42 INS8 INS43 MOV85 INS42 INS3 INS65 INS43 INS43 INS42 INS14 INS65 INS65 INS5 INS42 INS60 INS19 INS21 INS60 INS43 INS42 INS60 INS60 INS43 INS42 INS60 INS43 INS85 INS42 INS42 INS42 INS14 INS41 INS21 INS66 INS42 INS42 INS42 INS42 INS42 INS43 INS42 INS5 INS42 INS43 INS42 MOV21 INS21 MOV21 INS21 INS21 INS21 INS43 INS42 INS43 INS42 INS43 INS42 INS17 INS43 INS42 INS43 INS42 INS17 INS41 INS41 INS42 INS41 INS66 INS66 INS42 INS42 INS65 INS65 INS65 INS42 INS45 INS43 INS42 INS5 INS42 INS60 INS60 INS25 INS70 INS21 INS21 INS43 INS43 INS43 INS41 INS43 INS43 INS43 INS41 INS42 INS5 INS4 INS66 INS42 INS42 INS74 INS14 INS66 INS66 INS66 INS66 INS66 INS66 INS42 INS66 UPD43 MOV43 MOV85 INS43 INS59 INS59 INS8 INS38 UPD66 INS66 INS66 INS32 UPD66 INS66 INS66 UPD66 UPD66 INS66 INS66 UPD66 UPD66 INS66 INS66 INS43 INS59 MOV43 INS42 INS43 INS59 INS43 INS59 INS42 INS43 INS59 INS42 INS43 INS9 INS32 INS32 INS42 MOV43 MOV85 INS42 INS32 INS7 INS7 INS7 INS42 INS42 INS42 INS42 MOV3 INS42 INS42 INS42 INS42 MOV3 INS33 INS42 INS42 INS42 INS66 INS66 INS42 INS66 INS66 INS42 INS66 INS42 UPD43 MOV43 MOV85 INS74 MOV59 INS74 MOV59 INS27 INS8 INS44 INS42 INS8 INS7 INS7 INS42 MOV42 INS42 INS42 INS42 INS42 INS42 INS42 INS43 INS85 INS14 INS14 INS14 INS14 INS14 INS14 INS14 INS14 INS43 INS43 INS43 INS33 INS42 UPD42 INS42 INS42 INS42 INS21 INS21 INS32 INS42 INS3 INS32 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS32 INS32 INS42 INS60 INS42 INS42 INS32 INS32 INS42 INS42 INS42 INS9 INS42 INS42 INS9 UPD42 UPD42 INS42 INS42 INS42 INS42 UPD42 UPD42 INS27 INS22 INS42 INS22 INS42 INS22 INS42 UPD42 INS43 INS43 INS43 UPD42 INS43 INS43 INS43 UPD42 INS42 INS33 INS70 INS70 INS43 INS42 INS25 INS22 INS32 INS22 INS32 INS42 INS43 INS45 INS40 INS43 INS45 INS40 INS43 INS45 INS40 INS43 INS45 INS40 INS43 INS45 INS40 INS43 INS45 INS40 INS43 INS45 INS40 INS43 INS45 INS40 INS42 INS42 INS42 INS7 INS7 INS42 INS42 INS42 INS42 INS5 INS4 INS32 UPD42 MOV42 INS42 INS42 INS32 MOV43 INS42 INS42 INS32 INS32 INS42 INS42 INS42 UPD42 MOV42 INS32 INS32 INS32 INS43 INS59 INS42 INS42 INS42 UPD42 MOV42 INS40 INS34 INS52 INS42 INS52 INS42 INS52 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS44 INS32 INS8 INS44 INS32 INS8 INS42 INS38 INS8 INS52 INS42 INS42 INS42 INS42 INS52 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 UPD42 MOV42 INS42 INS42 INS42 INS32 INS42 INS14 INS43 INS85 INS14 INS42 INS42 INS42 UPD42 MOV42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 UPD42 MOV42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS74 INS42 INS40 UPD42 MOV42 INS21 INS74 INS42 INS40 UPD42 MOV42 INS21 INS32 INS60 INS21 INS70 INS42 INS42 INS43 INS42 INS42 UPD42 MOV42 INS43 INS42 MOV42 MOV42 INS3 INS32 INS32 INS42 INS42 INS43 INS43 INS43 INS32 INS43 INS43 INS43 INS32 INS42 INS42 INS32 MOV43 INS59 INS32 MOV44 INS32 INS8 INS42 INS42 INS5 INS4 INS42 UPD42 MOV42 INS42 UPD42 MOV42 INS42 INS42 INS42 UPD42 MOV42 INS42 INS32 INS32 INS42 MOV42 INS42 INS42 INS42 INS32 INS32 INS42 INS42 INS42 INS14 INS42 INS42 INS40 INS42 INS42 INS42 INS21 INS43 INS85 INS32 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 MOV43 INS32 INS32 INS32 INS32 INS42 INS32 INS42 INS42 INS42 UPD42 MOV42 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS40 INS42 UPD42 MOV42 INS42 INS42 INS42 UPD42 MOV42 INS32 INS42 INS42 INS32 INS42 UPD42 MOV42 DEL39 DEL42 DEL59 DEL23 DEL42 DEL9 DEL7 DEL21 DEL42 DEL9 DEL7 DEL21 DEL45 DEL45 DEL40 DEL4 DEL3 DEL40 DEL42 DEL42 DEL42 DEL32 DEL83 DEL42 DEL33 DEL27 DEL42 DEL42 DEL32 DEL34 DEL27 DEL27 DEL42 DEL33 DEL27 DEL27 DEL40 DEL34 DEL27 DEL27 DEL43 DEL14 DEL53 DEL8 DEL25 DEL42 DEL42 DEL32 DEL38 DEL42 DEL59 DEL60 DEL42 DEL14 DEL7 DEL21 DEL42 DEL42 DEL42 DEL42 DEL32 DEL21 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL21 DEL8 DEL70 DEL8 DEL25 DEL83 DEL83 DEL83 DEL42 DEL32 DEL21 DEL40 DEL40 DEL9 DEL7 DEL83 DEL83 DEL39 DEL42 DEL42 DEL42 DEL45 DEL40 DEL4 DEL3 DEL32 DEL21 DEL42 DEL42 DEL45 DEL40 DEL4 DEL3 DEL32 DEL21 DEL45 DEL43 DEL85 DEL5 DEL40 DEL4 DEL3 DEL32 DEL21 DEL42 DEL45 DEL43 DEL5 DEL40 DEL4 DEL3 DEL32 DEL21 DEL42 DEL42 DEL45 DEL43 DEL85 DEL5 DEL40 DEL4 DEL3 DEL32 DEL21 DEL42 DEL42 DEL45 DEL5 DEL40 DEL4 DEL3 DEL32 DEL21 DEL8 DEL31

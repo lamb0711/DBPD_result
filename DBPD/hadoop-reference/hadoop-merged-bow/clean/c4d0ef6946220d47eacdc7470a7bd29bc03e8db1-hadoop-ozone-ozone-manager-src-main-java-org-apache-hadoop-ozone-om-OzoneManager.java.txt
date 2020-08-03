@@ -1,0 +1,215 @@
+HDDS-816. Create OM metrics for bucket, volume, keys. Contributed by Bharat Viswanadham.
+
++import com.fasterxml.jackson.databind.ObjectMapper;
++import com.fasterxml.jackson.databind.ObjectReader;
++import com.fasterxml.jackson.databind.ObjectWriter;
++import org.apache.hadoop.ozone.OmUtils;
++import org.apache.hadoop.util.ShutdownHookManager;
++import java.io.BufferedWriter;
++import java.io.File;
++import java.io.FileOutputStream;
++import java.io.OutputStreamWriter;
++import java.nio.file.Files;
++import java.nio.file.StandardCopyOption;
++import java.util.Timer;
++import java.util.TimerTask;
++import java.util.concurrent.TimeUnit;
++import static org.apache.hadoop.ozone.OzoneConsts.OM_METRICS_FILE;
++import static org.apache.hadoop.ozone.OzoneConsts.OM_METRICS_TEMP_FILE;
++
+-import static org.apache.hadoop.ozone.om.OMConfigKeys.OZONE_OM_HANDLER_COUNT_DEFAULT;
+-import static org.apache.hadoop.ozone.om.OMConfigKeys.OZONE_OM_HANDLER_COUNT_KEY;
++import static org.apache.hadoop.ozone.om.OMConfigKeys
++    .OZONE_OM_HANDLER_COUNT_DEFAULT;
++import static org.apache.hadoop.ozone.om.OMConfigKeys
++    .OZONE_OM_HANDLER_COUNT_KEY;
++import static org.apache.hadoop.ozone.om.OMConfigKeys
++    .OZONE_OM_METRICS_SAVE_INTERVAL;
++import static org.apache.hadoop.ozone.om.OMConfigKeys
++    .OZONE_OM_METRICS_SAVE_INTERVAL_DEFAULT;
+-  private final RPC.Server omRpcServer;
+-  private final InetSocketAddress omRpcAddress;
++  private RPC.Server omRpcServer;
++  private InetSocketAddress omRpcAddress;
+-  private final OzoneManagerHttpServer httpServer;
++  private OzoneManagerHttpServer httpServer;
++  private Timer metricsTimer;
++  private ScheduleOMMetricsWriteTask scheduleOMMetricsWriteTask;
++  private static final ObjectWriter WRITER =
++      new ObjectMapper().writerWithDefaultPrettyPrinter();
++  private static final ObjectReader READER =
++      new ObjectMapper().readerFor(OmMetricsInfo.class);
++  private static final int SHUTDOWN_HOOK_PRIORITY = 30;
++  private final Runnable shutdownHook;
++  private final File omMetaDir;
+-    final int handlerCount = conf.getInt(OZONE_OM_HANDLER_COUNT_KEY,
+-        OZONE_OM_HANDLER_COUNT_DEFAULT);
+-    BlockingService omService = newReflectiveBlockingService(
+-        new OzoneManagerProtocolServerSideTranslatorPB(this));
+-    final InetSocketAddress omNodeRpcAddr =
+-        getOmAddress(configuration);
+-    omRpcServer = startRpcServer(configuration, omNodeRpcAddr,
+-        OzoneManagerProtocolPB.class, omService,
+-        handlerCount);
+-    omRpcAddress = updateRPCListenAddress(configuration,
+-        OZONE_OM_ADDRESS_KEY, omNodeRpcAddr, omRpcServer);
++    metrics = OMMetrics.create();
++
+-    metrics = OMMetrics.create();
+-    httpServer = new OzoneManagerHttpServer(configuration, this);
++
++    shutdownHook = () -> {
++      saveOmMetrics();
++    };
++    ShutdownHookManager.get().addShutdownHook(shutdownHook,
++        SHUTDOWN_HOOK_PRIORITY);
++
++    omMetaDir = OmUtils.getOmDbDir(configuration);
++
++   * Class which schedule saving metrics to a file.
++   */
++  private class ScheduleOMMetricsWriteTask extends TimerTask {
++    public void run() {
++      saveOmMetrics();
++    }
++  }
++
++  private void saveOmMetrics() {
++    try {
++      boolean success;
++      try (BufferedWriter writer = new BufferedWriter(
++          new OutputStreamWriter(new FileOutputStream(
++              getTempMetricsStorageFile()), "UTF-8"))) {
++        OmMetricsInfo metricsInfo = new OmMetricsInfo();
++        metricsInfo.setNumKeys(metrics.getNumKeys());
++        WRITER.writeValue(writer, metricsInfo);
++        success = true;
++      }
++
++      if (success) {
++        Files.move(getTempMetricsStorageFile().toPath(),
++            getMetricsStorageFile().toPath(), StandardCopyOption
++                .ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
++      }
++    } catch (IOException ex) {
++      LOG.error("Unable to write the om Metrics file", ex);
++    }
++  }
++
++  /**
++   * Returns temporary metrics storage file.
++   * @return File
++   */
++  private File getTempMetricsStorageFile() {
++    return new File(omMetaDir, OM_METRICS_TEMP_FILE);
++  }
++
++  /**
++   * Returns metrics storage file.
++   * @return File
++   */
++  private File getMetricsStorageFile() {
++    return new File(omMetaDir, OM_METRICS_FILE);
++  }
++
++
++  /**
++
++    InetSocketAddress omNodeRpcAddr = getOmAddress(configuration);
++    int handlerCount = configuration.getInt(OZONE_OM_HANDLER_COUNT_KEY,
++        OZONE_OM_HANDLER_COUNT_DEFAULT);
++    BlockingService omService = newReflectiveBlockingService(
++        new OzoneManagerProtocolServerSideTranslatorPB(this));
++    omRpcServer = startRpcServer(configuration, omNodeRpcAddr,
++        OzoneManagerProtocolPB.class, omService,
++        handlerCount);
++    omRpcAddress = updateRPCListenAddress(configuration,
++        OZONE_OM_ADDRESS_KEY, omNodeRpcAddr, omRpcServer);
++    omRpcServer.start();
++
++
++
+-    metadataManager.start();
+-    keyManager.start();
+-    omRpcServer.start();
++
++    metadataManager.start(configuration);
++
++
++    // Set metrics and start metrics back ground thread
++    metrics.setNumVolumes(metadataManager.countRowsInTable(metadataManager
++        .getVolumeTable()));
++    metrics.setNumBuckets(metadataManager.countRowsInTable(metadataManager
++        .getBucketTable()));
++
++    if (getMetricsStorageFile().exists()) {
++      OmMetricsInfo metricsInfo = READER.readValue(getMetricsStorageFile());
++      metrics.setNumKeys(metricsInfo.getNumKeys());
++    }
++
++    // Schedule save metrics
++    long period = configuration.getTimeDuration(OZONE_OM_METRICS_SAVE_INTERVAL,
++        OZONE_OM_METRICS_SAVE_INTERVAL_DEFAULT, TimeUnit.MILLISECONDS);
++    scheduleOMMetricsWriteTask = new ScheduleOMMetricsWriteTask();
++    metricsTimer = new Timer();
++    metricsTimer.schedule(scheduleOMMetricsWriteTask, 0, period);
++
++    keyManager.start(configuration);
++
++    httpServer = new OzoneManagerHttpServer(configuration, this);
+-      metadataManager.stop();
++      // Cancel the metrics timer and set to null.
++      metricsTimer.cancel();
++      metricsTimer = null;
++      scheduleOMMetricsWriteTask = null;
++      metadataManager.stop();
++      metrics.incNumVolumes();
++      metrics.decNumVolumes();
++      metrics.incNumBuckets();
++      // As when we commit the key it is visible, so we should increment here.
++      // As key also can have multiple versions, we need to increment keys
++      // only if version is 0. Currently we have not complete support of
++      // versioning of keys. So, this can be revisited later.
++      if (args != null && args.getLocationInfoList() != null &&
++          args.getLocationInfoList().size() > 0 &&
++          args.getLocationInfoList().get(0) != null &&
++          args.getLocationInfoList().get(0).getCreateVersion() == 0) {
++        metrics.incNumKeys();
++      }
++      metrics.decNumKeys();
++      metrics.decNumBuckets();
+-    s3BucketManager.createS3Bucket(userName, s3BucketName);
++    try {
++      metrics.incNumBucketCreates();
++      try {
++        boolean newVolumeCreate = s3BucketManager.createOzoneVolumeIfNeeded(
++            userName);
++        if (newVolumeCreate) {
++          metrics.incNumVolumeCreates();
++          metrics.incNumVolumes();
++        }
++      } catch (IOException ex) {
++        // We need to increment volume creates also because this is first
++        // time we are trying to create a volume, it failed. As we increment
++        // ops and create when we try to do that operation.
++        metrics.incNumVolumeCreates();
++        metrics.incNumVolumeCreateFails();
++        throw ex;
++      }
++
++      s3BucketManager.createS3Bucket(userName, s3BucketName);
++      metrics.incNumBuckets();
++    } catch (IOException ex) {
++      metrics.incNumBucketCreateFails();
++      throw ex;
++    }
+-    s3BucketManager.deleteS3Bucket(s3BucketName);
++    try {
++      metrics.incNumBucketDeletes();
++      s3BucketManager.deleteS3Bucket(s3BucketName);
++      metrics.decNumBuckets();
++    } catch (IOException ex) {
++      metrics.incNumBucketDeleteFails();
++    }
+
+INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS23 INS23 INS23 INS23 INS23 INS23 INS23 INS55 INS31 INS31 INS31 INS83 INS43 INS59 INS83 INS43 INS59 INS83 INS83 INS83 INS43 INS59 INS83 INS83 INS83 INS43 INS59 INS83 INS83 INS83 INS39 INS59 INS83 INS83 INS43 INS59 INS83 INS83 INS43 INS59 MOV21 INS29 INS83 INS42 INS43 INS31 INS83 INS39 INS42 INS8 INS29 INS83 INS43 INS42 INS8 INS29 INS83 INS43 INS42 INS8 MOV21 INS8 INS8 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS34 INS42 INS42 INS42 INS42 INS21 INS21 INS21 INS65 INS42 INS83 INS39 INS42 INS8 INS54 INS65 INS65 INS42 INS41 INS65 INS65 INS42 INS41 MOV60 INS60 MOV60 MOV21 MOV21 INS21 INS21 INS25 INS60 INS21 INS21 INS21 MOV21 INS54 INS54 INS14 INS42 INS14 INS42 INS57 INS7 INS32 INS7 INS66 INS21 INS8 INS12 INS66 INS66 INS14 INS66 INS66 INS14 INS39 INS59 INS32 INS32 INS32 INS8 INS39 INS59 INS7 INS7 INS32 MOV21 INS8 INS8 INS12 MOV8 INS12 INS43 INS43 INS43 INS42 INS86 INS32 UPD42 MOV42 UPD42 MOV42 INS42 INS42 INS32 INS32 INS60 INS54 INS25 INS44 INS8 INS43 INS42 INS42 INS43 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS32 INS42 INS42 INS32 INS32 INS42 INS60 INS21 INS42 INS32 INS42 INS14 INS42 INS14 INS42 INS42 INS42 INS34 INS42 INS42 INS21 INS21 INS21 INS21 INS21 INS21 MOV21 MOV21 MOV21 INS25 INS21 INS21 INS21 INS54 MOV21 INS21 INS44 INS8 INS21 INS21 INS44 INS8 INS42 INS42 INS42 INS8 UPD42 MOV42 UPD42 MOV42 INS42 INS42 INS42 INS42 INS39 INS59 INS58 INS8 INS42 INS8 INS43 INS42 INS21 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS43 INS59 INS32 INS42 INS42 INS42 INS42 INS40 INS43 INS43 INS32 INS7 INS7 INS32 INS32 INS32 INS27 INS8 INS32 INS32 INS32 INS8 INS12 INS32 INS43 INS42 INS21 INS53 INS32 INS32 INS43 INS42 INS21 INS21 INS42 INS43 INS59 INS60 INS21 INS21 INS21 INS21 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS33 INS42 INS33 INS42 INS42 INS42 INS42 INS42 INS42 INS27 INS27 INS21 INS42 INS42 INS42 INS42 INS42 INS42 INS60 INS25 INS44 INS8 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS32 INS42 INS42 INS14 INS43 INS59 INS32 INS32 INS7 INS32 INS42 INS42 INS45 INS42 INS42 INS42 INS32 INS42 INS42 INS27 INS27 INS32 INS34 INS32 INS39 INS59 INS42 INS8 INS43 INS42 INS21 INS21 INS53 INS42 INS42 INS42 INS42 INS42 INS43 INS14 INS42 INS42 INS14 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS9 INS42 INS42 INS32 INS32 INS40 INS40 INS42 INS27 INS27 INS32 INS33 INS32 INS42 INS42 INS42 INS42 INS32 INS21 INS21 INS42 INS32 INS32 INS42 INS42 INS43 INS14 INS45 INS43 INS42 INS42 INS32 INS42 INS32 INS42 INS27 INS27 INS32 INS34 INS32 INS42 INS34 INS32 INS42 INS34 INS42 INS42 INS42 INS32 INS32 INS42 INS42 INS42 INS42 INS42 INS43 INS32 INS42 INS42 INS42 INS42 INS33 INS32 INS33 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 DEL83 DEL83 DEL83 DEL83 DEL39 DEL42 DEL32 DEL59 DEL60 DEL83 DEL8 DEL8

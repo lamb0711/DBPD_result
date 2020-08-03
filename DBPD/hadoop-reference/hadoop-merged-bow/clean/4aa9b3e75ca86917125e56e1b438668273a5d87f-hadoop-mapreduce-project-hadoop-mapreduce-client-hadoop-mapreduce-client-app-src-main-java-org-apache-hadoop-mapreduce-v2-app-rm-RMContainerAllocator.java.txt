@@ -1,0 +1,159 @@
+MAPREDUCE-6302. Incorrect headroom can lead to a deadlock between map and reduce allocations. (kasha)
+
+-  /**
+-   * after this threshold, if the container request is not allocated, it is
+-   * considered delayed.
+-   */
+-  private long allocationDelayThresholdMs = 0;
++
++  // Mapper allocation timeout, after which a reducer is forcibly preempted
++  private long reducerUnconditionalPreemptionDelayMs;
++
++  // Duration to wait before preempting a reducer when there is NO room
++  private long reducerNoHeadroomPreemptionDelayMs = 0;
++
+-    allocationDelayThresholdMs = conf.getInt(
++    reducerUnconditionalPreemptionDelayMs = 1000 * conf.getInt(
++        MRJobConfig.MR_JOB_REDUCER_UNCONDITIONAL_PREEMPT_DELAY_SEC,
++        MRJobConfig.DEFAULT_MR_JOB_REDUCER_UNCONDITIONAL_PREEMPT_DELAY_SEC);
++    reducerNoHeadroomPreemptionDelayMs = conf.getInt(
+-    //check if reduces have taken over the whole cluster and there are 
+-    //unassigned maps
+-    if (scheduledRequests.maps.size() > 0) {
+-      Resource resourceLimit = getResourceLimit();
+-      Resource availableResourceForMap =
+-          Resources.subtract(
+-            resourceLimit,
+-            Resources.multiply(reduceResourceRequest,
+-              assignedRequests.reduces.size()
+-                  - assignedRequests.preemptionWaitingReduces.size()));
+-      // availableMemForMap must be sufficient to run at least 1 map
+-      if (ResourceCalculatorUtils.computeAvailableContainers(availableResourceForMap,
+-        mapResourceRequest, getSchedulerResourceTypes()) <= 0) {
+-        // to make sure new containers are given to maps and not reduces
+-        // ramp down all scheduled reduces if any
+-        // (since reduces are scheduled at higher priority than maps)
+-        LOG.info("Ramping down all scheduled reduces:"
+-            + scheduledRequests.reduces.size());
+-        for (ContainerRequest req : scheduledRequests.reduces.values()) {
+-          pendingReduces.add(req);
+-        }
+-        scheduledRequests.reduces.clear();
+-        //do further checking to find the number of map requests that were
+-        //hanging around for a while
+-        int hangingMapRequests = getNumOfHangingRequests(scheduledRequests.maps);
+-        if (hangingMapRequests > 0) {
+-          // preempt for making space for at least one map
+-          int preemptionReduceNumForOneMap =
+-              ResourceCalculatorUtils.divideAndCeilContainers(mapResourceRequest,
+-                reduceResourceRequest, getSchedulerResourceTypes());
+-          int preemptionReduceNumForPreemptionLimit =
+-              ResourceCalculatorUtils.divideAndCeilContainers(
+-                Resources.multiply(resourceLimit, maxReducePreemptionLimit),
+-                reduceResourceRequest, getSchedulerResourceTypes());
+-          int preemptionReduceNumForAllMaps =
+-              ResourceCalculatorUtils.divideAndCeilContainers(
+-                Resources.multiply(mapResourceRequest, hangingMapRequests),
+-                reduceResourceRequest, getSchedulerResourceTypes());
+-          int toPreempt =
+-              Math.min(Math.max(preemptionReduceNumForOneMap,
+-                preemptionReduceNumForPreemptionLimit),
+-                preemptionReduceNumForAllMaps);
++    if (assignedRequests.maps.size() > 0) {
++      // there are assigned mappers
++      return;
++    }
+-          LOG.info("Going to preempt " + toPreempt
+-              + " due to lack of space for maps");
+-          assignedRequests.preemptReduce(toPreempt);
+-        }
++    if (scheduledRequests.maps.size() <= 0) {
++      // there are no pending requests for mappers
++      return;
++    }
++    // At this point:
++    // we have pending mappers and all assigned resources are taken by reducers
++
++    if (reducerUnconditionalPreemptionDelayMs >= 0) {
++      // Unconditional preemption is enabled.
++      // If mappers are pending for longer than the configured threshold,
++      // preempt reducers irrespective of what the headroom is.
++      if (preemptReducersForHangingMapRequests(
++          reducerUnconditionalPreemptionDelayMs)) {
++        return;
++
++    // The pending mappers haven't been waiting for too long. Let us see if
++    // the headroom can fit a mapper.
++    Resource availableResourceForMap = getAvailableResources();
++    if (ResourceCalculatorUtils.computeAvailableContainers(availableResourceForMap,
++        mapResourceRequest, getSchedulerResourceTypes()) > 0) {
++      // the available headroom is enough to run a mapper
++      return;
++    }
++
++    // Available headroom is not enough to run mapper. See if we should hold
++    // off before preempting reducers and preempt if okay.
++    preemptReducersForHangingMapRequests(reducerNoHeadroomPreemptionDelayMs);
+-  private int getNumOfHangingRequests(Map<TaskAttemptId, ContainerRequest> requestMap) {
++  private boolean preemptReducersForHangingMapRequests(long pendingThreshold) {
++    int hangingMapRequests = getNumHangingRequests(
++        pendingThreshold, scheduledRequests.maps);
++    if (hangingMapRequests > 0) {
++      preemptReducer(hangingMapRequests);
++      return true;
++    }
++    return false;
++  }
++
++  private void clearAllPendingReduceRequests() {
++    LOG.info("Ramping down all scheduled reduces:"
++        + scheduledRequests.reduces.size());
++    for (ContainerRequest req : scheduledRequests.reduces.values()) {
++      pendingReduces.add(req);
++    }
++    scheduledRequests.reduces.clear();
++  }
++
++  private void preemptReducer(int hangingMapRequests) {
++    clearAllPendingReduceRequests();
++
++    // preempt for making space for at least one map
++    int preemptionReduceNumForOneMap =
++        ResourceCalculatorUtils.divideAndCeilContainers(mapResourceRequest,
++            reduceResourceRequest, getSchedulerResourceTypes());
++    int preemptionReduceNumForPreemptionLimit =
++        ResourceCalculatorUtils.divideAndCeilContainers(
++            Resources.multiply(getResourceLimit(), maxReducePreemptionLimit),
++            reduceResourceRequest, getSchedulerResourceTypes());
++    int preemptionReduceNumForAllMaps =
++        ResourceCalculatorUtils.divideAndCeilContainers(
++            Resources.multiply(mapResourceRequest, hangingMapRequests),
++            reduceResourceRequest, getSchedulerResourceTypes());
++    int toPreempt =
++        Math.min(Math.max(preemptionReduceNumForOneMap,
++                preemptionReduceNumForPreemptionLimit),
++            preemptionReduceNumForAllMaps);
++
++    LOG.info("Going to preempt " + toPreempt
++        + " due to lack of space for maps");
++    assignedRequests.preemptReduce(toPreempt);
++  }
++
++  private int getNumHangingRequests(long allocationDelayThresholdMs,
++      Map<TaskAttemptId, ContainerRequest> requestMap) {
+-    if (headRoom == null) {
+-      headRoom = Resources.none();
+-    }
+-    Resource headRoom =
+-        getAvailableResources() == null ? Resources.none() :
+-            Resources.clone(getAvailableResources());
++    Resource headRoom = Resources.clone(getAvailableResources());
+-    Resource newHeadRoom =
+-        getAvailableResources() == null ? Resources.none()
+-            : getAvailableResources();
++    Resource newHeadRoom = getAvailableResources();
+-    if (headRoom == null) {
+-      headRoom = Resources.none();
+-    }
+
+INS23 INS31 INS31 INS31 INS83 INS39 INS59 MOV78 MOV78 INS39 INS42 INS8 INS83 INS39 INS42 INS44 INS8 INS83 INS39 INS42 INS8 INS83 UPD42 INS44 MOV8 UPD42 INS44 INS42 UPD42 INS21 MOV25 INS25 INS25 INS25 INS60 INS25 INS21 INS39 INS42 INS60 INS25 INS41 MOV21 MOV70 MOV21 INS39 INS42 INS21 INS39 INS42 INS7 INS27 INS8 UPD27 MOV27 INS8 INS27 INS8 MOV43 INS59 UPD27 MOV27 INS8 INS32 INS39 INS59 MOV27 INS8 INS9 INS32 INS42 INS27 UPD42 INS32 INS34 INS41 INS41 INS42 INS34 INS25 INS42 MOV32 INS41 INS42 INS42 INS42 INS32 INS21 INS41 INS42 MOV32 MOV32 INS34 INS32 INS40 INS42 INS32 INS8 INS42 INS42 INS40 INS32 INS9 INS42 INS42 INS40 INS40 INS42 INS42 INS41 INS42 INS42 MOV32 DEL66 DEL66 DEL65 DEL29 DEL42 DEL42 DEL43 DEL42 DEL59 DEL60 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL40 DEL42 DEL32 DEL40 DEL42 DEL32 DEL27 DEL32 DEL32 DEL59 DEL60 DEL39 DEL42 DEL42 DEL40 DEL32 DEL59 DEL60 DEL25 DEL8 DEL25 DEL8 DEL25 DEL8 DEL42 DEL33 DEL27 DEL42 DEL42 DEL42 DEL32 DEL7 DEL21 DEL8 DEL25 DEL33 DEL27 DEL42 DEL42 DEL32 DEL16 DEL42 DEL32 DEL33 DEL27 DEL42 DEL42 DEL32 DEL16 DEL42 DEL33 DEL27 DEL42 DEL42 DEL42 DEL32 DEL7 DEL21 DEL8 DEL25

@@ -1,0 +1,358 @@
+HDFS-8965. Harden edit log reading code against out of memory errors (cmccabe)
+
+-  public static class Reader {
+-    private final DataInputStream in;
+-    private final StreamLimiter limiter;
+-    private final int logVersion;
+-    private final Checksum checksum;
+-    private final OpInstanceCache cache;
+-    private int maxOpSize;
+-    private final boolean supportEditLogLength;
++  public abstract static class Reader {
++    final DataInputStream in;
++    final StreamLimiter limiter;
++    final OpInstanceCache cache;
++    final byte[] temp = new byte[4096];
++    final int logVersion;
++    int maxOpSize;
++
++    public static Reader create(DataInputStream in, StreamLimiter limiter,
++                                int logVersion) {
++      if (logVersion < NameNodeLayoutVersion.CURRENT_LAYOUT_VERSION) {
++        // Use the LengthPrefixedReader on edit logs which are newer than what
++        // we can parse.  (Newer layout versions are represented by smaller
++        // negative integers, for historical reasons.) Even though we can't
++        // parse the Ops contained in them, we should still be able to call
++        // scanOp on them.  This is important for the JournalNode during rolling
++        // upgrade.
++        return new LengthPrefixedReader(in, limiter, logVersion);
++      } else if (NameNodeLayoutVersion.supports(
++              NameNodeLayoutVersion.Feature.EDITLOG_LENGTH, logVersion)) {
++        return new LengthPrefixedReader(in, limiter, logVersion);
++      } else if (NameNodeLayoutVersion.supports(
++          LayoutVersion.Feature.EDITS_CHECKSUM, logVersion)) {
++        Checksum checksum = DataChecksum.newCrc32();
++        return new ChecksummedReader(checksum, in, limiter, logVersion);
++      } else {
++        return new LegacyReader(in, limiter, logVersion);
++      }
++    }
+-     * @param in The stream to read from.
+-     * @param logVersion The version of the data coming from the stream.
++     * @param in            The stream to read from.
++     * @param limiter       The limiter for this stream.
++     * @param logVersion    The version of the data coming from the stream.
+-    public Reader(DataInputStream in, StreamLimiter limiter, int logVersion) {
+-      this.logVersion = logVersion;
+-      if (NameNodeLayoutVersion.supports(
+-          LayoutVersion.Feature.EDITS_CHESKUM, logVersion)) {
+-        this.checksum = DataChecksum.newCrc32();
+-      } else {
+-        this.checksum = null;
+-      }
+-      // It is possible that the logVersion is actually a future layoutversion
+-      // during the rolling upgrade (e.g., the NN gets upgraded first). We
+-      // assume future layout will also support length of editlog op.
+-      this.supportEditLogLength = NameNodeLayoutVersion.supports(
+-          NameNodeLayoutVersion.Feature.EDITLOG_LENGTH, logVersion)
+-          || logVersion < NameNodeLayoutVersion.CURRENT_LAYOUT_VERSION;
+-
+-      if (this.checksum != null) {
+-        this.in = new DataInputStream(
+-            new CheckedInputStream(in, this.checksum));
+-      } else {
+-        this.in = in;
+-      }
++    Reader(DataInputStream in, StreamLimiter limiter, int logVersion) {
++      this.in = in;
++      this.logVersion = logVersion;
+-    private void verifyTerminator() throws IOException {
++    void verifyTerminator() throws IOException {
+-      byte[] buf = new byte[4096];
+-          numRead = in.read(buf);
++          numRead = in.read(temp);
+-            if ((buf[idx] != (byte)0) && (buf[idx] != (byte)-1)) {
++            if ((temp[idx] != (byte)0) && (temp[idx] != (byte)-1)) {
+-            in.mark(buf.length + 1);
++            in.mark(temp.length + 1);
+-    private FSEditLogOp decodeOp() throws IOException {
++    public abstract FSEditLogOp decodeOp() throws IOException;
++
++    /**
++     * Similar to decodeOp(), but we only retrieve the transaction ID of the
++     * Op rather than reading it.  If the edit log format supports length
++     * prefixing, this can be much faster than full decoding.
++     *
++     * @return the last txid of the segment, or INVALID_TXID on EOF.
++     */
++    public abstract long scanOp() throws IOException;
++  }
++
++  /**
++   * Reads edit logs which are prefixed with a length.  These edit logs also
++   * include a checksum and transaction ID.
++   */
++  private static class LengthPrefixedReader extends Reader {
++    /**
++     * The minimum length of a length-prefixed Op.
++     *
++     * The minimum Op has:
++     * 1-byte opcode
++     * 4-byte length
++     * 8-byte txid
++     * 0-byte body
++     * 4-byte checksum
++     */
++    private static final int MIN_OP_LENGTH = 17;
++
++    /**
++     * The op id length.
++     *
++     * Not included in the stored length.
++     */
++    private static final int OP_ID_LENGTH = 1;
++
++    /**
++     * The checksum length.
++     *
++     * Not included in the stored length.
++     */
++    private static final int CHECKSUM_LENGTH = 4;
++
++    private final Checksum checksum;
++
++    LengthPrefixedReader(DataInputStream in, StreamLimiter limiter,
++                         int logVersion) {
++      super(in, limiter, logVersion);
++      this.checksum = DataChecksum.newCrc32();
++    }
++
++    @Override
++    public FSEditLogOp decodeOp() throws IOException {
++      long txid = decodeOpFrame();
++      if (txid == HdfsServerConstants.INVALID_TXID) {
++        return null;
++      }
++      in.reset();
++      in.mark(maxOpSize);
++      FSEditLogOpCodes opCode = FSEditLogOpCodes.fromByte(in.readByte());
++      FSEditLogOp op = cache.get(opCode);
++      if (op == null) {
++        throw new IOException("Read invalid opcode " + opCode);
++      }
++      op.setTransactionId(txid);
++      IOUtils.skipFully(in, 4 + 8); // skip length and txid
++      op.readFields(in, logVersion);
++      // skip over the checksum, which we validated above.
++      IOUtils.skipFully(in, CHECKSUM_LENGTH);
++      return op;
++    }
++
++    @Override
++    public long scanOp() throws IOException {
++      return decodeOpFrame();
++    }
++
++    /**
++     * Decode the opcode "frame".  This includes reading the opcode and
++     * transaction ID, and validating the checksum and length.  It does not
++     * include reading the opcode-specific fields.
++     * The input stream will be advanced to the end of the op at the end of this
++     * function.
++     *
++     * @return        An op with the txid set, but none of the other fields
++     *                  filled in, or null if we hit EOF.
++     */
++    private long decodeOpFrame() throws IOException {
+-
+-      if (checksum != null) {
+-        checksum.reset();
++      byte opCodeByte;
++      try {
++        opCodeByte = in.readByte();
++      } catch (EOFException eof) {
++        // EOF at an opcode boundary is expected.
++        return HdfsServerConstants.INVALID_TXID;
++      if (opCodeByte == FSEditLogOpCodes.OP_INVALID.getOpCode()) {
++        verifyTerminator();
++        return HdfsServerConstants.INVALID_TXID;
++      }
++      // Here, we verify that the Op size makes sense and that the
++      // data matches its checksum before attempting to construct an Op.
++      // This is important because otherwise we may encounter an
++      // OutOfMemoryException which could bring down the NameNode or
++      // JournalNode when reading garbage data.
++      int opLength =  in.readInt() + OP_ID_LENGTH + CHECKSUM_LENGTH;
++      if (opLength > maxOpSize) {
++        throw new IOException("Op " + (int)opCodeByte + " has size " +
++            opLength + ", but maxOpSize = " + maxOpSize);
++      } else  if (opLength < MIN_OP_LENGTH) {
++        throw new IOException("Op " + (int)opCodeByte + " has size " +
++            opLength + ", but the minimum op size is " + MIN_OP_LENGTH);
++      }
++      long txid = in.readLong();
++      // Verify checksum
++      in.reset();
++      in.mark(maxOpSize);
++      checksum.reset();
++      for (int rem = opLength - CHECKSUM_LENGTH; rem > 0;) {
++        int toRead = Math.min(temp.length, rem);
++        IOUtils.readFully(in, temp, 0, toRead);
++        checksum.update(temp, 0, toRead);
++        rem -= toRead;
++      }
++      int expectedChecksum = in.readInt();
++      int calculatedChecksum = (int)checksum.getValue();
++      if (expectedChecksum != calculatedChecksum) {
++        throw new ChecksumException(
++            "Transaction is corrupt. Calculated checksum is " +
++            calculatedChecksum + " but read checksum " +
++            expectedChecksum, txid);
++      }
++      return txid;
++    }
++  }
++  /**
++   * Read edit logs which have a checksum and a transaction ID, but not a
++   * length.
++   */
++  private static class ChecksummedReader extends Reader {
++    private final Checksum checksum;
++
++    ChecksummedReader(Checksum checksum, DataInputStream in,
++                      StreamLimiter limiter, int logVersion) {
++      super(new DataInputStream(
++          new CheckedInputStream(in, checksum)), limiter, logVersion);
++      this.checksum = checksum;
++    }
++
++    @Override
++    public FSEditLogOp decodeOp() throws IOException {
++      limiter.setLimit(maxOpSize);
++      in.mark(maxOpSize);
++      // Reset the checksum.  Since we are using a CheckedInputStream, each
++      // subsequent read from the  stream will update the checksum.
++      checksum.reset();
+-
+-
+-
+-      if (supportEditLogLength) {
+-        in.readInt();
++      op.setTransactionId(in.readLong());
++      op.readFields(in, logVersion);
++      // Verify checksum
++      int calculatedChecksum = (int)checksum.getValue();
++      int expectedChecksum = in.readInt();
++      if (expectedChecksum != calculatedChecksum) {
++        throw new ChecksumException(
++            "Transaction is corrupt. Calculated checksum is " +
++                calculatedChecksum + " but read checksum " +
++                expectedChecksum, op.txid);
++      return op;
++    }
++    @Override
++    public long scanOp() throws IOException {
++      // Edit logs of this age don't have any length prefix, so we just have
++      // to read the entire Op.
++      FSEditLogOp op = decodeOp();
++      return op == null ?
++          HdfsServerConstants.INVALID_TXID : op.getTransactionId();
++    }
++  }
++
++  /**
++   * Read older edit logs which may or may not have transaction IDs and other
++   * features.  This code is used during upgrades and to allow HDFS INotify to
++   * read older edit log files.
++   */
++  private static class LegacyReader extends Reader {
++    LegacyReader(DataInputStream in,
++                      StreamLimiter limiter, int logVersion) {
++      super(in, limiter, logVersion);
++    }
++
++    @Override
++    public FSEditLogOp decodeOp() throws IOException {
++      limiter.setLimit(maxOpSize);
++      in.mark(maxOpSize);
++      byte opCodeByte;
++      try {
++        opCodeByte = in.readByte();
++      } catch (EOFException eof) {
++        // EOF at an opcode boundary is expected.
++        return null;
++      }
++      FSEditLogOpCodes opCode = FSEditLogOpCodes.fromByte(opCodeByte);
++      if (opCode == OP_INVALID) {
++        verifyTerminator();
++        return null;
++      }
++      FSEditLogOp op = cache.get(opCode);
++      if (op == null) {
++        throw new IOException("Read invalid opcode " + opCode);
++      }
+-          LayoutVersion.Feature.STORED_TXIDS, logVersion)) {
+-        // Read the txid
++            LayoutVersion.Feature.STORED_TXIDS, logVersion)) {
+-
+-
+-      validateChecksum(in, checksum, op.txid);
+-    /**
+-     * Similar with decodeOp(), but instead of doing the real decoding, we skip
+-     * the content of the op if the length of the editlog is supported.
+-     * @return the last txid of the segment, or INVALID_TXID on exception
+-     */
++    @Override
+-      if (supportEditLogLength) {
+-        limiter.setLimit(maxOpSize);
+-        in.mark(maxOpSize);
+-
+-        final byte opCodeByte;
+-        try {
+-          opCodeByte = in.readByte(); // op code
+-        } catch (EOFException e) {
+-          return HdfsServerConstants.INVALID_TXID;
+-        }
+-
+-        FSEditLogOpCodes opCode = FSEditLogOpCodes.fromByte(opCodeByte);
+-        if (opCode == OP_INVALID) {
+-          verifyTerminator();
+-          return HdfsServerConstants.INVALID_TXID;
+-        }
+-
+-        int length = in.readInt(); // read the length of the op
+-        long txid = in.readLong(); // read the txid
+-
+-        // skip the remaining content
+-        IOUtils.skipFully(in, length - 8); 
+-        // TODO: do we want to verify checksum for JN? For now we don't.
+-        return txid;
+-      } else {
+-        FSEditLogOp op = decodeOp();
+-        return op == null ? HdfsServerConstants.INVALID_TXID : op.getTransactionId();
++      if (!NameNodeLayoutVersion.supports(
++          LayoutVersion.Feature.STORED_TXIDS, logVersion)) {
++        throw new IOException("Can't scan a pre-transactional edit log.");
+-    }
+-
+-    /**
+-     * Validate a transaction's checksum
+-     */
+-    private void validateChecksum(DataInputStream in,
+-                                  Checksum checksum,
+-                                  long txid)
+-        throws IOException {
+-      if (checksum != null) {
+-        int calculatedChecksum = (int)checksum.getValue();
+-        int readChecksum = in.readInt(); // read in checksum
+-        if (readChecksum != calculatedChecksum) {
+-          throw new ChecksumException(
+-              "Transaction is corrupt. Calculated checksum is " +
+-              calculatedChecksum + " but read checksum " + readChecksum, txid);
+-        }
+-      }
++      FSEditLogOp op = decodeOp();
++      return op == null ?
++          HdfsServerConstants.INVALID_TXID : op.getTransactionId();
+
+MOV23 MOV23 MOV31 INS55 INS55 INS55 INS83 INS31 INS29 INS83 INS83 INS42 INS43 INS23 INS23 INS23 MOV23 INS31 INS31 INS31 INS31 INS29 INS83 INS83 INS42 INS43 INS23 INS31 INS31 INS31 INS29 INS83 INS83 INS42 INS43 INS31 MOV31 INS31 MOV5 MOV59 UPD39 MOV59 INS83 INS43 INS42 INS44 INS44 INS44 MOV21 MOV29 INS83 INS83 INS43 INS42 INS43 UPD83 INS83 INS39 INS42 INS65 INS42 INS29 INS83 INS83 INS83 INS39 INS59 INS29 INS83 INS83 INS83 INS39 INS59 INS29 INS83 INS83 INS83 INS39 INS59 INS42 INS44 INS44 INS44 MOV8 INS78 INS83 INS43 INS42 INS43 INS8 INS78 INS83 INS39 INS42 INS43 INS8 INS29 INS83 INS39 INS42 INS43 INS8 INS65 INS42 INS83 INS83 INS43 INS59 INS42 MOV44 MOV44 INS44 INS44 INS8 INS78 INS83 INS43 INS42 INS43 INS8 INS78 INS83 INS39 INS42 MOV43 MOV8 INS65 INS42 INS42 INS44 INS44 INS44 INS8 INS78 UPD83 INS78 INS83 INS39 INS42 INS43 INS8 UPD42 INS42 INS43 INS42 INS43 INS42 INS39 INS42 INS25 INS65 MOV21 INS42 INS42 INS65 INS66 INS66 INS65 INS42 INS34 INS65 INS42 INS34 INS65 INS42 INS34 INS43 INS42 INS43 INS42 INS39 INS42 INS46 INS42 INS42 INS42 INS60 INS25 INS21 INS21 INS60 INS60 INS25 INS21 INS21 INS21 INS21 INS41 INS42 INS42 INS41 INS65 INS65 INS42 MOV21 MOV21 INS60 MOV54 MOV25 INS60 INS25 MOV60 INS21 INS21 INS21 INS24 MOV60 INS60 INS25 MOV41 INS66 INS66 INS42 INS42 INS43 INS42 INS39 INS42 INS46 INS21 INS42 INS42 INS42 INS21 INS21 MOV21 INS60 INS54 MOV60 INS25 INS60 INS25 INS21 INS21 MOV60 MOV60 INS25 INS41 INS42 INS66 INS66 INS66 INS43 INS42 INS43 INS42 INS39 INS42 INS46 INS42 INS42 INS42 INS25 INS60 INS41 INS42 INS42 MOV27 INS8 INS25 UPD66 INS42 INS66 UPD66 UPD66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS42 INS42 INS42 INS42 INS42 INS39 INS59 INS27 INS8 INS32 INS32 INS43 INS59 INS43 INS59 INS27 INS8 INS32 INS32 INS32 INS32 INS42 INS32 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS39 INS59 INS39 INS59 INS27 INS8 INS25 INS32 INS32 INS32 INS58 INS27 INS8 INS39 INS59 INS27 INS8 INS42 MOV14 INS42 INS42 INS7 INS32 INS32 INS39 INS59 INS8 INS12 INS27 INS8 INS43 INS59 INS27 INS8 INS32 INS32 INS27 INS8 INS42 INS42 INS42 INS42 INS42 INS42 INS38 INS8 INS43 INS59 INS16 INS41 MOV32 INS8 INS25 INS42 INS32 INS42 INS40 INS41 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS33 INS53 INS42 INS42 INS42 INS42 INS42 INS42 INS27 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 UPD42 INS32 INS42 INS27 INS42 INS42 INS53 INS27 INS8 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS39 INS59 INS42 INS34 INS60 INS21 INS21 INS21 UPD42 INS42 INS11 INS42 INS42 INS53 MOV22 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS21 INS44 INS8 INS42 INS42 INS21 INS41 INS42 INS42 INS32 INS42 INS33 INS53 INS42 INS42 INS32 INS42 INS42 INS42 INS42 UPD42 INS42 INS42 INS53 INS32 INS53 INS42 INS42 INS32 INS27 INS40 INS32 INS14 INS41 INS32 MOV8 INS8 INS42 INS33 INS42 INS42 INS32 INS42 INS42 INS42 INS14 INS34 INS34 UPD42 INS40 INS42 MOV32 INS42 INS42 INS14 INS42 INS42 INS53 INS42 INS27 INS39 INS59 INS32 INS32 INS7 INS39 INS32 INS14 INS42 INS7 INS43 INS42 INS41 INS32 INS33 INS42 INS42 INS42 INS14 INS42 INS42 INS14 INS42 INS42 INS40 INS42 INS14 INS42 INS42 INS33 INS42 INS42 INS43 INS42 INS42 INS42 INS14 INS42 INS42 INS40 INS42 INS41 INS41 INS42 INS42 INS43 INS27 INS43 INS27 INS14 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS34 INS42 INS42 INS42 INS42 INS34 INS42 INS42 INS42 INS42 INS42 MOV43 INS27 INS42 INS42 INS32 INS42 INS33 INS42 INS43 INS27 INS43 INS27 INS40 INS43 INS45 INS42 INS43 INS42 INS42 INS42 INS43 INS14 INS14 INS42 INS45 INS42 INS42 INS45 INS11 INS45 INS42 INS45 INS42 INS43 INS27 INS42 INS42 INS40 INS42 INS45 INS42 INS45 INS42 INS42 INS42 INS42 INS45 INS42 INS42 INS45 INS42 INS45 INS42 INS42 INS42 INS42 UPD42 INS32 INS43 INS42 INS42 INS42 INS42 INS43 INS42 INS42 INS42 INS39 INS42 INS42 INS45 INS11 INS45 INS42 INS45 INS42 INS42 INS42 INS42 INS42 UPD42 INS39 INS42 UPD40 UPD42 UPD42 DEL83 DEL83 DEL83 DEL83 DEL39 DEL83 DEL42 DEL59 DEL83 DEL66 DEL66 DEL65 DEL66 DEL65 DEL29 DEL39 DEL42 DEL83 DEL39 DEL42 DEL42 DEL42 DEL42 DEL34 DEL27 DEL32 DEL21 DEL42 DEL25 DEL83 DEL42 DEL42 DEL40 DEL42 DEL32 DEL52 DEL42 DEL22 DEL33 DEL7 DEL21 DEL8 DEL25 DEL52 DEL42 DEL22 DEL27 DEL7 DEL21 DEL33 DEL27 DEL52 DEL42 DEL22 DEL7 DEL21 DEL8 DEL8 DEL25 DEL83 DEL60 DEL39 DEL42 DEL39 DEL42 DEL44 DEL42 DEL33 DEL27 DEL42 DEL42 DEL27 DEL45 DEL42 DEL45 DEL42 DEL27 DEL42 DEL14 DEL53 DEL8 DEL25 DEL8 DEL25 DEL8 DEL42 DEL52 DEL42 DEL22 DEL42 DEL33 DEL27 DEL8 DEL25 DEL42 DEL21 DEL8 DEL25 DEL42 DEL42 DEL42 DEL40 DEL32 DEL21

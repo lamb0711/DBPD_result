@@ -1,0 +1,223 @@
+HADOOP-14445. Use DelegationTokenIssuer to create KMS delegation tokens that can authenticate to all KMS instances.
+Contributed by Daryn Sharp, Xiao Chen, Rushabh S Shah.
+
+-import org.apache.hadoop.security.authentication.client.AuthenticatedURL;
+-import org.apache.hadoop.security.authentication.client.KerberosAuthenticator;
++import org.apache.hadoop.security.token.delegation.AbstractDelegationTokenSelector;
+-import java.net.InetSocketAddress;
+-  private static final Logger LOG =
++  static final Logger LOG =
++  private KeyProviderDelegationTokenExtension.DelegationTokenExtension
++      clientTokenProvider = this;
++  // the token's service.
+-
+-  // Allow fallback to default kms server port 9600 for certain tests that do
+-  // not specify the port explicitly in the kms provider url.
+-  @VisibleForTesting
+-  public static volatile boolean fallbackDefaultPortForTesting = false;
++  // alias in the credentials.
++  private final Text canonicalService;
++  static class TokenSelector extends AbstractDelegationTokenSelector {
++    static final TokenSelector INSTANCE = new TokenSelector();
++
++    TokenSelector() {
++      super(TOKEN_KIND);
++    }
++  }
++
+-      KeyProvider keyProvider = KMSUtil.createKeyProvider(conf,
+-          KeyProviderFactory.KEY_PROVIDER_PATH);
++      KeyProvider keyProvider = createKeyProvider(token, conf);
+-      KeyProvider keyProvider = KMSUtil.createKeyProvider(conf,
+-          KeyProviderFactory.KEY_PROVIDER_PATH);
++      KeyProvider keyProvider = createKeyProvider(token, conf);
++
++    private static KeyProvider createKeyProvider(
++        Token<?> token, Configuration conf) throws IOException {
++      String service = token.getService().toString();
++      URI uri;
++      if (service != null && service.startsWith(SCHEME_NAME + ":/")) {
++        LOG.debug("Creating key provider with token service value {}", service);
++        uri = URI.create(service);
++      } else { // conf fallback
++        uri = KMSUtil.getKeyProviderUri(conf);
++      }
++      return (uri != null) ? KMSUtil.createKeyProviderFromUri(conf, uri) : null;
++    }
+-        return createProvider(conf, origUrl, port, hostsPart);
++        KMSClientProvider[] providers =
++            createProviders(conf, origUrl, port, hostsPart);
++        return new LoadBalancingKMSClientProvider(providerUri, providers, conf);
+-    private KeyProvider createProvider(Configuration conf,
++    private KMSClientProvider[] createProviders(Configuration conf,
+-      return new LoadBalancingKMSClientProvider(providers, conf);
++      return providers;
+-    int kmsPort = kmsUrl.getPort();
+-    if ((kmsPort == -1) && fallbackDefaultPortForTesting) {
+-      kmsPort = 9600;
+-    }
+-
+-    InetSocketAddress addr = new InetSocketAddress(kmsUrl.getHost(), kmsPort);
+-    dtService = SecurityUtil.buildTokenService(addr);
++    // the token's service so it can be instantiated for renew/cancel.
++    dtService = getDtService(uri);
++    // the canonical service is the alias for the token in the credentials.
++    // typically it's the actual service in the token but older clients expect
++    // an address.
++    URI serviceUri = URI.create(kmsUrl.toString());
++    canonicalService = SecurityUtil.buildTokenService(serviceUri);
+-    LOG.debug("KMSClientProvider for KMS url: {} delegation token service: {}" +
+-        " created.", kmsUrl, dtService);
++    LOG.debug("KMSClientProvider created for KMS url: {} delegation token "
++            + "service: {} canonical service: {}.", kmsUrl, dtService,
++        canonicalService);
++  }
++
++  protected static Text getDtService(URI uri) {
++    Text service;
++    // remove fragment for forward compatibility with logical naming.
++    final String fragment = uri.getFragment();
++    if (fragment != null) {
++      service = new Text(
++          uri.getScheme() + ":" + uri.getSchemeSpecificPart());
++    } else {
++      service = new Text(uri.toString());
++    }
++    return service;
+-              new DelegationTokenAuthenticatedURL(configurator);
++              createAuthenticatedURL();
++  // note: this is only a crutch for backwards compatibility.
++  // override the instance that will be used to select a token, intended
++  // to allow load balancing provider to find a token issued by any of its
++  // sub-providers.
++  protected void setClientTokenProvider(
++      KeyProviderDelegationTokenExtension.DelegationTokenExtension provider) {
++    clientTokenProvider = provider;
++  }
++
++  @VisibleForTesting
++  DelegationTokenAuthenticatedURL createAuthenticatedURL() {
++    return new DelegationTokenAuthenticatedURL(configurator) {
++      @Override
++      public org.apache.hadoop.security.token.Token<? extends TokenIdentifier>
++          selectDelegationToken(URL url, Credentials creds) {
++        if (LOG.isDebugEnabled()) {
++          LOG.debug("Looking for delegation token. creds: {}",
++              creds.getAllTokens());
++        }
++        // clientTokenProvider is either "this" or a load balancing instance.
++        // if the latter, it will first look for the load balancer's uri
++        // service followed by each sub-provider for backwards-compatibility.
++        return clientTokenProvider.selectDelegationToken(creds);
++      }
++    };
++  }
++
++  @InterfaceAudience.Private
++  @Override
++  public Token<?> selectDelegationToken(Credentials creds) {
++    Token<?> token = selectDelegationToken(creds, dtService);
++    if (token == null) {
++      token = selectDelegationToken(creds, canonicalService);
++    }
++    return token;
++  }
++
++  protected static Token<?> selectDelegationToken(Credentials creds,
++                                                  Text service) {
++    Token<?> token = creds.getToken(service);
++    LOG.debug("selected by alias={} token={}", service, token);
++    if (token != null && TOKEN_KIND.equals(token.getKind())) {
++      return token;
++    }
++    token = TokenSelector.INSTANCE.selectToken(service, creds.getAllTokens());
++    LOG.debug("selected by service={} token={}", service, token);
++    return token;
++  }
++
++  @Override
++  public String getCanonicalServiceName() {
++    return canonicalService.toString();
++  }
++
++  @Override
++  public Token<?> getDelegationToken(final String renewer) throws IOException {
++    final URL url = createURL(null, null, null, null);
++    final DelegationTokenAuthenticatedURL authUrl =
++        new DelegationTokenAuthenticatedURL(configurator);
++    Token<?> token = null;
++    try {
++      final String doAsUser = getDoAsUser();
++      token = getActualUgi().doAs(new PrivilegedExceptionAction<Token<?>>() {
++        @Override
++        public Token<?> run() throws Exception {
++          // Not using the cached token here.. Creating a new token here
++          // everytime.
++          LOG.debug("Getting new token from {}, renewer:{}", url, renewer);
++          return authUrl.getDelegationToken(url,
++              new DelegationTokenAuthenticatedURL.Token(), renewer, doAsUser);
++        }
++      });
++      if (token != null) {
++        token.setService(dtService);
++        LOG.info("New token created: ({})", token);
++      } else {
++        throw new IOException("Got NULL as delegation token");
++      }
++    } catch (InterruptedException e) {
++      Thread.currentThread().interrupt();
++    } catch (Exception e) {
++      if (e instanceof IOException) {
++        throw (IOException) e;
++      } else {
++        throw new IOException(e);
++      }
++    }
++    return token;
++  }
++
+-          new DelegationTokenAuthenticatedURL(configurator);
++          createAuthenticatedURL();
+-                  new DelegationTokenAuthenticatedURL(configurator);
++                  createAuthenticatedURL();
+-  @Override
+-  public Token<?>[] addDelegationTokens(final String renewer,
+-      Credentials credentials) throws IOException {
+-    Token<?>[] tokens = null;
+-    Token<?> token = credentials.getToken(dtService);
+-    if (token == null) {
+-      final URL url = createURL(null, null, null, null);
+-      final DelegationTokenAuthenticatedURL authUrl =
+-          new DelegationTokenAuthenticatedURL(configurator);
+-      try {
+-        final String doAsUser = getDoAsUser();
+-        token = getActualUgi().doAs(new PrivilegedExceptionAction<Token<?>>() {
+-          @Override
+-          public Token<?> run() throws Exception {
+-            // Not using the cached token here.. Creating a new token here
+-            // everytime.
+-            LOG.info("Getting new token from {}, renewer:{}", url, renewer);
+-            return authUrl.getDelegationToken(url,
+-                new DelegationTokenAuthenticatedURL.Token(), renewer, doAsUser);
+-          }
+-        });
+-        if (token != null) {
+-          LOG.info("New token received: ({})", token);
+-          credentials.addToken(token.getService(), token);
+-          tokens = new Token<?>[] { token };
+-        } else {
+-          throw new IOException("Got NULL as delegation token");
+-        }
+-      } catch (InterruptedException e) {
+-        Thread.currentThread().interrupt();
+-      } catch (Exception e) {
+-        if (e instanceof IOException) {
+-          throw (IOException) e;
+-        } else {
+-          throw new IOException(e);
+-        }
+-      }
+-    }
+-    return tokens;
+-  }
+-

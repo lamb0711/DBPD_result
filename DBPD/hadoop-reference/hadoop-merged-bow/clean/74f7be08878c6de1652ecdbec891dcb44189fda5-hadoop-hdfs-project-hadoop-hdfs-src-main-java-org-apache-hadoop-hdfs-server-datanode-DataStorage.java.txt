@@ -1,0 +1,187 @@
+merge from trunk r1617527
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/branches/fs-encryption@1617532 13f79535-47bb-0310-9956-ffa450edef68
+
++import java.util.HashSet;
+-   * Analyze storage directories.
+-   * Recover from previous transitions if required. 
+-   * Perform fs state transition if necessary depending on the namespace info.
+-   * Read storage info.
+-   * <br>
+-   * This method should be synchronized between multiple DN threads.  Only the 
+-   * first DN thread does DN level storage dir recoverTransitionRead.
+-   * 
++   * {{@inheritDoc org.apache.hadoop.hdfs.server.common.Storage#writeAll()}}
++   */
++  private void writeAll(Collection<StorageDirectory> dirs) throws IOException {
++    this.layoutVersion = getServiceLayoutVersion();
++    for (StorageDirectory dir : dirs) {
++      writeProperties(dir);
++    }
++  }
++
++  /**
++   * Add a list of volumes to be managed by DataStorage. If the volume is empty,
++   * format it, otherwise recover it from previous transitions if required.
++   *
++   * @param datanode the reference to DataNode.
+-  synchronized void recoverTransitionRead(DataNode datanode,
++  synchronized void addStorageLocations(DataNode datanode,
+-    if (initialized) {
+-      // DN storage has been initialized, no need to do anything
+-      return;
++    // Similar to recoverTransitionRead, it first ensures the datanode level
++    // format is completed.
++    List<StorageLocation> tmpDataDirs =
++        new ArrayList<StorageLocation>(dataDirs);
++    addStorageLocations(datanode, nsInfo, tmpDataDirs, startOpt, false, true);
++
++    Collection<File> bpDataDirs = new ArrayList<File>();
++    String bpid = nsInfo.getBlockPoolID();
++    for (StorageLocation dir : dataDirs) {
++      File dnRoot = dir.getFile();
++      File bpRoot = BlockPoolSliceStorage.getBpRoot(bpid, new File(dnRoot,
++          STORAGE_DIR_CURRENT));
++      bpDataDirs.add(bpRoot);
+-    LOG.info("Data-node version: " + HdfsConstants.DATANODE_LAYOUT_VERSION
+-        + " and name-node layout version: " + nsInfo.getLayoutVersion());
+-    
+-    // 1. For each data directory calculate its state and 
+-    // check whether all is consistent before transitioning.
+-    // Format and recover.
+-    this.storageDirs = new ArrayList<StorageDirectory>(dataDirs.size());
+-    ArrayList<StorageState> dataDirStates = new ArrayList<StorageState>(dataDirs.size());
++    // mkdir for the list of BlockPoolStorage
++    makeBlockPoolDataDir(bpDataDirs, null);
++    BlockPoolSliceStorage bpStorage = this.bpStorageMap.get(bpid);
++    if (bpStorage == null) {
++      bpStorage = new BlockPoolSliceStorage(
++          nsInfo.getNamespaceID(), bpid, nsInfo.getCTime(),
++          nsInfo.getClusterID());
++    }
++
++    bpStorage.recoverTransitionRead(datanode, nsInfo, bpDataDirs, startOpt);
++    addBlockPoolStorage(bpid, bpStorage);
++  }
++
++  /**
++   * Add a list of volumes to be managed by this DataStorage. If the volume is
++   * empty, it formats the volume, otherwise it recovers it from previous
++   * transitions if required.
++   *
++   * If isInitialize is false, only the directories that have finished the
++   * doTransition() process will be added into DataStorage.
++   *
++   * @param datanode the reference to DataNode.
++   * @param nsInfo namespace information
++   * @param dataDirs array of data storage directories
++   * @param startOpt startup option
++   * @param isInitialize whether it is called when DataNode starts up.
++   * @throws IOException
++   */
++  private synchronized void addStorageLocations(DataNode datanode,
++      NamespaceInfo nsInfo, Collection<StorageLocation> dataDirs,
++      StartupOption startOpt, boolean isInitialize, boolean ignoreExistingDirs)
++      throws IOException {
++    Set<String> existingStorageDirs = new HashSet<String>();
++    for (int i = 0; i < getNumStorageDirs(); i++) {
++      existingStorageDirs.add(getStorageDir(i).getRoot().getAbsolutePath());
++    }
++
++    // 1. For each data directory calculate its state and check whether all is
++    // consistent before transitioning. Format and recover.
++    ArrayList<StorageState> dataDirStates =
++        new ArrayList<StorageState>(dataDirs.size());
++    List<StorageDirectory> addedStorageDirectories =
++        new ArrayList<StorageDirectory>();
++      if (existingStorageDirs.contains(dataDir.getAbsolutePath())) {
++        LOG.info("Storage directory " + dataDir + " has already been used.");
++        it.remove();
++        continue;
++      }
+-        switch(curState) {
++        switch (curState) {
+-          LOG.info("Storage directory " + dataDir + " is not formatted");
++          LOG.info("Storage directory " + dataDir + " is not formatted for "
++            + nsInfo.getBlockPoolID());
+-      // add to the storage list
+-      addStorageDir(sd);
++      if (isInitialize) {
++        addStorageDir(sd);
++      }
++      addedStorageDirectories.add(sd);
+-    if (dataDirs.size() == 0 || dataDirStates.size() == 0)  // none of the data dirs exist
++    if (dataDirs.size() == 0 || dataDirStates.size() == 0) {
++      // none of the data dirs exist
++      if (ignoreExistingDirs) {
++        return;
++      }
++    }
+-    // During startup some of them can upgrade or rollback 
+-    // while others could be uptodate for the regular startup.
+-    try {
+-      for (int idx = 0; idx < getNumStorageDirs(); idx++) {
+-        doTransition(datanode, getStorageDir(idx), nsInfo, startOpt);
+-        createStorageID(getStorageDir(idx));
++    // During startup some of them can upgrade or rollback
++    // while others could be up-to-date for the regular startup.
++    for (Iterator<StorageDirectory> it = addedStorageDirectories.iterator();
++        it.hasNext(); ) {
++      StorageDirectory sd = it.next();
++      try {
++        doTransition(datanode, sd, nsInfo, startOpt);
++        createStorageID(sd);
++      } catch (IOException e) {
++        if (!isInitialize) {
++          sd.unlock();
++          it.remove();
++          continue;
++        }
++        unlockAll();
++        throw e;
+-    } catch (IOException e) {
+-      unlockAll();
+-      throw e;
+-    // 3. Update all storages. Some of them might have just been formatted.
+-    this.writeAll();
++    // 3. Update all successfully loaded storages. Some of them might have just
++    // been formatted.
++    this.writeAll(addedStorageDirectories);
++
++    // 4. Make newly loaded storage directories visible for service.
++    if (!isInitialize) {
++      this.storageDirs.addAll(addedStorageDirectories);
++    }
++  }
++
++  /**
++   * Analyze storage directories.
++   * Recover from previous transitions if required.
++   * Perform fs state transition if necessary depending on the namespace info.
++   * Read storage info.
++   * <br>
++   * This method should be synchronized between multiple DN threads.  Only the
++   * first DN thread does DN level storage dir recoverTransitionRead.
++   *
++   * @param nsInfo namespace information
++   * @param dataDirs array of data storage directories
++   * @param startOpt startup option
++   * @throws IOException
++   */
++  synchronized void recoverTransitionRead(DataNode datanode,
++      NamespaceInfo nsInfo, Collection<StorageLocation> dataDirs,
++      StartupOption startOpt)
++      throws IOException {
++    if (initialized) {
++      // DN storage has been initialized, no need to do anything
++      return;
++    }
++    LOG.info("DataNode version: " + HdfsConstants.DATANODE_LAYOUT_VERSION
++        + " and NameNode layout version: " + nsInfo.getLayoutVersion());
++
++    this.storageDirs = new ArrayList<StorageDirectory>(dataDirs.size());
++    addStorageLocations(datanode, nsInfo, dataDirs, startOpt, true, false);
+-    // 4. mark DN storage is initialized
++    // mark DN storage is initialized
+
+INS26 INS40 INS31 INS31 INS31 INS29 INS83 INS39 INS42 INS44 INS43 INS8 INS29 INS83 INS39 INS42 INS44 INS44 INS44 INS44 INS43 INS8 INS29 INS83 UPD42 INS44 INS44 MOV29 INS83 INS39 INS42 INS44 INS44 INS44 INS44 INS43 INS8 INS65 INS74 INS42 INS42 INS21 INS70 INS65 INS65 INS65 INS65 INS65 INS65 INS43 INS42 INS43 INS42 INS74 INS42 INS43 INS42 INS42 INS60 INS21 INS60 INS60 INS70 INS21 INS60 INS25 INS21 INS21 INS65 INS65 INS65 INS65 INS65 INS65 INS65 INS39 INS42 INS39 INS42 INS60 INS24 INS60 INS24 INS25 INS43 INS42 INS43 INS42 INS74 INS42 INS43 INS42 INS42 MOV25 MOV21 MOV21 INS21 MOV21 INS66 INS65 INS66 INS43 INS43 INS7 INS44 INS42 INS8 INS66 INS66 INS42 INS66 INS42 INS66 INS42 INS66 INS42 INS66 INS42 INS42 INS42 INS43 INS43 INS42 INS74 INS59 INS32 INS74 INS59 INS43 INS59 INS44 INS42 INS8 INS32 INS43 INS59 INS27 INS8 INS32 INS32 INS66 INS66 INS66 INS66 INS66 INS42 INS66 INS42 INS66 INS42 INS66 INS42 INS66 INS42 INS66 INS42 INS74 INS59 MOV58 MOV27 MOV37 INS8 INS74 INS59 INS8 INS58 INS32 INS8 INS38 INS8 UPD66 UPD66 INS42 INS42 INS43 INS43 INS42 INS32 INS66 INS42 INS42 INS22 INS32 INS43 INS42 INS21 INS42 INS42 INS43 INS43 INS42 INS14 INS42 INS42 INS42 INS42 INS42 INS9 INS9 INS43 INS43 INS42 INS14 INS42 INS42 INS32 INS43 INS42 INS60 INS60 INS21 INS42 INS42 INS33 INS42 INS42 INS32 INS42 INS33 INS21 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS43 INS43 INS42 INS14 UPD42 UPD42 INS21 INS43 INS43 INS42 INS14 INS25 INS25 INS21 INS25 MOV53 INS74 INS59 INS42 INS42 INS60 INS54 INS42 INS42 INS21 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS9 INS9 INS52 INS42 INS42 INS42 INS32 INS42 INS42 INS74 INS42 INS42 INS42 INS74 INS42 INS42 INS42 INS43 INS59 INS43 INS59 INS32 INS22 INS42 INS42 INS7 INS42 INS42 INS74 UPD42 INS32 INS42 INS42 INS74 INS32 INS8 INS42 INS8 INS32 INS42 INS8 INS43 INS43 INS42 INS32 INS43 INS59 INS8 MOV12 INS32 UPD45 UPD45 INS42 INS42 INS43 INS43 INS43 INS43 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS42 INS52 INS42 INS42 INS14 INS43 INS43 INS42 INS42 INS32 INS43 INS43 INS42 INS42 INS32 INS21 INS21 INS18 MOV21 INS42 INS42 INS42 INS41 INS42 INS42 INS42 INS42 INS42 INS42 INS32 MOV21 MOV21 INS8 INS22 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS14 INS43 INS32 INS42 INS32 INS32 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS32 INS32 INS42 INS42 INS25 MOV21 MOV53 INS52 INS42 INS43 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS27 INS42 INS42 UPD42 MOV42 UPD42 MOV42 INS38 INS8 INS42 INS42 INS42 INS45 INS42 INS45 INS42 INS21 INS21 INS18 UPD45 INS32 INS32 INS32 INS42 INS42 INS42 INS42 INS42 INS42 DEL42 DEL32 DEL42 DEL32 DEL8 DEL8 DEL24 DEL8 DEL54

@@ -1,0 +1,154 @@
+Merge trunk into auto-failover branch.
+
+Needs a few tweaks to fix compilation - will do in followup commit. This is just a straight merge
+
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/branches/HDFS-3042@1324567 13f79535-47bb-0310-9956-ffa450edef68
+
+-
+-  public FSEditLogLoader(FSNamesystem fsNamesys) {
++  private long lastAppliedTxId;
++  
++  public FSEditLogLoader(FSNamesystem fsNamesys, long lastAppliedTxId) {
++    this.lastAppliedTxId = lastAppliedTxId;
+-  long loadFSEdits(EditLogInputStream edits, long expectedStartingTxId)
+-      throws IOException {
+-    long numEdits = 0;
++  long loadFSEdits(EditLogInputStream edits, long expectedStartingTxId,
++      MetaRecoveryContext recovery) throws IOException {
+-      numEdits = loadEditRecords(logVersion, edits, false, 
+-                                 expectedStartingTxId);
++      long numEdits = loadEditRecords(logVersion, edits, false, 
++                                 expectedStartingTxId, recovery);
++      return numEdits;
+-    
+-    return numEdits;
+-                      long expectedStartingTxId)
+-      throws IOException, EditLogInputException {
++                      long expectedStartingTxId, MetaRecoveryContext recovery)
++      throws IOException {
+-    long numEdits = 0;
+-
+-    long txId = expectedStartingTxId - 1;
++    
++    long expectedTxId = expectedStartingTxId;
++    long numEdits = 0;
+-
+-
+-      try {
+-        while (true) {
++      while (true) {
++        try {
+-            if ((op = in.readOp()) == null) {
++            op = in.readOp();
++            if (op == null) {
+-          } catch (IOException ioe) {
+-            long badTxId = txId + 1; // because txId hasn't been incremented yet
+-            String errorMessage = formatEditLogReplayError(in, recentOpcodeOffsets, badTxId);
++          } catch (Throwable e) {
++            // Handle a problem with our input
++            check203UpgradeFailure(logVersion, e);
++            String errorMessage =
++              formatEditLogReplayError(in, recentOpcodeOffsets, expectedTxId);
+-            throw new EditLogInputException(errorMessage,
+-                ioe, numEdits);
++            if (recovery == null) {
++               // We will only try to skip over problematic opcodes when in
++               // recovery mode.
++              throw new EditLogInputException(errorMessage, e, numEdits);
++            }
++            MetaRecoveryContext.editLogLoaderPrompt(
++                "We failed to read txId " + expectedTxId,
++                recovery, "skipping the bad section in the log");
++            in.resync();
++            continue;
+-            long expectedTxId = txId + 1;
+-            txId = op.txid;
+-            if (txId != expectedTxId) {
+-              throw new IOException("Expected transaction ID " +
+-                  expectedTxId + " but got " + txId);
++            if (op.getTransactionId() > expectedTxId) { 
++              MetaRecoveryContext.editLogLoaderPrompt("There appears " +
++                  "to be a gap in the edit log.  We expected txid " +
++                  expectedTxId + ", but got txid " +
++                  op.getTransactionId() + ".", recovery, "ignoring missing " +
++                  " transaction IDs");
++            } else if (op.getTransactionId() < expectedTxId) { 
++              MetaRecoveryContext.editLogLoaderPrompt("There appears " +
++                  "to be an out-of-order edit in the edit log.  We " +
++                  "expected txid " + expectedTxId + ", but got txid " +
++                  op.getTransactionId() + ".", recovery,
++                  "skipping the out-of-order edit");
++              continue;
+-
+-          incrOpCount(op.opCode, opCounts);
+-          } catch (Throwable t) {
+-            // Catch Throwable because in the case of a truly corrupt edits log, any
+-            // sort of error might be thrown (NumberFormat, NullPointer, EOF, etc.)
+-            String errorMessage = formatEditLogReplayError(in, recentOpcodeOffsets, txId);
+-            FSImage.LOG.error(errorMessage);
+-            throw new IOException(errorMessage, t);
++          } catch (Throwable e) {
++            LOG.error("Encountered exception on operation " + op, e);
++            MetaRecoveryContext.editLogLoaderPrompt("Failed to " +
++             "apply edit log operation " + op + ": error " +
++             e.getMessage(), recovery, "applying edits");
+-
++          // Now that the operation has been successfully decoded and
++          // applied, update our bookkeeping.
++          incrOpCount(op.opCode, opCounts);
++          if (op.hasTransactionId()) {
++            lastAppliedTxId = op.getTransactionId();
++            expectedTxId = lastAppliedTxId + 1;
++          } else {
++            expectedTxId = lastAppliedTxId = expectedStartingTxId;
++          }
+-          if (now() - lastLogTime > REPLAY_TRANSACTION_LOG_INTERVAL) {
+-            int percent = Math.round((float) txId / numTxns * 100);
+-            LOG.info("replaying edit log: " + txId + "/" + numTxns
+-                + " transactions completed. (" + percent + "%)");
+-            lastLogTime = now();
++          if (LayoutVersion.supports(Feature.STORED_TXIDS, logVersion)) {
++            long now = now();
++            if (now - lastLogTime > REPLAY_TRANSACTION_LOG_INTERVAL) {
++              int percent = Math.round((float)lastAppliedTxId / numTxns * 100);
++              LOG.info("replaying edit log: " + lastAppliedTxId + "/" + numTxns
++                  + " transactions completed. (" + percent + "%)");
++              lastLogTime = now;
++            }
+-
++        } catch (MetaRecoveryContext.RequestStopException e) {
++          MetaRecoveryContext.LOG.warn("Stopped reading edit log at " +
++              in.getPosition() + "/"  + in.length());
++          break;
+-      } catch (IOException ex) {
+-        check203UpgradeFailure(logVersion, ex);
+-      } finally {
+-        if(closeOnExit)
+-          in.close();
++      if(closeOnExit) {
++        in.close();
++      }
+-    sb.append(" on transaction ID ").append(txid);
++    sb.append(".  Expected transaction ID was ").append(txid);
+-        throw new IOException("Mismatched block IDs or generation stamps, " + 
++        throw new IOException("Mismatched block IDs or generation stamps, " +
+-  private void check203UpgradeFailure(int logVersion, IOException ex)
++  private void check203UpgradeFailure(int logVersion, Throwable e)
+-      throw new IOException(msg, ex);
+-    } else {
+-      throw ex;
++      throw new IOException(msg, e);
+-          firstTxId = op.txid;
++          firstTxId = op.getTransactionId();
+-            || op.txid == lastTxId + 1) {
+-          lastTxId = op.txid;
++            || op.getTransactionId() == lastTxId + 1) {
++          lastTxId = op.getTransactionId();
+-          FSImage.LOG.error("Out of order txid found. Found " + op.txid 
+-                            + ", expected " + (lastTxId + 1));
++          FSImage.LOG.error("Out of order txid found. Found " +
++            op.getTransactionId() + ", expected " + (lastTxId + 1));
++  public long getLastAppliedTxId() {
++    return lastAppliedTxId;
++  }

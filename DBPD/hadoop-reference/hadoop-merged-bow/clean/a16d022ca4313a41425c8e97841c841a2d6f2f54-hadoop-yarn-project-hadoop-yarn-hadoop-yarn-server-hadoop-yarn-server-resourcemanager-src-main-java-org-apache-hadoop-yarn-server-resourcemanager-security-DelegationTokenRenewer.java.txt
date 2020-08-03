@@ -1,0 +1,270 @@
+YARN-2704. Changed ResourceManager to optionally obtain tokens itself for the sake of localization and log-aggregation for long-running services. Contributed by Jian He.
+
++import java.nio.ByteBuffer;
++import java.security.PrivilegedAction;
++import org.apache.hadoop.fs.FileSystem;
++import org.apache.hadoop.io.DataOutputBuffer;
++import org.apache.hadoop.io.Text;
++import org.apache.hadoop.security.token.delegation.AbstractDelegationTokenIdentifier;
++import org.apache.hadoop.util.Time;
++import org.apache.hadoop.yarn.exceptions.YarnRuntimeException;
+-  
+-  // managing the list of tokens using Map
+-  // appId=>List<tokens>
+-  private Set<DelegationTokenToRenew> delegationTokens = 
+-    Collections.synchronizedSet(new HashSet<DelegationTokenToRenew>());
+-  
++
++  private ConcurrentMap<ApplicationId, Set<DelegationTokenToRenew>> appTokens =
++      new ConcurrentHashMap<ApplicationId, Set<DelegationTokenToRenew>>();
++
+-  
++  private boolean hasProxyUserPrivileges;
++  private long credentialsValidTimeRemaining;
++
++  // this config is supposedly not used by end-users.
++  public static final String RM_SYSTEM_CREDENTIALS_VALID_TIME_REMAINING =
++      YarnConfiguration.RM_PREFIX + "system-credentials.valid-time-remaining";
++  public static final long DEFAULT_RM_SYSTEM_CREDENTIALS_VALID_TIME_REMAINING =
++      10800000; // 3h
++
+-  protected synchronized void serviceInit(Configuration conf) throws Exception {
++  protected void serviceInit(Configuration conf) throws Exception {
++    this.hasProxyUserPrivileges =
++        conf.getBoolean(YarnConfiguration.RM_PROXY_USER_PRIVILEGES_ENABLED,
++          YarnConfiguration.DEFAULT_RM_PROXY_USER_PRIVILEGES_ENABLED);
+-
++    this.credentialsValidTimeRemaining =
++        conf.getLong(RM_SYSTEM_CREDENTIALS_VALID_TIME_REMAINING,
++          DEFAULT_RM_SYSTEM_CREDENTIALS_VALID_TIME_REMAINING);
+-    delegationTokens.clear();
++    appTokens.clear();
+-    
+-    public DelegationTokenToRenew(
+-        ApplicationId jId, Token<?> token, 
+-        Configuration conf, long expirationDate, boolean shouldCancelAtEnd) {
++    public long maxDate;
++    public String user;
++
++    public DelegationTokenToRenew(ApplicationId jId, Token<?> token,
++        Configuration conf, long expirationDate, boolean shouldCancelAtEnd,
++        String user) {
++      this.user = user;
++      if (token.getKind().equals(new Text("HDFS_DELEGATION_TOKEN"))) {
++        try {
++          AbstractDelegationTokenIdentifier identifier =
++              (AbstractDelegationTokenIdentifier) token.decodeIdentifier();
++          maxDate = identifier.getMaxDate();
++        } catch (IOException e) {
++          throw new YarnRuntimeException(e);
++        }
++      }
+-      if (this.token==null || this.applicationId==null || this.conf==null) {
+-        throw new IllegalArgumentException("Invalid params to renew token" +
+-            ";token=" + this.token +
+-            ";appId=" + this.applicationId +
+-            ";conf=" + this.conf);
+-      }
+-  //adding token
+-  private void addTokenToList(DelegationTokenToRenew t) {
+-    delegationTokens.add(t);
+-  }
+-    for(DelegationTokenToRenew delegationToken : delegationTokens) {
+-      tokens.add(delegationToken.token);
++    for (Set<DelegationTokenToRenew> tokenList : appTokens.values()) {
++      for (DelegationTokenToRenew token : tokenList) {
++        tokens.add(token.token);
++      }
++   * @param user user
+-      boolean shouldCancelAtEnd) {
++      boolean shouldCancelAtEnd, String user) {
+-      applicationId, ts, shouldCancelAtEnd));
++      applicationId, ts, shouldCancelAtEnd, user));
++   * @param user user
+-      boolean shouldCancelAtEnd) throws IOException{
++      boolean shouldCancelAtEnd, String user) throws IOException,
++      InterruptedException {
+-      applicationId, ts, shouldCancelAtEnd));
++      applicationId, ts, shouldCancelAtEnd, user));
+-      throws IOException {
++      throws IOException, InterruptedException {
+-    List<DelegationTokenToRenew> tokenList =
+-        new ArrayList<DelegationTokenRenewer.DelegationTokenToRenew>();
++    appTokens.put(applicationId,
++      Collections.synchronizedSet(new HashSet<DelegationTokenToRenew>()));
++    Set<DelegationTokenToRenew> tokenList = new HashSet<DelegationTokenToRenew>();
++    boolean hasHdfsToken = false;
+-            token, getConfig(), now, shouldCancelAtEnd));
++            token, getConfig(), now, shouldCancelAtEnd, evt.getUser()));
++        if (token.getKind().equals(new Text("HDFS_DELEGATION_TOKEN"))) {
++          LOG.info(applicationId + " found existing hdfs token " + token);
++          hasHdfsToken = true;
++        }
++
+-        addTokenToList(dtr);
++        appTokens.get(applicationId).add(dtr);
+-        if (LOG.isDebugEnabled()) {
+-          LOG.debug("Registering token for renewal for:" + " service = "
+-              + dtr.token.getService() + " for appId = " + dtr.applicationId);
+-        }
++
++    if (!hasHdfsToken) {
++      requestNewHdfsDelegationToken(applicationId, evt.getUser(),
++        shouldCancelAtEnd);
++    }
++
+-        renewToken(dttr);
+-        if (LOG.isDebugEnabled()) {
+-          LOG.debug("Renewing delegation-token for:" + token.getService() + 
+-              "; new expiration;" + dttr.expirationDate);
++        requestNewHdfsDelegationTokenIfNeeded(dttr);
++        // if the token is not replaced by a new token, renew the token
++        if (appTokens.get(dttr.applicationId).contains(dttr)) {
++          renewToken(dttr);
++          setTimerForTokenRenewal(dttr);// set the next one
++        } else {
++          LOG.info("The token was removed already. Token = [" +dttr +"]");
+-        
+-        setTimerForTokenRenewal(dttr);// set the next one
+-    
++
++    LOG.info("Renew " + token + " in " + expiresIn + " ms, appId = "
++        + token.applicationId);
+-      dttr.expirationDate = UserGroupInformation.getLoginUser().doAs(
+-          new PrivilegedExceptionAction<Long>(){          
+-            @Override
+-            public Long run() throws Exception {
+-              return dttr.token.renew(dttr.conf);
+-            }
+-          });
++      dttr.expirationDate =
++          UserGroupInformation.getLoginUser().doAs(
++            new PrivilegedExceptionAction<Long>() {
++              @Override
++              public Long run() throws Exception {
++                return dttr.token.renew(dttr.conf);
++              }
++            });
++    LOG.info("Renewed delegation-token= [" + dttr + "], for "
++        + dttr.applicationId);
++  }
++
++  // Request new hdfs token if the token is about to expire, and remove the old
++  // token from the tokenToRenew list
++  private void requestNewHdfsDelegationTokenIfNeeded(
++      final DelegationTokenToRenew dttr) throws IOException,
++      InterruptedException {
++
++    if (hasProxyUserPrivileges
++        && dttr.maxDate - dttr.expirationDate < credentialsValidTimeRemaining
++        && dttr.token.getKind().equals(new Text("HDFS_DELEGATION_TOKEN"))) {
++
++      // remove all old expiring hdfs tokens for this application.
++      Set<DelegationTokenToRenew> tokenSet = appTokens.get(dttr.applicationId);
++      if (tokenSet != null && !tokenSet.isEmpty()) {
++        Iterator<DelegationTokenToRenew> iter = tokenSet.iterator();
++        synchronized (tokenSet) {
++          while (iter.hasNext()) {
++            DelegationTokenToRenew t = iter.next();
++            if (t.token.getKind().equals(new Text("HDFS_DELEGATION_TOKEN"))) {
++              iter.remove();
++              if (t.timerTask != null) {
++                t.timerTask.cancel();
++              }
++              LOG.info("Removed expiring token " + t);
++            }
++          }
++        }
++      }
++      LOG.info("Token= (" + dttr + ") is expiring, request new token.");
++      requestNewHdfsDelegationToken(dttr.applicationId, dttr.user,
++        dttr.shouldCancelAtEnd);
++    }
++  }
++
++  private void requestNewHdfsDelegationToken(ApplicationId applicationId,
++      String user, boolean shouldCancelAtEnd) throws IOException,
++      InterruptedException {
++    // Get new hdfs tokens for this user
++    Credentials credentials = new Credentials();
++    Token<?>[] newTokens = obtainSystemTokensForUser(user, credentials);
++
++    // Add new tokens to the toRenew list.
++    LOG.info("Received new tokens for " + applicationId + ". Received "
++        + newTokens.length + " tokens.");
++    if (newTokens.length > 0) {
++      for (Token<?> token : newTokens) {
++        if (token.isManaged()) {
++          DelegationTokenToRenew tokenToRenew =
++              new DelegationTokenToRenew(applicationId, token, getConfig(),
++                Time.now(), shouldCancelAtEnd, user);
++          // renew the token to get the next expiration date.
++          renewToken(tokenToRenew);
++          setTimerForTokenRenewal(tokenToRenew);
++          appTokens.get(applicationId).add(tokenToRenew);
++          LOG.info("Received new token " + token);
++        }
++      }
++    }
++    DataOutputBuffer dob = new DataOutputBuffer();
++    credentials.writeTokenStorageToStream(dob);
++    ByteBuffer byteBuffer = ByteBuffer.wrap(dob.getData(), 0, dob.getLength());
++    rmContext.getSystemCredentialsForApps().put(applicationId, byteBuffer);
++  }
++
++  protected Token<?>[] obtainSystemTokensForUser(String user,
++      final Credentials credentials) throws IOException, InterruptedException {
++    // Get new hdfs tokens on behalf of this user
++    UserGroupInformation proxyUser =
++        UserGroupInformation.createProxyUser(user,
++          UserGroupInformation.getLoginUser());
++    Token<?>[] newTokens =
++        proxyUser.doAs(new PrivilegedExceptionAction<Token<?>[]>() {
++          @Override
++          public Token<?>[] run() throws Exception {
++            return FileSystem.get(getConfig()).addDelegationTokens(
++              UserGroupInformation.getLoginUser().getUserName(), credentials);
++          }
++        });
++    return newTokens;
+-    if (LOG.isDebugEnabled())
+-      LOG.debug("removing failed delegation token for appid=" + applicationId + 
+-          ";t=" + t.token.getService());
+-    delegationTokens.remove(t);
++    LOG.error("removing failed delegation token for appid=" + applicationId
++        + ";t=" + t.token.getService());
++    appTokens.get(applicationId).remove(t);
+-    if(t.timerTask!=null)
++    if (t.timerTask != null) {
++    }
+-    synchronized (delegationTokens) {
+-      Iterator<DelegationTokenToRenew> it = delegationTokens.iterator();
+-      while(it.hasNext()) {
+-        DelegationTokenToRenew dttr = it.next();
+-        if (dttr.applicationId.equals(applicationId)) {
++    rmContext.getSystemCredentialsForApps().remove(applicationId);
++    Set<DelegationTokenToRenew> tokens = appTokens.get(applicationId);
++
++    if (tokens != null && !tokens.isEmpty()) {
++      synchronized (tokens) {
++        Iterator<DelegationTokenToRenew> it = tokens.iterator();
++        while (it.hasNext()) {
++          DelegationTokenToRenew dttr = it.next();
+-            LOG.debug("Removing delegation token for appId=" + applicationId + 
+-                "; token=" + dttr.token.getService());
++            LOG.debug("Removing delegation token for appId=" + applicationId
++                + "; token=" + dttr.token.getService());
+-          if(dttr.timerTask!=null)
++          if (dttr.timerTask != null)
+-  private static class DelegationTokenRenewerAppSubmitEvent extends
++  static class DelegationTokenRenewerAppSubmitEvent extends
++    private String user;
+-        Credentials credentails, boolean shouldCancelAtEnd) {
++        Credentials credentails, boolean shouldCancelAtEnd, String user) {
++      this.user = user;
++
++    public String getUser() {
++      return user;
++    }
+
+INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 MOV31 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS23 INS23 INS23 INS23 INS31 INS31 INS74 INS83 INS39 INS59 INS83 INS39 INS59 INS83 INS83 INS83 INS43 INS59 INS83 INS83 INS83 INS39 INS59 INS23 INS23 INS44 INS44 INS43 INS43 INS42 INS44 INS43 INS43 INS8 INS83 INS39 INS42 INS44 INS44 INS44 INS43 INS43 INS8 INS83 INS5 INS42 INS44 INS44 INS43 INS43 INS8 MOV8 INS83 INS42 INS23 INS31 INS43 INS43 MOV74 INS42 INS14 INS42 INS42 INS42 INS42 INS27 INS42 INS34 INS21 INS21 INS83 INS39 INS59 INS83 INS43 INS59 INS44 INS65 INS43 INS42 INS65 INS43 INS42 INS42 INS42 INS21 INS60 INS60 INS25 INS21 INS21 INS83 INS43 INS42 INS42 INS42 INS25 INS43 INS42 INS43 INS42 INS39 INS42 INS42 INS42 INS60 INS60 INS21 INS25 INS60 INS21 INS60 INS21 INS74 INS85 INS43 INS42 INS83 INS43 INS42 INS42 INS42 INS60 INS60 INS41 MOV21 INS25 INS21 INS60 INS83 INS43 INS59 INS44 INS83 INS43 INS42 INS8 INS42 INS42 INS74 INS40 INS45 INS7 INS7 INS42 INS42 INS42 INS43 INS42 INS21 INS25 INS32 INS8 INS42 INS66 INS42 INS42 INS66 INS42 INS32 INS74 INS59 INS39 INS59 INS38 INS8 INS32 INS32 INS42 INS27 INS8 INS42 INS42 INS43 INS59 INS5 INS59 INS32 INS27 INS8 INS43 INS59 INS32 INS43 INS59 INS32 INS43 INS76 INS42 INS42 INS43 INS59 INS5 INS59 INS42 INS27 INS8 INS32 INS74 INS59 INS27 INS8 INS42 INS42 INS43 INS42 INS21 INS42 INS41 INS43 INS43 INS74 INS22 INS32 INS22 INS32 UPD42 INS42 INS7 INS32 MOV8 INS74 INS42 INS42 INS42 INS70 INS42 INS42 INS42 MOV32 UPD43 MOV43 UPD43 MOV43 INS42 INS14 INS42 INS9 INS42 INS21 INS8 INS42 INS42 INS27 INS42 INS42 INS27 INS27 INS32 INS60 INS25 INS21 INS21 INS42 INS42 INS14 INS74 INS85 INS42 INS32 INS42 INS42 INS27 INS40 INS34 INS70 INS42 INS42 INS14 INS42 INS42 INS42 INS42 INS42 INS32 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS74 INS85 INS42 INS32 UPD42 INS32 INS40 INS33 INS21 INS32 INS42 INS42 INS43 INS43 INS42 INS32 INS27 INS38 INS51 INS42 INS7 INS42 INS42 INS42 INS43 INS43 INS52 INS42 INS42 INS42 INS40 INS40 INS52 INS42 INS42 INS42 INS42 INS42 INS22 INS42 INS32 INS42 INS14 INS54 INS43 INS43 INS44 INS42 MOV8 MOV43 INS42 MOV43 INS42 UPD42 INS42 UPD74 MOV74 INS32 INS21 INS25 INS45 INS42 INS45 INS42 INS45 INS40 INS45 INS42 INS45 INS40 INS42 INS27 INS32 INS42 INS14 INS74 INS59 INS27 INS8 INS32 INS32 INS43 INS43 INS76 INS42 INS42 INS42 INS45 INS42 INS45 INS40 INS45 INS44 INS42 INS8 INS43 INS42 INS42 INS32 INS34 INS32 INS42 INS42 INS42 INS42 INS42 INS32 INS43 INS76 INS42 INS42 INS14 UPD42 MOV42 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS33 INS32 INS42 INS8 INS22 INS42 INS42 INS42 MOV52 INS42 INS42 INS42 INS43 INS45 INS8 INS12 INS42 INS42 INS43 INS42 UPD43 INS25 INS21 INS42 INS42 INS32 INS42 INS32 INS32 MOV8 INS8 INS27 INS42 INS40 INS42 INS43 INS45 INS43 INS43 INS42 INS32 INS27 INS38 MOV60 INS51 INS42 INS42 INS27 INS42 INS40 INS40 INS40 INS42 INS42 INS74 INS42 INS25 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS74 INS1 INS40 INS42 UPD42 MOV42 UPD42 MOV42 INS60 INS61 INS52 INS42 INS42 INS60 INS21 INS44 INS8 INS42 UPD42 INS32 INS8 INS32 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS21 INS40 INS40 INS42 INS42 MOV42 INS42 INS42 INS40 INS42 INS33 INS32 INS42 INS8 INS45 INS42 INS45 INS43 INS76 INS32 INS8 INS43 INS5 INS31 INS74 INS59 MOV32 MOV8 INS43 INS59 INS7 INS43 INS42 INS53 UPD40 INS32 INS42 INS14 INS21 INS21 INS32 UPD42 MOV42 UPD42 MOV42 INS42 INS42 INS40 INS32 INS42 INS42 UPD42 INS61 INS42 INS42 INS42 INS60 INS21 INS21 INS21 INS21 INS42 INS74 INS85 INS78 INS83 INS5 INS42 INS43 INS8 INS43 INS43 INS42 INS32 MOV60 UPD42 MOV42 INS42 INS11 INS42 INS32 INS42 INS14 INS32 INS42 INS42 INS43 INS45 INS32 INS7 UPD42 MOV42 UPD42 MOV42 INS42 INS42 INS42 INS27 UPD42 INS32 INS8 INS43 INS59 INS32 INS32 INS32 INS32 INS43 INS76 INS42 INS74 INS85 INS42 INS41 INS42 INS42 INS42 INS42 INS43 INS32 INS42 INS42 INS43 INS42 INS42 INS42 INS42 INS42 INS42 INS27 INS42 INS9 INS45 INS42 INS45 INS42 INS42 INS60 INS25 INS42 INS42 INS14 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS27 INS42 INS43 INS76 INS32 INS42 INS42 INS42 INS42 INS42 INS45 INS42 MOV43 INS59 INS32 INS8 INS43 INS42 INS42 INS32 INS32 INS42 INS42 INS42 INS42 INS42 INS45 INS42 INS42 INS32 INS42 INS32 INS42 INS42 INS32 INS32 INS42 INS14 INS21 MOV25 MOV21 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS32 INS42 INS42 INS42 INS40 INS42 INS43 INS45 INS32 INS8 INS42 INS42 INS42 INS42 INS42 INS42 MOV21 UPD42 UPD42 INS27 INS45 INS42 DEL42 DEL83 DEL43 DEL45 DEL45 DEL27 DEL52 DEL42 DEL22 DEL45 DEL52 DEL42 DEL22 DEL45 DEL52 DEL42 DEL22 DEL27 DEL14 DEL53 DEL42 DEL22 DEL33 DEL27 DEL52 DEL42 DEL22 DEL33 DEL27 DEL27 DEL52 DEL42 DEL22 DEL33 DEL27 DEL27 DEL25 DEL42 DEL42 DEL40 DEL42 DEL74 DEL14 DEL59 DEL60 DEL32 DEL21 DEL42 DEL32 DEL42 DEL45 DEL45 DEL27 DEL40 DEL42 DEL32 DEL45 DEL40 DEL27 DEL32 DEL21 DEL8 DEL25 DEL42 DEL42 DEL32 DEL42 DEL42 DEL45 DEL42 DEL42 DEL32 DEL45 DEL40 DEL27 DEL32 DEL21 DEL8 DEL25 DEL42 DEL42 DEL43 DEL42 DEL44 DEL8 DEL42 DEL42 DEL32 DEL25 DEL40 DEL32 DEL42 DEL61 DEL8 DEL51 DEL8 DEL83 DEL83 DEL42

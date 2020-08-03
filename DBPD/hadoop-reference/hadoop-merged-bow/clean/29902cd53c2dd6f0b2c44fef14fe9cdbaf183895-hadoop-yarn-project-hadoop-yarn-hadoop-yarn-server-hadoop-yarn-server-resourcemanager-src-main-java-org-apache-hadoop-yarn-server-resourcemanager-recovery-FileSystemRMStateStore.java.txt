@@ -1,0 +1,180 @@
+YARN-638. Modified ResourceManager to restore RMDelegationTokens after restarting. Contributed by Jian He.
+
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/trunk@1487720 13f79535-47bb-0310-9956-ffa450edef68
+
++import java.io.ByteArrayInputStream;
++import java.io.ByteArrayOutputStream;
++import java.io.DataInputStream;
++import java.io.DataOutputStream;
++import org.apache.hadoop.security.token.delegation.DelegationKey;
++import org.apache.hadoop.yarn.security.client.RMDelegationTokenIdentifier;
+-
++  private static final String RM_DT_SECRET_MANAGER_ROOT = "RMDTSecretManagerRoot";
++  private static final String RM_APP_ROOT = "RMAppRoot";
++  private static final String DELEGATION_KEY_PREFIX = "DelegationKey_";
++  private static final String DELEGATION_TOKEN_PREFIX = "RMDelegationToken_";
++  private static final String DELEGATION_TOKEN_SEQUENCE_NUMBER_PREFIX =
++      "RMDTSequenceNumber_";
+-  private Path fsRootDirPath;
++  private Path rootDirPath;
++  private Path rmDTSecretManagerRoot;
++  private Path rmAppRoot;
++  private Path dtSequenceNumberPath = null;
+-    fsRootDirPath = new Path(fsWorkingPath, ROOT_DIR_NAME);
++    rootDirPath = new Path(fsWorkingPath, ROOT_DIR_NAME);
++    rmDTSecretManagerRoot = new Path(rootDirPath, RM_DT_SECRET_MANAGER_ROOT);
++    rmAppRoot = new Path(rootDirPath, RM_APP_ROOT);
+-    fs.mkdirs(fsRootDirPath);
++    fs.mkdirs(rmDTSecretManagerRoot);
++    fs.mkdirs(rmAppRoot);
++    RMState rmState = new RMState();
++    // recover DelegationTokenSecretManager
++    loadRMDTSecretManagerState(rmState);
++    // recover RM applications
++    loadRMAppState(rmState);
++    return rmState;
++  }
++
++  private void loadRMAppState(RMState rmState) throws Exception {
+-      RMState state = new RMState();
+-      FileStatus[] childNodes = fs.listStatus(fsRootDirPath);
++      FileStatus[] childNodes = fs.listStatus(rmAppRoot);
+-        Path childNodePath = getNodePath(childNodeName);
++        Path childNodePath = getNodePath(rmAppRoot, childNodeName);
+-          state.appState.put(appId, appState);
++          rmState.appState.put(appId, appState);
+-        ApplicationState appState = state.appState.get(appId);
++        ApplicationState appState = rmState.appState.get(appId);
+-          deleteFile(getNodePath(attemptState.getAttemptId().toString()));
++          deleteFile(getNodePath(rmAppRoot, attemptState.getAttemptId().toString()));
+-
+-      return state;
++  private void loadRMDTSecretManagerState(RMState rmState) throws Exception {
++    FileStatus[] childNodes = fs.listStatus(rmDTSecretManagerRoot);
++
++    for(FileStatus childNodeStatus : childNodes) {
++      assert childNodeStatus.isFile();
++      String childNodeName = childNodeStatus.getPath().getName();
++      Path childNodePath = getNodePath(rmDTSecretManagerRoot, childNodeName);
++      byte[] childData = readFile(childNodePath, childNodeStatus.getLen());
++      ByteArrayInputStream is = new ByteArrayInputStream(childData);
++      DataInputStream fsIn = new DataInputStream(is);
++      if(childNodeName.startsWith(DELEGATION_KEY_PREFIX)){
++        DelegationKey key = new DelegationKey();
++        key.readFields(fsIn);
++        rmState.rmSecretManagerState.masterKeyState.add(key);
++      } else if (childNodeName.startsWith(DELEGATION_TOKEN_PREFIX)) {
++        RMDelegationTokenIdentifier identifier = new RMDelegationTokenIdentifier();
++        identifier.readFields(fsIn);
++        long renewDate = fsIn.readLong();
++        rmState.rmSecretManagerState.delegationTokenState.put(identifier,
++          renewDate);
++      } else if(childNodeName.startsWith(DELEGATION_TOKEN_SEQUENCE_NUMBER_PREFIX)) {
++        rmState.rmSecretManagerState.dtSequenceNumber =
++            Integer.parseInt(childNodeName.split("_")[1]);
++      }else {
++        LOG.warn("Unknown file for recovering RMDelegationTokenSecretManager");
++      }
++      fsIn.close();
++    }
++  }
++
+-                                     ApplicationStateDataPBImpl appStateDataPB)
+-                                     throws Exception {
+-    Path nodeCreatePath = getNodePath(appId);
++      ApplicationStateDataPBImpl appStateDataPB) throws Exception {
++    Path nodeCreatePath = getNodePath(rmAppRoot, appId);
+-                          ApplicationAttemptStateDataPBImpl attemptStateDataPB)
+-                          throws Exception {
+-    Path nodeCreatePath = getNodePath(attemptId);
++      ApplicationAttemptStateDataPBImpl attemptStateDataPB) throws Exception {
++    Path nodeCreatePath = getNodePath(rmAppRoot, attemptId);
+-                                                            throws Exception {
++      throws Exception {
+-    Path nodeRemovePath = getNodePath(appId);
++    Path nodeRemovePath = getNodePath(rmAppRoot, appId);
+-                                                            throws Exception {
+-    Path nodeRemovePath = getNodePath(attemptId);
++      throws Exception {
++    Path nodeRemovePath = getNodePath(rmAppRoot, attemptId);
++  @Override
++  public synchronized void storeRMDelegationTokenAndSequenceNumberState(
++      RMDelegationTokenIdentifier identifier, Long renewDate,
++      int latestSequenceNumber) throws Exception {
++    Path nodeCreatePath =
++        getNodePath(rmDTSecretManagerRoot,
++          DELEGATION_TOKEN_PREFIX + identifier.getSequenceNumber());
++    ByteArrayOutputStream os = new ByteArrayOutputStream();
++    DataOutputStream fsOut = new DataOutputStream(os);
++    LOG.info("Storing RMDelegationToken_" + identifier.getSequenceNumber());
++    identifier.write(fsOut);
++    fsOut.writeLong(renewDate);
++    writeFile(nodeCreatePath, os.toByteArray());
++    fsOut.close();
++
++    // store sequence number
++    Path latestSequenceNumberPath = getNodePath(rmDTSecretManagerRoot,
++          DELEGATION_TOKEN_SEQUENCE_NUMBER_PREFIX + latestSequenceNumber);
++    LOG.info("Storing " + DELEGATION_TOKEN_SEQUENCE_NUMBER_PREFIX
++        + latestSequenceNumber);
++    if (dtSequenceNumberPath == null) {
++      if (!createFile(latestSequenceNumberPath)) {
++        throw new Exception("Failed to create " + latestSequenceNumberPath);
++      }
++    } else {
++      if (!renameFile(dtSequenceNumberPath, latestSequenceNumberPath)) {
++        throw new Exception("Failed to rename " + dtSequenceNumberPath);
++      }
++    }
++    dtSequenceNumberPath = latestSequenceNumberPath;
++  }
++
++  @Override
++  public synchronized void removeRMDelegationTokenState(
++      RMDelegationTokenIdentifier identifier) throws Exception {
++    Path nodeCreatePath = getNodePath(rmDTSecretManagerRoot,
++      DELEGATION_TOKEN_PREFIX + identifier.getSequenceNumber());
++    LOG.info("Removing RMDelegationToken_" + identifier.getSequenceNumber());
++    deleteFile(nodeCreatePath);
++  }
++
++  @Override
++  public synchronized void storeRMDTMasterKeyState(DelegationKey masterKey)
++      throws Exception {
++    Path nodeCreatePath = getNodePath(rmDTSecretManagerRoot,
++          DELEGATION_KEY_PREFIX + masterKey.getKeyId());
++    ByteArrayOutputStream os = new ByteArrayOutputStream();
++    DataOutputStream fsOut = new DataOutputStream(os);
++    LOG.info("Storing RMDelegationKey_" + masterKey.getKeyId());
++    masterKey.write(fsOut);
++    writeFile(nodeCreatePath, os.toByteArray());
++    fsOut.close();
++  }
++
++  @Override
++  public synchronized void
++      removeRMDTMasterKeyState(DelegationKey masterKey) throws Exception {
++    Path nodeCreatePath = getNodePath(rmDTSecretManagerRoot,
++          DELEGATION_KEY_PREFIX + masterKey.getKeyId());
++    LOG.info("Removing RMDelegationKey_"+ masterKey.getKeyId());
++    deleteFile(nodeCreatePath);
++  }
++
++    fsIn.close();
+-    fsOut.flush();
+-  @VisibleForTesting
+-  Path getNodePath(String nodeName) {
+-    return new Path(fsRootDirPath, nodeName);
++  private boolean renameFile(Path src, Path dst) throws Exception {
++    return fs.rename(src, dst);
++  }
++
++  private boolean createFile(Path newFile) throws Exception {
++    return fs.createNewFile(newFile);
++  }
++
++  private Path getNodePath(Path root, String nodeName) {
++    return new Path(root, nodeName);
+
+INS26 INS26 INS26 INS26 INS26 INS26 INS40 INS40 INS40 INS40 INS40 INS40 INS23 INS23 INS23 INS23 INS23 INS23 INS23 INS23 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS83 INS83 INS83 INS43 INS59 INS83 INS83 INS83 INS43 INS59 INS83 INS83 INS83 INS43 INS59 INS83 INS83 INS83 INS43 INS59 INS83 INS83 INS83 INS43 INS59 INS83 INS43 INS59 INS83 INS43 INS59 INS83 INS43 INS59 MOV78 INS83 INS83 MOV43 INS42 INS43 INS8 UPD83 INS39 UPD42 INS44 INS83 INS39 INS42 INS44 INS43 INS8 MOV78 INS83 INS83 INS39 INS42 INS44 INS44 INS44 INS43 INS8 INS78 INS83 INS83 INS39 INS42 INS44 INS43 INS8 INS78 INS83 INS83 INS39 INS42 INS44 INS43 INS8 INS78 INS83 INS83 INS39 INS42 INS44 INS43 INS8 INS83 INS39 INS42 INS44 INS44 INS43 INS8 INS83 INS39 INS42 INS44 INS43 INS8 INS83 MOV43 INS42 INS44 MOV44 MOV8 INS42 INS42 INS45 INS42 INS42 INS45 INS42 INS42 INS45 INS42 INS42 INS45 INS42 INS42 INS45 UPD42 INS42 INS42 INS42 INS42 INS42 INS42 INS33 INS21 INS21 INS21 INS42 MOV60 INS21 INS21 INS41 INS43 INS42 INS43 INS42 INS42 INS60 INS70 UPD42 INS43 INS42 INS43 INS42 INS39 INS42 INS42 INS60 INS60 INS60 INS21 INS21 INS21 INS21 INS21 INS60 INS21 INS25 INS21 INS42 INS43 INS42 INS42 INS60 INS21 INS21 INS42 INS43 INS42 INS42 INS60 INS60 INS60 INS21 INS21 INS21 INS21 INS42 INS43 INS42 INS42 INS60 INS21 INS21 INS21 INS43 INS42 INS43 INS42 INS42 INS41 INS43 INS42 INS42 INS41 INS43 INS42 INS7 INS7 INS32 INS32 INS32 INS42 INS42 INS42 INS5 INS59 INS44 INS42 INS8 INS43 MOV43 INS42 INS42 INS43 INS59 INS43 INS59 INS43 INS59 INS32 INS32 INS32 INS32 INS32 INS43 INS59 INS32 INS27 INS8 INS8 INS7 INS42 INS43 INS59 INS32 INS32 INS42 INS43 INS59 INS43 INS59 INS43 INS59 INS32 INS32 INS32 INS32 INS42 INS43 INS59 INS32 INS32 INS32 INS42 INS42 INS32 INS42 INS32 INS42 UPD42 INS42 INS14 INS42 INS14 INS42 INS42 INS42 UPD42 UPD42 INS42 INS42 INS42 INS42 INS43 INS85 INS42 INS32 INS43 INS42 INS6 INS60 INS60 INS60 INS60 INS60 INS25 INS21 INS42 INS42 INS42 INS32 INS42 INS42 INS14 INS42 INS42 INS14 INS42 INS42 INS27 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS27 INS42 INS33 INS25 INS25 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS27 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS14 INS42 INS42 INS14 INS42 INS42 INS27 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS27 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 UPD42 INS43 INS42 INS42 INS43 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS43 INS59 MOV43 INS59 INS5 INS59 INS43 INS59 INS43 INS59 INS32 INS8 INS25 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS27 INS43 INS43 INS42 INS45 INS32 INS42 INS42 INS42 INS42 INS27 INS45 INS42 INS42 INS38 INS8 INS38 INS8 INS42 INS42 INS27 INS45 INS32 INS42 INS42 INS27 INS43 INS43 INS42 INS45 INS32 INS42 INS42 INS42 INS42 INS27 INS45 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS32 INS39 INS85 INS42 INS32 INS42 INS42 INS14 INS42 INS42 INS14 INS42 INS42 INS42 INS60 INS21 INS21 INS32 INS8 INS25 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS53 INS32 INS53 INS42 INS32 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS42 UPD42 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS43 INS42 INS43 INS42 INS43 INS59 INS32 INS32 INS42 INS42 INS42 INS60 INS21 INS60 INS21 INS32 INS8 INS8 INS42 INS42 INS42 INS42 INS14 INS42 INS42 INS42 INS14 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS14 INS42 INS42 INS42 INS40 INS42 INS42 INS43 INS59 INS32 INS39 INS59 INS32 INS42 INS42 INS42 INS21 INS21 INS43 INS27 INS43 INS27 INS42 UPD40 INS43 INS42 INS42 INS14 INS42 INS42 INS42 INS42 INS32 INS40 INS42 INS42 INS42 INS7 INS32 INS42 INS45 INS42 INS42 INS45 INS42 UPD40 INS42 INS43 INS42 INS42 INS40 INS32 INS42 INS42 INS45 INS42 INS42 INS42 INS42 INS2 INS32 INS34 INS42 INS42 INS45 DEL83 DEL42 DEL41 DEL42 DEL42 DEL32 DEL21 DEL42 DEL31

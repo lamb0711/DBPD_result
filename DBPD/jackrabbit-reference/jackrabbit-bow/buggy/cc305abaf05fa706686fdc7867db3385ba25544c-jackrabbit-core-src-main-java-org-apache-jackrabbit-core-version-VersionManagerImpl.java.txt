@@ -1,0 +1,190 @@
+JCR-1592 - JSR 283: Activities
+
+
+git-svn-id: https://svn.apache.org/repos/asf/jackrabbit/trunk@784261 13f79535-47bb-0310-9956-ffa450edef68
+
+-import java.util.Iterator;
++import java.util.Map;
++import javax.jcr.version.ActivityViolationException;
++import org.apache.jackrabbit.core.ItemId;
++import org.apache.jackrabbit.core.state.NodeReferences;
++    /**
++     * The path to the version storage: /jcr:system/jcr:versionStorage/jcr:activities
++     */
++    private static final Path ACTIVITIES_PATH;
++
++
++            builder = new PathBuilder();
++            builder.addRoot();
++            builder.addLast(NameConstants.JCR_SYSTEM);
++            builder.addLast(NameConstants.JCR_VERSIONSTORAGE);
++            builder.addLast(NameConstants.JCR_ACTIVITIES);
++            ACTIVITIES_PATH = builder.getPath();
+-    private final ReferenceMap versionItems = new ReferenceMap(ReferenceMap.HARD, ReferenceMap.WEAK);
++    private final Map<ItemId, InternalVersionItem> versionItems =
++            new ReferenceMap(ReferenceMap.HARD, ReferenceMap.WEAK);
+-                              DelegatingObservationDispatcher obsMgr, NodeId rootId,
++                              DelegatingObservationDispatcher obsMgr,
++                              NodeId storageId,
++                              NodeId activitiesId,
+-            if (!pMgr.exists(rootId)) {
+-                NodeState root = pMgr.createNew(rootId);
++            if (!pMgr.exists(storageId)) {
++                NodeState root = pMgr.createNew(storageId);
+-                PropertyState pt = pMgr.createNew(new PropertyId(rootId, NameConstants.JCR_PRIMARYTYPE));
++                PropertyState pt = pMgr.createNew(new PropertyId(storageId, NameConstants.JCR_PRIMARYTYPE));
+-            sharedStateMgr = createItemStateManager(pMgr, rootId, ntReg, cacheFactory, ismLocking);
++
++            // check for jcr:activities
++            if (!pMgr.exists(activitiesId)) {
++                NodeState root = pMgr.createNew(activitiesId);
++                root.setParentId(storageId);
++                root.setDefinitionId(ntReg.getEffectiveNodeType(NameConstants.REP_VERSIONSTORAGE).getApplicableChildNodeDef(
++                        NameConstants.JCR_ACTIVITIES, NameConstants.REP_ACTIVITIES, ntReg).getId());
++                root.setNodeTypeName(NameConstants.REP_ACTIVITIES);
++                PropertyState pt = pMgr.createNew(new PropertyId(activitiesId, NameConstants.JCR_PRIMARYTYPE));
++                pt.setDefinitionId(ntReg.getEffectiveNodeType(NameConstants.REP_ACTIVITIES).getApplicablePropertyDef(
++                        NameConstants.JCR_PRIMARYTYPE, PropertyType.NAME, false).getId());
++                pt.setMultiValued(false);
++                pt.setType(PropertyType.NAME);
++                pt.setValues(new InternalValue[]{InternalValue.create(NameConstants.REP_ACTIVITIES)});
++                root.addPropertyName(pt.getName());
++
++                // add activities as child
++                NodeState historyState = pMgr.load(storageId);
++                historyState.addChildNodeEntry(NameConstants.JCR_ACTIVITIES, activitiesId);
++                                
++                ChangeLog cl = new ChangeLog();
++                cl.added(root);
++                cl.added(pt);
++                cl.modified(historyState);
++                pMgr.store(cl);
++            }
++
++            sharedStateMgr = createItemStateManager(pMgr, storageId, ntReg, cacheFactory, ismLocking);
+-            NodeState nodeState = (NodeState) stateMgr.getItemState(rootId);
++            NodeState nodeState = (NodeState) stateMgr.getItemState(storageId);
++            nodeState = (NodeState) stateMgr.getItemState(activitiesId);
++            activitiesRoot =  new NodeStateEx(stateMgr, ntReg, nodeState, NameConstants.JCR_ACTIVITIES);
++
+-                return createVersionHistory(node, copiedFrom);
++                return internalCreateVersionHistory(node, copiedFrom);
++     * <p/>
++     * This method must not be synchronized since it could cause deadlocks with
++     * item-reading listeners in the observation thread.
++     */
++    public NodeId createActivity(Session session, final String title) throws RepositoryException {
++        NodeStateEx state = (NodeStateEx)
++                escFactory.doSourced((SessionImpl) session, new SourcedTarget() {
++            public Object run() throws RepositoryException {
++                return internalCreateActivity(title);
++            }
++        });
++        return state.getNodeId();
++    }
++
++    /**
++     * {@inheritDoc}
++     * <p/>
++     * This method must not be synchronized since it could cause deadlocks with
++     * item-reading listeners in the observation thread.
++     */
++    public void removeActivity(Session session, final NodeId nodeId)
++            throws RepositoryException {
++        escFactory.doSourced((SessionImpl) session, new SourcedTarget() {
++            public Object run() throws RepositoryException {
++                InternalActivityImpl act = (InternalActivityImpl) getItem(nodeId);
++                internalRemoveActivity(act);
++                return null;
++            }
++        });
++    }
++
++    /**
++     * {@inheritDoc}
+-                InternalVersionItem item = (InternalVersionItem) versionItems.get(id);
++                InternalVersionItem item = versionItems.get(id);
+-    
++    /**
++     * {@inheritDoc}
++     *
++     * this method currently does no modifications to the persistence and just
++     * checks if the checkout is valid in respect to a possible activity set on
++     * the session
++     */
++    public Version checkout(NodeImpl node) throws RepositoryException {
++        NodeId baseId = NodeId.valueOf(node.getProperty(NameConstants.JCR_BASEVERSION).getString());
++        NodeImpl activity = (NodeImpl) node.getSession().getWorkspace().getVersionManager().getActivity();
++        if (activity != null) {
++            // If there exists another workspace with node N' where N' also has version
++            // history H, N' is checked out and the jcr:activity property of N'
++            // references A, then the checkout fails with an
++            // ActivityViolationException indicating which workspace currently has
++            // the checkout.
++
++            // we're currently leverage the fact, that only references to "real"
++            // workspaces are recorded.
++            NodeId nodeId = activity.getNodeId();
++            NodeReferencesId refId = new NodeReferencesId(nodeId);
++            if (stateMgr.hasNodeReferences(refId)) {
++                try {
++                    NodeReferences refs = stateMgr.getNodeReferences(refId);
++                    if (refs.hasReferences()) {
++                        throw new ActivityViolationException("Unable to checkout. " +
++                                "Activity is already used for the same node in " +
++                                "another workspace.");
++                    }
++                } catch (ItemStateException e) {
++                    throw new RepositoryException("Error during checkout.", e);
++                }
++            }
++
++            // TODO:
++            // If there is a version in H that is not an eventual predecessor of N but
++            // whose jcr:activity references A, then the checkout fails with an
++            // ActivityViolationException
++            InternalActivityImpl a = (InternalActivityImpl) getItem(nodeId);
++            NodeId historyId = NodeId.valueOf(node.getProperty(NameConstants.JCR_VERSIONHISTORY).getString());
++            InternalVersionHistory history = (InternalVersionHistory) getItem(historyId);
++            InternalVersion version = a.getLatestVersion(history);
++            if (version != null) {
++                InternalVersion baseVersion = (InternalVersion) getItem(baseId);
++                while (baseVersion != null && !baseVersion.getId().equals(version.getId())) {
++                    baseVersion = baseVersion.getLinearPredecessor();
++                }
++                if (baseVersion == null) {
++                    throw new ActivityViolationException("Unable to checkout. " +
++                            "Activity is used by another version on a different branch: " + version.getName());
++                }
++            }
++        }
++        return (VersionImpl)
++                ((SessionImpl) node.getSession()).getNodeById(baseId);
++    }
++
+-                    return checkin((InternalVersionHistoryImpl) vh, node, false);
++                    return internalCheckin((InternalVersionHistoryImpl) vh, node, false);
+-                    return checkin((InternalVersionHistoryImpl) vh, node, true);
++                    return internalCheckin((InternalVersionHistoryImpl) vh, node, true);
+-                removeVersion(vh, name);
++                internalRemoveVersion(vh, name);
+-    public void itemsUpdated(Collection items) {
++    public void itemsUpdated(Collection<InternalVersionItem> items) {
+-                Iterator iter = items.iterator();
+-                while (iter.hasNext()) {
+-                    InternalVersionItem item = (InternalVersionItem) iter.next();
+-                    InternalVersionItem cached = (InternalVersionItem) versionItems.remove(item.getId());
++                for (InternalVersionItem item : items) {
++                    InternalVersionItem cached = versionItems.remove(item.getId());
+-     * Return the shared item state manager.
++     * Returns the shared item state manager.
++     * @return the shared item state manager.
+-         * @param obsMgr
++         * @param obsMgr dispatcher
+-         * @param eventSource
+-         * @param runnable
+-         * @throws RepositoryException
++         * @param eventSource event source
++         * @param runnable the runnable to execute
++         * @return the return value of the executed runnable
++         * @throws RepositoryException if an error occurs

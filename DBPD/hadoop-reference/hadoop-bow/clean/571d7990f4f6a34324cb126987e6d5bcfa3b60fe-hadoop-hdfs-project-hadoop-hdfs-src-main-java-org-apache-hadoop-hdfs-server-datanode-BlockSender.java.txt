@@ -1,0 +1,136 @@
+Merge trunk into HA branch
+
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/branches/HDFS-1623@1196458 13f79535-47bb-0310-9956-ffa450edef68
+
++import java.io.FileDescriptor;
++import org.apache.hadoop.io.ReadaheadPool;
++import org.apache.hadoop.io.ReadaheadPool.ReadaheadRequest;
++import org.apache.hadoop.io.nativeio.NativeIO;
+-  /** Starting position to read */
++  /** Initial position to read */
++  private long initialOffset;
++  /** Current position of read */
+-  /** true if chunk offset is needed to be sent in Checksum header */
+-  private final boolean chunkOffsetOK;
++  /** The file descriptor of the block being sent */
++  private FileDescriptor blockInFd;
++
++  // Cache-management related fields
++  private final long readaheadLength;
++  private boolean shouldDropCacheBehindRead;
++  private ReadaheadRequest curReadahead;
++  private long lastCacheDropOffset;
++  private static final long CACHE_DROP_INTERVAL_BYTES = 1024 * 1024; // 1MB
++  /**
++   * Minimum length of read below which management of the OS
++   * buffer cache is disabled.
++   */
++  private static final long LONG_READ_THRESHOLD_BYTES = 256 * 1024;
++  
++  private static ReadaheadPool readaheadPool =
++    ReadaheadPool.getInstance();
++
+-   * @param chunkOffsetOK need to send check offset in checksum header
+-              boolean corruptChecksumOk, boolean chunkOffsetOK,
+-              boolean verifyChecksum, DataNode datanode, String clientTraceFmt)
++              boolean corruptChecksumOk, boolean verifyChecksum,
++              DataNode datanode, String clientTraceFmt)
+-      this.chunkOffsetOK = chunkOffsetOK;
++      this.readaheadLength = datanode.getReadaheadLength();
++      this.shouldDropCacheBehindRead = datanode.shouldDropCacheBehindReads();
++      if (blockIn instanceof FileInputStream) {
++        blockInFd = ((FileInputStream)blockIn).getFD();
++      } else {
++        blockInFd = null;
++      }
++    if (blockInFd != null && shouldDropCacheBehindRead) {
++      // drop the last few MB of the file from cache
++      try {
++        NativeIO.posixFadviseIfPossible(
++            blockInFd, lastCacheDropOffset, offset - lastCacheDropOffset,
++            NativeIO.POSIX_FADV_DONTNEED);
++      } catch (Exception e) {
++        LOG.warn("Unable to drop cache on file close", e);
++      }
++    }
++    if (curReadahead != null) {
++      curReadahead.cancel();
++    }
++    
++      blockInFd = null;
+-    final long initialOffset = offset;
++    initialOffset = offset;
++    lastCacheDropOffset = initialOffset;
++
++    if (isLongRead() && blockInFd != null) {
++      // Advise that this file descriptor will be accessed sequentially.
++      NativeIO.posixFadviseIfPossible(blockInFd, 0, 0, NativeIO.POSIX_FADV_SEQUENTIAL);
++    }
++    
++    // Trigger readahead of beginning of file if configured.
++    manageOsCache();
++
+-      writeChecksumHeader(out);
+-      
++        manageOsCache();
+-  
++
+-   * Write checksum header to the output stream
++   * Manage the OS buffer cache by performing read-ahead
++   * and drop-behind.
+-  private void writeChecksumHeader(DataOutputStream out) throws IOException {
+-    try {
+-      checksum.writeHeader(out);
+-      if (chunkOffsetOK) {
+-        out.writeLong(offset);
++  private void manageOsCache() throws IOException {
++    if (!isLongRead() || blockInFd == null) {
++      // don't manage cache manually for short-reads, like
++      // HBase random read workloads.
++      return;
++    }
++
++    // Perform readahead if necessary
++    if (readaheadLength > 0 && readaheadPool != null) {
++      curReadahead = readaheadPool.readaheadStream(
++          clientTraceFmt, blockInFd,
++          offset, readaheadLength, Long.MAX_VALUE,
++          curReadahead);
++    }
++
++    // Drop what we've just read from cache, since we aren't
++    // likely to need it again
++    long nextCacheDropOffset = lastCacheDropOffset + CACHE_DROP_INTERVAL_BYTES;
++    if (shouldDropCacheBehindRead &&
++        offset >= nextCacheDropOffset) {
++      long dropLength = offset - lastCacheDropOffset;
++      if (dropLength >= 1024) {
++        NativeIO.posixFadviseIfPossible(blockInFd,
++            lastCacheDropOffset, dropLength,
++            NativeIO.POSIX_FADV_DONTNEED);
+-      out.flush();
+-    } catch (IOException e) { //socket error
+-      throw ioeToSocketException(e);
++      lastCacheDropOffset += CACHE_DROP_INTERVAL_BYTES;
+-    
++
++  private boolean isLongRead() {
++    return (endOffset - offset) > LONG_READ_THRESHOLD_BYTES;
++  }
++
++
++  /**
++   * @return the checksum type that will be used with this block transfer.
++   */
++  DataChecksum getChecksum() {
++    return checksum;
++  }
++
++  /**
++   * @return the offset into the block file where the sender is currently
++   * reading.
++   */
++  long getOffset() {
++    return offset;
++  }

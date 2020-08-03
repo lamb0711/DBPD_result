@@ -1,0 +1,181 @@
+YARN-6127. Add support for work preserving NM restart when AMRMProxy is enabled. (Botong Huang via asuresh).
+
+-
++import org.apache.hadoop.yarn.server.nodemanager.recovery.NMStateStoreService.RecoveredAMRMProxyState;
++
++  private static final String NMSS_USER_KEY = "user";
++  private static final String NMSS_AMRMTOKEN_KEY = "amrmtoken";
++
+-   * 
+-   * @param nmContext
+-   * @param dispatcher
++   *
++   * @param nmContext NM context
++   * @param dispatcher NM dispatcher
++  protected void serviceInit(Configuration conf) throws Exception {
++    super.serviceInit(conf);
++    this.secretManager =
++        new AMRMProxyTokenSecretManager(this.nmContext.getNMStateStore());
++    this.secretManager.init(conf);
++  }
++
++  @Override
+-    this.secretManager = new AMRMProxyTokenSecretManager(serverConf);
++   * Recover from NM state store. Called after serviceInit before serviceStart.
++   *
++   * @throws IOException if recover fails
++   */
++  public void recover() throws IOException {
++    LOG.info("Recovering AMRMProxyService");
++
++    RecoveredAMRMProxyState state =
++        this.nmContext.getNMStateStore().loadAMRMProxyState();
++
++    this.secretManager.recover(state);
++
++    LOG.info("Recovering {} running applications for AMRMProxy",
++        state.getAppContexts().size());
++    for (Map.Entry<ApplicationAttemptId, Map<String, byte[]>> entry : state
++        .getAppContexts().entrySet()) {
++      ApplicationAttemptId attemptId = entry.getKey();
++      LOG.info("Recovering app attempt {}", attemptId);
++
++      // Try recover for the running application attempt
++      try {
++        String user = null;
++        Token<AMRMTokenIdentifier> amrmToken = null;
++        for (Map.Entry<String, byte[]> contextEntry : entry.getValue()
++            .entrySet()) {
++          if (contextEntry.getKey().equals(NMSS_USER_KEY)) {
++            user = new String(contextEntry.getValue(), "UTF-8");
++          } else if (contextEntry.getKey().equals(NMSS_AMRMTOKEN_KEY)) {
++            amrmToken = new Token<>();
++            amrmToken.decodeFromUrlString(
++                new String(contextEntry.getValue(), "UTF-8"));
++          }
++        }
++
++        if (amrmToken == null) {
++          throw new IOException(
++              "No amrmToken found for app attempt " + attemptId);
++        }
++        if (user == null) {
++          throw new IOException("No user found for app attempt " + attemptId);
++        }
++
++        Token<AMRMTokenIdentifier> localToken =
++            this.secretManager.createAndGetAMRMToken(attemptId);
++
++        initializePipeline(attemptId, user, amrmToken, localToken,
++            entry.getValue(), true);
++      } catch (Exception e) {
++        LOG.error("Exception when recovering " + attemptId
++            + ", removing it from NMStateStore and move on", e);
++        this.nmContext.getNMStateStore().removeAMRMProxyAppContext(attemptId);
++      }
++    }
++  }
++
++  /**
+-   * @throws IOException
+-   * @throws YarnException
++   * @throws IOException if fails
++   * @throws YarnException if fails
+-    initializePipeline(containerTokenIdentifierForKey.getContainerID()
+-        .getApplicationAttemptId(),
+-        containerTokenIdentifierForKey.getApplicationSubmitter(),
+-        amrmToken, localToken);
++    initializePipeline(appAttemptId,
++        containerTokenIdentifierForKey.getApplicationSubmitter(), amrmToken,
++        localToken, null, false);
+-   * 
+-   * @param applicationAttemptId
+-   * @param user
+-   * @param amrmToken
++   *
++   * @param applicationAttemptId attempt id
++   * @param user user name
++   * @param amrmToken amrmToken issued by RM
++   * @param localToken amrmToken issued by AMRMProxy
++   * @param recoveredDataMap the recovered states for AMRMProxy from NMSS
++   * @param isRecovery whether this is to recover a previously existing pipeline
+-      Token<AMRMTokenIdentifier> localToken) {
++      Token<AMRMTokenIdentifier> localToken,
++      Map<String, byte[]> recoveredDataMap, boolean isRecovery) {
++          // TODO: revisit in AMRMProxy HA in YARN-6128
++
++          if (!isRecovery && this.nmContext.getNMStateStore() != null) {
++            try {
++              this.nmContext.getNMStateStore()
++                  .removeAMRMProxyAppContext(applicationAttemptId);
++            } catch (IOException e) {
++              LOG.error("Error removing AMRMProxy application context for "
++                  + applicationAttemptId, e);
++            }
++          }
++
++      if (isRecovery) {
++        if (recoveredDataMap == null) {
++          throw new YarnRuntimeException(
++              "null recoveredDataMap recieved for recover");
++        }
++        interceptorChain.recover(recoveredDataMap);
++      }
++
++      if (!isRecovery && this.nmContext.getNMStateStore() != null) {
++        try {
++          this.nmContext.getNMStateStore().storeAMRMProxyAppContextEntry(
++              applicationAttemptId, NMSS_USER_KEY, user.getBytes("UTF-8"));
++          this.nmContext.getNMStateStore().storeAMRMProxyAppContextEntry(
++              applicationAttemptId, NMSS_AMRMTOKEN_KEY,
++              amrmToken.encodeToUrlString().getBytes("UTF-8"));
++        } catch (IOException e) {
++          LOG.error("Error storing AMRMProxy application context entry for "
++              + applicationAttemptId, e);
++        }
++      }
+-   * @param applicationId
++   * @param applicationId application id
++
++      // Remove the app context from NMSS after the interceptors are shutdown
++      if (this.nmContext.getNMStateStore() != null) {
++        try {
++          this.nmContext.getNMStateStore()
++              .removeAMRMProxyAppContext(pipeline.getApplicationAttemptId());
++        } catch (IOException e) {
++          LOG.error("Error removing AMRMProxy application context for "
++              + applicationId, e);
++        }
++      }
+-      org.apache.hadoop.security.token.Token<AMRMTokenIdentifier> newTokenId =
++      org.apache.hadoop.security.token.Token<AMRMTokenIdentifier> newToken =
+-      context.setAMRMToken(newTokenId);
++      context.setAMRMToken(newToken);
++
++      // Update the AMRMToken in context map in NM state store
++      if (this.nmContext.getNMStateStore() != null) {
++        try {
++          this.nmContext.getNMStateStore().storeAMRMProxyAppContextEntry(
++              context.getApplicationAttemptId(), NMSS_AMRMTOKEN_KEY,
++              newToken.encodeToUrlString().getBytes("UTF-8"));
++        } catch (IOException e) {
++          LOG.error("Error storing AMRMProxy application context entry for "
++              + context.getApplicationAttemptId(), e);
++        }
++      }
+-   * 
++   *
+-   * @param conf
++   * @param conf configuration
+-   * @throws YarnException
++   * @throws YarnException if fails
+-     * @param rootInterceptor
+-     * @param applicationAttemptId
++     * @param rootInterceptor the root request intercepter
++     * @param applicationAttemptId attempt id
+-     * 
++     *
+-     * 
++     *
+-     * 
++     *
