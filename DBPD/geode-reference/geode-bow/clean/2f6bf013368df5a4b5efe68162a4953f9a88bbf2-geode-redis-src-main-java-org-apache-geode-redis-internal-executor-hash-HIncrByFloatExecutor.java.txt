@@ -1,0 +1,144 @@
+GEODE-7828: Convert backing store for Redis Hashes and Sets to single regions (#4745)
+
+* GEODE-7828: Convert backing store for Redis Hashes and Sets to single regions
+
+This PR builds on the work originally submitted by Greg Green in
+https://github.com/apache/geode/pull/404. Also acknowledgements to Galen
+O'Sullivan for addressing locking issues in that PR.
+
+This commit changes the storage model of Redis hashes and sets from one
+region per each Redis key to a single hash region and single set region.
+The Redis key is now also the region key and the data is stored in a Map
+and Set respectively in the region. Currently, the backing values do not
+implement Delta changes, however this will be a future optimization.
+
+This also fixes the inability of Redis keys to contain other characters
+commonly used, such as colons (':').
+
+- Add `RedisLockService` which manages a lock per key within a single
+  JVM. Locks are held in a WeakHasMap to allow for automatic cleanup
+  (prior PR work, using a pure ConcurrentHashMap, ended up leaking
+  memory since there is no straight-forward way to clean up unused
+  keys/locks).
+- Add new tests including concurrency tests for hashes and sets
+
+Co-authored-by: Greg Green <ggreen@pivotal.io>
+Co-authored-by: Ray Ingles <ringles@pivotal.io>
+Co-authored-by: Sarah Abbey <sabbey@pivotal.io>
+Co-authored-by: John Hutchison <jhutchison@pivotal.io>
+Co-authored-by: Murtuza Boxwala <mboxwala@pivotal.io>
+Co-authored-by: Prasath Durairaj <prasathd@pivotal.io>
+Co-authored-by: Jens Deppe <jdeppe@pivotal.io>
+
++import java.util.Map;
+-import org.apache.geode.cache.Region;
++import org.apache.geode.cache.TimeoutException;
++import org.apache.geode.redis.internal.AutoCloseableLock;
+-import org.apache.geode.redis.internal.RedisDataType;
++/**
++ * <pre>
++ * Implementation of HINCRBYFLOAT Redis command.
++ * The purpose is to increment the specified field of a hash for a given key.
++ *  The value is floating number (represented as a double), by the specified increment.
++ *
++ * Examples:
++ *
++ * redis> HSET mykey field 10.50
++ * (integer) 1
++ * redis> HINCRBYFLOAT mykey field 0.1
++ * "10.6"
++ * redis> HINCRBYFLOAT mykey field -5
++ * "5.6"
++ * redis> HSET mykey field 5.0e3
++ * (integer) 0
++ * redis> HINCRBYFLOAT mykey field 2.0e2
++ * "5200"
++ *
++ *
++ * </pre>
++ */
+-
+-    Region<ByteArrayWrapper, ByteArrayWrapper> keyRegion =
+-        getOrCreateRegion(context, key, RedisDataType.REDIS_HASH);
+-
+-    byte[] byteField = commandElems.get(FIELD_INDEX);
+-    ByteArrayWrapper field = new ByteArrayWrapper(byteField);
+-
+-    /*
+-     * Put incrememnt as value if field doesn't exist
+-     */
+-
+-    ByteArrayWrapper oldValue = keyRegion.get(field);
+-
+-    if (oldValue == null) {
+-      keyRegion.put(field, new ByteArrayWrapper(incrArray));
+-      respondBulkStrings(command, context, increment);
+-      return;
+-    }
+-
+-    /*
+-     * If the field did exist then increment the field
+-     */
+-    String valueS = oldValue.toString();
+-    if (valueS.contains(" ")) {
+-      command.setResponse(
+-          Coder.getErrorResponse(context.getByteBufAllocator(), ERROR_FIELD_NOT_USABLE));
+-      return;
+-    }
+-    try {
+-      value = Coder.stringToDouble(valueS);
+-    } catch (NumberFormatException e) {
++    try (AutoCloseableLock regionLock = withRegionLock(context, key)) {
++      Map<ByteArrayWrapper, ByteArrayWrapper> map = getMap(context, key);
++
++      byte[] byteField = commandElems.get(FIELD_INDEX);
++      ByteArrayWrapper field = new ByteArrayWrapper(byteField);
++
++      /*
++       * Put increment as value if field doesn't exist
++       */
++
++      ByteArrayWrapper oldValue = map.get(field);
++
++      if (oldValue == null) {
++        map.put(field, new ByteArrayWrapper(incrArray));
++
++        this.saveMap(map, context, key);
++
++        respondBulkStrings(command, context, increment);
++        return;
++      }
++
++      /*
++       * If the field did exist then increment the field
++       */
++      String valueS = oldValue.toString();
++      if (valueS.contains(" ")) {
++        command.setResponse(
++            Coder.getErrorResponse(context.getByteBufAllocator(), ERROR_FIELD_NOT_USABLE));
++        return;
++      }
++
++      try {
++        value = Coder.stringToDouble(valueS);
++      } catch (NumberFormatException e) {
++        command.setResponse(
++            Coder.getErrorResponse(context.getByteBufAllocator(), ERROR_FIELD_NOT_USABLE));
++        return;
++      }
++
++      value += increment;
++      map.put(field, new ByteArrayWrapper(Coder.doubleToBytes(value)));
++
++      this.saveMap(map, context, key);
++    } catch (InterruptedException e) {
++      Thread.currentThread().interrupt();
+-          Coder.getErrorResponse(context.getByteBufAllocator(), ERROR_FIELD_NOT_USABLE));
++          Coder.getErrorResponse(context.getByteBufAllocator(), "Thread interrupted."));
++      return;
++    } catch (TimeoutException e) {
++      command.setResponse(Coder.getErrorResponse(context.getByteBufAllocator(),
++          "Timeout acquiring lock. Please try again."));
+-
+-    value += increment;
+-    keyRegion.put(field, new ByteArrayWrapper(Coder.doubleToBytes(value)));

@@ -1,0 +1,204 @@
+GEODE-4894: Changes are made to support case sensitivity between region, table name and pdx field, column name (#1663)
+
+* meta-data is now used to compute the column name
+* reads will now consult the pdx registry for an existing pdx type to use its field name.
+* Convert field name to lowercase only when column name is uppercase.
+* Table name lookup is changes to look for exact match first, than case insensitive match.
+* Field to column name lookup is changed to find exact column name or case insensitive match in the metadata.
+
++import java.util.HashSet;
++import java.util.Set;
++import java.util.concurrent.ConcurrentHashMap;
++import java.util.concurrent.ConcurrentMap;
++import org.apache.geode.connectors.jdbc.JdbcConnectorException;
++import org.apache.geode.pdx.internal.PdxType;
++import org.apache.geode.pdx.internal.TypeRegistry;
+-  private final Map<String, String> fieldToColumnMap;
+-  private final Map<String, String> columnToFieldMap;
++  private final ConcurrentMap<String, String> fieldToColumnMap;
++  private final ConcurrentMap<String, String> columnToFieldMap;
++
++  private final Map<String, String> configuredFieldToColumnMap;
++  private final Map<String, String> configuredColumnToFieldMap;
+-      Map<String, String> fieldToColumnMap) {
++      Map<String, String> configuredFieldToColumnMap) {
+-    this.fieldToColumnMap =
+-        fieldToColumnMap == null ? null : Collections.unmodifiableMap(fieldToColumnMap);
+-    this.columnToFieldMap = createReverseMap(fieldToColumnMap);
++    this.fieldToColumnMap = new ConcurrentHashMap<>();
++    this.columnToFieldMap = new ConcurrentHashMap<>();
++    if (configuredFieldToColumnMap != null) {
++      this.configuredFieldToColumnMap =
++          Collections.unmodifiableMap(new HashMap<>(configuredFieldToColumnMap));
++      this.configuredColumnToFieldMap =
++          Collections.unmodifiableMap(createReverseMap(configuredFieldToColumnMap));
++    } else {
++      this.configuredFieldToColumnMap = null;
++      this.configuredColumnToFieldMap = null;
++    }
+-  private static Map<String, String> createReverseMap(Map<String, String> fieldToColumnMap) {
+-    if (fieldToColumnMap == null) {
+-      return null;
+-    }
+-    Map<String, String> reverseMap = new HashMap<>();
+-    for (Map.Entry<String, String> entry : fieldToColumnMap.entrySet()) {
+-      String reverseMapKey = entry.getValue().toLowerCase();
++  private static Map<String, String> createReverseMap(Map<String, String> input) {
++    Map<String, String> output = new HashMap<>();
++    for (Map.Entry<String, String> entry : input.entrySet()) {
++      String reverseMapKey = entry.getValue();
+-      if (reverseMap.containsKey(reverseMapKey)) {
++      if (output.containsKey(reverseMapKey)) {
+-      reverseMap.put(reverseMapKey, reverseMapValue);
++      output.put(reverseMapKey, reverseMapValue);
+-    return Collections.unmodifiableMap(reverseMap);
++    return output;
+-  public String getColumnNameForField(String fieldName) {
+-    String columnName = null;
+-    if (fieldToColumnMap != null) {
+-      columnName = fieldToColumnMap.get(fieldName);
++  private String getConfiguredColumnNameForField(String fieldName) {
++    String result = fieldName;
++    if (configuredFieldToColumnMap != null) {
++      String mapResult = configuredFieldToColumnMap.get(fieldName);
++      if (mapResult != null) {
++        result = mapResult;
++      }
+-    return columnName != null ? columnName : fieldName;
++    return result;
+-  public String getFieldNameForColumn(String columnName) {
+-    String canonicalColumnName = columnName.toLowerCase();
+-    String fieldName = null;
+-    if (this.columnToFieldMap != null) {
+-      fieldName = columnToFieldMap.get(canonicalColumnName);
++  public String getColumnNameForField(String fieldName, TableMetaDataView tableMetaDataView) {
++    String columnName = fieldToColumnMap.get(fieldName);
++    if (columnName == null) {
++      String configuredColumnName = getConfiguredColumnNameForField(fieldName);
++      Set<String> columnNames = tableMetaDataView.getColumnNames();
++      if (columnNames.contains(configuredColumnName)) {
++        // exact match
++        columnName = configuredColumnName;
++      } else {
++        for (String candidate : columnNames) {
++          if (candidate.equalsIgnoreCase(configuredColumnName)) {
++            if (columnName != null) {
++              throw new JdbcConnectorException(
++                  "The SQL table has at least two columns that match the PDX field: " + fieldName);
++            }
++            columnName = candidate;
++          }
++        }
++      }
++
++      if (columnName == null) {
++        columnName = configuredColumnName;
++      }
++      fieldToColumnMap.put(fieldName, columnName);
++      columnToFieldMap.put(columnName, fieldName);
+-    return fieldName != null ? fieldName : canonicalColumnName;
++    return columnName;
+-  public Map<String, String> getFieldToColumnMap() {
+-    return fieldToColumnMap;
++  private String getConfiguredFieldNameForColumn(String columnName) {
++    String result = columnName;
++    if (configuredColumnToFieldMap != null) {
++      String mapResult = configuredColumnToFieldMap.get(columnName);
++      if (mapResult != null) {
++        result = mapResult;
++      }
++    }
++    return result;
++  }
++
++  public String getFieldNameForColumn(String columnName, TypeRegistry typeRegistry) {
++    String fieldName = columnToFieldMap.get(columnName);
++    if (fieldName == null) {
++      String configuredFieldName = getConfiguredFieldNameForColumn(columnName);
++      if (getPdxClassName() == null) {
++        if (configuredFieldName.equals(configuredFieldName.toUpperCase())) {
++          fieldName = configuredFieldName.toLowerCase();
++        } else {
++          fieldName = configuredFieldName;
++        }
++      } else {
++        Set<PdxType> pdxTypes = getPdxTypesForClassName(typeRegistry);
++        fieldName = findExactMatch(configuredFieldName, pdxTypes);
++        if (fieldName == null) {
++          fieldName = findCaseInsensitiveMatch(columnName, configuredFieldName, pdxTypes);
++        }
++      }
++      assert fieldName != null;
++      fieldToColumnMap.put(fieldName, columnName);
++      columnToFieldMap.put(columnName, fieldName);
++    }
++    return fieldName;
++  }
++
++  private Set<PdxType> getPdxTypesForClassName(TypeRegistry typeRegistry) {
++    Set<PdxType> pdxTypes = typeRegistry.getPdxTypesForClassName(getPdxClassName());
++    if (pdxTypes.isEmpty()) {
++      throw new JdbcConnectorException(
++          "The class " + getPdxClassName() + " has not been pdx serialized.");
++    }
++    return pdxTypes;
+-   * For unit tests
++   * Given a column name and a set of pdx types, find the field name in those types that match,
++   * ignoring case, the column name.
++   *
++   * @return the matching field name or null if no match
++   * @throws JdbcConnectorException if no fields match
++   * @throws JdbcConnectorException if more than one field matches
+-  Map<String, String> getColumnToFieldMap() {
+-    return this.columnToFieldMap;
++  private String findCaseInsensitiveMatch(String columnName, String configuredFieldName,
++      Set<PdxType> pdxTypes) {
++    HashSet<String> matchingFieldNames = new HashSet<>();
++    for (PdxType pdxType : pdxTypes) {
++      for (String existingFieldName : pdxType.getFieldNames()) {
++        if (existingFieldName.equalsIgnoreCase(configuredFieldName)) {
++          matchingFieldNames.add(existingFieldName);
++        }
++      }
++    }
++    if (matchingFieldNames.isEmpty()) {
++      throw new JdbcConnectorException("The class " + getPdxClassName()
++          + " does not have a field that matches the column " + columnName);
++    } else if (matchingFieldNames.size() > 1) {
++      throw new JdbcConnectorException(
++          "Could not determine what pdx field to use for the column name " + columnName
++              + " because the pdx fields " + matchingFieldNames + " all match it.");
++    }
++    return matchingFieldNames.iterator().next();
++  }
++
++  /**
++   * Given a column name, search the given pdxTypes for a field whose name exactly matches the
++   * column name.
++   *
++   * @return the matching field name or null if no match
++   */
++  private String findExactMatch(String columnName, Set<PdxType> pdxTypes) {
++    for (PdxType pdxType : pdxTypes) {
++      if (pdxType.getPdxField(columnName) != null) {
++        return columnName;
++      }
++    }
++    return null;
++  }
++
++  public Map<String, String> getFieldToColumnMap() {
++    return configuredFieldToColumnMap;
+-    return fieldToColumnMap != null ? fieldToColumnMap.equals(that.fieldToColumnMap)
+-        : that.fieldToColumnMap == null;
++
++    return (configuredFieldToColumnMap != null
++        ? configuredFieldToColumnMap.equals(that.configuredFieldToColumnMap)
++        : that.configuredFieldToColumnMap == null);
+-    result = 31 * result + (fieldToColumnMap != null ? fieldToColumnMap.hashCode() : 0);
++    result = 31 * result
++        + (configuredFieldToColumnMap != null ? configuredFieldToColumnMap.hashCode() : 0);
+-        + ", fieldToColumnMap=" + fieldToColumnMap + '}';
++        + ", fieldToColumnMap=" + configuredFieldToColumnMap + '}';
+
+INS26 INS26 INS26 INS26 INS26 INS26 INS26 MOV23 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS23 INS23 INS31 INS31 INS31 INS31 INS83 INS83 INS74 MOV59 INS83 INS83 INS74 MOV59 INS59 INS59 INS44 MOV44 INS83 INS43 INS42 INS44 INS8 INS43 INS44 INS83 INS43 INS42 INS44 INS8 INS44 INS83 INS74 INS42 INS44 INS8 INS29 UPD83 INS43 INS42 INS44 INS44 INS44 INS29 INS83 INS43 INS42 INS44 INS44 INS8 INS83 UPD42 INS43 INS43 INS43 INS43 INS43 INS43 INS42 INS42 MOV74 INS42 INS21 INS25 UPD42 INS42 INS43 INS42 INS60 INS25 INS41 INS42 INS43 INS42 INS25 INS41 INS42 INS43 INS42 INS60 INS25 INS41 INS43 INS42 INS25 INS41 INS43 INS43 INS43 INS42 INS60 INS25 INS41 INS65 INS65 INS65 INS65 UPD42 MOV42 INS43 INS42 INS43 INS42 INS74 INS42 INS60 INS70 INS25 INS65 INS65 INS42 INS43 INS42 INS74 INS42 INS70 MOV41 INS42 INS42 INS42 INS42 INS42 INS42 INS7 INS27 INS8 INS8 INS42 INS42 MOV43 INS59 INS27 INS8 INS42 INS42 MOV43 INS27 INS8 INS42 INS42 INS43 INS59 INS27 INS8 INS42 INS42 INS43 INS27 INS8 INS42 INS42 INS42 INS42 INS74 INS59 INS32 INS8 INS42 INS66 INS66 INS66 INS42 INS66 INS42 INS66 MOV42 MOV42 INS43 INS43 INS74 INS59 INS44 INS42 INS8 INS32 INS8 INS25 INS32 INS66 INS66 INS66 INS42 INS43 INS43 INS44 INS42 INS8 INS42 INS36 MOV22 INS14 INS14 INS42 INS33 MOV21 INS21 INS21 INS21 UPD42 UPD42 INS42 INS42 INS42 INS33 INS60 INS25 MOV32 INS42 INS33 INS60 INS60 INS25 MOV25 INS21 INS21 INS42 INS42 INS42 INS42 INS33 INS60 INS25 INS42 UPD42 INS42 INS33 MOV60 INS25 INS6 INS21 INS21 INS43 INS43 INS42 INS32 INS42 INS42 INS53 INS42 INS42 INS43 INS43 INS42 INS14 INS43 INS42 INS70 INS42 INS42 INS53 INS27 INS8 INS32 INS42 INS42 INS42 INS43 INS42 INS25 INS16 UPD42 INS74 INS74 INS7 INS7 INS7 MOV43 INS59 INS27 INS8 MOV43 INS59 INS74 INS59 INS32 INS8 INS8 UPD27 INS32 INS32 INS43 INS59 INS27 INS8 UPD42 INS42 UPD42 INS43 INS27 INS8 INS8 MOV27 INS32 INS32 INS42 INS42 INS42 INS42 INS32 INS14 INS42 INS42 INS74 INS42 INS44 INS32 INS8 INS14 INS32 INS34 INS53 INS42 INS42 INS42 INS27 INS8 MOV27 MOV32 MOV27 INS43 INS43 INS22 INS32 INS22 INS32 INS22 INS33 INS22 INS33 MOV32 UPD42 UPD42 INS42 INS32 INS42 INS33 INS21 INS42 INS32 INS43 INS43 INS42 INS32 INS42 INS42 INS42 INS21 INS70 UPD42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS33 INS21 INS42 UPD42 INS32 INS32 INS33 INS25 INS60 INS21 MOV25 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS43 INS27 INS43 INS43 INS42 INS42 INS42 INS25 INS43 INS27 INS42 INS42 INS14 INS32 INS33 INS41 UPD42 UPD42 UPD40 UPD40 INS42 INS42 INS52 INS42 MOV42 MOV42 INS14 INS52 INS42 INS42 INS42 INS32 INS52 INS42 INS52 INS42 INS42 INS42 INS42 INS7 INS42 INS42 INS42 INS42 INS42 INS42 INS7 INS44 INS42 INS8 INS42 INS42 INS42 INS7 INS42 INS42 INS42 INS32 INS8 INS8 INS74 INS59 INS7 UPD27 INS42 INS45 INS32 INS45 INS42 INS42 INS32 INS8 INS42 INS45 INS32 INS45 INS42 INS43 INS27 INS42 INS42 INS42 INS42 INS74 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS43 INS42 INS25 INS42 INS42 INS42 INS42 INS42 INS32 INS21 INS21 INS43 INS43 INS42 INS32 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS21 INS42 INS42 INS45 INS42 INS45 INS42 INS45 UPD42 UPD42 INS43 INS42 INS32 INS8 INS42 INS42 INS7 INS7 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS25 INS21 INS42 INS32 INS42 INS42 INS42 INS42 INS42 MOV27 INS8 INS7 INS42 INS42 INS42 UPD42 UPD42 UPD42 INS53 INS42 INS42 INS14 INS43 INS27 INS42 INS45 INS42 DEL42 DEL42 DEL32 DEL42 DEL33 DEL27 DEL33 DEL42 DEL32 DEL16 DEL42 DEL44 DEL42 DEL33 DEL27 DEL8 DEL25 DEL42 DEL32 DEL42 DEL42 DEL42 DEL32 DEL33 DEL42 DEL42 DEL16 DEL41 DEL33 DEL52 DEL42 DEL22 DEL42 DEL42 DEL16 DEL41 DEL43 DEL43 DEL43 DEL74 DEL42 DEL42 DEL66 DEL65 DEL29 DEL52 DEL42 DEL22 DEL16

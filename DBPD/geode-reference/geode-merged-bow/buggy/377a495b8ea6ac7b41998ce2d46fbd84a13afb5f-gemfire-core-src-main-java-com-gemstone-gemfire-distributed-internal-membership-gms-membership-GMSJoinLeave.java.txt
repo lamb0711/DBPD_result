@@ -1,0 +1,214 @@
+GEODE-77 fixing LocatorDUnitTest issues
+
+Members trying to rejoin with the same inetaddr:port were causing
+issues.
+This also moves us to JGroups 3.6.6.Final
+
++import com.gemstone.gemfire.distributed.Locator;
+-  /** number of times to try joining before giving up */
+-  private static final int JOIN_ATTEMPTS = Integer.getInteger("gemfire.join-attempts", 4);
+-  
+-  /** amount of time to wait for a view to be acked by all members before performing suspect processing on non-responders */
+-  private static final int VIEW_INSTALLATION_TIMEOUT = Integer.getInteger("gemfire.view-ack-timeout", 12500);
+-
+-  public static final long MEMBER_REQUEST_COLLECTION_INTERVAL = Long.getLong("gemfire.member-request-collection-interval", 2000);
++  public static final long MEMBER_REQUEST_COLLECTION_INTERVAL = Long.getLong("gemfire.member-request-collection-interval", 500);
+-  private static final long LEAVE_MESSAGE_SLEEP_TIME = Long.getLong("gemfire.leave-message-sleep-time", 4000);
++  private static final long LEAVE_MESSAGE_SLEEP_TIME = Long.getLong("gemfire.leave-message-sleep-time", 1000);
+-  private boolean isJoined;
++  private volatile boolean isJoined;
+-    Set<InternalDistributedMember> alreadyTried = new HashSet<>();
+-    int[] lastViewIdHolder = new int[] {-1};
++    
++    SearchState state = new SearchState();
++    
++    long timeout = services.getConfig().getJoinTimeout();
++    long retrySleep =  JOIN_RETRY_SLEEP;
++    long startTime = System.currentTimeMillis();
++    long giveupTime = startTime + timeout;
+-    for (int tries=0; tries<JOIN_ATTEMPTS; tries++) {
+-      InternalDistributedMember coord = findCoordinator(alreadyTried, lastViewIdHolder);
+-      logger.debug("found possible coordinator {}", coord);
+-      if (coord != null) {
+-        if (coord.equals(this.localAddress)) {
+-          if (tries > (JOIN_ATTEMPTS/2)) {
++    for (int tries=0; !this.isJoined; tries++) {
++
++      boolean found = findCoordinator(state);
++      if (found) {
++        logger.debug("found possible coordinator {}", state.possibleCoordinator);
++        if (state.possibleCoordinator.equals(this.localAddress)) {
++          if (tries > 2 || System.currentTimeMillis() < giveupTime ) {
+-          if (attemptToJoin(coord)) {
++          if (attemptToJoin(state)) {
+-          alreadyTried.add(coord);
++          if (System.currentTimeMillis() < giveupTime) {
++            break;
++          }
++          if (!state.possibleCoordinator.equals(localAddress)) {
++            state.alreadyTried.add(state.possibleCoordinator);
++          }
++      } else {
++        if (System.currentTimeMillis() < giveupTime) {
++          break;
++        }
++        state.alreadyTried.clear();
+-        Thread.sleep(JOIN_RETRY_SLEEP);
++        Thread.sleep(retrySleep);
++        logger.debug("retry sleep interrupted - giving up on joining the distributed system");
++    
++    if (!this.isJoined) {
++      logger.debug("giving up attempting to join the distributed system after " + (System.currentTimeMillis() - startTime) + "ms");
++    }
++    
++    // to preserve old behavior we need to throw a SystemConnectException if
++    // unable to contact any of the locators
++    if (!this.isJoined && state.hasContactedALocator) {
++      throw new SystemConnectException("Unable to join the distributed system in "
++         + (System.currentTimeMillis()-startTime) + "ms");
++    }
++    
+-  private boolean attemptToJoin(InternalDistributedMember coord) {
++  private boolean attemptToJoin(SearchState state) {
++    InternalDistributedMember coord = state.possibleCoordinator;
+-          joinResponse.wait(services.getConfig().getJoinTimeout()/JOIN_ATTEMPTS);
++          // Note that if we give up waiting but a response is on
++          // the way we will get the new view and join that way.
++          // See installView()
++          long timeout = Math.max(services.getConfig().getMemberTimeout(),
++                                     services.getConfig().getJoinTimeout()/5);
++          joinResponse.wait(timeout);
++          logger.debug("join attempt was interrupted");
+-      if (response.getBecomeCoordinator()) {
+-        logger.info("I am being told to become the membership coordinator by {}", coord);
+-        this.currentView = response.getCurrentView();
+-        becomeCoordinator(response.getCurrentView().getCoordinator());
+-        return true;
+-      }
+-        GMSMember o = (GMSMember)response.getMemberID().getNetMember();
+-        me.setSplitBrainEnabled(o.isSplitBrainEnabled());
+-        me.setPreferredForCoordinator(o.preferredForCoordinator());
+-        services.getConfig().getDistributionConfig().setEnableNetworkPartitionDetection(o.isSplitBrainEnabled());
+-        services.getConfig().setNetworkPartitionDetectionEnabled(o.isSplitBrainEnabled());
++
++        if (response.getBecomeCoordinator()) {
++          logger.info("I am being told to become the membership coordinator by {}", coord);
++          this.currentView = response.getCurrentView();
++          becomeCoordinator(response.getCurrentView().getCoordinator());
++        }
++
++
++    } else {
++      logger.debug("received no join response");
+-    if (!this.localAddress.getNetMember().preferredForCoordinator() &&
+-        incomingRequest.getMemberID().getNetMember().preferredForCoordinator()) {
+-      // tell the new guy to become the coordinator
+-      
+-    }
+-    
++    
++    if (!this.localAddress.getNetMember().preferredForCoordinator() &&
++        incomingRequest.getMemberID().getNetMember().preferredForCoordinator()) {
++      JoinResponseMessage m = new JoinResponseMessage(incomingRequest.getMemberID(), currentView, true);
++      services.getMessenger().send(m);
++      return;
++    }
+-  private InternalDistributedMember findCoordinator(Set<InternalDistributedMember> alreadyTried,
+-      int[] lastViewIdHolder) {
++  private boolean findCoordinator(SearchState state) {
+-    FindCoordinatorRequest request = new FindCoordinatorRequest(this.localAddress, alreadyTried, lastViewIdHolder[0]);
++    FindCoordinatorRequest request = new FindCoordinatorRequest(this.localAddress, state.alreadyTried, state.viewId);
++    boolean flagsSet = false;
+-            if (viewId > lastViewIdHolder[0]) {
++            if (viewId > state.viewId) {
+-              alreadyTried.clear();
+-              lastViewIdHolder[0] = viewId;
++              state.alreadyTried.clear();
++              state.viewId = viewId;
+-            if (response.isFromView()) {
++            if (!flagsSet) {
++              flagsSet = true;
++              
++              boolean enabled = response.isNetworkPartitionDetectionEnabled();
++              if (!enabled && services.getConfig().isNetworkPartitionDetectionEnabled()) {
++                throw new GemFireConfigException("locator at "+addr
++                    +" does not have network-partition-detection enabled but my configuration has it enabled");
++              }
++
+-              services.getConfig().setNetworkPartitionDetectionEnabled(response.isNetworkPartitionDetectionEnabled());
+-              if (response.isUsePreferredCoordinators()
+-                  && localAddress.getVmKind() != DistributionManager.LOCATOR_DM_TYPE) {
+-                mbr.setPreferredForCoordinator(false);
++              mbr.setSplitBrainEnabled(enabled);
++              services.getConfig().setNetworkPartitionDetectionEnabled(enabled);
++              services.getConfig().getDistributionConfig().setEnableNetworkPartitionDetection(enabled);
++
++              if (response.isUsePreferredCoordinators()) {
++                logger.debug("The locator indicates that all locators should be preferred as coordinators");
++                if (services.getLocator() != null
++                    || Locator.hasLocator()
++                    || !services.getConfig().getDistributionConfig().getStartLocator().isEmpty()
++                    || localAddress.getVmKind() == DistributionManager.LOCATOR_DM_TYPE) {
++                  ((GMSMember)localAddress.getNetMember()).setPreferredForCoordinator(true);
++                }
+-        return null;
++        return false;
+-          return null;
++          return false;
++    
+-      return it.next();
+-    }
+-    InternalDistributedMember oldest = it.next();
+-    while (it.hasNext()) {
+-      InternalDistributedMember candidate = it.next();
+-      if (oldest.compareTo(candidate) > 0) {
+-        oldest = candidate;
++      state.possibleCoordinator = it.next();
++    } else {
++      InternalDistributedMember oldest = it.next();
++      while (it.hasNext()) {
++        InternalDistributedMember candidate = it.next();
++        if (oldest.compareTo(candidate) > 0) {
++          oldest = candidate;
++        }
++      state.possibleCoordinator = oldest;
+-    return oldest;
++    return true;
++      if (currentView == null && !this.isJoined) {
++        for (InternalDistributedMember mbr: newView.getMembers()) {
++          if (this.localAddress.equals(mbr)) {
++            this.birthViewId = mbr.getVmViewId();
++            this.localAddress.setVmViewId(this.birthViewId);
++            GMSMember me = (GMSMember)this.localAddress.getNetMember();
++            me.setBirthViewId(birthViewId);
++            isJoined = true;
++            break;
++          }
++        }
++      }
++      
++    boolean waitForProcessing = false;
++      stopCoordinatorServices();
+-            stopCoordinatorServices();
+-            try { Thread.sleep(LEAVE_MESSAGE_SLEEP_TIME); }
+-            catch (InterruptedException e) { Thread.currentThread().interrupt(); }
++            waitForProcessing = true;
++            waitForProcessing = true;
+-      
++    if (waitForProcessing) {
++      try {
++        Thread.sleep(LEAVE_MESSAGE_SLEEP_TIME);
++      }
++      catch (InterruptedException e) {
++        Thread.currentThread().interrupt();
++      }
++    }
++  
++  private static class SearchState {
++    Set<InternalDistributedMember> alreadyTried = new HashSet<>();
++    InternalDistributedMember possibleCoordinator;
++    int viewId = -1;
++    private boolean hasContactedALocator;
++  }
+
+INS26 INS40 INS55 INS83 MOV25 MOV25 INS39 MOV8 INS83 INS83 INS42 INS23 INS23 INS23 INS23 INS60 INS60 INS60 INS24 INS25 INS25 INS43 INS42 INS60 INS43 INS42 INS60 INS25 MOV41 INS60 INS51 INS25 MOV74 MOV59 MOV43 INS59 INS39 INS59 INS83 INS39 INS59 UPD34 UPD34 INS43 INS59 INS39 INS39 INS59 INS39 INS59 INS39 INS59 MOV58 INS38 MOV37 MOV8 INS38 INS8 INS27 INS8 INS42 MOV43 INS59 INS8 INS8 UPD42 MOV42 MOV43 INS39 INS59 MOV27 MOV8 INS8 INS39 INS59 INS42 INS8 INS42 INS8 INS42 INS42 MOV38 INS42 INS42 INS42 INS14 UPD42 INS32 INS42 INS42 INS42 INS32 INS42 INS27 INS22 INS25 INS22 INS21 INS38 INS40 INS53 INS42 INS40 INS25 MOV21 INS21 INS60 INS21 INS41 INS42 INS9 MOV25 INS21 MOV60 MOV61 INS21 INS25 INS42 INS9 MOV60 MOV21 MOV21 INS25 MOV54 INS43 INS32 INS42 INS42 INS42 UPD42 MOV42 UPD42 MOV42 INS52 INS42 INS39 INS42 INS8 INS8 INS52 INS42 INS32 INS22 INS14 MOV27 INS8 INS32 INS43 INS59 INS32 MOV43 INS40 INS40 MOV8 MOV38 INS7 INS7 INS27 INS8 MOV27 INS8 INS42 INS42 INS42 UPD42 MOV21 MOV25 INS25 INS21 INS8 INS42 INS42 INS27 INS52 INS42 INS43 INS27 INS54 MOV25 MOV41 INS42 INS42 INS45 INS42 INS42 INS14 INS32 INS42 INS42 INS40 MOV32 INS40 INS42 INS27 INS38 INS70 MOV25 UPD42 INS8 INS27 INS8 INS32 INS21 INS41 INS45 INS36 INS45 INS42 INS45 INS36 INS45 MOV8 INS12 INS43 INS32 INS42 INS9 INS42 INS42 MOV8 INS42 INS33 INS22 INS44 INS32 INS8 INS40 INS40 MOV25 INS25 INS25 INS32 INS42 INS10 INS40 INS42 UPD42 INS32 INS9 INS27 INS27 INS60 MOV44 INS8 INS42 INS42 INS42 INS52 INS42 MOV43 INS42 INS42 INS42 INS25 INS27 INS27 INS8 INS38 MOV8 INS42 INS42 INS42 INS42 INS45 INS32 INS42 INS32 INS42 INS39 INS59 INS32 INS21 MOV21 INS41 INS32 INS8 INS27 INS27 UPD42 INS32 INS42 INS10 INS32 INS42 INS42 INS42 INS42 INS42 MOV32 INS42 INS42 INS42 INS32 INS9 INS22 INS42 INS42 INS21 INS21 INS60 INS21 INS21 INS10 INS21 INS21 MOV42 MOV34 INS32 INS42 INS42 INS42 INS40 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS45 INS38 INS8 INS52 INS42 INS7 INS32 INS43 INS59 INS32 INS7 INS7 INS7 INS42 INS42 INS40 INS40 MOV32 UPD42 MOV42 INS34 INS40 INS42 INS21 INS60 INS25 MOV60 INS21 INS21 MOV21 INS25 INS22 INS32 INS22 INS42 INS22 INS42 INS42 INS11 INS42 INS42 INS42 INS42 INS9 INS42 INS9 INS42 INS9 UPD42 MOV42 INS7 INS39 INS59 INS27 INS8 INS32 INS32 MOV32 MOV8 INS52 INS42 INS42 INS42 INS52 INS42 INS52 INS42 INS43 INS32 INS40 INS40 INS42 INS9 INS42 MOV32 INS38 MOV32 INS53 UPD42 MOV42 UPD42 MOV42 INS42 INS32 INS42 INS42 UPD42 MOV42 INS42 INS22 INS42 INS42 UPD42 INS14 INS42 INS42 INS32 INS27 INS52 INS42 INS43 INS27 INS42 INS42 INS45 INS27 UPD27 MOV27 INS42 INS45 INS42 INS45 INS27 INS38 INS27 INS32 INS32 INS36 UPD9 INS32 INS33 INS42 INS42 INS32 INS42 INS11 INS42 INS42 INS32 INS42 MOV43 INS32 INS32 INS42 INS42 UPD42 MOV42 INS42 INS42 DEL66 DEL65 DEL29 DEL83 DEL83 DEL83 DEL39 DEL42 DEL42 DEL42 DEL45 DEL34 DEL32 DEL59 DEL23 DEL66 DEL65 DEL29 DEL83 DEL83 DEL83 DEL39 DEL42 DEL42 DEL42 DEL45 DEL34 DEL32 DEL59 DEL23 DEL39 DEL85 DEL5 DEL39 DEL85 DEL5 DEL4 DEL3 DEL42 DEL42 DEL42 DEL42 DEL27 DEL36 DEL27 DEL42 DEL42 DEL42 DEL33 DEL27 DEL8 DEL25 DEL27 DEL24 DEL42 DEL42 DEL8 DEL42 DEL43 DEL42 DEL42 DEL42 DEL32 DEL42 DEL32 DEL11 DEL59 DEL60 DEL42 DEL42 DEL42 DEL42 DEL32 DEL32 DEL21 DEL42 DEL42 DEL42 DEL42 DEL32 DEL32 DEL21 DEL42 DEL42 DEL42 DEL32 DEL32 DEL21 DEL43 DEL42 DEL43 DEL74 DEL42 DEL39 DEL85 DEL5 DEL42 DEL44 DEL42 DEL42 DEL34 DEL2 DEL42 DEL34 DEL2 DEL42 DEL42 DEL34 DEL2 DEL42 DEL32 DEL27 DEL32 DEL33 DEL41 DEL8 DEL33 DEL41 DEL8 DEL12 DEL54 DEL8 DEL25 DEL41 DEL25 DEL42 DEL41 DEL42 DEL25 DEL8 DEL51 DEL8

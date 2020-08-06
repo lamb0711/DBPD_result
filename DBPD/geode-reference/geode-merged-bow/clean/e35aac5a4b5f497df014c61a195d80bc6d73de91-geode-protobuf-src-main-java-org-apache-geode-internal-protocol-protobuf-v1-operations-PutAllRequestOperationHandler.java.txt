@@ -1,0 +1,125 @@
+Merge branch 'release/1.5.0'
+
+-import static org.apache.geode.internal.protocol.ProtocolErrorCode.INVALID_REQUEST;
+-import static org.apache.geode.internal.protocol.ProtocolErrorCode.SERVER_ERROR;
+-
+-import java.util.Objects;
+-import java.util.stream.Collectors;
++import static org.apache.geode.internal.protocol.protobuf.v1.BasicTypes.ErrorCode.INVALID_REQUEST;
++import static org.apache.geode.internal.protocol.protobuf.v1.BasicTypes.ErrorCode.SERVER_ERROR;
++import org.apache.shiro.util.ThreadState;
+-import org.apache.geode.internal.protocol.Failure;
+-import org.apache.geode.internal.protocol.MessageExecutionContext;
+-import org.apache.geode.internal.protocol.ProtocolErrorCode;
+-import org.apache.geode.internal.protocol.Result;
+-import org.apache.geode.internal.protocol.Success;
+-import org.apache.geode.internal.protocol.protobuf.v1.ClientProtocol;
++import org.apache.geode.internal.protocol.protobuf.v1.Failure;
++import org.apache.geode.internal.protocol.protobuf.v1.MessageExecutionContext;
+-import org.apache.geode.internal.protocol.protobuf.v1.utilities.ProtobufResponseUtilities;
+-import org.apache.geode.internal.protocol.protobuf.v1.utilities.ProtobufUtilities;
+-import org.apache.geode.internal.protocol.serialization.SerializationService;
+-import org.apache.geode.internal.protocol.serialization.exception.EncodingException;
++import org.apache.geode.internal.protocol.protobuf.v1.Result;
++import org.apache.geode.internal.protocol.protobuf.v1.Success;
++import org.apache.geode.internal.protocol.protobuf.v1.serialization.SerializationService;
++import org.apache.geode.internal.protocol.protobuf.v1.serialization.exception.DecodingException;
++import org.apache.geode.internal.protocol.protobuf.v1.state.ProtobufConnectionAuthorizingStateProcessor;
++import org.apache.geode.internal.security.SecurityService;
++import org.apache.geode.security.NotAuthorizedException;
++import org.apache.geode.security.ResourcePermission;
+-  public Result<RegionAPI.PutAllResponse, ClientProtocol.ErrorResponse> process(
+-      ProtobufSerializationService serializationService, RegionAPI.PutAllRequest putAllRequest,
+-      MessageExecutionContext messageExecutionContext) throws InvalidExecutionContextException {
++  public Result<RegionAPI.PutAllResponse> process(ProtobufSerializationService serializationService,
++      RegionAPI.PutAllRequest putAllRequest, MessageExecutionContext messageExecutionContext)
++      throws InvalidExecutionContextException, DecodingException {
+-      logger.error("Received PutAll request for non-existing region {}", regionName);
+-      return Failure.of(ProtobufResponseUtilities.makeErrorResponse(SERVER_ERROR,
+-          "Region passed does not exist: " + regionName));
++      logger.error("Received put-all request for nonexistent region: {}", regionName);
++      return Failure.of(BasicTypes.ErrorCode.SERVER_ERROR,
++          "Region \"" + regionName + "\" not found");
+-    RegionAPI.PutAllResponse.Builder builder = RegionAPI.PutAllResponse.newBuilder()
+-        .addAllFailedKeys(putAllRequest.getEntryList().stream()
+-            .map((entry) -> singlePut(serializationService, region, entry)).filter(Objects::nonNull)
+-            .collect(Collectors.toList()));
++    ThreadState threadState = null;
++    SecurityService securityService = messageExecutionContext.getCache().getSecurityService();
++    boolean perKeyAuthorization = false;
++    if (messageExecutionContext
++        .getConnectionStateProcessor() instanceof ProtobufConnectionAuthorizingStateProcessor) {
++      threadState = ((ProtobufConnectionAuthorizingStateProcessor) messageExecutionContext
++          .getConnectionStateProcessor()).prepareThreadForAuthorization();
++      // Check if authorized for entire region
++      try {
++        securityService.authorize(new ResourcePermission(ResourcePermission.Resource.DATA,
++            ResourcePermission.Operation.WRITE, regionName));
++        ((ProtobufConnectionAuthorizingStateProcessor) messageExecutionContext
++            .getConnectionStateProcessor()).restoreThreadState(threadState);
++        threadState = null;
++      } catch (NotAuthorizedException ex) {
++        // Not authorized for the region, have to check keys individually
++        perKeyAuthorization = true;
++      }
++    }
++    final boolean authorizeKeys = perKeyAuthorization; // Required for use in lambda
++
++    long startTime = messageExecutionContext.getStatistics().startOperation();
++    RegionAPI.PutAllResponse.Builder builder = RegionAPI.PutAllResponse.newBuilder();
++    try {
++      messageExecutionContext.getCache().setReadSerializedForCurrentThread(true);
++
++      putAllRequest.getEntryList().stream().forEach((entry) -> processSinglePut(builder,
++          serializationService, region, entry, securityService, authorizeKeys));
++
++    } finally {
++      messageExecutionContext.getCache().setReadSerializedForCurrentThread(false);
++      if (threadState != null) {
++        ((ProtobufConnectionAuthorizingStateProcessor) messageExecutionContext
++            .getConnectionStateProcessor()).restoreThreadState(threadState);
++      }
++    }
+-  private BasicTypes.KeyedError singlePut(SerializationService serializationService, Region region,
+-      BasicTypes.Entry entry) {
++  private void processSinglePut(RegionAPI.PutAllResponse.Builder builder,
++      SerializationService serializationService, Region region, BasicTypes.Entry entry,
++      SecurityService securityService, boolean authorizeKeys) {
+-      Object decodedValue = serializationService.decode(entry.getValue());
+-      Object decodedKey = serializationService.decode(entry.getKey());
++      Object decodedKey = serializationService.decode(entry.getKey());
++      Object decodedValue = serializationService.decode(entry.getValue());
++      if (decodedKey == null || decodedValue == null) {
++        builder.addFailedKeys(
++            buildKeyedError(entry, INVALID_REQUEST, "Key and value must both be non-NULL"));
++      }
++      if (authorizeKeys) {
++        securityService.authorize(new ResourcePermission(ResourcePermission.Resource.DATA,
++            ResourcePermission.Operation.WRITE, region.getName(), decodedKey.toString()));
++      }
+-    } catch (EncodingException ex) {
+-      return buildAndLogKeyedError(entry, INVALID_REQUEST, "Encoding not supported", ex);
++
++    } catch (NotAuthorizedException ex) {
++      builder.addFailedKeys(
++          buildKeyedError(entry, BasicTypes.ErrorCode.AUTHORIZATION_FAILED, "Unauthorized access"));
++    } catch (DecodingException ex) {
++      logger.info("Encoding not supported: " + ex);
++      builder.addFailedKeys(this.buildKeyedError(entry, INVALID_REQUEST, "Encoding not supported"));
+-      return buildAndLogKeyedError(entry, SERVER_ERROR, ex.toString(), ex);
++      builder.addFailedKeys(buildKeyedError(entry, SERVER_ERROR, ex.toString()));
++    } catch (Exception ex) {
++      logger.warn("Error processing putAll entry", ex);
++      builder.addFailedKeys(buildKeyedError(entry, SERVER_ERROR, ex.toString()));
+-    return null;
+-  private BasicTypes.KeyedError buildAndLogKeyedError(BasicTypes.Entry entry,
+-      ProtocolErrorCode errorCode, String message, Exception ex) {
+-    logger.error(message, ex);
+-
++  private BasicTypes.KeyedError buildKeyedError(BasicTypes.Entry entry,
++      BasicTypes.ErrorCode errorCode, String message) {
+-        .setError(BasicTypes.Error.newBuilder()
+-            .setErrorCode(ProtobufUtilities.getProtobufErrorCode(errorCode)).setMessage(message))
++        .setError(BasicTypes.Error.newBuilder().setErrorCode(errorCode).setMessage(message))
+
+MOV26 MOV26 MOV26 MOV26 MOV26 UPD40 UPD40 UPD40 UPD40 UPD40 UPD40 UPD40 UPD40 UPD40 UPD40 UPD40 UPD40 UPD40 UPD74 INS43 INS39 INS42 INS44 INS44 INS44 UPD42 INS42 INS60 INS60 INS60 INS25 INS60 INS60 INS60 INS54 INS43 INS42 INS43 INS42 INS39 INS42 UPD43 INS43 INS59 INS43 INS59 INS39 INS59 INS62 INS8 INS83 INS39 INS59 INS39 INS59 MOV43 INS59 INS8 INS8 UPD40 MOV40 INS42 MOV60 INS12 INS12 INS40 INS42 INS42 INS33 INS42 INS42 INS32 INS42 INS9 INS32 INS43 INS21 INS54 INS42 INS42 INS42 INS32 MOV42 MOV32 INS21 INS21 INS21 INS25 INS25 INS25 INS44 INS8 MOV44 INS8 INS32 INS42 INS42 INS42 INS42 INS7 INS8 INS12 INS32 INS42 INS32 INS32 INS32 INS27 INS8 INS27 INS8 INS42 INS8 INS43 INS42 INS21 UPD43 INS21 INS21 INS21 INS21 INS21 UPD45 INS40 MOV27 INS42 INS42 INS42 INS32 INS21 INS21 INS21 INS44 INS8 INS42 INS42 INS32 INS42 INS9 MOV32 UPD42 MOV42 MOV86 INS32 INS42 INS9 INS42 INS33 INS21 INS27 INS27 INS21 INS21 INS42 INS32 UPD42 INS32 INS32 INS32 INS32 INS32 UPD45 INS45 INS36 INS42 INS32 INS32 INS7 INS43 INS42 INS21 UPD42 MOV42 INS42 UPD42 MOV42 INS42 INS32 INS42 INS33 INS42 INS33 INS32 INS32 INS42 INS42 INS32 INS42 INS42 INS27 INS42 INS42 INS32 INS42 INS42 MOV32 INS42 INS42 INS45 INS42 INS42 INS42 INS32 MOV42 INS11 INS42 INS42 INS14 INS36 INS42 INS42 INS42 INS33 INS42 INS7 UPD42 INS42 INS42 INS42 INS36 UPD42 MOV42 UPD42 MOV42 INS42 INS42 INS32 INS42 INS42 INS14 INS42 INS42 INS40 INS45 INS45 INS42 INS52 UPD42 MOV42 MOV42 MOV42 MOV45 UPD42 INS42 INS42 INS42 INS32 INS43 INS32 INS43 INS40 INS40 INS42 INS11 INS42 INS9 INS11 INS42 INS42 INS42 INS45 INS43 INS40 INS40 INS32 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS43 INS32 INS43 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 DEL40 DEL26 DEL40 DEL43 DEL42 DEL42 DEL42 DEL32 DEL32 DEL42 DEL42 DEL90 DEL32 DEL42 DEL32 DEL32 DEL32 DEL59 DEL60 DEL43 DEL42 DEL42 DEL32 DEL41 DEL42 DEL41 DEL33 DEL41 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL21 DEL42 DEL42 DEL32

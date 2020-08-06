@@ -1,0 +1,541 @@
+GEODE-2686: Remove JarClassLoader
+
+ - Remove JarClassLoader
+ - Replace ClassPathLoader's collection of JarClassLoaders with a single URLClassLoader
+ - Change naming scheme for deployed jars from 'vf.gf#myJar.jar#1' to 'myJar.v1.jar'
+
++import static java.util.stream.Collectors.joining;
++
++import org.apache.commons.io.FileUtils;
++import java.util.concurrent.ConcurrentHashMap;
+-
+-  public static final String ENABLE_TRACE_PROPERTY =
+-      DistributionConfig.GEMFIRE_PREFIX + "ClassPathLoader.enableTrace";
+-  public static final String ENABLE_TRACE_DEFAULT_VALUE = "false";
+-  private final boolean ENABLE_TRACE = false;
+-
++
++  private static volatile ClassPathLoader latest;
++
++  private volatile URLClassLoader classLoaderForDeployedJars;
++  private final JarDeployer jarDeployer;
++
+-  // This calculates the location of the extlib directory relative to the
+-  // location of the gemfire jar file. If for some reason the ClassPathLoader
+-  // class is found in a directory instead of a JAR file (as when testing),
+-  // then it will be relative to the location of the root of the package and
+-  // class.
+-  public static final String EXT_LIB_DIR_PARENT_PROPERTY =
+-      DistributionConfig.GEMFIRE_PREFIX + "ClassPathLoader.EXT_LIB_DIR";
+-  public static final String EXT_LIB_DIR_PARENT_DEFAULT =
+-      ClassPathLoader.class.getProtectionDomain().getCodeSource().getLocation().getPath();
++  public void rebuildClassLoaderForDeployedJars() {
++    ClassLoader parent = ClassPathLoader.class.getClassLoader();
+-  static final File defineEXT_LIB_DIR() {
+-    return new File(
+-        (new File(System.getProperty(EXT_LIB_DIR_PARENT_PROPERTY, EXT_LIB_DIR_PARENT_DEFAULT)))
+-            .getParent(),
+-        "ext");
++    this.classLoaderForDeployedJars = new URLClassLoader(jarDeployer.getDeployedJarURLs(), parent);
+-  // This token is placed into the list of class loaders to determine where
+-  // to insert the TCCL when in forName(...), getResource(...), etc.
+-  private static final ClassLoader TCCL_PLACEHOLDER = new ClassLoader() { // This is never used for
+-                                                                          // class loading
+-  };
+-
+-  private static final AtomicReference<ClassPathLoader> latest =
+-      new AtomicReference<ClassPathLoader>();
+-
+-  private final List<ClassLoader> classLoaders;
+-
+-  private static final Set<ClassLoader> defaultLoaders;
+-  static {
+-    defaultLoaders = new HashSet<ClassLoader>();
+-    try {
+-      ClassLoader classLoader = ClassPathLoader.class.getClassLoader();
+-      if (classLoader != null) {
+-        defaultLoaders.add(classLoader);
+-      }
+-    } catch (SecurityException sex) {
+-      // Nothing to do, just don't add it
+-    }
+-
+-    try {
+-      ClassLoader classLoader = ClassLoader.getSystemClassLoader();
+-      if (classLoader != null) {
+-        defaultLoaders.add(classLoader);
+-      }
+-    } catch (SecurityException sex) {
+-      // Nothing to do, just don't add it
+-    }
+-
+-    setLatestToDefault();
+-  }
+-
+-  /**
+-   * Starting at the files or directories identified by 'files', search for valid JAR files and
+-   * return a list of their URLs. Sub-directories will also be searched.
+-   * 
+-   * @param files Files or directories to search for valid JAR content.
+-   * 
+-   * @return A list of URLs for all JAR files found.
+-   */
+-  private static List<URL> getJarURLsFromFiles(final File... files) {
+-    final List<URL> urls = new ArrayList<URL>();
+-
+-    Assert.assertTrue(files != null, "file list cannot be null");
+-
+-    for (File file : files) {
+-      if (file.exists()) {
+-        if (file.isDirectory()) {
+-          urls.addAll(getJarURLsFromFiles(file.listFiles()));
+-        } else {
+-          if (!JarClassLoader.hasValidJarContent(file)) {
+-            logger.warn("Invalid JAR content when attempting to create ClassLoader for file: {}",
+-                file.getAbsolutePath());
+-            continue;
+-          }
+-
+-          try {
+-            urls.add(file.toURI().toURL());
+-          } catch (MalformedURLException muex) {
+-            logger.warn(
+-                "Encountered invalid URL when attempting to create ClassLoader for file: {}:{}",
+-                file.getAbsolutePath(), muex.getMessage());
+-            continue;
+-          }
+-        }
+-      }
+-    }
+-
+-    return urls;
+-  }
+-
+-  private ClassPathLoader(final List<ClassLoader> classLoaders, final boolean excludeTCCL) {
+-
+-    Assert.assertTrue(classLoaders != null, "custom loaders must not be null");
+-    for (ClassLoader classLoader : classLoaders) {
+-      Assert.assertTrue(classLoader != null, "null classloaders not allowed");
+-    }
+-
+-    this.classLoaders = new ArrayList<ClassLoader>(classLoaders);
++  public ClassPathLoader(boolean excludeTCCL) {
++    this.jarDeployer = new JarDeployer();
++    rebuildClassLoaderForDeployedJars();
+-  /**
+-   * Get a copy of the collection of ClassLoaders currently in use.
+-   * 
+-   * @return Collection of ClassLoaders currently in use.
+-   */
+-  public Collection<ClassLoader> getClassLoaders() {
+-    List<ClassLoader> classLoadersCopy = new ArrayList<ClassLoader>(this.classLoaders);
++  public ClassPathLoader(boolean excludeTCCL, File workingDir) {
++    this.excludeTCCL = excludeTCCL;
++    this.jarDeployer = new JarDeployer(workingDir);
++    rebuildClassLoaderForDeployedJars();
++  }
+-    for (int i = 0; i < classLoadersCopy.size(); i++) {
+-      if (classLoadersCopy.get(i).equals(TCCL_PLACEHOLDER)) {
+-        if (excludeTCCL) {
+-          classLoadersCopy.remove(i);
+-        } else {
+-          classLoadersCopy.set(i, Thread.currentThread().getContextClassLoader());
+-        }
+-        break;
+-      }
+-    }
++  public static ClassPathLoader setLatestToDefault() {
++    latest = new ClassPathLoader(Boolean.getBoolean(EXCLUDE_TCCL_PROPERTY));
++    return latest;
++  }
+-    return classLoadersCopy;
++  public static ClassPathLoader setLatestToDefault(File workingDir) {
++    latest = new ClassPathLoader(Boolean.getBoolean(EXCLUDE_TCCL_PROPERTY), workingDir);
++    return latest;
++  }
++
++  public JarDeployer getJarDeployer() {
++    return this.jarDeployer;
+-    List<ClassLoader> classLoaders = new LinkedList<ClassLoader>();
+-
+-    classLoaders.add(TCCL_PLACEHOLDER);
+-
+-    for (final ClassLoader classLoader : defaultLoaders) {
+-      classLoaders.add(classLoader);
+-    }
+-
+-    // Add user JAR files from the EXT_LIB_DIR directory using a single ClassLoader
+-    try {
+-      File EXT_LIB_DIR = defineEXT_LIB_DIR();
+-      if (EXT_LIB_DIR.exists()) {
+-        if (!EXT_LIB_DIR.isDirectory() || !EXT_LIB_DIR.canRead()) {
+-          logger.warn("Cannot read from directory when attempting to load JAR files: {}",
+-              EXT_LIB_DIR.getAbsolutePath());
+-        } else {
+-          List<URL> extLibJarURLs = getJarURLsFromFiles(EXT_LIB_DIR);
+-          ClassLoader classLoader =
+-              new URLClassLoader(extLibJarURLs.toArray(new URL[extLibJarURLs.size()]));
+-          classLoaders.add(classLoader);
+-        }
+-      }
+-    } catch (SecurityException sex) {
+-      // Nothing to do, just don't add it
+-    }
+-
+-    return new ClassPathLoader(classLoaders, excludeTCCL);
+-  }
+-
+-  public static ClassPathLoader setLatestToDefault() {
+-    return setLatestToDefault(Boolean.getBoolean(EXCLUDE_TCCL_PROPERTY));
+-  }
+-
+-  public static ClassPathLoader setLatestToDefault(final boolean excludeTCCL) {
+-    ClassPathLoader classPathLoader = createWithDefaults(excludeTCCL);
+-
+-    // Clean up JarClassLoaders that attached to the previous ClassPathLoader
+-    ClassPathLoader oldClassPathLoader = latest.getAndSet(classPathLoader);
+-    if (oldClassPathLoader != null) {
+-      for (ClassLoader classLoader : oldClassPathLoader.classLoaders) {
+-        if (classLoader instanceof JarClassLoader) {
+-          ((JarClassLoader) classLoader).cleanUp();
+-        }
+-      }
+-    }
+-
+-    return classPathLoader;
+-  }
+-
+-  // This is exposed for testing.
+-  ClassPathLoader addOrReplace(final ClassLoader classLoader) {
+-    final boolean isDebugEnabled = logger.isTraceEnabled();
+-    if (isDebugEnabled) {
+-      logger.trace("adding classLoader: {}", classLoader);
+-    }
+-
+-    List<ClassLoader> classLoadersCopy = new ArrayList<ClassLoader>(this.classLoaders);
+-    classLoadersCopy.add(0, classLoader);
+-
+-    // Ensure there is only one instance of this class loader in the list
+-    ClassLoader removingClassLoader = null;
+-    int index = classLoadersCopy.lastIndexOf(classLoader);
+-    if (index != 0) {
+-      removingClassLoader = classLoadersCopy.get(index);
+-      if (isDebugEnabled) {
+-        logger.trace("removing previous classLoader: {}", removingClassLoader);
+-      }
+-      classLoadersCopy.remove(index);
+-    }
+-
+-    if (removingClassLoader != null && removingClassLoader instanceof JarClassLoader) {
+-      ((JarClassLoader) removingClassLoader).cleanUp();
+-    }
+-
+-    return new ClassPathLoader(classLoadersCopy, this.excludeTCCL);
+-  }
+-
+-  /**
+-   * Add or replace the provided {@link ClassLoader} to the list held by this ClassPathLoader. Then
+-   * use the resulting list to create a new ClassPathLoader and set it as the latest.
+-   * 
+-   * @param classLoader {@link ClassLoader} to add
+-   */
+-  public ClassPathLoader addOrReplaceAndSetLatest(final ClassLoader classLoader) {
+-    ClassPathLoader classPathLoader = addOrReplace(classLoader);
+-    latest.set(classPathLoader);
+-    return classPathLoader;
+-  }
+-
+-  // This is exposed for testing.
+-  ClassPathLoader remove(final ClassLoader classLoader) {
+-    final boolean isDebugEnabled = logger.isTraceEnabled();
+-    if (isDebugEnabled) {
+-      logger.trace("removing classLoader: {}", classLoader);
+-    }
+-
+-    List<ClassLoader> classLoadersCopy = new ArrayList<ClassLoader>();
+-    classLoadersCopy.addAll(this.classLoaders);
+-
+-    if (!classLoadersCopy.contains(classLoader)) {
+-      if (isDebugEnabled) {
+-        logger.trace("cannot remove classLoader since it doesn't exist: {}", classLoader);
+-      }
+-      return this;
+-    }
+-
+-    classLoadersCopy.remove(classLoader);
+-
+-    if (classLoader instanceof JarClassLoader) {
+-      ((JarClassLoader) classLoader).cleanUp();
+-    }
+-
+-    return new ClassPathLoader(classLoadersCopy, this.excludeTCCL);
+-  }
+-
+-  /**
+-   * Remove the provided {@link ClassLoader} from the list held by this ClassPathLoader. Then use
+-   * the resulting list to create a new ClassPathLoader and set it as the latest. Silently ignores
+-   * requests to remove non-existent ClassLoaders.
+-   * 
+-   * @param classLoader {@link ClassLoader} to remove
+-   */
+-  public ClassPathLoader removeAndSetLatest(final ClassLoader classLoader) {
+-    ClassPathLoader classPathLoader = remove(classLoader);
+-    latest.set(classPathLoader);
+-    return classPathLoader;
++    return new ClassPathLoader(excludeTCCL);
+-    URL url = null;
+-    ClassLoader tccl = null;
+-    if (!excludeTCCL) {
+-      tccl = Thread.currentThread().getContextClassLoader();
+-    }
+-    for (ClassLoader classLoader : this.classLoaders) {
+-      if (classLoader == TCCL_PLACEHOLDER) {
+-        try {
+-          if (tccl != null) {
+-            if (isDebugEnabled) {
+-              logger.trace("getResource trying TCCL: {}", tccl);
+-            }
+-            url = tccl.getResource(name);
+-            if (url != null) {
+-              if (isDebugEnabled) {
+-                logger.trace("getResource found by TCCL");
+-              }
+-              return url;
+-            }
+-          } else {
+-            if (isDebugEnabled) {
+-              logger.trace("getResource skipping TCCL because it's null");
+-            }
+-          }
+-        } catch (SecurityException sex) {
+-          // Continue to next ClassLoader
+-        }
+-      } else if (excludeTCCL || !classLoader.equals(tccl)) {
+-        if (isDebugEnabled) {
+-          logger.trace("getResource trying classLoader: {}", classLoader);
+-        }
+-        url = classLoader.getResource(name);
++    for (ClassLoader classLoader : getClassLoaders()) {
++      if (isDebugEnabled) {
++        logger.trace("getResource trying: {}", classLoader);
++      }
++      try {
++        URL url = classLoader.getResource(name);
++
+-            logger.trace("getResource found by classLoader: {}", classLoader);
++            logger.trace("getResource found by: {}", classLoader);
++      } catch (SecurityException e) {
++        // try next classLoader
+-    if (isDebugEnabled) {
+-      logger.trace("getResource returning null");
+-    }
+-    return url;
++    return null;
+-    Class<?> clazz = null;
+-    ClassLoader tccl = null;
+-    if (!excludeTCCL) {
+-      tccl = Thread.currentThread().getContextClassLoader();
+-    }
+-    for (ClassLoader classLoader : this.classLoaders) {
++    for (ClassLoader classLoader : this.getClassLoaders()) {
++      if (isDebugEnabled) {
++        logger.trace("forName trying: {}", classLoader);
++      }
+-        if (classLoader == TCCL_PLACEHOLDER) {
+-          if (tccl != null) {
+-            if (isDebugEnabled) {
+-              logger.trace("forName trying TCCL: {}", tccl);
+-            }
+-            clazz = Class.forName(name, true, tccl);
+-            if (clazz != null) {
+-              if (isDebugEnabled) {
+-                logger.trace("forName found by TCCL");
+-              }
+-              return clazz;
+-            } else {
+-              if (isDebugEnabled) {
+-                logger.trace("forName skipping TCCL because it's null");
+-              }
+-            }
+-          }
+-        } else if (excludeTCCL || !classLoader.equals(tccl)) {
++        Class<?> clazz = Class.forName(name, true, classLoader);
++
++        if (clazz != null) {
+-            logger.trace("forName trying classLoader: {}", classLoader);
++            logger.trace("forName found by: {}", classLoader);
+-          clazz = Class.forName(name, true, classLoader);
+-          if (clazz != null) {
+-            if (isDebugEnabled) {
+-              logger.trace("forName found by classLoader: {}", classLoader);
+-            }
+-            return clazz;
+-          }
++          return clazz;
+-      } catch (SecurityException sex) {
+-        // Continue to next ClassLoader
+-      } catch (ClassNotFoundException cnfex) {
+-        // Continue to next ClassLoader
++      } catch (SecurityException | ClassNotFoundException e) {
++        // try next classLoader
+-    if (isDebugEnabled) {
+-      logger.trace("forName throwing ClassNotFoundException");
+-    }
+-    ClassLoader tccl = null;
+-    if (!excludeTCCL) {
+-      tccl = Thread.currentThread().getContextClassLoader();
+-    }
+-    for (ClassLoader classLoader : this.classLoaders) {
++    for (ClassLoader classLoader : this.getClassLoaders()) {
+-        if (classLoader == TCCL_PLACEHOLDER) {
+-          if (tccl != null) {
+-            return Proxy.getProxyClass(tccl, classObjs);
+-          }
+-        } else if (excludeTCCL || !classLoader.equals(tccl)) {
+-          return Proxy.getProxyClass(classLoader, classObjs);
+-        }
++        return Proxy.getProxyClass(classLoader, classObjs);
+-    assert ex != null;
+-    sb.append("isLatest=").append(getLatest() == this);
+-    for (int i = 0; i < this.classLoaders.size(); i++) {
+-      if (i > 0) {
+-        sb.append(", ");
+-      }
+-      sb.append(this.classLoaders.get(i).toString());
+-    }
+-    sb.append("]");
+-    if (!this.excludeTCCL) {
+-      sb.append(", TCCL=").append(Thread.currentThread().getContextClassLoader());
+-    }
++    sb.append(this.getClassLoaders().stream().map(ClassLoader::toString).collect(joining(", ")));
+-   * 
++   *
+-   * 
++
+-   * 
+-   *
+-   *
+-   * 
+-    final boolean isDebugEnabled = logger.isTraceEnabled();
+-
+-    if (isDebugEnabled) {
+-      logger.trace(new StringBuilder("getResources(").append(name).append(")"));
+-    }
+-
+-    try {
+-      if (contextClass != null) {
+-        CollectionUtils.addAll(urls, contextClass.getClassLoader().getResources(name));
++    if (contextClass != null) {
++      CollectionUtils.addAll(urls, contextClass.getClassLoader().getResources(name));
++    }
++
++    for (ClassLoader classLoader : getClassLoaders()) {
++      Enumeration<URL> resources = classLoader.getResources(name);
++      if (resources != null && resources.hasMoreElements()) {
++        CollectionUtils.addAll(urls, resources);
+-    } catch (IOException ignore) {
+-      // ignore and search others
+-    }
+-
+-    Enumeration<URL> resources = null;
+-    ClassLoader tccl = null;
+-    if (!excludeTCCL) {
+-      tccl = Thread.currentThread().getContextClassLoader();
+-    }
+-
+-    IOException ioException = null;
+-    for (ClassLoader classLoader : this.classLoaders) {
+-      ioException = null; // reset to null for next ClassLoader
+-      if (classLoader == TCCL_PLACEHOLDER) {
+-        try {
+-          if (tccl != null) {
+-            if (isDebugEnabled) {
+-              logger.trace("getResources trying TCCL: {}", tccl);
+-            }
+-            resources = tccl.getResources(name);
+-            if (resources != null && resources.hasMoreElements()) {
+-              if (isDebugEnabled) {
+-                logger.trace("getResources found by TCCL");
+-              }
+-              CollectionUtils.addAll(urls, resources);
+-            }
+-          } else {
+-            if (isDebugEnabled) {
+-              logger.trace("getResources skipping TCCL because it's null");
+-            }
+-          }
+-        } catch (SecurityException ignore) {
+-          // Continue to next ClassLoader
+-        } catch (IOException ignore) {
+-          ioException = ignore;
+-          // Continue to next ClassLoader
+-        }
+-      } else if (excludeTCCL || !classLoader.equals(tccl)) {
+-        try {
+-          if (isDebugEnabled) {
+-            logger.trace("getResources trying classLoader: {}", classLoader);
+-          }
+-          resources = classLoader.getResources(name);
+-          if (resources != null && resources.hasMoreElements()) {
+-            if (logger.isTraceEnabled()) {
+-              logger.trace(
+-                  new StringBuilder("getResources found by classLoader: ").append(classLoader));
+-            }
+-            CollectionUtils.addAll(urls, resources);
+-          }
+-        } catch (IOException ignore) {
+-          ioException = ignore;
+-          // Continue to next ClassLoader
+-        }
+-      }
+-    }
+-
+-    if (ioException != null) {
+-      if (isDebugEnabled) {
+-        logger.trace("getResources throwing IOException");
+-      }
+-      throw ioException;
+-    }
+-
+-    if (isDebugEnabled) {
+-      logger.trace("getResources returning empty enumeration");
+-  /**
+-   * Finds all the resources with the given name.
+-   * 
+-   * @param name The resource name
+-   *
+-   * @return An enumeration of {@link java.net.URL <tt>URL</tt>} objects for the resource. If no
+-   *         resources could be found, the enumeration will be empty. Resources that the class
+-   *         loader doesn't have access to will not be in the enumeration.
+-   *
+-   * @throws IOException If I/O errors occur
+-   * 
+-   * @see ClassLoader#getResources(String)
+-   */
+-  public Enumeration<URL> getResources(String name) throws IOException {
++  public Enumeration<URL> getResources(final String name) throws IOException {
++  private List<ClassLoader> getClassLoaders() {
++    ArrayList<ClassLoader> classLoaders = new ArrayList<>();
++
++    if (!excludeTCCL) {
++      classLoaders.add(Thread.currentThread().getContextClassLoader());
++    }
++
++    classLoaders.add(classLoaderForDeployedJars);
++
++    return classLoaders;
++  }
++
+-    return latest.get();
++    if (latest == null) {
++      synchronized (ClassPathLoader.class) {
++        if (latest == null)
++          setLatestToDefault();
++      }
++    }
++
++    return latest;
+-    return latest.get().asClassLoader();
++    return latest.asClassLoader();
+
+INS26 INS26 INS26 MOV23 INS40 INS40 INS40 INS31 INS31 INS31 UPD83 MOV43 UPD83 INS43 INS43 UPD83 INS39 INS42 MOV8 UPD83 MOV83 MOV42 MOV44 INS8 UPD83 INS42 INS44 INS8 MOV83 MOV83 MOV43 MOV42 MOV8 INS83 MOV43 UPD42 INS83 INS43 INS42 UPD83 MOV43 INS42 MOV44 INS83 MOV74 INS42 INS8 MOV43 UPD42 MOV42 UPD42 UPD42 MOV42 UPD42 INS21 INS39 UPD42 MOV21 MOV21 MOV21 MOV43 INS42 MOV21 INS21 MOV21 MOV21 MOV43 INS42 UPD42 MOV42 MOV41 INS21 MOV25 INS83 MOV60 MOV25 INS21 INS41 INS25 INS41 INS7 INS7 INS32 INS7 INS42 INS7 UPD42 INS22 INS32 INS8 INS33 INS32 INS32 INS32 INS32 INS8 MOV74 MOV38 INS32 INS42 INS27 INS8 INS42 UPD42 INS22 INS14 INS22 INS42 UPD42 MOV42 INS22 INS14 UPD42 UPD42 INS14 INS42 INS14 MOV52 UPD42 MOV42 INS42 MOV25 INS54 INS52 INS42 MOV25 INS54 INS52 INS42 MOV42 MOV42 INS32 UPD42 MOV42 MOV60 MOV25 UPD42 INS42 INS42 INS42 INS42 INS33 INS51 MOV42 INS52 INS42 INS43 INS32 INS42 INS52 INS42 UPD42 INS43 INS52 INS42 UPD43 MOV43 INS42 MOV43 INS32 MOV43 MOV32 INS42 INS8 MOV12 INS8 MOV12 MOV8 INS32 UPD42 MOV42 INS32 UPD42 MOV42 UPD42 MOV42 UPD74 MOV57 INS8 INS42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 UPD42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 INS60 MOV25 INS60 MOV25 INS32 UPD42 MOV42 INS90 UPD42 MOV42 UPD45 MOV45 MOV32 UPD42 MOV42 UPD42 MOV42 INS25 MOV43 INS59 UPD42 MOV74 INS59 MOV27 INS84 INS42 INS32 UPD42 MOV42 INS42 INS42 INS27 MOV21 UPD45 UPD42 INS42 MOV32 UPD45 UPD42 INS42 MOV32 MOV41 MOV43 MOV43 INS52 INS42 INS42 INS33 UPD45 INS42 UPD45 DEL83 DEL83 DEL83 DEL42 DEL43 DEL42 DEL40 DEL45 DEL27 DEL59 DEL23 DEL83 DEL83 DEL83 DEL42 DEL43 DEL42 DEL45 DEL59 DEL23 DEL83 DEL83 DEL39 DEL42 DEL9 DEL59 DEL23 DEL83 DEL83 DEL83 DEL42 DEL43 DEL42 DEL40 DEL45 DEL27 DEL59 DEL23 DEL83 DEL83 DEL83 DEL42 DEL43 DEL42 DEL42 DEL32 DEL42 DEL32 DEL42 DEL32 DEL42 DEL32 DEL59 DEL23 DEL83 DEL83 DEL42 DEL43 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL14 DEL36 DEL42 DEL32 DEL45 DEL14 DEL41 DEL8 DEL31 DEL83 DEL83 DEL83 DEL42 DEL43 DEL42 DEL42 DEL43 DEL1 DEL14 DEL59 DEL23 DEL42 DEL43 DEL42 DEL43 DEL74 DEL42 DEL43 DEL74 DEL14 DEL42 DEL43 DEL43 DEL74 DEL83 DEL42 DEL43 DEL43 DEL74 DEL83 DEL42 DEL42 DEL43 DEL42 DEL43 DEL74 DEL14 DEL7 DEL21 DEL42 DEL43 DEL42 DEL44 DEL8 DEL12 DEL54 DEL42 DEL43 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL33 DEL27 DEL42 DEL42 DEL42 DEL32 DEL21 DEL8 DEL25 DEL8 DEL42 DEL43 DEL42 DEL44 DEL8 DEL12 DEL54 DEL8 DEL28 DEL66 DEL66 DEL65 DEL42 DEL66 DEL65 DEL66 DEL65 DEL29 DEL83 DEL42 DEL33 DEL27 DEL42 DEL32 DEL21 DEL8 DEL25 DEL42 DEL43 DEL42 DEL43 DEL74 DEL42 DEL83 DEL42 DEL43 DEL42 DEL44 DEL42 DEL42 DEL42 DEL33 DEL27 DEL45 DEL32 DEL21 DEL42 DEL43 DEL42 DEL44 DEL42 DEL42 DEL42 DEL32 DEL42 DEL42 DEL32 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL32 DEL32 DEL21 DEL8 DEL42 DEL42 DEL42 DEL32 DEL38 DEL42 DEL42 DEL45 DEL42 DEL42 DEL32 DEL32 DEL21 DEL18 DEL8 DEL25 DEL42 DEL42 DEL42 DEL42 DEL32 DEL42 DEL32 DEL32 DEL21 DEL8 DEL42 DEL43 DEL42 DEL44 DEL42 DEL42 DEL45 DEL42 DEL42 DEL32 DEL42 DEL42 DEL32 DEL32 DEL21 DEL18 DEL8 DEL12 DEL54 DEL8 DEL25 DEL8 DEL25 DEL8 DEL70 DEL42 DEL41 DEL8 DEL83 DEL42 DEL42 DEL42 DEL33 DEL27 DEL45 DEL32 DEL42 DEL43 DEL43 DEL74 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL32 DEL32 DEL42 DEL43 DEL42 DEL44 DEL42 DEL42 DEL42 DEL42 DEL33 DEL27 DEL45 DEL32 DEL21 DEL8 DEL70 DEL8 DEL31 DEL66 DEL65 DEL66 DEL65 DEL29 DEL83 DEL42 DEL43 DEL42 DEL43 DEL74 DEL42 DEL42 DEL43 DEL42 DEL43 DEL74 DEL42 DEL42 DEL43 DEL42 DEL43 DEL74 DEL52 DEL42 DEL22 DEL14 DEL59 DEL60 DEL39 DEL42 DEL34 DEL59 DEL58 DEL42 DEL42 DEL42 DEL32 DEL27 DEL42 DEL37 DEL42 DEL42 DEL42 DEL32 DEL42 DEL42 DEL32 DEL42 DEL42 DEL42 DEL42 DEL32 DEL21 DEL8 DEL8 DEL25 DEL10 DEL8 DEL25 DEL8 DEL24 DEL42 DEL41 DEL8 DEL31 DEL42 DEL43 DEL42 DEL83 DEL42 DEL42 DEL42 DEL43 DEL42 DEL43 DEL74 DEL42 DEL42 DEL43 DEL42 DEL43 DEL74 DEL14 DEL59 DEL60 DEL42 DEL42 DEL42 DEL32 DEL21 DEL83 DEL42 DEL43 DEL42 DEL44 DEL42 DEL42 DEL42 DEL42 DEL32 DEL21 DEL8 DEL70 DEL42 DEL43 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL42 DEL32 DEL42 DEL42 DEL32 DEL38 DEL42 DEL42 DEL32 DEL38 DEL27 DEL42 DEL42 DEL45 DEL42 DEL42 DEL32 DEL32 DEL21 DEL8 DEL42 DEL43 DEL42 DEL43 DEL74 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL43 DEL42 DEL42 DEL42 DEL85 DEL5 DEL42 DEL42 DEL32 DEL3 DEL32 DEL14 DEL59 DEL60 DEL8 DEL25 DEL8 DEL25 DEL8 DEL42 DEL43 DEL42 DEL44 DEL8 DEL12 DEL54 DEL8 DEL32 DEL83 DEL39 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL42 DEL42 DEL45 DEL42 DEL32 DEL21 DEL8 DEL25 DEL42 DEL43 DEL42 DEL43 DEL74 DEL42 DEL42 DEL43 DEL42 DEL43 DEL74 DEL52 DEL42 DEL22 DEL14 DEL59 DEL60 DEL42 DEL42 DEL34 DEL42 DEL32 DEL21 DEL42 DEL43 DEL42 DEL33 DEL59 DEL60 DEL39 DEL42 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL34 DEL27 DEL42 DEL42 DEL42 DEL45 DEL42 DEL32 DEL21 DEL8 DEL25 DEL42 DEL42 DEL42 DEL32 DEL21 DEL8 DEL25 DEL42 DEL33 DEL27 DEL42 DEL42 DEL43 DEL62 DEL27 DEL42 DEL43 DEL42 DEL11 DEL36 DEL42 DEL32 DEL21 DEL8 DEL25 DEL42 DEL43 DEL42 DEL52 DEL42 DEL22 DEL14 DEL42 DEL32 DEL41 DEL8 DEL31 DEL83 DEL83 DEL42 DEL83 DEL39 DEL42 DEL44 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL33 DEL27 DEL42 DEL43 DEL42 DEL44 DEL40 DEL42 DEL42 DEL43 DEL62 DEL42 DEL43 DEL42 DEL11 DEL36 DEL42 DEL32 DEL21 DEL8 DEL25 DEL8 DEL70 DEL8 DEL25 DEL42 DEL41 DEL8 DEL31 DEL42 DEL43 DEL42 DEL83 DEL42 DEL43 DEL42 DEL44 DEL31 DEL66 DEL42 DEL65 DEL66 DEL66 DEL65 DEL42 DEL66 DEL42 DEL65 DEL66 DEL65 DEL29 DEL83 DEL42 DEL43 DEL42 DEL42 DEL43 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL42 DEL42 DEL32 DEL42 DEL43 DEL42 DEL83 DEL43 DEL42 DEL44 DEL83 DEL39 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL42 DEL42 DEL45 DEL42 DEL32 DEL21 DEL8 DEL25 DEL42 DEL43 DEL42 DEL43 DEL74 DEL42 DEL14 DEL59 DEL60 DEL42 DEL42 DEL52 DEL42 DEL22 DEL32 DEL21 DEL42 DEL42 DEL42 DEL32 DEL38 DEL42 DEL42 DEL42 DEL45 DEL42 DEL32 DEL21 DEL8 DEL25 DEL52 DEL41 DEL8 DEL25 DEL42 DEL42 DEL42 DEL32 DEL21 DEL42 DEL42 DEL43 DEL62 DEL42 DEL43 DEL42 DEL11 DEL36 DEL42 DEL32 DEL21 DEL8 DEL25 DEL42 DEL43 DEL42 DEL22 DEL14 DEL66 DEL42 DEL65 DEL66 DEL66 DEL66 DEL65 DEL42 DEL66 DEL42 DEL65 DEL66 DEL65 DEL29 DEL42 DEL83 DEL42 DEL43 DEL42 DEL44 DEL42 DEL42 DEL43 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL42 DEL42 DEL32 DEL21 DEL42 DEL41 DEL42 DEL43 DEL42 DEL33 DEL59 DEL60 DEL42 DEL43 DEL42 DEL33 DEL59 DEL60 DEL42 DEL42 DEL42 DEL32 DEL42 DEL32 DEL7 DEL21 DEL8 DEL25 DEL52 DEL42 DEL22 DEL42 DEL42 DEL27 DEL42 DEL33 DEL27 DEL42 DEL42 DEL42 DEL42 DEL32 DEL7 DEL21 DEL8 DEL42 DEL42 DEL42 DEL45 DEL32 DEL21 DEL8 DEL25 DEL8 DEL25 DEL8 DEL54 DEL8 DEL42 DEL42 DEL42 DEL42 DEL32 DEL38 DEL27 DEL42 DEL42 DEL42 DEL45 DEL42 DEL32 DEL21 DEL8 DEL25 DEL42 DEL7 DEL21 DEL42 DEL33 DEL27 DEL42 DEL42 DEL42 DEL45 DEL42 DEL32 DEL21 DEL8 DEL25 DEL42 DEL41 DEL8 DEL25 DEL8 DEL25 DEL25 DEL8 DEL42 DEL42 DEL42 DEL45 DEL32 DEL21 DEL8 DEL25 DEL42 DEL42 DEL33 DEL59 DEL60 DEL42 DEL43 DEL42 DEL33 DEL59 DEL60 DEL42 DEL38 DEL42 DEL42 DEL42 DEL32 DEL42 DEL32 DEL7 DEL21 DEL8 DEL25 DEL52 DEL42 DEL22 DEL42 DEL33 DEL27 DEL42 DEL41 DEL42 DEL43 DEL42 DEL42 DEL42 DEL27 DEL42 DEL33 DEL27 DEL42 DEL42 DEL42 DEL42 DEL9 DEL42 DEL32 DEL7 DEL21 DEL42 DEL42 DEL42 DEL45 DEL32 DEL21 DEL8 DEL25 DEL8 DEL42 DEL42 DEL42 DEL45 DEL32 DEL21 DEL8 DEL25 DEL8 DEL25 DEL8 DEL25 DEL8 DEL42 DEL42 DEL42 DEL42 DEL32 DEL38 DEL27 DEL42 DEL42 DEL42 DEL45 DEL42 DEL32 DEL21 DEL8 DEL25 DEL42 DEL7 DEL21 DEL8 DEL25 DEL25 DEL8 DEL42 DEL44 DEL8 DEL12 DEL54 DEL42 DEL42 DEL42 DEL45 DEL32 DEL21 DEL8 DEL25 DEL42 DEL43 DEL42 DEL33 DEL59 DEL60 DEL42 DEL38 DEL42 DEL42 DEL42 DEL32 DEL42 DEL32 DEL7 DEL21 DEL8 DEL25 DEL52 DEL42 DEL22 DEL42 DEL42 DEL27 DEL42 DEL33 DEL27 DEL42 DEL42 DEL42 DEL42 DEL32 DEL41 DEL8 DEL25 DEL8 DEL42 DEL42 DEL42 DEL42 DEL32 DEL38 DEL27 DEL25 DEL25 DEL8 DEL42 DEL33 DEL27 DEL6 DEL45 DEL32 DEL42 DEL42 DEL32 DEL52 DEL27 DEL32 DEL21 DEL39 DEL42 DEL34 DEL59 DEL58 DEL42 DEL52 DEL42 DEL22 DEL42 DEL32 DEL27 DEL42 DEL37 DEL42 DEL34 DEL27 DEL45 DEL32 DEL21 DEL8 DEL25 DEL42 DEL42 DEL52 DEL42 DEL22 DEL42 DEL42 DEL32 DEL42 DEL32 DEL32 DEL21 DEL8 DEL24 DEL32 DEL21 DEL83 DEL39 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL42 DEL42 DEL42 DEL43 DEL45 DEL14 DEL42 DEL42 DEL32 DEL42 DEL45 DEL32 DEL32 DEL21 DEL8 DEL25 DEL8 DEL42 DEL43 DEL42 DEL44 DEL8 DEL12 DEL54 DEL42 DEL43 DEL42 DEL33 DEL59 DEL60 DEL42 DEL38 DEL42 DEL42 DEL42 DEL32 DEL42 DEL32 DEL7 DEL21 DEL8 DEL25 DEL42 DEL43 DEL42 DEL33 DEL59 DEL60 DEL33 DEL42 DEL42 DEL42 DEL45 DEL32 DEL21 DEL8 DEL25 DEL52 DEL42 DEL22 DEL42 DEL33 DEL7 DEL21 DEL42 DEL42 DEL27 DEL42 DEL33 DEL27 DEL42 DEL42 DEL42 DEL45 DEL42 DEL32 DEL21 DEL8 DEL25 DEL42 DEL42 DEL42 DEL42 DEL32 DEL7 DEL21 DEL8 DEL42 DEL42 DEL42 DEL45 DEL32 DEL21 DEL8 DEL25 DEL8 DEL25 DEL8 DEL42 DEL44 DEL8 DEL12 DEL42 DEL43 DEL42 DEL44 DEL42 DEL42 DEL7 DEL21 DEL8 DEL12 DEL54 DEL8 DEL42 DEL42 DEL42 DEL32 DEL38 DEL27 DEL42 DEL42 DEL42 DEL45 DEL42 DEL32 DEL21 DEL8 DEL25 DEL42 DEL7 DEL21 DEL42 DEL33 DEL27 DEL42 DEL42 DEL32 DEL27 DEL42 DEL42 DEL32 DEL42 DEL42 DEL42 DEL43 DEL45 DEL14 DEL42 DEL42 DEL32 DEL32 DEL21 DEL8 DEL25 DEL42 DEL42 DEL42 DEL42 DEL32 DEL21 DEL8 DEL25 DEL8 DEL42 DEL43 DEL42 DEL44 DEL42 DEL42 DEL7 DEL21 DEL8 DEL12 DEL54 DEL8 DEL25 DEL25 DEL8 DEL42 DEL33 DEL27 DEL42 DEL42 DEL42 DEL45 DEL32 DEL21 DEL8 DEL25 DEL42 DEL53 DEL8 DEL25 DEL42 DEL42 DEL42 DEL45 DEL32 DEL21 DEL8 DEL25 DEL66 DEL65 DEL42 DEL66 DEL65 DEL66 DEL40 DEL66 DEL65 DEL66 DEL66 DEL66 DEL65 DEL42 DEL66 DEL65 DEL42 DEL42 DEL42 DEL43 DEL69 DEL68 DEL65 DEL29 DEL83 DEL42 DEL43 DEL52 DEL42 DEL22 DEL38 DEL45 DEL32 DEL42 DEL42 DEL43 DEL42 DEL42 DEL32 DEL41 DEL42 DEL32

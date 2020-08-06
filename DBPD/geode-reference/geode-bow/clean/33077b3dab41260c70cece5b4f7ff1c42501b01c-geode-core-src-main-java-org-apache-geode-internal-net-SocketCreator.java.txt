@@ -1,0 +1,156 @@
+GEODE-2113 Implement SSL over NIO
+
+This fixes several bugs in the original implementation of SSL over NIO.
+Notably there were buffer handling problems in MsgReader and the
+NioFilters.  This new commit includes code coverage for these classes
+in new tests.
+
+Original commit message:
+
+This removes old-I/O use in TCPConduit peer-to-peer communications.
+This was used for SSL/TLS secure commuications but Java has had an
+SSLEngine implementation that allows you to implement secure communications
+on new-I/O SocketChannels or any other transport mechanism.
+
+A new NioSSLEngine class wraps the JDK's SSLEngine and provides the
+SSL handshake as well as encryption/decryption of messages. SocketCreator
+performs the SSL handshake and returns a NioSslEngine that TCPConduit
+then uses for messaging.
+
+The SSL handshake needs to be done in Connection.java now because the
+ByteBuffer used to do the handshake is also used for reading messages
+in Receivers. Because of this the Handshake pool in TCPConduit became
+obsolete and I deleted it.
+
+I've also done a lot of cleanup of compilation warnings in Connection.java
+and removed references to "NIO". The primary SSL/TLS changes in that class
+are in writeFully (renamed from nioWriteFully) and processBuffer (renamed
+from processNIOBuffer).
+
+While testing I noticed some places where we're creating non-daemon
+threads that were keeping DUnit ChildVM processes from exiting.  I've
+changed these places to use daemon threads.  Very few threads in Geode
+should be non-daemon.
+
+Porting client/server to use NioSSLEngine will be done under a separate
+ticket and a different version of NioEngine may be created to secure
+UDP messaging.
+
++import java.nio.ByteBuffer;
++import java.nio.channels.SocketChannel;
++import javax.net.ssl.SSLException;
++import org.apache.geode.distributed.internal.DMStats;
+-import org.apache.geode.internal.security.SecurableCommunicationChannel;
+-   * True if this SocketCreator has been initialized and is ready to use
+-   */
+-  private boolean ready = false;
+-
+-  /**
++        if (inetAddress == null) {
++          inetAddress = InetAddress.getLocalHost();
++        }
+-      // set p2p values...
+-      if (SecurableCommunicationChannel.CLUSTER
+-          .equals(sslConfig.getSecuredCommunicationChannel())) {
+-        if (this.sslConfig.isEnabled()) {
+-          System.setProperty("p2p.useSSL", "true");
+-          System.setProperty("p2p.oldIO", "true");
+-          System.setProperty("p2p.nodirectBuffers", "true");
+-        } else {
+-          System.setProperty("p2p.useSSL", "false");
+-        }
+-      }
+-
+-      this.ready = true;
++
++
++    public String chooseEngineClientAlias(String[] keyTypes, Principal[] principals,
++        SSLEngine sslEngine) {
++      return delegate.chooseEngineClientAlias(keyTypes, principals, sslEngine);
++    }
++
++    @Override
+-   * Return a client socket. This method is used by peers.
+-   */
+-  public Socket connectForServer(InetAddress inetadd, int port, int socketBufferSize)
+-      throws IOException {
+-    return connect(inetadd, port, 0, null, false, socketBufferSize);
+-  }
+-
+-  /**
++   * Returns an SSLEngine that can be used to perform TLS handshakes and communication
++   */
++  public SSLEngine createSSLEngine(String hostName, int port) {
++    return sslContext.createSSLEngine(hostName, port);
++  }
++
++  /**
++   * @see <a
++   *      href=https://docs.oracle.com/javase/8/docs/technotes/guides/security/jsse/JSSERefGuide.html#SSLENG">JSSE
++   *      Reference Guide</a>
++   *
++   * @param socketChannel the socket's NIO channel
++   * @param engine the sslEngine (see createSSLEngine)
++   * @param timeout handshake timeout in milliseconds. No timeout if <= 0
++   * @param clientSocket set to true if you initiated the connect(), false if you accepted it
++   * @param peerNetBuffer the buffer to use in reading data fron socketChannel. This should also be
++   *        used in subsequent I/O operations
++   * @return The SSLEngine to be used in processing data for sending/receiving from the channel
++   */
++  public NioSslEngine handshakeSSLSocketChannel(SocketChannel socketChannel, SSLEngine engine,
++      int timeout,
++      boolean clientSocket,
++      ByteBuffer peerNetBuffer,
++      DMStats stats)
++      throws IOException {
++    engine.setUseClientMode(clientSocket);
++    while (!socketChannel.finishConnect()) {
++      try {
++        Thread.sleep(50);
++      } catch (InterruptedException e) {
++        if (!socketChannel.socket().isClosed()) {
++          socketChannel.close();
++        }
++        throw new IOException("Interrupted while performing handshake", e);
++      }
++    }
++
++    NioSslEngine nioSslEngine = new NioSslEngine(engine, stats);
++
++    boolean blocking = socketChannel.isBlocking();
++    if (blocking) {
++      socketChannel.configureBlocking(false);
++    }
++
++    try {
++      nioSslEngine.handshake(socketChannel, timeout, peerNetBuffer);
++    } catch (SSLException e) {
++      if (!socketChannel.socket().isClosed()) {
++        socketChannel.close();
++      }
++      logger.warn("SSL handshake exception", e);
++      throw e;
++    } catch (InterruptedException e) {
++      if (!socketChannel.socket().isClosed()) {
++        socketChannel.close();
++      }
++      throw new IOException("SSL handshake interrupted");
++    } finally {
++      if (blocking) {
++        try {
++          socketChannel.configureBlocking(true);
++        } catch (IOException ignored) {
++          // problem setting the socket back to blocking mode but the socket's going to be closed
++        }
++      }
++    }
++    return nioSslEngine;
++  }
++
++  /**
+-            .fatal(String.format("SSL Error in connecting to peer %s[%s].",
+-                new Object[] {socket.getInetAddress(), Integer.valueOf(socket.getPort())}),
++            .fatal(String.format("Problem forming SSL connection to %s[%s].",
++                socket.getInetAddress(), Integer.valueOf(socket.getPort())),
+-          logger.fatal("SSL Error in authenticating peer.", ex);
++          logger.fatal("SSL authentication exception.", ex);

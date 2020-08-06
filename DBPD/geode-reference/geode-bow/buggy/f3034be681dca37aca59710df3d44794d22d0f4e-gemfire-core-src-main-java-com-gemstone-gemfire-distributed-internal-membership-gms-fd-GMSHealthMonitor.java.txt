@@ -1,0 +1,864 @@
+GEODE-77: bug fixes
+
+GMSHealthMonitorJUnitTest was incorrectly using Mockito's any() when it should
+have used isA().  Fixing this exposed a lot of problems in the health monitor
+that this checkin addresses.  I've also renamed a number of entities so that we
+now have more uniform use of the term "heartbeat" instead of "check".
+
+GMSHealthMonitor now has a positive heartbeat sender thread that determines
+who might be watching it and sends unsolicited heartbeats to those members.
+
+GMSHealthMonitor now sends the viewID of its membership ID in TCP/IP
+health checks.  This enables the receiver to differentiate between the
+received UUID/viewID and its own information when it is a reconnected
+member (using auto-reconnect).  The response threads are now also moved
+to a cached thread-pool to decrease the cost of these checks.  Responses
+now have soLinger set on them (experimental) because I was seeing a lot
+of checks fail with EOF even though the member wrote an OK status.
+
+The health monitor now uses suspectMembersInView to avoid suspecting the
+same member over and over again.  This means that it can't be used to
+avoid duplicate final-checks.  I've also disabled the collection thread for
+suspect events because it was adding unnecessary delay in initiating
+final-checks on crashed members and I have yet to see it collect more than
+one event.
+
+SuspectMembersMessage processing now checks to see if the receiver is the
+target of the suspicion and, if so, send a heartbeat to the sender.  This
+seems to happen a lot when the membership coordinator is a locator because
+the locator doesn't push operations out to other members very often.  The
+positive heartbeat sender will also help with this.
+
+This change-set also turns off the JGroups thread pools because they were found
+to be causing our performance problem.  This exposed a bug in JGroups that they
+are fixing, but for now there is a workaround in StatRecorder.  Along with the
+removal of thread pools we now need to pass messages through
+handleOrDeferMessage() in GMSMembershipManager since processMessage() can be
+blocked during initialization, causing a new process to time out trying to join
+the distributed system.
+
+GMSJoinLeave was not setting the failure detection ports on a new view if it
+abandoned a view that it could not prepare.
+
+The Connection class had some incorrect checks for shutdown conditions when
+the shared/ordered connection to another member is shut down.  This should
+improve our detection time for crashed members.
+
+-import static com.gemstone.gemfire.internal.DataSerializableFixedID.CHECK_REQUEST;
+-import static com.gemstone.gemfire.internal.DataSerializableFixedID.CHECK_RESPONSE;
++import static com.gemstone.gemfire.internal.DataSerializableFixedID.HEARTBEAT_REQUEST;
++import static com.gemstone.gemfire.internal.DataSerializableFixedID.HEARTBEAT_RESPONSE;
++import java.net.SocketTimeoutException;
++import com.gemstone.gemfire.CancelException;
++import com.gemstone.gemfire.GemFireConfigException;
+-import com.gemstone.gemfire.distributed.internal.membership.gms.messages.CheckRequestMessage;
+-import com.gemstone.gemfire.distributed.internal.membership.gms.messages.CheckResponseMessage;
++import com.gemstone.gemfire.distributed.internal.membership.gms.messages.HeartbeatMessage;
++import com.gemstone.gemfire.distributed.internal.membership.gms.messages.HeartbeatRequestMessage;
+-import com.gemstone.gemfire.internal.concurrent.ConcurrentHashSet;
++  
++  /**
++   * The number of recipients of periodic heartbeats.  The recipients will
++   * be selected from the members that are likely to be monitoring this member.
++   */
++  private static final int NUM_HEARTBEATS = Integer.getInteger("geode.heartbeat-recipients", 2);
+-   * Each interval will be member-timeout/LOGICAL_INTERVAL. LOGICAL_INTERVAL will be configured
+-   * via system property. Default will be 10. Atleast 1 interval is needed.
++   * Each interval will be member-timeout/LOGICAL_INTERVAL. LOGICAL_INTERVAL may be configured
++   * via a system property with a default of 2. At least 1 interval is needed.
+-  private static final int LOGICAL_INTERVAL = Integer.getInteger("geode.logical-message-received-interval", 10) > 1 ? Integer.getInteger(
+-      "geode.logical-message-received-interval", 10) : 10;
++  public static final int LOGICAL_INTERVAL = Integer.getInteger("geode.logical-message-received-interval", 2);
+-  final ConcurrentMap<InternalDistributedMember, CustomTimeStamp> memberVsLastMsgTS = new ConcurrentHashMap<>();
+-  final private Map<Integer, Response> requestIdVsResponse = new ConcurrentHashMap<>();
+-  final private ConcurrentHashMap<InternalDistributedMember, NetView> suspectedMemberVsView = new ConcurrentHashMap<>();
+-  final private Map<NetView, Set<SuspectRequest>> viewVsSuspectedMembers = new HashMap<>();
++  /**
++   * Timestamp at which we last had contact from a member
++   */
++  final ConcurrentMap<InternalDistributedMember, TimeStamp> memberTimeStamps = new ConcurrentHashMap<>();
++  
++  /**
++   * Members currently being suspected and the view they were suspected in
++   */
++  final private ConcurrentHashMap<InternalDistributedMember, NetView> suspectedMemberInView = new ConcurrentHashMap<>();
+-   * currentSuspects tracks members that we've already checked and
+-   * did not receive a response from.  This collection keeps us from
+-   * checking the same member over and over if it's already under
+-   * suspicion
++   * Replies to messages
+-  final private Set<InternalDistributedMember> currentSuspects = new ConcurrentHashSet<>();
++  final private Map<Integer, Response> requestIdVsResponse = new ConcurrentHashMap<>();
++  
++  /**
++   * Members suspected in a particular view
++   */
++  final private Map<NetView, Set<SuspectRequest>> viewVsSuspectedMembers = new HashMap<>();
+-  List<SuspectRequest> suspectRequests = new ArrayList<SuspectRequest>();
+-  private RequestCollector<SuspectRequest> suspectRequestCollectorThread;
++//  List<SuspectRequest> suspectRequests = new ArrayList<SuspectRequest>();
++//  private RequestCollector<SuspectRequest> suspectRequestCollectorThread;
+-  boolean playingDead = false;
++  volatile boolean playingDead = false;
+-  boolean beingSick = false;
++  volatile boolean beingSick = false;
+-  private static final int OK = 0x01;
+-  private static final int ERROR = 0x02;  
++  private static final int OK = 0x7B;
++  private static final int ERROR = 0x00;  
+-  public GMSHealthMonitor() {
+-
+-  }
+-
+-  public static void loadEmergencyClasses() {
+-  }
+-
+-  /*
+-   * It records the member activity for current time interval.
+-   */
+-  @Override
+-  public void contactedBy(InternalDistributedMember sender) {
+-    CustomTimeStamp cTS = new CustomTimeStamp(currentTimeStamp);
+-    cTS = memberVsLastMsgTS.putIfAbsent(sender, cTS);
+-    if (cTS != null) {
+-      cTS.setTimeStamp(currentTimeStamp);
+-    }
+-    if (currentSuspects.remove(sender)) {
+-      logger.info("No longer suspecting {}", sender);
+-      setNextNeighbor(currentView, null);
+-    }
+-  }
+-
+-  private static class CustomTimeStamp {
++  private static class TimeStamp {
+-    CustomTimeStamp(long timeStamp) {
++    TimeStamp(long timeStamp) {
+-    public long getTimeStamp() {
++    public long getTime() {
+-        CustomTimeStamp nextNeighborTS;
++        TimeStamp nextNeighborTS;
+-          nextNeighborTS = GMSHealthMonitor.this.memberVsLastMsgTS.get(neighbour);
++          nextNeighborTS = GMSHealthMonitor.this.memberTimeStamps.get(neighbour);
+-
++        
+-          CustomTimeStamp customTS = new CustomTimeStamp(currentTime);
+-          memberVsLastMsgTS.put(neighbour, customTS);
++          TimeStamp customTS = new TimeStamp(currentTime);
++          memberTimeStamps.put(neighbour, customTS);
+-        long lastTS = currentTime - nextNeighborTS.getTimeStamp();
++        long lastTS = currentTime - nextNeighborTS.getTime();
+-  private CheckRequestMessage constructCheckRequestMessage(final InternalDistributedMember mbr) {
++  class ClientSocketHandler implements Runnable {
++
++    private Socket socket;
++
++    public ClientSocketHandler(Socket socket) {
++      this.socket = socket;
++    }
++
++    public void run() {
++      try {
++        DataInputStream in = new DataInputStream(socket.getInputStream());
++        OutputStream out = socket.getOutputStream();
++        short version = in.readShort();
++        int  vmViewId = in.readInt();
++        long uuidLSBs = in.readLong();
++        long uuidMSBs = in.readLong();
++        boolean debug = logger.isDebugEnabled();
++        GMSMember gmbr = (GMSMember) GMSHealthMonitor.this.localAddress.getNetMember();
++        UUID myUUID = gmbr.getUUID();
++        // during reconnect or rapid restart we will have a zero viewId but there may still
++        // be an old ID in the membership view that we do not want to respond to
++        int myVmViewId = gmbr.getVmViewId();
++        if (debug) {
++          if (playingDead) {
++            logger.debug("simulating sick member in health check");
++          } else if (vmViewId == myVmViewId
++            && uuidLSBs == myUUID.getLeastSignificantBits()
++            && uuidMSBs == myUUID.getMostSignificantBits()) {
++            logger.debug("UUID matches my own - sending OK reply");
++          } else {
++            logger.debug("GMSHealthMonitor my UUID is {},{} received is {},{}.  My viewID is {} received is {}",
++              Long.toHexString(myUUID.getMostSignificantBits()),
++              Long.toHexString(myUUID.getLeastSignificantBits()),
++              Long.toHexString(uuidMSBs), Long.toHexString(uuidLSBs),
++              myVmViewId, vmViewId);
++          }
++        }
++        if (!playingDead
++            && uuidLSBs == myUUID.getLeastSignificantBits()
++            && uuidMSBs == myUUID.getMostSignificantBits()
++            && vmViewId == myVmViewId) {
++          socket.setSoLinger(true, (int)memberTimeout);
++          out.write(OK);
++          out.flush();
++          socket.shutdownOutput();
++          if (debug) {
++            logger.debug("GMSHealthMonitor server socket replied OK.");
++          }
++        }
++        else {
++          socket.setSoLinger(true, (int)memberTimeout);
++          out.write(ERROR);
++          out.flush();
++          socket.shutdownOutput();
++          if (debug) {
++            logger.debug("GMSHealthMonitor server socket replied ERROR.");
++          }
++        }
++      } catch (IOException e) {
++        logger.trace("Unexpected exception", e);
++      } finally {
++        if (socket != null) {
++          try {
++            socket.close();
++          } catch (IOException e) {
++            logger.info("Unexpected exception", e);
++          }
++        }
++      }
++    }
++  }
++
++  public GMSHealthMonitor() {
++
++  }
++
++  public static void loadEmergencyClasses() {
++  }
++
++  /*
++   * It records the member activity for current time interval.
++   */
++  @Override
++  public void contactedBy(InternalDistributedMember sender) {
++    TimeStamp cTS = new TimeStamp(currentTimeStamp);
++    cTS = memberTimeStamps.putIfAbsent(sender, cTS);
++    if (cTS != null) {
++      cTS.setTimeStamp(currentTimeStamp);
++    }
++    if (suspectedMemberInView.remove(sender) != null) {
++      logger.info("No longer suspecting {}", sender);
++    }
++    setNextNeighbor(currentView, null);
++  }
++
++  private HeartbeatRequestMessage constructHeartbeatRequestMessage(final InternalDistributedMember mbr) {
+-    final CheckRequestMessage prm = new CheckRequestMessage(mbr, reqId);
++    final HeartbeatRequestMessage prm = new HeartbeatRequestMessage(mbr, reqId);
++        // TODO GemFire used the tcp/ip connection but this is using heartbeats
+-          String reason = "Member isn't responding to health checks";
++          suspectedMemberInView.put(mbr, currentView);
++          String reason = "Member isn't responding to heartbeat requests";
+-          currentSuspects.add(mbr);
+-          currentSuspects.remove(mbr);
++          suspectedMemberInView.remove(mbr);
+-    logger.info("Sending suspect request {} reason=\"{}\"", mbr, reason);
+-   * This method sends check request to other member and waits for {@link #MEMBER_CHECK_TIMEOUT}
++   * This method sends heartbeat request to other member and waits for member-timeout
+-   * @param pingMember
++   * @param member
+-  private boolean doCheckMember(InternalDistributedMember pingMember) {
++  private boolean doCheckMember(InternalDistributedMember member) {
+-    logger.trace("Checking member {}", pingMember);
+-    final CheckRequestMessage prm = constructCheckRequestMessage(pingMember);
++    logger.trace("Checking member {}", member);
++    final HeartbeatRequestMessage prm = constructHeartbeatRequestMessage(member);
+-      if (membersNotReceivedMsg != null && membersNotReceivedMsg.contains(pingMember)) {
++      if (membersNotReceivedMsg != null && membersNotReceivedMsg.contains(member)) {
+-        logger.trace("Member {} is not part of current view.", pingMember);
++        logger.trace("Member {} is not part of current view.", member);
+-            pingResp.wait(services.getConfig().getMemberTimeout());
++            pingResp.wait(memberTimeout);
+-          CustomTimeStamp ts = memberVsLastMsgTS.get(pingMember);
++          TimeStamp ts = memberTimeStamps.get(member);
+-            if (isStopping ||
+-                (ts != null &&
+-                 ts.getTimeStamp()
+-                  > (System.currentTimeMillis() - services.getConfig().getMemberTimeout())
+-                  )) {
++            long now = System.currentTimeMillis();
++            if (isStopping) {
++            if (ts != null && (now - ts.getTime()) <= memberTimeout) {
++              logger.trace("detected message traffic from member {}ms ago.  member-timeout is {}", now - ts.getTime(),
++                  memberTimeout);
++              return true;
++            }
++            logger.trace("no heartbeat response received from {}", member);
++            logger.trace("received heartbeat from {}", member);
+-      logger.debug("GMSHealthMonitor checking thread interrupted, while waiting for response from member: {} .", pingMember);
++      logger.debug("GMSHealthMonitor checking thread interrupted, while waiting for response from member: {} .", member);
+-   * @param suspectMember member that does not respond to CheckRequestMessage
++   * @param suspectMember member that does not respond to HeartbeatRequestMessage
+-    logger.trace("Checking member {} with TCP socket connection.", suspectMember);
+-        DataOutputStream out = new DataOutputStream(clientSocket.getOutputStream());   
+-        logger.info("TCP check: suspect member uuid: " + ((GMSMember) suspectMember.getNetMember()).getUUID());
++        DataOutputStream out = new DataOutputStream(clientSocket.getOutputStream());
++        GMSMember gmbr = (GMSMember) suspectMember.getNetMember();
+-        out.writeLong(((GMSMember) suspectMember.getNetMember()).getUuidLSBs());
+-        out.writeLong(((GMSMember) suspectMember.getNetMember()).getUuidMSBs());
++        out.writeInt(gmbr.getVmViewId());
++        out.writeLong(gmbr.getUuidLSBs());
++        out.writeLong(gmbr.getUuidMSBs());
+-        logger.debug("Send suspect member uuid to member {} with TCP socket connection.", suspectMember);
++        logger.debug("Connected - reading response", suspectMember);
+-        logger.debug("Received {} from member {} with TCP socket connection.", (b == OK ? "OK" : (b == ERROR ? "ERROR" : b)), suspectMember);
++        logger.debug("Received {}", (b == OK ? "OK" : (b == ERROR ? "ERROR" : b)), suspectMember);
+-          CustomTimeStamp ts = memberVsLastMsgTS.get(suspectMember);
++          TimeStamp ts = memberTimeStamps.get(suspectMember);
++    } catch (SocketTimeoutException e) {
++      return false;
+-    synchronized (suspectRequests) {
+-      SuspectRequest sr = new SuspectRequest((InternalDistributedMember) mbr, reason);
+-      if (!suspectRequests.contains(sr)) {
+-        logger.info("Suspecting member {}. Reason= {}.", mbr, reason);
+-        suspectRequests.add(sr);
+-        suspectRequests.notify();
+-      }
+-    }
++    sendSuspectMessage(mbr, reason);
++    // Background suspect-collecting thread is currently disabled - it takes too long
++//    synchronized (suspectRequests) {
++//      SuspectRequest sr = new SuspectRequest((InternalDistributedMember) mbr, reason);
++//      if (!suspectRequests.contains(sr)) {
++//        logger.info("Suspecting member {}. Reason= {}.", mbr, reason);
++//        suspectRequests.add(sr);
++//        suspectRequests.notify();
++//      }
++//    }
+-    {      
+-      scheduler = Executors.newScheduledThreadPool(1, new ThreadFactory() {
+-        @Override
+-        public Thread newThread(Runnable r) {
+-          Thread th = new Thread(Services.getThreadGroup(), r, "GemFire Failure Detection Scheduler");
+-          th.setDaemon(true);
+-          return th;
+-        }
+-      });
+-    }
+-    {
+-      checkExecutor = Executors.newCachedThreadPool(new ThreadFactory() {
+-        AtomicInteger threadIdx = new AtomicInteger();
++    scheduler = Executors.newScheduledThreadPool(1, new ThreadFactory() {
++      @Override
++      public Thread newThread(Runnable r) {
++        Thread th = new Thread(Services.getThreadGroup(), r, "Geode Failure Detection Scheduler");
++        th.setDaemon(true);
++        return th;
++      }
++    });
+-        @Override
+-        public Thread newThread(Runnable r) {
+-          int id = threadIdx.getAndIncrement();
+-          Thread th = new Thread(Services.getThreadGroup(), r, "GemFire Failure Detection thread " + id);
+-          th.setDaemon(true);
+-          return th;
+-        }
+-      });
+-    }
+-    {
+-      Monitor m = this.new Monitor(memberTimeout);
+-      long delay = memberTimeout / LOGICAL_INTERVAL;
+-      monitorFuture = scheduler.scheduleAtFixedRate(m, delay, delay, TimeUnit.MILLISECONDS);
+-    }
++    checkExecutor = Executors.newCachedThreadPool(new ThreadFactory() {
++      AtomicInteger threadIdx = new AtomicInteger();
+-    {
+-      suspectRequestCollectorThread = this.new RequestCollector<SuspectRequest>("GemFire Suspect Message Collector", Services.getThreadGroup(), suspectRequests,
+-          new Callback<SuspectRequest>() {
+-            @Override
+-            public void process(List<SuspectRequest> requests) {
+-              GMSHealthMonitor.this.sendSuspectRequest(requests);
++      @Override
++      public Thread newThread(Runnable r) {
++        int id = threadIdx.getAndIncrement();
++        Thread th = new Thread(Services.getThreadGroup(), r, "Geode Failure Detection thread " + id);
++        th.setDaemon(true);
++        return th;
++      }
++    });
++    Monitor m = this.new Monitor(memberTimeout);
++    long delay = memberTimeout / LOGICAL_INTERVAL;
++    monitorFuture = scheduler.scheduleAtFixedRate(m, delay, delay, TimeUnit.MILLISECONDS);
+-            }
+-          }, MEMBER_SUSPECT_COLLECTION_INTERVAL);
+-      suspectRequestCollectorThread.setDaemon(true);
+-      suspectRequestCollectorThread.start();
+-    }
++//    suspectRequestCollectorThread = this.new RequestCollector<SuspectRequest>("Geode Suspect Message Collector", Services.getThreadGroup(), suspectRequests,
++//        new Callback<SuspectRequest>() {
++//      @Override
++//      public void process(List<SuspectRequest> requests) {
++//        GMSHealthMonitor.this.sendSuspectRequest(requests);
++//
++//      }
++//    }, MEMBER_SUSPECT_COLLECTION_INTERVAL);
++//    suspectRequestCollectorThread.setDaemon(true);
++//    suspectRequestCollectorThread.start();
+-    {
+-      serverSocketExecutor = Executors.newCachedThreadPool(new ThreadFactory() {
+-        AtomicInteger threadIdx = new AtomicInteger();
++    serverSocketExecutor = Executors.newCachedThreadPool(new ThreadFactory() {
++      AtomicInteger threadIdx = new AtomicInteger();
+-        @Override
+-        public Thread newThread(Runnable r) {
+-          int id = threadIdx.getAndIncrement();
+-          Thread th = new Thread(Services.getThreadGroup(), r, "GemFire Failure Detection Server thread " + id);
+-          th.setDaemon(true);
+-          return th;
+-        }
+-      });
++      @Override
++      public Thread newThread(Runnable r) {
++        int id = threadIdx.getAndIncrement();
++        Thread th = new Thread(Services.getThreadGroup(), r, "Geode Failure Detection Server thread " + id);
++        th.setDaemon(true);
++        return th;
++      }
++    });
+-      serverSocketExecutor.execute(new Runnable() {
+-        @Override
+-        public void run() {
+-          Socket socket = null;
+-          try {
+-            // start server socket for TCP check
+-            if (serverSocket == null) {
+-              localAddress = services.getMessenger().getMemberID();            
+-              socketAddress = localAddress.getInetAddress();
+-              int[] portRange = services.getConfig().getMembershipPortRange();            
+-              socketPort = AvailablePort.getAvailablePortInRange(portRange[0], portRange[1], AvailablePort.SOCKET);
+-              if (socketPort == -1) {
+-                throw new SystemConnectException("Unable to find a free port in the membership port range");
+-              }
+-              serverSocket = new ServerSocket();
+-              serverSocket.bind(new InetSocketAddress(socketAddress, socketPort));
+-              logger.info("Started failure detection server thread on {}:{}.", socketAddress, socketPort);
+-              while (!services.getCancelCriterion().isCancelInProgress() 
+-                  && !GMSHealthMonitor.this.isStopping) {
+-                try {
+-                  socket = serverSocket.accept();
+-                  if (GMSHealthMonitor.this.playingDead) {
+-                    continue;
+-                  }
+-                  socket.setSoTimeout((int) services.getConfig().getMemberTimeout());
+-                  new ClientSocketHandler(socket).start();
+-                } catch (IOException e) {
+-                  if (!isStopping) {
+-                    logger.trace("Unexpected exception", e);
+-                  }
+-                  try {
+-                    if (socket != null) {
+-                      socket.close();
+-                    }
+-                  } catch (IOException ioe) {
+-                    logger.trace("Unexpected exception", ioe);
+-                  }
+-                }
+-              }
+-              logger.info("GMSHealthMonitor server thread exiting");
+-            }
+-          } catch (IOException e) {
+-            logger.trace("Unexpected exception", e);
+-          } finally {
+-            // close the server socket
+-            if (serverSocket != null && !serverSocket.isClosed()) {
+-              try {
+-                serverSocket.close();
+-                serverSocket = null;
+-                logger.info("GMSHealthMonitor server socket closed.");
+-              } catch (IOException e) {
+-                logger.debug("Unexpected exception", e);
+-              }
+-            }
+-          }
+-        }
+-      });
+-    }
+-  class ClientSocketHandler extends Thread {
+-
+-    private Socket socket;
+-
+-    public ClientSocketHandler(Socket socket) {
+-      super(services.getThreadGroup(), "ClientSocketHandler");
+-      this.socket = socket;
+-      setDaemon(true);
++  /**
++   * start the thread that listens for tcp/ip connections and responds
++   * to connection attempts
++   */
++  private void startTcpServer() {
++    // allocate a socket here so there are no race conditions between knowing the FD
++    // socket port and joining the system
++    socketAddress = localAddress.getInetAddress();
++    int[] portRange = services.getConfig().getMembershipPortRange();            
++    socketPort = AvailablePort.getAvailablePortInRange(portRange[0], portRange[1], AvailablePort.SOCKET);
++    if (socketPort == -1) {
++      throw new SystemConnectException("Unable to find a free port in the membership port range");
++    }
++    try {
++      serverSocket = new ServerSocket();
++      serverSocket.bind(new InetSocketAddress(socketAddress, socketPort));
++    } catch (IOException e) {
++      throw new GemFireConfigException("Unable to allocate a failure detection port in the membership-port range");
+-    public void run() {
+-      try {
+-        DataInputStream in = new DataInputStream(socket.getInputStream());
+-        OutputStream out = socket.getOutputStream();
+-        short version = in.readShort();
+-        long uuidLSBs = in.readLong();
+-        long uuidMSBs = in.readLong();
+-        boolean debug = logger.isDebugEnabled();
+-        if (debug) {
+-          logger.debug("GMSHealthMonitor received health check UUID {},{}",
+-              Long.toHexString(uuidMSBs),
+-              Long.toHexString(uuidLSBs));
+-        }
+-        UUID myUUID = ((GMSMember) GMSHealthMonitor.this.localAddress.getNetMember()).getUUID();
+-        if (debug) {
+-          if (playingDead) {
+-            logger.debug("simulating sick member in health check");
+-          } else if (uuidLSBs == myUUID.getLeastSignificantBits()
+-            && uuidMSBs == myUUID.getMostSignificantBits()) {
+-            logger.debug("UUID matches my own - sending OK reply");
+-          } else {
+-            logger.debug("GMSHealthMonitor my UUID is                 {},{}",
+-              Long.toHexString(myUUID.getMostSignificantBits()),
+-              Long.toHexString(myUUID.getLeastSignificantBits()));
++    serverSocketExecutor.execute(new Runnable() {
++      @Override
++      public void run() {
++        logger.info("Started failure detection server thread on {}:{}.", socketAddress, socketPort);
++        Socket socket = null;
++        try {
++          while (!services.getCancelCriterion().isCancelInProgress() 
++              && !GMSHealthMonitor.this.isStopping) {
++            try {
++              socket = serverSocket.accept();
++              if (GMSHealthMonitor.this.playingDead) {
++                continue;
++              }
++              // [bruce] do we really want a timeout on the server-side?
++//              socket.setSoTimeout((int) services.getConfig().getMemberTimeout());
++              serverSocketExecutor.execute(new ClientSocketHandler(socket)); //start();  [bruce] I'm seeing a lot of failures due to this thread not being created fast enough, sometimes as long as 30 seconds
++            } catch (IOException e) {
++              if (!isStopping) {
++                logger.trace("Unexpected exception", e);
++              }
++              try {
++                if (socket != null) {
++                  socket.close();
++                }
++              } catch (IOException ioe) {
++                logger.trace("Unexpected exception", ioe);
++              }
++            }
+-        }
+-        if (!playingDead
+-            && uuidLSBs == myUUID.getLeastSignificantBits()
+-            && uuidMSBs == myUUID.getMostSignificantBits()) {
+-          out.write(OK);
+-          out.flush();
+-          socket.shutdownOutput();
+-          if (debug) {
+-            logger.debug("GMSHealthMonitor server socket replied OK.");
+-          }
+-        }
+-        else {
+-          out.write(ERROR);
+-          out.flush();
+-          socket.shutdownOutput();
+-          if (debug) {
+-            logger.debug("GMSHealthMonitor server socket replied ERROR.");
+-          }
+-        }
+-      } catch (IOException e) {
+-        logger.trace("Unexpected exception", e);
+-      } finally {
+-        if (socket != null) {
+-          try {
+-            socket.close();
+-          } catch (IOException e) {
+-            logger.info("Unexpected exception", e);
++          logger.info("GMSHealthMonitor server thread exiting");
++        } finally {
++          // close the server socket
++          if (serverSocket != null && !serverSocket.isClosed()) {
++            try {
++              serverSocket.close();
++              serverSocket = null;
++              logger.info("GMSHealthMonitor server socket closed.");
++            } catch (IOException e) {
++              logger.debug("Unexpected exception", e);
++            }
+-    }
++    });
++  }
++  
++  /**
++   * start the thread that periodically sends a message to processes
++   * that might be watching this process
++   */
++  private void startHeartbeatThread() {
++    checkExecutor.execute(new Runnable() {
++      public void run() {
++        Thread.currentThread().setName("Geode Heartbeat Sender");
++        sendPeriodicHeartbeats();
++      }
++      private void sendPeriodicHeartbeats() {
++        while (!isStopping && !services.getCancelCriterion().isCancelInProgress()) {
++          try {
++            Thread.sleep(memberTimeout/LOGICAL_INTERVAL);
++          } catch (InterruptedException e) {
++            return;
++          }
++          NetView v = currentView;
++          if (v != null) {
++            List<InternalDistributedMember> mbrs = v.getMembers();
++            int index = mbrs.indexOf(localAddress);
++            if (index < 0 || mbrs.size() < 2) {
++              continue;
++            }
++            if (!playingDead) {
++              sendHeartbeats(mbrs, index);
++            }
++          }
++        }
++      }
++      
++      private void sendHeartbeats(List<InternalDistributedMember> mbrs, int startIndex) {
++        InternalDistributedMember coordinator = currentView.getCoordinator();
++        if (coordinator != null && !coordinator.equals(localAddress)) {
++          HeartbeatMessage message = new HeartbeatMessage(-1);
++          message.setRecipient(coordinator);
++          try {
++            services.getMessenger().sendUnreliably(message);
++          } catch (CancelException e) {
++            return;
++          }
++        }
++
++        int index = startIndex;
++        int numSent = 0;
++        for (;;) {
++          index--;
++          if (index < 0) {
++            index = mbrs.size()-1;
++          }
++          InternalDistributedMember mbr = mbrs.get(index);
++          if (mbr.equals(localAddress)) {
++            break;
++          }
++          if (mbr.equals(coordinator)) {
++            continue;
++          }
++          HeartbeatMessage message = new HeartbeatMessage(-1);
++          message.setRecipient(mbr);
++          try {
++            services.getMessenger().sendUnreliably(message);
++            numSent++;
++            if (numSent >= NUM_HEARTBEATS) {
++              break;
++            }
++          } catch (CancelException e) {
++            return;
++          }
++        }
++      } // for (;;)
++    });
+-    currentSuspects.removeAll(newView.getCrashedMembers());
+-    currentSuspects.removeAll(newView.getShutdownMembers());
++    for (Iterator<InternalDistributedMember> it=memberTimeStamps.keySet().iterator(); it.hasNext(); ) {
++      if (!newView.contains(it.next())) {
++        it.remove();
++      }
++    }
++    for (Iterator<InternalDistributedMember> it=suspectedMemberInView.keySet().iterator(); it.hasNext(); ) {
++      if (!newView.contains(it.next())) {
++        it.remove();
++      }
++    }
++//    for (InternalDistributedMember mbr: newView.getMembers()) {
++//      if (!memberVsLastMsgTS.containsKey(mbr)) {
++//        CustomTimeStamp customTS = new CustomTimeStamp(System.currentTimeMillis());
++//        memberVsLastMsgTS.put(mbr, customTS);
++//      }
++//    }
++    if (newView == null) {
++      return;
++    }
+-    boolean sameView = false;
+-
+-    if (currentView != null &&
+-        newView.getCreator().equals(currentView.getCreator()) &&
+-        newView.getViewId() == currentView.getViewId()) {
+-      sameView = true;
+-    }
+-    checkAllSuspected.removeAll(currentSuspects);
++    checkAllSuspected.removeAll(suspectedMemberInView.keySet());
+-      if (currentSuspects.contains(newNeighbor)) {
++      if (suspectedMemberInView.containsKey(newNeighbor)) {
+-    if (!sameView || memberVsLastMsgTS.size() == 0) {
+-      
+-      if (memberVsLastMsgTS.size() > 0) {
+-        memberVsLastMsgTS.clear();
+-      }
+-
+-      long cts = System.currentTimeMillis();
+-      for (InternalDistributedMember mbr: allMembers) {
+-        CustomTimeStamp customTS = new CustomTimeStamp(cts);
+-        memberVsLastMsgTS.put(mbr, customTS);
+-      }
+-    }
++    isStopping = false;
+-    services.getMessenger().addHandler(CheckRequestMessage.class, this);
+-    services.getMessenger().addHandler(CheckResponseMessage.class, this);
++    services.getMessenger().addHandler(HeartbeatRequestMessage.class, this);
++    services.getMessenger().addHandler(HeartbeatMessage.class, this);
++    startTcpServer();
++    startHeartbeatThread();
++      try {
++        serverSocketExecutor.awaitTermination(2000, TimeUnit.MILLISECONDS);
++      } catch (InterruptedException e) {
++        Thread.currentThread().interrupt();
++      }
+-    if (suspectRequestCollectorThread != null) {
+-      suspectRequestCollectorThread.shutdown();
+-    }
++//    if (suspectRequestCollectorThread != null) {
++//      suspectRequestCollectorThread.shutdown();
++//    }
+-    return scheduler.isShutdown() && checkExecutor.isShutdown() && serverSocketExecutor.isShutdown() && !suspectRequestCollectorThread.isAlive();
++    return scheduler.isShutdown() && checkExecutor.isShutdown() && serverSocketExecutor.isShutdown() /*&& !suspectRequestCollectorThread.isAlive()*/;
++  }
++
++  /**
++   * Test method - check to see if a member is under suspicion
++   */
++  public boolean isSuspectMember(InternalDistributedMember m) {
++    return this.suspectedMemberInView.containsKey(m);
+-    sendSuspectMessage(localAddress, "playDead invoked on GMSHealthMonitor");
++    sendSuspectMessage(localAddress, "playDead invoked on GMSHealthMonitor");
+-    logger.trace("HealthMonitor processing {}", m);
++    logger.trace("processing {}", m);
+-    case CHECK_REQUEST:
++    case HEARTBEAT_REQUEST:
+-        processCheckRequest((CheckRequestMessage) m);
++        processHeartbeatRequest((HeartbeatRequestMessage) m);
+-    case CHECK_RESPONSE:
++    case HEARTBEAT_RESPONSE:
+-        processCheckResponse((CheckResponseMessage) m);
++        processHeartbeat((HeartbeatMessage) m);
+-  private void processCheckRequest(CheckRequestMessage m) {
++  private void processHeartbeatRequest(HeartbeatRequestMessage m) {
+-      CheckResponseMessage prm = new CheckResponseMessage(m.getRequestId());
++      HeartbeatMessage prm = new HeartbeatMessage(m.getRequestId());
+-        logger.debug("Unable to send check response to member: {}", m.getSender());
++        logger.debug("Unable to send heartbeat to member: {}", m.getSender());
+-      logger.debug("Ignoring check request intended for {}.  My ID is {}", m.getTarget(), me);
++      logger.debug("Ignoring heartbeat request intended for {}.  My ID is {}", m.getTarget(), me);
+-  private void processCheckResponse(CheckResponseMessage m) {
+-    Response resp = requestIdVsResponse.get(m.getRequestId());
+-    logger.trace("Got check response from member {}. {}", m.getSender(), (resp != null ? "Check Thread still waiting" : "Check thread is not waiting"));
+-    if (resp != null) {
+-      synchronized (resp) {
+-        resp.setResponseMsg(m);
+-        resp.notify();
++  private void processHeartbeat(HeartbeatMessage m) {
++    if (m.getRequestId() < 0) {
++      // a periodic heartbeat
++      contactedBy(m.getSender());
++    } else {
++      Response resp = requestIdVsResponse.get(m.getRequestId());
++      logger.trace("Got heartbeat from member {}. {}", m.getSender(), (resp != null ? "Check thread still waiting" : "Check thread is not waiting"));
++      if (resp != null) {
++        synchronized (resp) {
++          resp.setResponseMsg(m);
++          resp.notify();
++        }
++    // take care of any suspicion of this member by sending a heartbeat back
++    if (!playingDead) {
++      for (Iterator<SuspectRequest> it = incomingRequest.getMembers().iterator(); it.hasNext(); ) {
++        SuspectRequest req = it.next();
++        if (req.getSuspectMember().equals(localAddress)) {
++          HeartbeatMessage message = new HeartbeatMessage(-1);
++          message.setRecipient(sender);
++          try {
++            services.getMessenger().send(message);
++            it.remove();
++          } catch (CancelException e) {
++            return;
++          }
++        }
++      }
++    }
++
++    
+-        if (!viewVsMembers.contains(sr)) {
+-          viewVsMembers.add(sr);
+-        }
++        viewVsMembers.add(sr);
+-      NetView view;
+-      view = suspectedMemberVsView.putIfAbsent(mbr, cv);
++      // suspectMemberInView is now set by the heartbeat monitoring code
++      // to allow us to move on from watching members we've already
++      // suspected.  Since that code is updating this collection we
++      // cannot use it here as an indication that a member is currently
++      // undergoing a final check.
++//      NetView view;
++//      view = suspectedMemberInView.putIfAbsent(mbr, cv);
+-      if (view == null || !view.equals(cv)) {
++//      if (view == null || !view.equals(cv)) {
+-              CustomTimeStamp ts = new CustomTimeStamp(startTime);
+-              memberVsLastMsgTS.put(mbr, ts);
++              // for some reason we used to update the timestamp for the member
++              // with the startTime, but we don't want to do that because it looks
++              // like a heartbeat has been received
+-              logger.info("Final check {}", pinged? "succeeded" : "failed");
++              boolean failed = false;
+-                ts = memberVsLastMsgTS.get(mbr);
+-                if (ts == null || ts.getTimeStamp() <= startTime) {
++                TimeStamp ts = memberTimeStamps.get(mbr);
++                if (ts == null || ts.getTime() <= startTime) {
++                  logger.info("Final check failed - requesting removal");
++                  failed = true;
++                } else {
++                  logger.info("check failed but detected recent message traffic");
++              if (!failed) {
++                logger.info("Final check passed");
++              }
++              suspectedMemberInView.remove(mbr);
+-              GMSHealthMonitor.this.suspectedMemberVsView.remove(mbr);
++              GMSHealthMonitor.this.suspectedMemberInView.remove(mbr);
+-      }// scheduling for final check and removing it..
++//      }// scheduling for final check and removing it..
+-              logger.debug("Health Monitor is sending {} member suspect requests to coordinator", requests.size());
++              logger.info("Health Monitor is sending {} member suspect requests to coordinator", requests.size());
++    // the background suspect-collector thread is currently disabled
++//    synchronized (suspectRequests) {
++//      if (suspectRequests.size() > 0) {
++//        for (SuspectRequest sr: suspectRequests) {
++//          if (!requests.contains(sr)) {
++//            requests.add(sr);
++//          }
++//        }
++//        suspectRequests.clear();
++//      }
++//    }
+-    synchronized (suspectRequests) {
+-      if (suspectRequests.size() > 0) {
+-        for (SuspectRequest sr: suspectRequests) {
+-          if (!requests.contains(sr)) {
+-            requests.add(sr);
+-          }
+-        }
+-        suspectRequests.clear();
+-      }
+-    }
++//  TODO this needs some rethinking - we need the guys near the
++//  front of the membership view who aren't preferred for coordinator
++//  to see the suspect message.
+-//      // TODO this needs some rethinking - we need the guys near the
+-//      // front of the membership view who aren't preferred for coordinator
+-//      // to see the suspect message.
+-    } catch (DistributedSystemDisconnectedException e) {
++    } catch (CancelException e) {

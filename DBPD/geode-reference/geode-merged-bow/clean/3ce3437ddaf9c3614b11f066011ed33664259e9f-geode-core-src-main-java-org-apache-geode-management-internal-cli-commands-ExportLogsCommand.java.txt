@@ -1,0 +1,304 @@
+GEODE-2420: Enable export logs size estimation and user warning
+
+Adds 'export logs' option, --file-limit-size, to allow user to set
+maximun size of the epxorted logs zip file.
+
+When size checking is enabled (file-limit-size > 0) then the check
+will also prevent filling up the disk on each member while consolidating
+and filtering the logs.
+
++import org.apache.geode.cache.execute.ResultCollector;
++import org.apache.geode.management.ManagementException;
++import org.apache.geode.management.internal.cli.util.BytesToString;
+-  private static final Pattern DISK_SPACE_LIMIT_PATTERN = Pattern.compile("(\\d+)([mgtMGT]?)");
++  private static final Pattern DISK_SPACE_LIMIT_PATTERN = Pattern.compile("(\\d+)([kmgtKMGT]?)");
+-          help = CliStrings.EXPORT_LOGS__STATSONLY__HELP) boolean statsOnly) {
+-    // @CliOption(key = CliStrings.EXPORT_LOGS__FILESIZELIMIT,
+-    // unspecifiedDefaultValue = CliStrings.EXPORT_LOGS__FILESIZELIMIT__UNSPECIFIED_DEFAULT,
+-    // specifiedDefaultValue = CliStrings.EXPORT_LOGS__FILESIZELIMIT__SPECIFIED_DEFAULT,
+-    // help = CliStrings.EXPORT_LOGS__FILESIZELIMIT__HELP) String fileSizeLimit) {
+-    Result result = null;
++          help = CliStrings.EXPORT_LOGS__STATSONLY__HELP) boolean statsOnly,
++      @CliOption(key = CliStrings.EXPORT_LOGS__FILESIZELIMIT,
++          unspecifiedDefaultValue = CliStrings.EXPORT_LOGS__FILESIZELIMIT__UNSPECIFIED_DEFAULT,
++          specifiedDefaultValue = CliStrings.EXPORT_LOGS__FILESIZELIMIT__SPECIFIED_DEFAULT,
++          help = CliStrings.EXPORT_LOGS__FILESIZELIMIT__HELP) String fileSizeLimit) {
++
++    long totalEstimatedExportSize = 0;
++    Result result;
+-      Set<DistributedMember> targetMembers =
+-          CliUtil.findMembersIncludingLocators(groups, memberIds);
++      Set<DistributedMember> targetMembers = getMembers(groups, memberIds);
+-      if (false) {
+-        // TODO: get estimated size of exported logs from all servers first
+-        Map<String, Integer> fileSizesFromMembers = new HashMap<>();
++      if (parseFileSizeLimit(fileSizeLimit) > 0) {
++        // Get estimated size of exported logs from all servers before exporting anything
+-          List<Object> results = (List<Object>) CliUtil
+-              .executeFunction(new SizeExportLogsFunction(), args, server).getResult();
++          List<Object> results = (List<Object>) estimateLogSize(args, server).getResult();
+-          List<?> res = (List<?>) results.get(0);
+-          if (res.get(0) instanceof ExportedLogsSizeInfo) {
+-            ExportedLogsSizeInfo sizeInfo = (ExportedLogsSizeInfo) res.get(0);
+-            estimatedSize = sizeInfo.getLogsSize();
+-            diskAvailable = sizeInfo.getDiskAvailable();
+-            diskSize = sizeInfo.getDiskSize();
+-          } else {
+-            estimatedSize = 0;
++          if (!results.isEmpty()) {
++            List<?> res = (List<?>) results.get(0);
++            if (res.get(0) instanceof ExportedLogsSizeInfo) {
++              ExportedLogsSizeInfo sizeInfo = (ExportedLogsSizeInfo) res.get(0);
++              estimatedSize = sizeInfo.getLogsSize();
++              diskAvailable = sizeInfo.getDiskAvailable();
++              diskSize = sizeInfo.getDiskSize();
++            }
++          logger.info("Received estimated export size from member {}: {}", server.getId(),
++              estimatedSize);
++          totalEstimatedExportSize += estimatedSize;
+-
+-          logger.info("Received file size from member {}: {}", server.getId(), estimatedSize);
++          // If export size checking is enabled, then estimated size on each member shouldn't exceed
++          // the available disk on that member
++          try {
++            isSizeCheckEnabledAndWithinDiskSpaceOfMember(server.getName(),
++                parseFileSizeLimit(fileSizeLimit), estimatedSize, diskAvailable, diskSize);
++          } catch (ManagementException e) {
++            return ResultBuilder.createUserErrorResult(e.getMessage());
++          }
+-        // TODO: Check log size limits on the locator
+-      }
+-
+-      // get zipped files from all servers next
+-      Map<String, Path> zipFilesFromMembers = new HashMap<>();
+-      for (DistributedMember server : targetMembers) {
+-        Region region = ExportLogsFunction.createOrGetExistingExportLogsRegion(true, cache);
+-
+-        ExportLogsCacheWriter cacheWriter =
+-            (ExportLogsCacheWriter) region.getAttributes().getCacheWriter();
+-
+-        cacheWriter.startFile(server.getName());
+-
+-        CliUtil.executeFunction(new ExportLogsFunction(),
+-            new ExportLogsFunction.Args(start, end, logLevel, onlyLogLevel, logsOnly, statsOnly),
+-            server).getResult();
+-        Path zipFile = cacheWriter.endFile();
+-        ExportLogsFunction.destroyExportLogsRegion(cache);
+-
+-        // only put the zipfile in the map if it is not null
+-        if (zipFile != null) {
+-          logger.info("Received zip file from member {}: {}", server.getId(), zipFile);
+-          zipFilesFromMembers.put(server.getId(), zipFile);
++        // The sum of the estimated export sizes from each member should not exceed the
++        // disk availble on the locator
++        try {
++          isSizeCheckEnabledAndWithinDiskSpaceOfMember("locator", parseFileSizeLimit(fileSizeLimit),
++              totalEstimatedExportSize, getLocalDiskAvailable(), getLocalDiskSize());
++        } catch (ManagementException e) {
++          return ResultBuilder.createUserErrorResult(e.getMessage());
+-      if (zipFilesFromMembers.isEmpty()) {
+-        return ResultBuilder.createUserErrorResult("No files to be exported.");
+-      }
+-
+-      Path tempDir = Files.createTempDirectory("exportedLogs");
+-      // make sure the directory is created, so that even if there is no files unzipped to this dir,
+-      // we can still zip it and send an empty zip file back to the client
+-      Path exportedLogsDir = tempDir.resolve("exportedLogs");
+-      FileUtils.forceMkdir(exportedLogsDir.toFile());
+-
+-      for (Path zipFile : zipFilesFromMembers.values()) {
+-        Path unzippedMemberDir =
+-            exportedLogsDir.resolve(zipFile.getFileName().toString().replace(".zip", ""));
+-        ZipUtils.unzip(zipFile.toAbsolutePath().toString(), unzippedMemberDir.toString());
+-        FileUtils.deleteQuietly(zipFile.toFile());
+-      }
+-
+-      Path dirPath;
+-      if (StringUtils.isBlank(dirName)) {
+-        dirPath = Paths.get(System.getProperty("user.dir"));
++      if (testhookSkipExports()) {
++        result = ResultBuilder.createInfoResult("Estimated size of exported logs is "
++            + new BytesToString().of(totalEstimatedExportSize));
+-        dirPath = Paths.get(dirName);
++        // get zipped files from all servers next
++        Map<String, Path> zipFilesFromMembers = new HashMap<>();
++        for (DistributedMember server : targetMembers) {
++          Region region = ExportLogsFunction.createOrGetExistingExportLogsRegion(true, cache);
++
++          ExportLogsCacheWriter cacheWriter =
++              (ExportLogsCacheWriter) region.getAttributes().getCacheWriter();
++
++          cacheWriter.startFile(server.getName());
++
++          CliUtil.executeFunction(new ExportLogsFunction(),
++              new ExportLogsFunction.Args(start, end, logLevel, onlyLogLevel, logsOnly, statsOnly),
++              server).getResult();
++          Path zipFile = cacheWriter.endFile();
++          ExportLogsFunction.destroyExportLogsRegion(cache);
++
++          // only put the zipfile in the map if it is not null
++          if (zipFile != null) {
++            logger.info("Received zip file from member {}: {}", server.getId(), zipFile);
++            zipFilesFromMembers.put(server.getId(), zipFile);
++          }
++        }
++
++        if (zipFilesFromMembers.isEmpty()) {
++          return ResultBuilder.createUserErrorResult("No files to be exported.");
++        }
++
++        Path tempDir = Files.createTempDirectory("exportedLogs");
++        // make sure the directory is created, so that even if there is no files unzipped to this
++        // dir, we can still zip it and send an empty zip file back to the client
++        Path exportedLogsDir = tempDir.resolve("exportedLogs");
++        FileUtils.forceMkdir(exportedLogsDir.toFile());
++
++        for (Path zipFile : zipFilesFromMembers.values()) {
++          Path unzippedMemberDir =
++              exportedLogsDir.resolve(zipFile.getFileName().toString().replace(".zip", ""));
++          ZipUtils.unzip(zipFile.toAbsolutePath().toString(), unzippedMemberDir.toString());
++          FileUtils.deleteQuietly(zipFile.toFile());
++        }
++
++        Path dirPath;
++        if (StringUtils.isBlank(dirName)) {
++          dirPath = Paths.get(System.getProperty("user.dir"));
++        } else {
++          dirPath = Paths.get(dirName);
++        }
++        Path exportedLogsZipFile =
++            dirPath.resolve("exportedLogs_" + System.currentTimeMillis() + ".zip").toAbsolutePath();
++
++        logger.info("Zipping into: " + exportedLogsZipFile.toString());
++        ZipUtils.zipDirectory(exportedLogsDir, exportedLogsZipFile);
++        try {
++          isFileSizeCheckEnabledAndWithinLimit(parseFileSizeLimit(fileSizeLimit),
++              exportedLogsZipFile.toFile());
++        } catch (ManagementException e) {
++          return ResultBuilder.createUserErrorResult(e.getMessage());
++        } finally {
++          FileUtils.deleteDirectory(tempDir.toFile());
++        }
++        result = ResultBuilder.createInfoResult(exportedLogsZipFile.toString());
+-      Path exportedLogsZipFile =
+-          dirPath.resolve("exportedLogs_" + System.currentTimeMillis() + ".zip").toAbsolutePath();
+-
+-      logger.info("Zipping into: " + exportedLogsZipFile.toString());
+-      ZipUtils.zipDirectory(exportedLogsDir, exportedLogsZipFile);
+-      FileUtils.deleteDirectory(tempDir.toFile());
+-
+-      result = ResultBuilder.createInfoResult(exportedLogsZipFile.toString());
++   * Test hook for unit testing. To limit scope of test to only estimate size of exports (i.e. skip
++   * the filtering and exporting logs & stats from cluster members), stub this method to return true
++   * to skip exporting.
++   */
++  boolean testhookSkipExports() {
++    return false;
++  }
++
++  /**
++   * Wrapper to enable stubbing of static method call for unit testing
++   */
++  Set<DistributedMember> getMembers(String[] groups, String[] memberIds) {
++    return CliUtil.findMembersIncludingLocators(groups, memberIds);
++  }
++
++  /**
++   * Wrapper to enable stubbing of static method call for unit testing
++   */
++  ResultCollector estimateLogSize(SizeExportLogsFunction.Args args, DistributedMember member) {
++    return CliUtil.executeFunction(new SizeExportLogsFunction(), args, member);
++  }
++
++  /**
++   * Wrapper to enable stubbing of static method call for unit testing
++   */
++  long getLocalDiskSize() {
++    return FileUtils.getUserDirectory().getTotalSpace();
++  }
++
++  /**
++   * Wrapper to enable stubbing of static method call for unit testing
++   */
++  long getLocalDiskAvailable() {
++    return FileUtils.getUserDirectory().getUsableSpace();
++  }
++
++  /**
+-  int parseFileSizeLimit(String fileSizeLimit) {
++  private long parseFileSizeLimit(String fileSizeLimit) {
+-    int sizeLimit = parseSize(fileSizeLimit);
+-    int byteMultiplier = parseByteMultiplier(fileSizeLimit);
++    long sizeLimit = parseSize(fileSizeLimit);
++    long byteMultiplier = parseByteMultiplier(fileSizeLimit);
+-   * Throws IllegalArgumentException if file size is over fileSizeLimitBytes
++   * Throws ManagementException if file size is over fileSizeLimit bytes
++   *
++   * @return false == limit is zero (checking disabled)<br>
++   *         true == file size is less than limit<br>
++   *         exception == file size is over limit
+-  void checkOverDiskSpaceThreshold(int fileSizeLimitBytes, File file) {
+-    // TODO:GEODE-2420: warn user if exportedLogsZipFile size > threshold
+-    if (FileUtils.sizeOf(file) > fileSizeLimitBytes) {
+-      throw new IllegalArgumentException("TOO BIG"); // FileTooBigException
+-    }
+-  }
+-
+-  /**
+-   * Throws IllegalArgumentException if file size is over fileSizeLimitBytes false == limit is zero
+-   * true == file size is less than limit exception == file size is over limit
+-   */
+-  boolean isFileSizeCheckEnabledAndWithinLimit(int fileSizeLimitBytes, File file) {
+-    // TODO:GEODE-2420: warn user if exportedLogsZipFile size > threshold
++  boolean isFileSizeCheckEnabledAndWithinLimit(long fileSizeLimitBytes, File file) {
++      // size checks disabled
+-    throw new IllegalArgumentException("TOO BIG: fileSizeLimit = " + fileSizeLimitBytes
+-        + ", fileSize = " + FileUtils.sizeOf(file)); // FileTooBigException
++    StringBuilder sb = new StringBuilder();
++    sb.append("Exported logs zip file size = ").append(FileUtils.sizeOf(file)).append(", ")
++        .append(CliStrings.EXPORT_LOGS__FILESIZELIMIT).append(" = ").append(fileSizeLimitBytes)
++        .append(". To disable exported logs file size check use option \"--file-size-limit=0\".");
++    throw new ManagementException(sb.toString()); // FileTooBigException
++  }
++
++  /**
++   * Throws ManagementException if export file size checking is enabled and the space required on a
++   * cluster member to filter and zip up files to be exported exceeds the disk space available
++   */
++  boolean isSizeCheckEnabledAndWithinDiskSpaceOfMember(String memberName, long fileSizeLimitBytes,
++      long estimatedSize, long diskAvailable, long diskSize) {
++    // TODO:GEODE-2420: warn user if exportedLogs filtering will exceed disk available
++    if (fileSizeLimitBytes < 1) {
++      // size checks disabled
++      return false;
++    }
++    StringBuilder sb = new StringBuilder();
++    BytesToString bytesToString = new BytesToString();
++    if (estimatedSize > diskAvailable) {
++      sb.append("Estimated disk space required (").append(bytesToString.of(estimatedSize))
++          .append(") to consolidate logs on member ").append(memberName)
++          .append(" will exceed available disk space (").append(bytesToString.of(diskAvailable))
++          .append(")");
++      throw new ManagementException(sb.toString()); // FileTooBigException
++    }
++    return true;
+-  static int parseByteMultiplier(String diskSpaceLimit) {
++  static long parseByteMultiplier(String diskSpaceLimit) {
++      case "k":
++        return KILOBYTE;
+-        return (int) TERABYTE;
++        return TERABYTE;
+-        return (int) GIGABYTE;
++        return GIGABYTE;
+-        return (int) MEGABYTE;
++        return MEGABYTE;
+-  static final int MEGABYTE = (int) Math.pow(1024, 2);
+-  static final int GIGABYTE = (int) Math.pow(1024, 3);
+-  static final int TERABYTE = (int) Math.pow(1024, 4);
+-
++  static final long KILOBYTE = 1024L;
++  static final long MEGABYTE = KILOBYTE * 1024;
++  static final long GIGABYTE = MEGABYTE * 1024;
++  static final long TERABYTE = GIGABYTE * 1024;
+
+INS26 INS26 INS26 INS40 INS40 INS40 INS31 INS31 INS31 INS31 INS31 INS31 INS23 INS44 MOV29 UPD39 MOV39 UPD42 MOV42 INS8 INS29 MOV74 INS42 INS44 INS44 INS8 INS29 INS43 INS42 MOV44 MOV44 INS8 INS29 INS39 INS42 INS8 INS29 INS39 INS42 INS8 INS83 UPD39 INS29 INS39 INS42 INS44 INS44 INS44 INS44 INS44 INS8 UPD39 INS83 INS83 INS39 INS59 UPD39 UPD39 UPD39 INS77 MOV43 INS42 INS60 INS41 INS65 INS5 INS42 INS5 INS42 INS41 INS65 INS42 INS43 UPD42 UPD43 UPD42 INS41 INS65 INS41 INS65 INS41 INS65 UPD65 UPD39 INS60 INS21 INS53 INS65 INS43 INS42 INS39 INS42 INS39 INS42 INS39 INS42 INS39 INS42 INS25 INS60 INS60 INS25 INS41 INS42 INS34 INS27 INS27 INS27 UPD45 INS42 INS80 INS80 INS80 INS80 INS39 INS59 UPD66 INS66 INS66 INS9 INS66 INS43 INS85 INS43 INS85 MOV32 INS66 INS40 UPD42 INS32 INS66 INS32 INS66 INS32 UPD39 UPD39 INS66 UPD66 INS66 UPD66 INS43 INS59 INS32 INS14 INS66 INS66 INS42 INS27 INS8 INS43 INS59 INS43 INS59 INS27 INS8 INS9 INS49 INS41 INS42 INS34 INS42 INS34 INS42 INS34 INS42 INS40 INS42 INS40 INS42 INS40 INS42 INS40 INS42 INS34 INS25 INS42 INS42 INS42 INS42 MOV14 INS42 INS42 INS32 UPD42 MOV42 INS32 INS42 UPD42 MOV42 INS42 INS14 INS32 INS42 INS45 INS43 INS32 INS42 INS34 INS41 INS42 INS42 INS14 INS42 INS42 INS14 INS42 INS42 INS21 INS53 INS45 INS42 INS42 INS42 INS42 INS74 INS27 INS32 INS8 INS8 MOV42 UPD42 MOV42 INS42 INS42 INS43 INS32 INS42 INS42 INS42 INS42 INS42 INS9 INS43 INS43 INS32 INS14 INS43 INS43 INS32 INS32 INS34 INS54 INS42 INS21 MOV60 MOV70 MOV25 MOV60 MOV60 MOV21 MOV70 MOV60 MOV25 MOV60 MOV21 MOV21 INS54 MOV21 INS42 INS32 INS42 INS45 INS42 INS42 INS32 INS42 INS45 INS43 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS8 INS12 INS7 INS8 INS12 INS8 INS32 INS42 INS40 INS32 INS42 INS32 INS42 INS42 INS42 INS25 INS21 INS54 INS21 INS44 INS8 INS42 INS32 INS21 INS44 INS8 MOV21 INS32 INS42 INS45 INS32 INS42 INS45 INS42 INS42 INS42 MOV74 INS38 INS8 INS7 INS8 INS12 INS32 INS43 INS42 INS41 INS42 INS42 INS27 INS32 INS43 INS42 INS41 INS32 INS42 MOV32 INS32 INS42 INS42 INS32 MOV60 MOV25 UPD45 INS42 INS42 INS21 INS44 INS8 INS42 INS45 INS32 INS42 INS32 INS32 UPD42 MOV42 INS32 INS45 INS32 INS42 INS32 INS32 INS42 INS32 INS42 INS42 INS45 INS32 INS42 INS45 MOV74 INS42 INS42 INS32 INS43 INS42 INS41 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS14 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS32 INS42 INS32 INS42 INS32 INS32 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS43 INS42 INS42 INS42 INS42 INS45 INS42 INS42 INS42 UPD42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS42 DEL33 DEL9 DEL43 DEL42 DEL43 DEL74 DEL42 DEL42 DEL43 DEL74 DEL14 DEL59 DEL60 DEL42 DEL42 DEL34 DEL7 DEL21 DEL8 DEL39 DEL32 DEL42 DEL27 DEL42 DEL43 DEL45 DEL14 DEL53 DEL8 DEL25 DEL8 DEL31 DEL43 DEL45 DEL42 DEL45 DEL27 DEL14 DEL53 DEL39 DEL42 DEL11 DEL39 DEL42 DEL11 DEL39 DEL42 DEL11 DEL39 DEL42 DEL42 DEL34 DEL34 DEL32 DEL11 DEL39 DEL42 DEL42 DEL34 DEL34 DEL32 DEL11 DEL39 DEL42 DEL42 DEL34 DEL34 DEL32 DEL11

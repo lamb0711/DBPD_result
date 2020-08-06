@@ -1,0 +1,273 @@
+Merge branch 'release/1.8.0'
+
+-import java.util.Iterator;
+-import java.util.PriorityQueue;
++import java.util.concurrent.locks.ReentrantReadWriteLock;
+-import org.apache.geode.internal.i18n.LocalizedStrings;
+-import org.apache.geode.internal.logging.log4j.LocalizedMessage;
+-  /**
+-   * The current key used to do put into the region. Once put is complete, then the {@link #tailKey}
+-   * is reconciled with this value.
+-   */
+-  private long currentKey;
+-
++  /**
++   * The writeLock of this concurrent lock is used to protect access to the queue.
++   * It is implemented as a fair lock to ensure FIFO ordering of queueing attempts.
++   * Otherwise threads can be unfairly delayed.
++   */
++  private ReentrantReadWriteLock lock = new ReentrantReadWriteLock(true);
+-  private final boolean keyPutNoSync;
+-  private final int maxPendingPuts;
+-  private final PriorityQueue<Long> pendingPuts;
+-
+-    this.currentKey = -1;
+-    if (Boolean.getBoolean(DistributionConfig.GEMFIRE_PREFIX + "gateway-queue-sync")) {
+-      this.keyPutNoSync = false;
+-      this.maxPendingPuts = 0;
+-      this.pendingPuts = null;
+-    } else {
+-      this.keyPutNoSync = true;
+-      this.maxPendingPuts = Math.max(this.batchSize, 100);
+-      this.pendingPuts = new PriorityQueue<Long>(this.maxPendingPuts + 5);
+-    }
+-  public synchronized boolean put(Object event) throws CacheException {
+-    GatewaySenderEventImpl eventImpl = (GatewaySenderEventImpl) event;
+-    final Region r = eventImpl.getRegion();
+-    final boolean isPDXRegion =
+-        (r instanceof DistributedRegion && r.getName().equals(PeerTypeRegistration.REGION_NAME));
+-    final boolean isWbcl = this.regionName.startsWith(AsyncEventQueueImpl.ASYNC_EVENT_QUEUE_PREFIX);
+-    if (!(isPDXRegion && isWbcl)) {
+-      putAndGetKey(event);
+-      return true;
++  public boolean put(Object event) throws CacheException {
++    lock.writeLock().lock();
++    try {
++      GatewaySenderEventImpl eventImpl = (GatewaySenderEventImpl) event;
++      final Region r = eventImpl.getRegion();
++      final boolean isPDXRegion =
++          (r instanceof DistributedRegion && r.getName().equals(PeerTypeRegistration.REGION_NAME));
++      final boolean isWbcl =
++          this.regionName.startsWith(AsyncEventQueueImpl.ASYNC_EVENT_QUEUE_PREFIX);
++      if (!(isPDXRegion && isWbcl)) {
++        putAndGetKey(event);
++        return true;
++      }
++      return false;
++    } finally {
++      lock.writeLock().unlock();
+-    return false;
+-  private long putAndGetKeyNoSync(Object object) throws CacheException {
+-    // don't sync on whole put; callers will do the puts in parallel but
+-    // will wait later for previous tailKey put to complete after its own
+-    // put is done
+-
+-    Long key;
+-    synchronized (this) {
+-      initializeKeys();
+-      // Get and increment the current key
+-      // Go for full sync in case of wrapover
+-      long ckey = this.currentKey;
+-      if (logger.isTraceEnabled()) {
+-        logger.trace("{}: Determined current key: {}", this, ckey);
+-      }
+-      key = Long.valueOf(ckey);
+-      this.currentKey = inc(ckey);
+-    }
+-
+-    try {
+-      // Put the object into the region at that key
+-      this.region.put(key, (AsyncEvent) object);
+-
+-      if (logger.isDebugEnabled()) {
+-        logger.debug("{}: Inserted {} -> {}", this, key, object);
+-      }
+-    } finally {
+-
+-      final Object sync = this.pendingPuts;
+-      synchronized (sync) {
+-        // Increment the tail key
+-        // It is important that we increment the tail
+-        // key after putting in the region, this is the
+-        // signal that a new object is available.
+-
+-        while (true) {
+-          if (key.longValue() == this.tailKey.get()) {
+-            // this is the next thread, so increment tail and signal all other
+-            // waiting threads if required
+-            incrementTailKey();
+-            // check pendingPuts
+-            boolean notifyWaiters = false;
+-            if (this.pendingPuts.size() > 0) {
+-              Iterator<Long> itr = this.pendingPuts.iterator();
+-              while (itr.hasNext()) {
+-                Long k = itr.next();
+-                if (k.longValue() == this.tailKey.get()) {
+-                  incrementTailKey();
+-                  // removed something from pending queue, so notify any waiters
+-                  if (!notifyWaiters) {
+-                    notifyWaiters = (this.pendingPuts.size() >= this.maxPendingPuts);
+-                  }
+-                  itr.remove();
+-                } else {
+-                  break;
+-                }
+-              }
+-            }
+-            if (notifyWaiters) {
+-              sync.notifyAll();
+-            }
+-            break;
+-          } else if (this.pendingPuts.size() < this.maxPendingPuts) {
+-            this.pendingPuts.add(key);
+-            break;
+-          } else {
+-            // wait for the queue size to go down
+-            boolean interrupted = Thread.interrupted();
+-            Throwable t = null;
+-            try {
+-              sync.wait(5);
+-            } catch (InterruptedException ie) {
+-              t = ie;
+-              interrupted = true;
+-            } finally {
+-              if (interrupted) {
+-                Thread.currentThread().interrupt();
+-              }
+-              ((LocalRegion) this.region).getCancelCriterion().checkCancelInProgress(t);
+-            }
+-          }
+-        }
+-      }
+-    }
+-
+-    if (object instanceof Conflatable) {
+-      removeOldEntry((Conflatable) object, key);
+-    }
+-
+-    return key.longValue();
+-  }
+-
+-  public synchronized AsyncEvent take() throws CacheException {
++  public AsyncEvent take() throws CacheException {
+-  public synchronized void remove() throws CacheException {
+-    if (this.peekedIds.isEmpty()) {
+-      return;
+-    }
+-    Long key = this.peekedIds.remove();
++  public void remove() throws CacheException {
++    lock.writeLock().lock();
+-      // Increment the head key
+-      updateHeadKey(key.longValue());
+-      removeIndex(key);
+-      // Remove the entry at that key with a callback arg signifying it is
+-      // a WAN queue so that AbstractRegionEntry.destroy can get the value
+-      // even if it has been evicted to disk. In the normal case, the
+-      // AbstractRegionEntry.destroy only gets the value in the VM.
+-      this.region.localDestroy(key, WAN_QUEUE_TOKEN);
+-      this.stats.decQueueSize();
++      if (this.peekedIds.isEmpty()) {
++        return;
++      }
++      Long key = this.peekedIds.remove();
++      try {
++        // Increment the head key
++        updateHeadKey(key.longValue());
++        removeIndex(key);
++        // Remove the entry at that key with a callback arg signifying it is
++        // a WAN queue so that AbstractRegionEntry.destroy can get the value
++        // even if it has been evicted to disk. In the normal case, the
++        // AbstractRegionEntry.destroy only gets the value in the VM.
++        this.region.localDestroy(key, WAN_QUEUE_TOKEN);
++        this.stats.decQueueSize();
+-    } catch (EntryNotFoundException ok) {
+-      // this is acceptable because the conflation can remove entries
+-      // out from underneath us.
++      } catch (EntryNotFoundException ok) {
++        // this is acceptable because the conflation can remove entries
++        // out from underneath us.
++        if (logger.isDebugEnabled()) {
++          logger.debug(
++              "{}: Did not destroy entry at {} it was not there. It should have been removed by conflation.",
++              this, key);
++        }
++      }
++
++      boolean wasEmpty = this.lastDispatchedKey == this.lastDestroyedKey;
++      this.lastDispatchedKey = key;
++      if (wasEmpty) {
++        synchronized (this) {
++          notifyAll();
++        }
++      }
++
+-            "{}: Did not destroy entry at {} it was not there. It should have been removed by conflation.",
+-            this, key);
++            "{}: Destroyed entry at key {} setting the lastDispatched Key to {}. The last destroyed entry was {}",
++            this, key, this.lastDispatchedKey, this.lastDestroyedKey);
+-    }
+-
+-    boolean wasEmpty = this.lastDispatchedKey == this.lastDestroyedKey;
+-    this.lastDispatchedKey = key;
+-    if (wasEmpty) {
+-      notifyAll();
+-    }
+-
+-    if (logger.isDebugEnabled()) {
+-      logger.debug(
+-          "{}: Destroyed entry at key {} setting the lastDispatched Key to {}. The last destroyed entry was {}",
+-          this, key, this.lastDispatchedKey, this.lastDestroyedKey);
++    } finally {
++      lock.writeLock().unlock();
+-      synchronized (this) {
++      lock.writeLock().lock();
++      try {
++      } finally {
++        lock.writeLock().unlock();
+-  // No need to synchronize because it is called from a synchronized method
++  /*
++   * this must be invoked with lock.writeLock() held
++   */
+-    synchronized (this) {
++    lock.writeLock().lock();
++    try {
+-        logger.info(LocalizedMessage.create(
+-            LocalizedStrings.SingleWriteSingleReadRegionQueue_0_DURING_FAILOVER_DETECTED_THAT_KEYS_HAVE_WRAPPED,
+-            new Object[] {this, this.tailKey, Long.valueOf(this.headKey)}));
++        logger.info("{}: During failover, detected that keys have wrapped tailKey={} headKey={}",
++            new Object[] {this, this.tailKey, Long.valueOf(this.headKey)});
++    } finally {
++      lock.writeLock().unlock();
+-          logger.fatal(LocalizedMessage.create(
+-              LocalizedStrings.SingleWriteSingleReadRegionQueue_UNEXPECTED_EXCEPTION_DURING_INIT_OF_0,
+-              this.getClass()), veryUnLikely);
++          logger.fatal(String.format("Unexpected Exception during init of %s",
++              this.getClass()),
++              veryUnLikely);
+-          logger.fatal(LocalizedMessage.create(
+-              LocalizedStrings.SingleWriteSingleReadRegionQueue_UNEXPECTED_EXCEPTION_DURING_INIT_OF_0,
+-              this.getClass()), alsoUnlikely);
++          logger.fatal(String.format("Unexpected Exception during init of %s",
++              this.getClass()),
++              alsoUnlikely);
+-        logger.fatal(LocalizedMessage.create(
+-            LocalizedStrings.SingleWriteSingleReadRegionQueue_0_THE_QUEUE_REGION_NAMED_1_COULD_NOT_BE_CREATED,
+-            new Object[] {this, this.regionName}), e);
++        logger.fatal(String.format("%s: The queue region named %s could not be created",
++            new Object[] {this, this.regionName}),
++            e);
+-                this.wait(messageSyncInterval * 1000);
++                this.wait(messageSyncInterval * 1000L);
+-            synchronized (SerialGatewaySenderQueue.this) {
++            lock.writeLock().lock();
++            try {
++            } finally {
++              lock.writeLock().unlock();
+-        logger.info(
+-            LocalizedMessage.create(LocalizedStrings.HARegionQueue_THE_QUEUEREMOVALTHREAD_IS_DONE));
++        logger.info("The QueueRemovalThread is done.");
+-        logger.warn(LocalizedMessage
+-            .create(LocalizedStrings.HARegionQueue_QUEUEREMOVALTHREAD_IGNORED_CANCELLATION));
++        logger.warn("QueueRemovalThread ignored cancellation");
+
+MOV26 UPD40 INS23 MOV29 MOV83 INS43 INS59 INS8 INS8 UPD42 MOV42 INS42 INS14 INS21 INS54 INS21 INS54 INS21 INS54 UPD66 UPD66 INS66 INS43 INS9 INS32 MOV8 INS8 INS32 MOV8 INS8 INS32 MOV8 INS8 UPD42 MOV42 INS32 INS42 INS21 INS32 INS42 INS21 INS21 INS54 INS32 INS42 INS21 INS42 INS42 INS32 INS42 INS42 INS8 INS32 INS32 MOV8 INS8 INS42 INS42 INS32 INS32 INS42 INS51 INS32 INS42 INS32 INS42 INS21 INS32 INS42 MOV12 INS42 INS42 INS52 MOV8 INS42 INS42 INS42 INS42 INS32 MOV32 INS42 INS42 INS45 INS45 INS32 INS42 UPD42 UPD42 INS45 MOV44 MOV44 INS42 INS42 INS21 INS54 UPD42 UPD42 INS45 INS32 MOV8 INS8 UPD42 UPD42 INS32 INS42 INS21 UPD42 UPD42 INS45 UPD42 UPD42 INS45 INS42 INS42 INS32 INS32 INS42 INS42 INS42 UPD34 DEL40 DEL26 DEL40 DEL26 DEL40 DEL26 DEL39 DEL42 DEL59 DEL23 DEL42 DEL67 DEL65 DEL83 DEL83 DEL39 DEL42 DEL59 DEL23 DEL83 DEL83 DEL39 DEL42 DEL59 DEL23 DEL83 DEL83 DEL43 DEL42 DEL43 DEL74 DEL42 DEL59 DEL23 DEL52 DEL42 DEL22 DEL34 DEL38 DEL7 DEL21 DEL42 DEL42 DEL40 DEL45 DEL27 DEL32 DEL52 DEL42 DEL22 DEL9 DEL7 DEL21 DEL52 DEL42 DEL22 DEL34 DEL7 DEL21 DEL52 DEL42 DEL22 DEL33 DEL7 DEL21 DEL8 DEL52 DEL42 DEL22 DEL9 DEL7 DEL21 DEL52 DEL42 DEL22 DEL42 DEL42 DEL52 DEL42 DEL22 DEL34 DEL32 DEL7 DEL21 DEL52 DEL42 DEL22 DEL42 DEL43 DEL42 DEL43 DEL74 DEL52 DEL42 DEL22 DEL34 DEL27 DEL14 DEL7 DEL21 DEL8 DEL25 DEL83 DEL83 DEL39 DEL42 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL43 DEL42 DEL59 DEL60 DEL52 DEL42 DEL32 DEL21 DEL39 DEL42 DEL52 DEL42 DEL22 DEL59 DEL60 DEL42 DEL42 DEL32 DEL42 DEL42 DEL45 DEL52 DEL42 DEL32 DEL21 DEL8 DEL25 DEL42 DEL42 DEL42 DEL42 DEL32 DEL7 DEL21 DEL52 DEL42 DEL22 DEL42 DEL42 DEL32 DEL7 DEL21 DEL8 DEL51 DEL52 DEL42 DEL22 DEL42 DEL42 DEL43 DEL42 DEL11 DEL32 DEL21 DEL42 DEL42 DEL32 DEL42 DEL42 DEL45 DEL52 DEL42 DEL42 DEL32 DEL21 DEL8 DEL25 DEL8 DEL83 DEL42 DEL43 DEL42 DEL52 DEL42 DEL22 DEL59 DEL60 DEL42 DEL9 DEL42 DEL42 DEL32 DEL52 DEL42 DEL22 DEL42 DEL32 DEL27 DEL42 DEL32 DEL21 DEL39 DEL42 DEL9 DEL59 DEL60 DEL52 DEL42 DEL22 DEL42 DEL32 DEL34 DEL27 DEL42 DEL43 DEL42 DEL43 DEL74 DEL42 DEL52 DEL42 DEL22 DEL42 DEL32 DEL59 DEL60 DEL42 DEL42 DEL32 DEL42 DEL43 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL42 DEL32 DEL52 DEL42 DEL22 DEL42 DEL32 DEL27 DEL42 DEL32 DEL21 DEL42 DEL38 DEL42 DEL52 DEL42 DEL22 DEL42 DEL32 DEL52 DEL42 DEL22 DEL27 DEL36 DEL7 DEL21 DEL8 DEL25 DEL42 DEL42 DEL32 DEL21 DEL8 DEL10 DEL8 DEL25 DEL8 DEL61 DEL8 DEL25 DEL42 DEL42 DEL42 DEL32 DEL21 DEL8 DEL25 DEL10 DEL8 DEL52 DEL42 DEL22 DEL42 DEL32 DEL52 DEL42 DEL22 DEL27 DEL52 DEL42 DEL22 DEL42 DEL42 DEL32 DEL21 DEL10 DEL8 DEL39 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL43 DEL42 DEL33 DEL59 DEL60 DEL42 DEL42 DEL34 DEL32 DEL21 DEL8 DEL42 DEL43 DEL42 DEL44 DEL42 DEL42 DEL7 DEL21 DEL42 DEL9 DEL7 DEL21 DEL8 DEL12 DEL42 DEL42 DEL42 DEL32 DEL42 DEL32 DEL21 DEL8 DEL25 DEL42 DEL43 DEL52 DEL42 DEL22 DEL11 DEL36 DEL42 DEL32 DEL42 DEL42 DEL32 DEL21 DEL8 DEL54 DEL8 DEL25 DEL25 DEL8 DEL61 DEL8 DEL51 DEL8 DEL54 DEL42 DEL42 DEL43 DEL62 DEL42 DEL42 DEL43 DEL42 DEL11 DEL42 DEL32 DEL21 DEL8 DEL25 DEL42 DEL42 DEL32 DEL41 DEL8 DEL31 DEL83 DEL83 DEL52 DEL51 DEL40 DEL42 DEL42 DEL32 DEL52 DEL51 DEL40 DEL40 DEL40 DEL42 DEL52 DEL51 DEL42 DEL42 DEL40 DEL32 DEL42 DEL42 DEL40 DEL32

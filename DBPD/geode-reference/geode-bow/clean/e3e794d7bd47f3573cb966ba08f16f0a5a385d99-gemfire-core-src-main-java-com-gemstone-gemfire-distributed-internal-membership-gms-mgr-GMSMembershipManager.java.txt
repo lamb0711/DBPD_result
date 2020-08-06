@@ -1,0 +1,111 @@
+GEODE-77 fixes for network failure handling & miscellaneous unit test failures
+
+Network failure handling was not properly shutting down TCPConduit, leaving threads hanging trying to send messages.  The shutdown code was calling Services.emergencyClose too soon, and the recursion back into GMSMembershipManager shutdown code caused some problems, too.
+
+GMSHealthMonitor was continually switching between two members to watch even though it had already sent suspect messages about them and had received no response.  I added a collection of IDs that are in this state and modified setNextNeighbor to avoid reusing them.
+
+GMSHealthMonitor was sending removeMember messages to the locators and a random member, but for some reason this wasn't resolving a network partition fast enough.  I've disabled that behavior for now, sending the messages to all members.  This needs to be revisited because sending the message to all members is not scalable.
+
+GMSHealthMonitor had some issues with initiating removals when it was in the process of shutting down.  I added some isStopping checks to fix this.
+
+MembershipJUnitTest and StatRecorderJUnitTest were failing in gradle runs but not under Eclipse because my Eclipse launch configuration wasn't set to enable assertions.  After fixing that I found a number of problems with these tests and fixed them.
+
+Multicast tests are now implemented in GMSMembershipManager and JGroupsMessenger.  This leverages the ping/pong messaging added for the quorum checker.
+
+GMSJoinLeave was too slow in sending out new views when there were process failures.  I added code to inform the reply processor if there are queued leave/remove requests so it wouldn't wait for these, and also added similar checks in the removeHealthyMembers method (which performs checks on members using the HealthMonitor).
+
+When there is a network partition GMSJoinLeave will now send a NetworkPartitionMessage to other members to prod them along in figuring out that they should shut down.
+
+During a forced-disconnect there can be a lot of warning/fatail log messages.  If there are alert listeners in the system this can create a lot of network traffic and extra work figuring out whether the receiver is even there or not.  GMSMembershipManager now throws away outbound alerts when a forced-disconnect is in process.
+
+Some of the forced-disconnect shutdown processing has been moved out of the membershp manager's DisconnectThread that was introduced with the quorum checker in order to set the shutdown cause, etc, as quickly as possible.
+
+I noticed a lot of TXState log messages at debug level with a Throwable stack trace.  There was no comment saying why this was being done so I commented it out.
+
+JGroups logging level is now set to FATAL by default.  The default log level was a problem during network partitions because each message send was causing a dire warning to be logged.
+
+I observed a number of threads being left behind when a locator failed to start during auto-reconnect testing.  I added a unit test to LocatorJUnitTest for this and fixed the leaks.
+
++import java.util.Arrays;
++import com.gemstone.gemfire.distributed.internal.AdminMessageType;
+-    return true;
++    try {
++      return services.getMessenger().testMulticast(services.getConfig().getMemberTimeout());
++    } catch (InterruptedException e) {
++      services.getCancelCriterion().checkCancelInProgress(e);
++      Thread.currentThread().interrupt();
++      return false;
++    }
++    
++    if (cleanupTimer != null) {
++      cleanupTimer.cancel();
++    }
++    
++    
++    if (msg instanceof AdminMessageType
++        && this.shutdownInProgress) {
++      // no alerts while shutting down - this can cause threads to hang
++      return new HashSet(Arrays.asList(msg.getRecipients()));
++    }
+-	if (GMSMembershipManager.this.shutdownInProgress) {
+-		return; // probably a race condition
+-	}
+-	saveCacheXmlForReconnect();
++    if (GMSMembershipManager.this.shutdownInProgress  || isJoining()) {
++      return; // probably a race condition
++    }
++    
++    final Exception shutdownCause = new ForcedDisconnectException(reason);
++    if (!inhibitForceDisconnectLogging) {
++      logger.fatal(LocalizedMessage.create(
++          LocalizedStrings.GroupMembershipService_MEMBERSHIP_SERVICE_FAILURE_0, reason), shutdownCause);
++    }
++    
++    if (!services.getConfig().getDistributionConfig().getDisableAutoReconnect()) {
++      saveCacheXmlForReconnect();
++    }
++    
++    AlertAppender.getInstance().shuttingDown();
++
++    services.getCancelCriterion().cancel(reason);
++    // cache the exception so it can be appended to ShutdownExceptions
++    services.setShutdownCause(shutdownCause);
++
+-        // make sure that we've received a connected channel and aren't responsible
+-        // for the notification
+-        if (!isJoining()) {
+-
+-          AlertAppender.getInstance().shuttingDown();
+-
+-          services.getCancelCriterion().cancel(reason);
+-          // cache the exception so it can be appended to ShutdownExceptions
+-          Exception shutdownCause = new ForcedDisconnectException(reason);
+-          services.setShutdownCause(shutdownCause);
+-
+-          if (!inhibitForceDisconnectLogging) {
+-            logger.fatal(LocalizedMessage.create(
+-                LocalizedStrings.GroupMembershipService_MEMBERSHIP_SERVICE_FAILURE_0, reason), shutdownCause);
+-          }
+-          
+-          services.emergencyClose();
+-
+-          // stop server locators immediately since they may not have correct
+-          // information.  This has caused client failures in bridge/wan
+-          // network-down testing
+-          InternalLocator loc = (InternalLocator)Locator.getLocator();
+-          if (loc != null) {
+-            loc.stop(!services.getConfig().getDistributionConfig()
+-                         .getDisableAutoReconnect(), false);
+-          }
+-          
+-          uncleanShutdown(reason, shutdownCause);
++        // stop server locators immediately since they may not have correct
++        // information.  This has caused client failures in bridge/wan
++        // network-down testing
++        InternalLocator loc = (InternalLocator)Locator.getLocator();
++        if (loc != null) {
++          loc.stop(true, !services.getConfig().getDistributionConfig()
++              .getDisableAutoReconnect(), false);
++
++        uncleanShutdown(reason, shutdownCause);
++    

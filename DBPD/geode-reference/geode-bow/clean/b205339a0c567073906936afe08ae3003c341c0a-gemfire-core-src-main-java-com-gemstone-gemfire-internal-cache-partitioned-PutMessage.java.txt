@@ -1,0 +1,216 @@
+Merge branch 'feature/GEODE-8' into develop
+
++import com.gemstone.gemfire.internal.cache.CachedDeserializableFactory;
++import com.gemstone.gemfire.internal.cache.EntryEventImpl.NewValueImporter;
++import com.gemstone.gemfire.internal.cache.EntryEventImpl.OldValueImporter;
++import com.gemstone.gemfire.internal.offheap.StoredObject;
++import com.gemstone.gemfire.internal.offheap.annotations.Unretained;
++import static com.gemstone.gemfire.internal.offheap.annotations.OffHeapIdentifier.ENTRY_EVENT_OLD_VALUE;
++import static com.gemstone.gemfire.internal.offheap.annotations.OffHeapIdentifier.ENTRY_EVENT_NEW_VALUE;
++
+-public final class PutMessage extends PartitionMessageWithDirectReply
+-  {
++public final class PutMessage extends PartitionMessageWithDirectReply implements NewValueImporter {
+-  
++
++  @Unretained(ENTRY_EVENT_NEW_VALUE) 
++  /** whether this operation should fetch oldValue from HDFS*/
++  private transient boolean fetchFromHDFS;
++
++  private transient boolean isPutDML;
++  
++  //using the left most bit for IS_PUT_DML, the last available bit
++  protected static final short IS_PUT_DML = (short) (HAS_VERSION_TAG << 1);
++  // TODO this should really have been at the PartitionMessage level but all
++  // masks there are taken
++  // also switching the masks will impact backwards compatibility. Need to
++  // verify if it is ok to break backwards compatibility
++  protected static final int FETCH_FROM_HDFS = getNextByteMask(HAS_CALLBACKARG);  
+-        {
++        if (original.valObj instanceof StoredObject && !((StoredObject)original.valObj).isSerialized()) {
++          this.valObj = ((StoredObject)original.valObj).getDeserializedForReading();
++        } else {
+-      CachedDeserializable cd = (CachedDeserializable) event.getSerializedNewValue();
+-      if (cd != null) {
+-        {
+-          this.deserializationPolicy =
+-            DistributedCacheOperation.DESERIALIZATION_POLICY_LAZY;
+-          Object v = cd.getValue();
+-          if (v instanceof byte[]) {
+-            setValBytes((byte[])v);
+-          }
+-          else {
+-            // Defer serialization until toData is called.
+-            setValObj(v);
+-          }
+-        }
++      if (CachedDeserializableFactory.preferObject() || event.hasDelta()) {
++        this.deserializationPolicy = DistributedCacheOperation.DESERIALIZATION_POLICY_EAGER;
++      } else {
++        this.deserializationPolicy = DistributedCacheOperation.DESERIALIZATION_POLICY_LAZY;
+-      else {
+-        Object v = event.getRawNewValue();
+-        if (v instanceof byte[]) {
+-          this.deserializationPolicy =
+-            DistributedCacheOperation.DESERIALIZATION_POLICY_NONE;
+-          setValBytes((byte[]) v);
+-        }
+-        else if (event.hasDelta()) {
+-          this.deserializationPolicy =
+-            DistributedCacheOperation.DESERIALIZATION_POLICY_EAGER;
+-          if (event.getCachedSerializedNewValue() != null) {
+-            setValBytes(event.getCachedSerializedNewValue());
+-          } else {
+-            setValObj(v);
+-          }
+-        }
+-        else {
+-          this.deserializationPolicy =
+-            DistributedCacheOperation.DESERIALIZATION_POLICY_LAZY;
+-          if (event.getCachedSerializedNewValue() != null) {
+-            setValBytes(event.getCachedSerializedNewValue());
+-          } else {
+-            setValObj(v);
+-          }
+-        }
+-      }
++      event.exportNewValue(this);
++    m.setTransactionDistributed(r.getCache().getTxManager().isDistributed());
+-  private void setValObj(Object o) {
++  private void setValObj(@Unretained(ENTRY_EVENT_NEW_VALUE) Object o) {
+-
++    if ((extraFlags & FETCH_FROM_HDFS) != 0) {
++      this.fetchFromHDFS = true;
++    }
++    if ((flags & IS_PUT_DML) != 0) {
++      this.isPutDML = true;
++    }
++    
++    if (this.event.isFetchFromHDFS()) extraFlags |= FETCH_FROM_HDFS;
+-      // for eager deserialization avoid extra byte array serialization
+-      if (this.deserializationPolicy
+-          == DistributedCacheOperation.DESERIALIZATION_POLICY_EAGER) {
+-        byte[] newValBytes = getValBytes();
+-        if (getValBytes() == null) {
+-          newValBytes = BlobHelper.serializeToBlob(this.valObj);
+-          this.event.setCachedSerializedNewValue(newValBytes);
+-        }
+-        out.write(getValBytes());
+-      }
+-      else if (this.deserializationPolicy == DistributedCacheOperation.DESERIALIZATION_POLICY_LAZY) {
+-        byte[] newValBytes = getValBytes();
+-        if (getValBytes() == null) {
+-          newValBytes = BlobHelper.serializeToBlob(this.valObj);
+-          this.event.setCachedSerializedNewValue(newValBytes);
+-        }
+-        DataSerializer.writeByteArray(newValBytes, out);
+-      }
+-      else { // POLICY_NONE
+-        DataSerializer.writeByteArray(getValBytes(), out);
+-      }
++      // TODO OFFHEAP MERGE: cache serialized blob in event
++      DistributedCacheOperation.writeValue(this.deserializationPolicy, this.valObj, getValBytes(), out);
++    if (this.event.isPutDML()) s |= IS_PUT_DML;
+-    final EntryEventImpl ev = new EntryEventImpl(
++    final EntryEventImpl ev = EntryEventImpl.create(
++    try {
++	ev.setFetchFromHDFS(this.fetchFromHDFS);
++    ev.setPutDML(this.isPutDML);
++      try {
++      } finally {
++        // if e2 == ev then no need to free it here. The outer finally block will get it.
++        if (e2 != ev) {
++          e2.release();
++        }
++      }
+-      Object oldValue = null;
+-      if (!this.notificationOnly && this.requireOldValue) {
+-        oldValue = ev.getSerializedOldValue();
+-        if (oldValue == null) {
+-          oldValue = ev.getRawOldValue();
+-        }
+-      }
+-                oldValue, ev.getVersionTag());
++                ev);
++    } finally {
++      ev.release();
++    }
+-                           Object oldValue,
+-                           VersionTag version) {
++                           EntryEventImpl ev) {
+-    PutReplyMessage.send(member, procId, getReplySender(dm), result, getOperation(), ex, oldValue, version);
++    PutReplyMessage.send(member, procId, getReplySender(dm), result, getOperation(), ex, this, ev);
++  
++  @Override
++  protected boolean mayAddToMultipleSerialGateways(DistributionManager dm) {
++    return _mayAddToMultipleSerialGateways(dm);
++  }
+-  public static final class PutReplyMessage extends ReplyMessage {
++  public static final class PutReplyMessage extends ReplyMessage implements OldValueImporter {
++    @Unretained(ENTRY_EVENT_OLD_VALUE)
+-                            Object oldValue,
+-                            VersionTag version)
++                            PutMessage sourceMessage,
++                            EntryEventImpl ev)
+-      PutReplyMessage m = new PutReplyMessage(processorId, result, op, ex, oldValue, version);
++      PutReplyMessage m = new PutReplyMessage(processorId, result, op, ex, null, ev.getVersionTag());
++      if (!sourceMessage.notificationOnly && sourceMessage.requireOldValue) {
++        ev.exportOldValue(m);
++      }
++
++
++    @Override
++    public boolean prefersOldSerialized() {
++      return true;
++    }
++
++    @Override
++    public boolean isUnretainedOldReferenceOk() {
++      return true;
++    }
++    
++    @Override
++    public boolean isCachedDeserializableValueOk() {
++      return true;
++    }
++
++
++    @Override
++    public void importOldObject(@Unretained(ENTRY_EVENT_OLD_VALUE) Object ov, boolean isSerialized) {
++      this.oldValue = ov;
++    }
++
++    @Override
++    public void importOldBytes(byte[] ov, boolean isSerialized) {
++      this.oldValue = ov;
++    }
++
++  // NewValueImporter methods
++  
++  @Override
++  public boolean prefersNewSerialized() {
++    return true;
++  }
++
++  @Override
++  public boolean isUnretainedNewReferenceOk() {
++    return true;
++  }
++  
++  private void setDeserializationPolicy(boolean isSerialized) {
++    if (!isSerialized) {
++      this.deserializationPolicy = DistributedCacheOperation.DESERIALIZATION_POLICY_NONE;
++    }
++  }
++
++  @Override
++  public void importNewObject(@Unretained(ENTRY_EVENT_NEW_VALUE) Object nv, boolean isSerialized) {
++    setDeserializationPolicy(isSerialized);
++    setValObj(nv);
++  }
++
++  @Override
++  public void importNewBytes(byte[] nv, boolean isSerialized) {
++    setDeserializationPolicy(isSerialized);
++    setValBytes(nv);
++  }

@@ -1,0 +1,180 @@
+Merge branch 'release/1.0.0-incubating.M1'
+
+-/*=========================================================================
+- * Copyright (c) 2002-2014 Pivotal Software, Inc. All Rights Reserved.
+- * This product is protected by U.S. and international copyright
+- * and intellectual property laws. Pivotal products are covered by
+- * more patents listed at http://www.pivotal.io/patents.
+- *========================================================================
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++import java.io.Serializable;
++import java.util.ArrayList;
++import java.util.List;
++import java.util.concurrent.RejectedExecutionException;
+-  private Future<RebalanceResults> future;
++  private List<Future<RebalanceResults>> futureList = new ArrayList<Future<RebalanceResults>>();
++  private int pendingTasks;
+-    ScheduledExecutorService ex = manager.getExecutor();
+-      future = ex.submit(new Callable<RebalanceResults>() {
+-        public RebalanceResults call() {
+-          SystemFailure.checkFailure();
+-          cache.getCancelCriterion().checkCancelInProgress(null);
+-          try {
+-            return RebalanceOperationImpl.this.call();
+-          }
+-          catch (RuntimeException e) {
+-            logger.debug("Unexpected exception in rebalancing: {}", e.getMessage(), e);
+-            throw e;
+-          } finally {
+-            manager.removeInProgressRebalance(RebalanceOperationImpl.this);
+-          }
+-        }
+-      });
++      this.scheduleRebalance();      
+-  private RebalanceResults call() {
+-    RebalanceResultsImpl results = new RebalanceResultsImpl();
++  private void scheduleRebalance() {
++    
+-            Set<PartitionRebalanceInfo> detailSet = null;
+-                detailSet = prOp.execute();
++                this.futureList.add(submitRebalanceTask(prOp,start));
+-              detailSet = prOp.execute();
+-            }
+-            for (PartitionRebalanceInfo details : detailSet) {
+-              results.addDetails(details);
+-            }
++              this.futureList.add(submitRebalanceTask(prOp,start));
++            }            
+-      stats.endRebalance(start);
++      if(pendingTasks == 0) {
++        //if we didn't submit any tasks, end the rebalance now.
++        stats.endRebalance(start);
++      }
+-    return results;
+-  private Future<RebalanceResults> getFuture() {
+-    synchronized (this.futureLock) {
+-      return this.future;
++  private Future<RebalanceResults> submitRebalanceTask(final PartitionedRegionRebalanceOp rebalanceOp, final long rebalanceStartTime) {
++    final InternalResourceManager manager = this.cache.getResourceManager();
++    ScheduledExecutorService ex = manager.getExecutor();
++
++    synchronized(futureLock) {
++      //this update should happen inside this.futureLock 
++      pendingTasks++;
++
++      try {
++        Future<RebalanceResults> future = ex.submit(new Callable<RebalanceResults>() {
++          public RebalanceResults call() {
++            try {
++              RebalanceResultsImpl results = new RebalanceResultsImpl();
++              SystemFailure.checkFailure();
++              cache.getCancelCriterion().checkCancelInProgress(null);
++
++              Set<PartitionRebalanceInfo> detailSet = null;
++
++              detailSet = rebalanceOp.execute();
++
++              for (PartitionRebalanceInfo details : detailSet) {
++                results.addDetails(details);
++              }
++              return results;
++            }
++            catch (RuntimeException e) {
++              logger.debug("Unexpected exception in rebalancing: {}", e.getMessage(), e);
++              throw e;
++            } finally {
++              synchronized (RebalanceOperationImpl.this.futureLock) {
++                pendingTasks--;
++                if(pendingTasks == 0) {//all threads done
++                  manager.removeInProgressRebalance(RebalanceOperationImpl.this);
++                  manager.getStats().endRebalance(rebalanceStartTime);
++                }
++              }
++            }
++          }
++        });
++
++        return future;
++      } catch(RejectedExecutionException e) {
++        cache.getCancelCriterion().checkCancelInProgress(null);
++        throw e;
++      }
++    }
++  }
++  
++  private List<Future<RebalanceResults>> getFutureList() {
++    synchronized(this.futureList) {
++      return this.futureList;
+-    if(getFuture().cancel(false)) {
+-      cache.getResourceManager().removeInProgressRebalance(this);
++    
++    synchronized (this.futureLock) {
++      for(Future<RebalanceResults> fr : getFutureList()) {
++        if(fr.cancel(false)) {
++          pendingTasks--;
++        }
++      }
++      if(pendingTasks == 0 ) {
++        cache.getResourceManager().removeInProgressRebalance(this);
++      }
++    
++    RebalanceResultsImpl results = new RebalanceResultsImpl();
++    List<Future<RebalanceResults>> frlist =  getFutureList();
++    for(Future<RebalanceResults> fr : frlist) {
+-        return getFuture().get();
++        RebalanceResults rr =  fr.get();
++        results.addDetails((RebalanceResultsImpl)rr);
++        
++    }
++    return results;
+-    try {
+-      return getFuture().get(timeout, unit);
+-    } catch (ExecutionException e) {
+-      if(e.getCause() instanceof GemFireException) {
+-        throw (GemFireException) e.getCause();
+-      } else if(e.getCause() instanceof InternalGemFireError) {
+-        throw (InternalGemFireError) e.getCause();
+-      } else {
+-        throw new InternalGemFireError(e.getCause());
++    long endTime = unit.toNanos(timeout) + System.nanoTime();
++    
++    RebalanceResultsImpl results = new RebalanceResultsImpl();
++    List<Future<RebalanceResults>> frlist =  getFutureList();
++    for(Future<RebalanceResults> fr : frlist) {
++      try {
++        long waitTime = endTime - System.nanoTime();
++        RebalanceResults rr =  fr.get(waitTime, TimeUnit.NANOSECONDS);                
++        results.addDetails((RebalanceResultsImpl)rr);
++      } catch (ExecutionException e) {
++        if(e.getCause() instanceof GemFireException) {
++          throw (GemFireException) e.getCause();
++        } else if(e.getCause() instanceof InternalGemFireError) {
++          throw (InternalGemFireError) e.getCause();
++        } else {
++          throw new InternalGemFireError(e.getCause());
++        }
++    return results;
++  private boolean isAllDone() {
++    for(Future<RebalanceResults> fr : getFutureList()) {
++      if(!fr.isDone())
++        return false;
++    }
++    return true;
++  }
++  
+-    return this.cancelled.get() || getFuture().isDone();
++    return this.cancelled.get() || isAllDone();

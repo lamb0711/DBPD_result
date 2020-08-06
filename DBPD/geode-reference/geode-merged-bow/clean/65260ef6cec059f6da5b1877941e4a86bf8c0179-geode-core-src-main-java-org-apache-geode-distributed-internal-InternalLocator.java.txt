@@ -1,0 +1,275 @@
+GEODE-7585: Create API for starting a locator in the membership package
+
+Creating a new MembershipLocator and MembershipLocatorBuilder that are used to
+create the membership locator. These classes encapsulate the TcpServer,
+PrimaryHandler, and GMSLocator that were previously held by InternalLocator.
+
+Getting rid of some intermdiate classes that wrapped the GMSLocator -
+NetLocator and GMSLocatorAdapter.
+
+Refactoring the restart logic out of PrimaryHandler. There is now a separate
+RestartHandler, and a separate collection that tracks RestartHandlers. Removing
+RestartableTcpHandler.
+
+Removing TcpServerFactory.
+
+-import java.net.ConnectException;
++import java.util.concurrent.ThreadPoolExecutor;
++import java.util.function.Supplier;
++import org.apache.geode.GemFireConfigException;
+-import org.apache.geode.distributed.internal.membership.NetLocator;
+-import org.apache.geode.distributed.internal.membership.NetLocatorFactory;
++import org.apache.geode.distributed.internal.membership.InternalDistributedMember;
++import org.apache.geode.distributed.internal.membership.adapter.ServiceConfig;
++import org.apache.geode.distributed.internal.membership.api.MemberIdentifier;
++import org.apache.geode.distributed.internal.membership.api.MembershipConfig;
++import org.apache.geode.distributed.internal.membership.api.MembershipConfigurationException;
++import org.apache.geode.distributed.internal.membership.api.MembershipLocator;
++import org.apache.geode.distributed.internal.membership.api.MembershipLocatorBuilder;
+-import org.apache.geode.distributed.internal.membership.gms.locator.PeerLocatorRequest;
+-import org.apache.geode.distributed.internal.tcpserver.TcpClient;
++import org.apache.geode.distributed.internal.tcpserver.TcpHandler;
++import org.apache.geode.internal.CopyOnWriteHashSet;
++import org.apache.geode.internal.admin.remote.RemoteTransportConfig;
+-import org.apache.geode.internal.cache.tier.sockets.TcpServerFactory;
++import org.apache.geode.internal.cache.client.protocol.ClientProtocolServiceLoader;
++import org.apache.geode.internal.logging.CoreLoggingExecutors;
++  public static final int MAX_POOL_SIZE =
++      Integer.getInteger(GEMFIRE_PREFIX + "TcpServer.MAX_POOL_SIZE", 100);
++  public static final int POOL_IDLE_TIMEOUT = 60 * 1000;
++
+-  /**
+-   * The tcp server responding to locator requests
+-   */
+-  private final TcpServer server;
+-
+-  /**
+-   * @since GemFire 5.7
+-   */
+-  private final PrimaryHandler handler;
++  private final Set<RestartHandler> restartHandlers = new CopyOnWriteHashSet<>();
++  private final MembershipLocator<InternalDistributedMember> membershipLocator;
+-  /**
+-   * the TcpHandler used for peer location
+-   */
+-  private NetLocator netLocator;
+-    this.distributionConfig = distributionConfig;
+-    if (this.distributionConfig == null) {
+-      this.distributionConfig = new DistributionConfigImpl(env);
++    if (distributionConfig == null) {
++      distributionConfig = new DistributionConfigImpl(env);
+-      env.putAll(this.distributionConfig.getProps());
++      env.putAll(distributionConfig.getProps());
++    this.distributionConfig = distributionConfig;
+-    handler = new PrimaryHandler(this, locatorListener);
+-    handler.addHandler(InfoRequest.class, new InfoRequestHandler());
+-    server = new TcpServerFactory().makeTcpServer(port, this.bindAddress,
+-        handler, new DelayedPoolStatHelper(), toString(), this);
++    InternalLocatorTcpHandler handler = new InternalLocatorTcpHandler();
++    try {
++      MembershipConfig config = new ServiceConfig(
++          new RemoteTransportConfig(distributionConfig, MemberIdentifier.LOCATOR_DM_TYPE),
++          distributionConfig);
++      Supplier<ExecutorService> executor = () -> CoreLoggingExecutors
++          .newThreadPoolWithSynchronousFeed("locator request thread ",
++              MAX_POOL_SIZE, new DelayedPoolStatHelper(),
++              POOL_IDLE_TIMEOUT,
++              new ThreadPoolExecutor.CallerRunsPolicy());
++      membershipLocator =
++          MembershipLocatorBuilder.<InternalDistributedMember>newLocatorBuilder().setPort(port)
++              .setBindAddress(bindAddress)
++              .setProtocolChecker(new ProtocolCheckerImpl(this, new ClientProtocolServiceLoader()))
++              .setExecutorServiceSupplier(
++                  executor)
++              .setSocketCreator(asTcpSocketCreator(
++                  SocketCreatorFactory
++                      .getSocketCreatorForComponent(SecurableCommunicationChannel.LOCATOR)))
++              .setObjectSerializer(
++                  InternalDataSerializer.getDSFIDSerializer().getObjectSerializer())
++              .setObjectDeserializer(
++                  InternalDataSerializer.getDSFIDSerializer().getObjectDeserializer())
++              .setFallbackHandler(handler)
++              .setLocatorsAreCoordinators(shouldLocatorsBeCoordinators())
++              .setLocatorStats(locatorStats).setWorkingDirectory(workingDirectory).setConfig(config)
++              .create();
++    } catch (MembershipConfigurationException | UnknownHostException e) {
++      throw new GemFireConfigException(e.getMessage());
++    }
++
++    membershipLocator.addHandler(InfoRequest.class, new InfoRequestHandler());
++    restartHandlers.add((ds, cache, sharedConfig) -> {
++      InternalDistributedSystem ids = (InternalDistributedSystem) ds;
++      Distribution distribution = ids.getDM().getDistribution();
++      membershipLocator.setMembership(distribution.getMembership());
++    });
+-    server.start();
++    membershipLocator.start();
++    peerLocator = true;
++    int boundPort =
++        membershipLocator
++            .start();
++    File productUseFile = workingDirectory.resolve("locator" + boundPort + "views.log").toFile();
++    productUseLog = new ProductUseLog(productUseFile);
++
++    return boundPort;
++  }
++
++  private boolean shouldLocatorsBeCoordinators() {
+-    String securityUDPDHAlgo = distributionConfig.getSecurityUDPDHAlgo();
+-
+-    final String locatorsConfigValue = distributionConfig.getLocators();
+-
+-    netLocator = NetLocatorFactory.newLocatorHandler(bindAddress, locatorsConfigValue,
+-        locatorsAreCoordinators, networkPartitionDetectionEnabled, locatorStats, securityUDPDHAlgo,
+-        workingDirectory);
+-    handler.addHandler(PeerLocatorRequest.class, netLocator);
+-    peerLocator = true;
+-    if (!server.isAlive()) {
+-      startTcpServer();
+-    }
+-    int boundPort = server.getPort();
+-    File productUseFile = workingDirectory.resolve("locator" + boundPort + "views.log").toFile();
+-    productUseLog = new ProductUseLog(productUseFile);
+-
+-    return boundPort;
++    return locatorsAreCoordinators;
+-  public NetLocator getLocatorHandler() {
+-    return netLocator;
++  public MembershipLocator getMembershipLocator() {
++    return membershipLocator;
+-        netLocator
++        membershipLocator
+-    handler.addHandler(LocatorListRequest.class, serverLocator);
+-    handler.addHandler(ClientConnectionRequest.class, serverLocator);
+-    handler.addHandler(QueueConnectionRequest.class, serverLocator);
+-    handler.addHandler(ClientReplacementRequest.class, serverLocator);
+-    handler.addHandler(GetAllServersRequest.class, serverLocator);
+-    handler.addHandler(LocatorStatusRequest.class, serverLocator);
++    restartHandlers.add(serverLocator);
++    membershipLocator.addHandler(LocatorListRequest.class, serverLocator);
++    membershipLocator.addHandler(ClientConnectionRequest.class, serverLocator);
++    membershipLocator.addHandler(QueueConnectionRequest.class, serverLocator);
++    membershipLocator.addHandler(ClientReplacementRequest.class, serverLocator);
++    membershipLocator.addHandler(GetAllServersRequest.class, serverLocator);
++    membershipLocator.addHandler(LocatorStatusRequest.class, serverLocator);
+-    if (!server.isAlive()) {
++    if (!membershipLocator.isAlive()) {
+-    if (server.isShuttingDown()) {
++    if (membershipLocator.isShuttingDown()) {
+-        if (isDebugEnabled && server.isAlive()) {
++        if (isDebugEnabled && membershipLocator.isAlive()) {
+-        while (server.isAlive() && System.currentTimeMillis() < endOfWait) {
++        while (membershipLocator.isAlive() && System.currentTimeMillis() < endOfWait) {
+-          if (server.isAlive()) {
++          if (membershipLocator.isAlive()) {
+-    if (server.isAlive()) {
+-      logger.info("Stopping {}", this);
+-      try {
+-        new TcpClient(
+-            asTcpSocketCreator(
+-                SocketCreatorFactory
+-                    .getSocketCreatorForComponent(SecurableCommunicationChannel.LOCATOR)),
+-            InternalDataSerializer.getDSFIDSerializer().getObjectSerializer(),
+-            InternalDataSerializer.getDSFIDSerializer().getObjectDeserializer())
+-                .stop(bindAddress, getPort());
+-      } catch (ConnectException ignore) {
+-        // must not be running
+-      }
+-
+-      boolean interrupted = Thread.interrupted();
+-      try {
+-        // TcpServer up to SHUTDOWN_WAIT_TIME for its executor pool to shut down.
+-        // We wait 2 * SHUTDOWN_WAIT_TIME here to account for that shutdown, and then our own.
+-        server.join(TcpServer.SHUTDOWN_WAIT_TIME * 2);
+-
+-      } catch (InterruptedException ex) {
+-        interrupted = true;
+-        logger.warn("Interrupted while stopping {}", this, ex);
+-
+-        // Continue running -- doing our best to stop everything...
+-      } finally {
+-        if (interrupted) {
+-          Thread.currentThread().interrupt();
+-        }
+-      }
+-
+-      if (server.isAlive()) {
+-        logger.fatal("Could not stop {} in 60 seconds", this);
+-      }
+-    }
++    membershipLocator.stop();
+-    return server == null || !server.isAlive();
++    return !membershipLocator.isAlive();
+-      server.join();
++      membershipLocator.waitToShutdown();
+-      handler.restarting(null, null, null);
+-      server.restarting();
++      membershipLocator.restarting();
+-      if (!server.isAlive()) {
++      if (!membershipLocator.isAlive()) {
+-      handler.restarting(newSystem, newCache, configurationPersistenceService);
+-      server.restarting();
++      restartHandlers.forEach(
++          handler -> handler.restarting(newSystem, newCache, configurationPersistenceService));
++      membershipLocator.restarting();
+-    if (!server.isAlive()) {
++    if (!membershipLocator.isAlive()) {
+-    handler.restartCompleted(newSystem);
++    restartHandlers.forEach(handler -> handler.restartCompleted(newSystem));
+-    if (server != null) {
+-      return server.getPort();
++    if (membershipLocator != null && membershipLocator.isAlive()) {
++      return membershipLocator.getPort();
+-          LocalHostUtil.getLocalHost().getCanonicalHostName() + '-' + server.getBindAddress());
++          LocalHostUtil.getLocalHost().getCanonicalHostName() + '-' + membershipLocator
++              .getBindAddress());
+-      if (!handler.isHandled(JmxManagerLocatorRequest.class)) {
+-        handler.addHandler(JmxManagerLocatorRequest.class,
+-            new JmxManagerLocator(internalCache));
++      if (!membershipLocator.isHandled(JmxManagerLocatorRequest.class)) {
++        JmxManagerLocator jmxHandler = new JmxManagerLocator(internalCache);
++        restartHandlers.add(jmxHandler);
++        membershipLocator.addHandler(JmxManagerLocatorRequest.class,
++            jmxHandler);
+-    if (!handler.isHandled(SharedConfigurationStatusRequest.class)) {
+-      handler.addHandler(SharedConfigurationStatusRequest.class,
++    if (!membershipLocator.isHandled(SharedConfigurationStatusRequest.class)) {
++      membershipLocator.addHandler(SharedConfigurationStatusRequest.class,
+-    if (!handler.isHandled(ClusterManagementServiceInfoRequest.class)) {
+-      handler.addHandler(ClusterManagementServiceInfoRequest.class,
++    if (!membershipLocator.isHandled(ClusterManagementServiceInfoRequest.class)) {
++      membershipLocator.addHandler(ClusterManagementServiceInfoRequest.class,
+-    return handler.isHandled(messageClass);
++    return membershipLocator.isHandled(messageClass);
++
++  private class InternalLocatorTcpHandler implements TcpHandler {
++    @Override
++    public Object processRequest(Object request) throws IOException {
++      return locatorListener == null ? null : locatorListener.handleRequest(request);
++    }
++
++    @Override
++    public void endRequest(Object request, long startTime) {
++
++    }
++
++    @Override
++    public void endResponse(Object request, long startTime) {
++
++    }
++
++    @Override
++    public void shutDown() {
++      handleShutdown();
++    }
++
++    @Override
++    public void init(TcpServer tcpServer) {
++      if (locatorListener != null) {
++        // This is deferred until now as the initial requested port could have been 0
++        locatorListener.setPort(tcpServer.getPort());
++      }
++    }
++  }
+
+MOV26 MOV26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 MOV23 MOV23 INS40 INS40 UPD40 INS40 INS40 UPD40 INS40 INS40 UPD40 UPD40 UPD40 INS40 INS40 UPD40 INS40 INS23 INS31 INS55 UPD83 INS83 INS39 INS83 INS83 INS83 INS39 INS59 INS74 INS59 INS83 INS74 MOV21 MOV21 INS8 INS83 INS39 INS42 MOV8 UPD43 UPD42 INS83 INS42 INS43 INS31 INS31 INS31 INS31 INS31 INS42 INS32 INS42 INS27 INS43 INS43 INS42 INS14 INS43 INS43 UPD42 INS60 INS54 INS21 MOV25 MOV21 MOV21 INS60 MOV60 MOV21 MOV41 INS41 UPD42 INS21 MOV21 INS42 INS78 INS83 INS43 INS42 INS44 INS43 INS8 INS78 INS83 INS39 INS42 INS44 INS44 INS8 INS78 INS83 INS39 INS42 INS44 INS44 INS8 INS78 INS83 INS39 INS42 INS8 INS78 INS83 INS39 INS42 INS44 INS8 INS42 INS42 INS27 INS34 INS34 INS34 INS42 UPD42 MOV42 INS74 UPD42 MOV42 INS42 INS43 INS59 INS8 INS12 INS32 INS39 INS59 INS42 UPD42 INS32 INS38 INS32 INS27 INS42 INS42 INS43 INS42 INS42 INS41 INS42 INS43 INS42 INS39 INS42 INS42 INS43 INS42 INS39 INS42 INS42 INS21 INS42 MOV43 INS42 INS25 INS42 INS45 INS43 INS42 INS42 INS42 INS14 INS60 INS60 MOV21 INS44 INS8 UPD42 INS42 INS42 INS86 UPD42 INS42 INS32 INS42 INS42 INS42 UPD42 UPD42 UPD42 UPD42 UPD42 UPD42 UPD42 UPD42 MOV42 MOV32 INS42 INS42 INS86 INS27 INS32 UPD42 INS42 INS16 INS42 INS42 INS32 INS27 INS8 INS42 INS43 INS43 INS59 INS74 INS59 INS84 INS42 INS53 INS59 INS59 INS59 INS8 INS42 INS42 UPD42 UPD42 INS32 UPD42 INS59 MOV32 UPD42 MOV42 MOV33 INS42 INS42 UPD42 UPD42 INS27 INS33 INS32 INS42 INS42 INS33 INS21 INS42 INS42 INS42 INS42 INS14 INS43 INS43 INS42 INS86 UPD42 INS32 INS43 INS43 INS14 INS42 INS42 INS42 INS60 INS60 INS21 UPD42 UPD42 UPD42 INS42 INS42 INS86 UPD42 INS42 UPD42 INS32 INS60 INS21 UPD42 UPD42 INS42 INS33 INS42 INS42 INS42 INS32 INS42 INS43 INS14 INS42 INS42 INS42 INS32 INS32 INS42 INS42 INS42 INS43 INS32 INS43 INS59 INS43 INS59 INS32 UPD42 MOV59 MOV32 INS42 INS42 MOV57 INS43 INS59 MOV32 MOV42 INS42 INS42 INS32 INS42 UPD43 MOV43 UPD42 MOV42 INS40 INS42 INS42 INS45 INS42 MOV14 INS42 INS14 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS11 INS42 INS42 INS32 INS42 INS42 INS32 UPD42 UPD42 INS42 INS42 MOV14 UPD42 INS42 UPD42 INS42 UPD42 UPD42 INS42 INS42 UPD42 INS43 INS32 INS42 INS42 INS43 INS42 INS32 INS42 INS42 INS42 UPD42 UPD42 INS40 INS32 INS42 INS42 INS42 INS42 INS42 UPD42 INS32 INS42 MOV32 INS32 INS42 MOV42 UPD42 INS32 INS42 MOV32 INS32 INS42 MOV32 INS32 INS42 MOV32 INS32 INS42 INS42 INS42 INS32 INS42 INS14 INS32 INS42 INS42 INS43 INS52 INS14 INS32 INS42 MOV42 INS42 INS43 INS42 INS43 UPD42 MOV42 INS42 UPD42 MOV42 DEL66 DEL65 DEL29 DEL42 DEL66 DEL65 DEL29 DEL43 DEL66 DEL65 DEL29 DEL43 DEL52 DEL42 DEL22 DEL52 DEL42 DEL22 DEL52 DEL42 DEL22 DEL42 DEL52 DEL14 DEL7 DEL21 DEL43 DEL14 DEL52 DEL42 DEL22 DEL52 DEL32 DEL42 DEL43 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL83 DEL42 DEL43 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL7 DEL21 DEL42 DEL42 DEL42 DEL43 DEL57 DEL42 DEL32 DEL21 DEL42 DEL42 DEL32 DEL38 DEL42 DEL32 DEL21 DEL8 DEL25 DEL39 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL43 DEL14 DEL42 DEL42 DEL32 DEL42 DEL42 DEL32 DEL42 DEL42 DEL45 DEL52 DEL32 DEL21 DEL8 DEL42 DEL43 DEL42 DEL44 DEL8 DEL12 DEL54 DEL39 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL42 DEL40 DEL34 DEL27 DEL32 DEL21 DEL8 DEL42 DEL43 DEL42 DEL44 DEL42 DEL9 DEL7 DEL21 DEL42 DEL42 DEL45 DEL52 DEL42 DEL32 DEL21 DEL8 DEL12 DEL42 DEL42 DEL42 DEL32 DEL42 DEL32 DEL21 DEL8 DEL25 DEL8 DEL54 DEL42 DEL42 DEL32 DEL42 DEL42 DEL45 DEL52 DEL32 DEL21 DEL8 DEL25 DEL8 DEL25 DEL42 DEL33 DEL27 DEL38 DEL27 DEL42 DEL42 DEL33 DEL33 DEL33 DEL32 DEL21 DEL27

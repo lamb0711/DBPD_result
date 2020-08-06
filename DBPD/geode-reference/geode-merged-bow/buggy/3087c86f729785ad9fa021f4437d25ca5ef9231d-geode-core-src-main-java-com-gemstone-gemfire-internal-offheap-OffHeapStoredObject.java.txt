@@ -1,0 +1,402 @@
+GEODE-982: refactor off-heap
+
+- removed unused MemoryChunk implementations
+- collapsed OffHeapCacheDeserializable into StoredObject
+- Added Slab, SlabFactory, SlabImpl, and AddressableMemoryManager.
+- collapsed MemoryChunkWithRefCount into StoredObject
+- methods that access and modify the data now have Data in their name
+- collapsed AddressableStoredObject into StoredObject
+- changed product code to use the StoredObject interface
+  instead of internal class implementations of it
+- renamed DataAsAddress to TinyStoredObject
+- renamed ObjectChunk to OffHeapStoredObject
+- renamed ObjectChunkWithHeapForm to OffHeapStoredObjectWithHeapForm
+- renamed allocateChunk to allocateOffHeapStoredObject
+- renamed FakeChunk to SearchMarker
+- renamed ObjectChunkSlice to OffHeapStoredObjectSlice
+- renamed SyncChunkStack to OffHeapStoredObjectAddressStack
+- renamed ChunkValueWrapper to OffHeapValueWrapper
+
+-import java.lang.reflect.Constructor;
+-import java.lang.reflect.InvocationTargetException;
+-import java.lang.reflect.Method;
++import com.gemstone.gemfire.internal.cache.BytesAndBitsForCompactor;
++import com.gemstone.gemfire.internal.cache.EntryBits;
+-   * A chunk that stores a Java object.
+-   * Currently the object stored in this chunk
++   * A class that stores a Java object in off-heap memory.
++   * See {@link AddressableMemoryManager} for how off-heap memory
++   * can be allocated, accessed, modified, and freed.
++   * Currently the object stored in this class
+-  public class ObjectChunk extends OffHeapCachedDeserializable implements Comparable<ObjectChunk>, MemoryBlock {
++  public class OffHeapStoredObject extends AbstractStoredObject implements Comparable<OffHeapStoredObject>, MemoryBlock {
+-     * The unsafe memory address of the first byte of this chunk
++     * The memory address of the first byte of addressable memory that belongs to this object
+-     * are all stored in off heap memory in a HEADER. This saves heap memory
++     * are all stored in addressable memory in a HEADER. This saves heap memory
+-    public final static int OFF_HEAP_HEADER_SIZE = 4 + 4;
++    public final static int HEADER_SIZE = 4 + 4;
+-    public final static int MIN_CHUNK_SIZE = OFF_HEAP_HEADER_SIZE + 8;
++    public final static int MIN_CHUNK_SIZE = HEADER_SIZE + 8;
+-    protected ObjectChunk(long memoryAddress, int chunkSize) {
++    protected OffHeapStoredObject(long memoryAddress, int chunkSize) {
+-      UnsafeMemoryChunk.writeAbsoluteIntVolatile(getMemoryAddress()+REF_COUNT_OFFSET, MAGIC_NUMBER);
++      AddressableMemoryManager.writeIntVolatile(getAddress()+REF_COUNT_OFFSET, MAGIC_NUMBER);
+-      UnsafeMemoryChunk.writeAbsoluteIntVolatile(getMemoryAddress()+REF_COUNT_OFFSET, 0);
++      AddressableMemoryManager.writeIntVolatile(getAddress()+REF_COUNT_OFFSET, 0);
+-      if (!UnsafeMemoryChunk.writeAbsoluteIntVolatile(getMemoryAddress()+REF_COUNT_OFFSET, 0, MAGIC_NUMBER)) {
+-        throw new IllegalStateException("Expected 0 but found " + Integer.toHexString(UnsafeMemoryChunk.readAbsoluteIntVolatile(getMemoryAddress()+REF_COUNT_OFFSET)));
++      if (!AddressableMemoryManager.writeIntVolatile(getAddress()+REF_COUNT_OFFSET, 0, MAGIC_NUMBER)) {
++        throw new IllegalStateException("Expected 0 but found " + Integer.toHexString(AddressableMemoryManager.readIntVolatile(getAddress()+REF_COUNT_OFFSET)));
+-    protected ObjectChunk() {
++    protected OffHeapStoredObject() {
+-    protected ObjectChunk(long memoryAddress) {
++    protected OffHeapStoredObject(long memoryAddress) {
+-    protected ObjectChunk(ObjectChunk chunk) {
++    protected OffHeapStoredObject(OffHeapStoredObject chunk) {
++    @Override
++    public void fillSerializedValue(BytesAndBitsForCompactor wrapper, byte userBits) {
++      if (isSerialized()) {
++        userBits = EntryBits.setSerialized(userBits, true);
++      }
++      wrapper.setOffHeapData(this, userBits);
++    }
++    
++    String getShortClassName() {
++      String cname = getClass().getName();
++      return cname.substring(getClass().getPackage().getName().length()+1);
++    }
++
++    @Override
++    public boolean checkDataEquals(@Unretained StoredObject so) {
++      if (this == so) {
++        return true;
++      }
++      if (isSerialized() != so.isSerialized()) {
++        return false;
++      }
++      int mySize = getValueSizeInBytes();
++      if (mySize != so.getValueSizeInBytes()) {
++        return false;
++      }
++      if (!(so instanceof OffHeapStoredObject)) {
++        return false;
++      }
++      OffHeapStoredObject other = (OffHeapStoredObject) so;
++      if (getAddress() == other.getAddress()) {
++        return true;
++      }
++      // We want to be able to do this operation without copying any of the data into the heap.
++      // Hopefully the jvm is smart enough to use our stack for this short lived array.
++      final byte[] dataCache1 = new byte[1024];
++      final byte[] dataCache2 = new byte[dataCache1.length];
++      // TODO OFFHEAP: no need to copy to heap. Just get the address of each and compare each byte. No need to call incReads when reading from address.
++      int i;
++      // inc it twice since we are reading two different objects
++      SimpleMemoryAllocatorImpl.getAllocator().getStats().incReads();
++      SimpleMemoryAllocatorImpl.getAllocator().getStats().incReads();
++      for (i=0; i < mySize-(dataCache1.length-1); i+=dataCache1.length) {
++        this.readDataBytes(i, dataCache1);
++        other.readDataBytes(i, dataCache2);
++        for (int j=0; j < dataCache1.length; j++) {
++          if (dataCache1[j] != dataCache2[j]) {
++            return false;
++          }
++        }
++      }
++      int bytesToRead = mySize-i;
++      if (bytesToRead > 0) {
++        // need to do one more read which will be less than dataCache.length
++        this.readDataBytes(i, dataCache1, 0, bytesToRead);
++        other.readDataBytes(i, dataCache2, 0, bytesToRead);
++        for (int j=0; j < bytesToRead; j++) {
++          if (dataCache1[j] != dataCache2[j]) {
++            return false;
++          }
++        }
++      }
++      return true;
++    }
++    
++    @Override
++    public boolean checkDataEquals(byte[] serializedObj) {
++      // caller was responsible for checking isSerialized
++      int mySize = getValueSizeInBytes();
++      if (mySize != serializedObj.length) {
++        return false;
++      }
++      // We want to be able to do this operation without copying any of the data into the heap.
++      // Hopefully the jvm is smart enough to use our stack for this short lived array.
++      // TODO OFFHEAP: no need to copy to heap. Just get the address of each and compare each byte. No need to call incReads when reading from address.
++      final byte[] dataCache = new byte[1024];
++      int idx=0;
++      int i;
++      SimpleMemoryAllocatorImpl.getAllocator().getStats().incReads();
++      for (i=0; i < mySize-(dataCache.length-1); i+=dataCache.length) {
++        this.readDataBytes(i, dataCache);
++        for (int j=0; j < dataCache.length; j++) {
++          if (dataCache[j] != serializedObj[idx++]) {
++            return false;
++          }
++        }
++      }
++      int bytesToRead = mySize-i;
++      if (bytesToRead > 0) {
++        // need to do one more read which will be less than dataCache.length
++        this.readDataBytes(i, dataCache, 0, bytesToRead);
++        for (int j=0; j < bytesToRead; j++) {
++          if (dataCache[j] != serializedObj[idx++]) {
++            return false;
++          }
++        }
++      }
++      return true;
++    }
++
++    
+-      int originalBits = UnsafeMemoryChunk.readAbsoluteIntVolatile(this.memoryAddress+REF_COUNT_OFFSET);
++      int originalBits = AddressableMemoryManager.readIntVolatile(this.memoryAddress+REF_COUNT_OFFSET);
+-    public long getMemoryAddress() {
++    @Override
++    public long getAddress() {
++    @Override
+-      /*int dataSizeDelta = UnsafeMemoryChunk.readAbsoluteInt(this.memoryAddress+REF_COUNT_OFFSET);
+-      dataSizeDelta &= DATA_SIZE_DELTA_MASK;
+-      dataSizeDelta >>= DATA_SIZE_SHIFT;
+-      return getSize() - dataSizeDelta;*/
+-      int dataSizeDelta = UnsafeMemoryChunk.readAbsoluteInt(memoryAdress+REF_COUNT_OFFSET);
++      int dataSizeDelta = AddressableMemoryManager.readInt(memoryAdress+REF_COUNT_OFFSET);
+-      return this.memoryAddress+OFF_HEAP_HEADER_SIZE;
++      return this.memoryAddress+HEADER_SIZE;
+-    /**
+-     * Creates and returns a direct ByteBuffer that contains the contents of this Chunk.
+-     * Note that the returned ByteBuffer has a reference to this chunk's
+-     * off-heap address so it can only be used while this Chunk is retained.
+-     * @return the created direct byte buffer or null if it could not be created.
+-     */
++    @Override
+-      return basicCreateDirectByteBuffer(getBaseDataAddress(), getDataSize());
++      return AddressableMemoryManager.createDirectByteBuffer(getBaseDataAddress(), getDataSize());
+-    private static volatile Class dbbClass = null;
+-    private static volatile Constructor dbbCtor = null;
+-    private static volatile boolean dbbCreateFailed = false;
+-    
+-     * @return the created direct byte buffer or null if it could not be created.
+-     */
+-    private static ByteBuffer basicCreateDirectByteBuffer(long baseDataAddress, int dataSize) {
+-      if (dbbCreateFailed) {
+-        return null;
+-      }
+-      Constructor ctor = dbbCtor;
+-      if (ctor == null) {
+-        Class c = dbbClass;
+-        if (c == null) {
+-          try {
+-            c = Class.forName("java.nio.DirectByteBuffer");
+-          } catch (ClassNotFoundException e) {
+-            //throw new IllegalStateException("Could not find java.nio.DirectByteBuffer", e);
+-            dbbCreateFailed = true;
+-            dbbAddressFailed = true;
+-            return null;
+-          }
+-          dbbClass = c;
+-        }
+-        try {
+-          ctor = c.getDeclaredConstructor(long.class, int.class);
+-        } catch (NoSuchMethodException | SecurityException e) {
+-          //throw new IllegalStateException("Could not get constructor DirectByteBuffer(long, int)", e);
+-          dbbClass = null;
+-          dbbCreateFailed = true;
+-          return null;
+-        }
+-        ctor.setAccessible(true);
+-        dbbCtor = ctor;
+-      }
+-      try {
+-        return (ByteBuffer)ctor.newInstance(baseDataAddress, dataSize);
+-      } catch (InstantiationException | IllegalAccessException | IllegalArgumentException | InvocationTargetException e) {
+-        //throw new IllegalStateException("Could not create an instance using DirectByteBuffer(long, int)", e);
+-        dbbClass = null;
+-        dbbCtor = null;
+-        dbbCreateFailed = true;
+-        return null;
+-      }
+-    }
+-    private static volatile Method dbbAddressMethod = null;
+-    private static volatile boolean dbbAddressFailed = false;
+-    
+-    /**
+-     * Returns the address of the Unsafe memory for the first byte of a direct ByteBuffer.
+-     * If the buffer is not direct or the address can not be obtained return 0.
+-     */
+-    public static long getDirectByteBufferAddress(ByteBuffer bb) {
+-      if (!bb.isDirect()) {
+-        return 0L;
+-      }
+-      if (dbbAddressFailed) {
+-        return 0L;
+-      }
+-      Method m = dbbAddressMethod;
+-      if (m == null) {
+-        Class c = dbbClass;
+-        if (c == null) {
+-          try {
+-            c = Class.forName("java.nio.DirectByteBuffer");
+-          } catch (ClassNotFoundException e) {
+-            //throw new IllegalStateException("Could not find java.nio.DirectByteBuffer", e);
+-            dbbCreateFailed = true;
+-            dbbAddressFailed = true;
+-            return 0L;
+-          }
+-          dbbClass = c;
+-        }
+-        try {
+-          m = c.getDeclaredMethod("address");
+-        } catch (NoSuchMethodException | SecurityException e) {
+-          //throw new IllegalStateException("Could not get method DirectByteBuffer.address()", e);
+-          dbbClass = null;
+-          dbbAddressFailed = true;
+-          return 0L;
+-        }
+-        m.setAccessible(true);
+-        dbbAddressMethod = m;
+-      }
+-      try {
+-        return (Long)m.invoke(bb);
+-      } catch (IllegalAccessException | IllegalArgumentException | InvocationTargetException e) {
+-        //throw new IllegalStateException("Could not create an invoke DirectByteBuffer.address()", e);
+-        dbbClass = null;
+-        dbbAddressMethod = null;
+-        dbbAddressFailed = true;
+-        return 0L;
+-      }
+-    }
+-    /**
+-     * Returns an address that can be used with unsafe apis to access this chunks memory.
++     * Returns an address that can be used with AddressableMemoryManager to access this object's data.
+-     * @return a memory address that can be used with unsafe apis
++     * @return a memory address that can be used to access this object's data
+-    public long getUnsafeAddress(int offset, int size) {
++    @Override
++    public long getAddressForReadingData(int offset, int size) {
+-    public byte readByte(int offset) {
++    public byte readDataByte(int offset) {
+-      return UnsafeMemoryChunk.readAbsoluteByte(getBaseDataAddress() + offset);
++      return AddressableMemoryManager.readByte(getBaseDataAddress() + offset);
+-    public void writeByte(int offset, byte value) {
++    public void writeDataByte(int offset, byte value) {
+-      UnsafeMemoryChunk.writeAbsoluteByte(getBaseDataAddress() + offset, value);
++      AddressableMemoryManager.writeByte(getBaseDataAddress() + offset, value);
+-    public void readBytes(int offset, byte[] bytes) {
+-      readBytes(offset, bytes, 0, bytes.length);
++    public void readDataBytes(int offset, byte[] bytes) {
++      readDataBytes(offset, bytes, 0, bytes.length);
+-    public void writeBytes(int offset, byte[] bytes) {
+-      writeBytes(offset, bytes, 0, bytes.length);
++    public void writeDataBytes(int offset, byte[] bytes) {
++      writeDataBytes(offset, bytes, 0, bytes.length);
+-    public long getAddressForReading(int offset, int size) {
+-      //delegate to getUnsafeAddress - as both the methods does return the memory address from given offset
+-      return getUnsafeAddress(offset, size);
+-    }
+-    
+-    public void readBytes(int offset, byte[] bytes, int bytesOffset, int size) {
++    public void readDataBytes(int offset, byte[] bytes, int bytesOffset, int size) {
+-      UnsafeMemoryChunk.readAbsoluteBytes(getBaseDataAddress() + offset, bytes, bytesOffset, size);
++      AddressableMemoryManager.readBytes(getBaseDataAddress() + offset, bytes, bytesOffset, size);
+-    public void writeBytes(int offset, byte[] bytes, int bytesOffset, int size) {
++    public void writeDataBytes(int offset, byte[] bytes, int bytesOffset, int size) {
+-      UnsafeMemoryChunk.writeAbsoluteBytes(getBaseDataAddress() + offset, bytes, bytesOffset, size);
++      AddressableMemoryManager.writeBytes(getBaseDataAddress() + offset, bytes, bytesOffset, size);
+-    public int compareTo(ObjectChunk o) {
++    public int compareTo(OffHeapStoredObject o) {
+-        result = Long.signum(getMemoryAddress() - o.getMemoryAddress());
++        result = Long.signum(getAddress() - o.getAddress());
+-      if (o instanceof ObjectChunk) {
+-        return getMemoryAddress() == ((ObjectChunk) o).getMemoryAddress();
++      if (o instanceof OffHeapStoredObject) {
++        return getAddress() == ((OffHeapStoredObject) o).getAddress();
+-      long value = this.getMemoryAddress();
++      long value = this.getAddress();
+-    // OffHeapCachedDeserializable methods 
+-    
+-    @Override
+-      writeBytes(0, value);
++      writeDataBytes(0, value);
+-      readBytes(0, result);
++      readDataBytes(0, result);
+-    public void copyBytes(int src, int dst, int size) {
+-      throw new UnsupportedOperationException("Implement if used");
+-//      assert src+size <= getDataSize();
+-//      assert dst+size < getDataSize();
+-//      getSlabs()[this.getSlabIdx()].copyBytes(getBaseDataAddress()+src, getBaseDataAddress()+dst, size);
+-    }
+-
+-    @Override
+-      return (UnsafeMemoryChunk.readAbsoluteInt(this.memoryAddress+REF_COUNT_OFFSET) & IS_SERIALIZED_BIT) != 0;
++      return (AddressableMemoryManager.readInt(this.memoryAddress+REF_COUNT_OFFSET) & IS_SERIALIZED_BIT) != 0;
+-      return (UnsafeMemoryChunk.readAbsoluteInt(this.memoryAddress+REF_COUNT_OFFSET) & IS_COMPRESSED_BIT) != 0;
++      return (AddressableMemoryManager.readInt(this.memoryAddress+REF_COUNT_OFFSET) & IS_COMPRESSED_BIT) != 0;
+-      return UnsafeMemoryChunk.readAbsoluteInt(memAddr+CHUNK_SIZE_OFFSET);
++      return AddressableMemoryManager.readInt(memAddr+CHUNK_SIZE_OFFSET);
+-      UnsafeMemoryChunk.writeAbsoluteInt(memAddr+CHUNK_SIZE_OFFSET, size);
++      AddressableMemoryManager.writeInt(memAddr+CHUNK_SIZE_OFFSET, size);
+-      return UnsafeMemoryChunk.readAbsoluteLong(memAddr+OFF_HEAP_HEADER_SIZE);
++      return AddressableMemoryManager.readLong(memAddr+HEADER_SIZE);
+-      UnsafeMemoryChunk.writeAbsoluteLong(memAddr+OFF_HEAP_HEADER_SIZE, next);
++      AddressableMemoryManager.writeLong(memAddr+HEADER_SIZE, next);
+-     * @param baseAddress the starting address for a {@link ObjectChunk}.
++     * @param baseAddress the starting address for a {@link OffHeapStoredObject}.
+-      UnsafeMemoryChunk.fill(startAddress, size, FILL_BYTE);
++      AddressableMemoryManager.fill(startAddress, size, FILL_BYTE);
+-      long startAddress = getMemoryAddress() + MIN_CHUNK_SIZE;
++      long startAddress = getAddress() + MIN_CHUNK_SIZE;
+-        if(UnsafeMemoryChunk.readAbsoluteLong(startAddress + i) != FILL_PATTERN) {
+-          throw new IllegalStateException("Fill pattern violated for chunk " + getMemoryAddress() + " with size " + getSize());
++        if(AddressableMemoryManager.readLong(startAddress + i) != FILL_PATTERN) {
++          throw new IllegalStateException("Fill pattern violated for chunk " + getAddress() + " with size " + getSize());
+-          originalBits = UnsafeMemoryChunk.readAbsoluteIntVolatile(this.memoryAddress+REF_COUNT_OFFSET);
++          originalBits = AddressableMemoryManager.readIntVolatile(this.memoryAddress+REF_COUNT_OFFSET);
+-        } while (!UnsafeMemoryChunk.writeAbsoluteIntVolatile(this.memoryAddress+REF_COUNT_OFFSET, originalBits, bits));
++        } while (!AddressableMemoryManager.writeIntVolatile(this.memoryAddress+REF_COUNT_OFFSET, originalBits, bits));
+-          originalBits = UnsafeMemoryChunk.readAbsoluteIntVolatile(this.memoryAddress+REF_COUNT_OFFSET);
++          originalBits = AddressableMemoryManager.readIntVolatile(this.memoryAddress+REF_COUNT_OFFSET);
+-        } while (!UnsafeMemoryChunk.writeAbsoluteIntVolatile(this.memoryAddress+REF_COUNT_OFFSET, originalBits, bits));
++        } while (!AddressableMemoryManager.writeIntVolatile(this.memoryAddress+REF_COUNT_OFFSET, originalBits, bits));
+-        originalBits = UnsafeMemoryChunk.readAbsoluteIntVolatile(this.memoryAddress+REF_COUNT_OFFSET);
++        originalBits = AddressableMemoryManager.readIntVolatile(this.memoryAddress+REF_COUNT_OFFSET);
+-      } while (!UnsafeMemoryChunk.writeAbsoluteIntVolatile(this.memoryAddress+REF_COUNT_OFFSET, originalBits, bits));
++      } while (!AddressableMemoryManager.writeIntVolatile(this.memoryAddress+REF_COUNT_OFFSET, originalBits, bits));
+-        rawBits = UnsafeMemoryChunk.readAbsoluteIntVolatile(this.memoryAddress+REF_COUNT_OFFSET);
++        rawBits = AddressableMemoryManager.readIntVolatile(this.memoryAddress+REF_COUNT_OFFSET);
+-      } while (!UnsafeMemoryChunk.writeAbsoluteIntVolatile(this.memoryAddress+REF_COUNT_OFFSET, rawBits, rawBits+1));
++      } while (!AddressableMemoryManager.writeIntVolatile(this.memoryAddress+REF_COUNT_OFFSET, rawBits, rawBits+1));
+-      return UnsafeMemoryChunk.readAbsoluteInt(memAddr+REF_COUNT_OFFSET) & REF_COUNT_MASK;
++      return AddressableMemoryManager.readInt(memAddr+REF_COUNT_OFFSET) & REF_COUNT_MASK;
+-        rawBits = UnsafeMemoryChunk.readAbsoluteIntVolatile(memAddr+REF_COUNT_OFFSET);
++        rawBits = AddressableMemoryManager.readIntVolatile(memAddr+REF_COUNT_OFFSET);
+-      } while (!UnsafeMemoryChunk.writeAbsoluteIntVolatile(memAddr+REF_COUNT_OFFSET, rawBits, rawBits+1));
++      } while (!AddressableMemoryManager.writeIntVolatile(memAddr+REF_COUNT_OFFSET, rawBits, rawBits+1));
+-        rawBits = UnsafeMemoryChunk.readAbsoluteIntVolatile(memAddr+REF_COUNT_OFFSET);
++        rawBits = AddressableMemoryManager.readIntVolatile(memAddr+REF_COUNT_OFFSET);
+-      } while (!UnsafeMemoryChunk.writeAbsoluteIntVolatile(memAddr+REF_COUNT_OFFSET, rawBits, newCount));
++      } while (!AddressableMemoryManager.writeIntVolatile(memAddr+REF_COUNT_OFFSET, rawBits, newCount));
+-      return toStringForOffHeapByteSource();
+-      // This old impl is not safe because it calls getDeserializedForReading and we have code that call toString that does not inc the refcount.
+-      // Also if this Chunk is compressed we don't know how to decompress it.
+-      //return super.toString() + ":<dataSize=" + getDataSize() + " refCount=" + getRefCount() + " addr=" + getMemoryAddress() + " storedObject=" + getDeserializedForReading() + ">";
+-    }
+-    
+-    protected String toStringForOffHeapByteSource() {
+-      return super.toString() + ":<dataSize=" + getDataSize() + " refCount=" + getRefCount() + " addr=" + Long.toHexString(getMemoryAddress()) + ">";
++      return super.toString() + ":<dataSize=" + getDataSize() + " refCount=" + getRefCount() + " addr=" + Long.toHexString(getAddress()) + ">";
+-    public ObjectChunk slice(int position, int limit) {
+-      return new ObjectChunkSlice(this, position, limit);
++    public StoredObject slice(int position, int limit) {
++      return new OffHeapStoredObjectSlice(this, position, limit);
++    }
++    @Override
++    public boolean hasRefCount() {
++      return true;
+
+MOV26 MOV26 MOV31 MOV31 MOV31 MOV31 MOV31 UPD40 UPD40 UPD42 UPD43 UPD74 INS31 INS31 INS31 INS31 INS31 UPD42 UPD43 UPD42 UPD42 UPD42 UPD42 INS78 INS83 INS39 INS42 INS44 INS44 INS8 INS43 INS42 INS8 INS78 INS83 INS39 INS42 INS44 INS8 INS78 UPD39 UPD42 INS78 UPD42 MOV78 MOV78 INS78 UPD42 MOV78 UPD39 UPD42 MOV44 MOV78 UPD39 UPD42 MOV44 MOV44 MOV8 MOV78 UPD42 MOV44 MOV44 MOV78 UPD42 MOV44 MOV44 MOV78 UPD42 MOV44 MOV44 MOV78 UPD42 MOV44 MOV44 INS8 UPD42 UPD42 UPD39 UPD42 MOV44 UPD39 UPD42 MOV44 MOV44 MOV44 MOV78 MOV83 MOV43 MOV42 MOV8 UPD43 INS78 INS83 INS39 INS42 INS8 UPD66 INS66 INS65 INS66 INS66 UPD66 UPD42 UPD42 UPD43 INS42 INS43 INS42 INS39 INS42 INS25 INS21 UPD42 MOV42 INS60 INS41 INS42 INS78 INS43 INS42 INS25 INS25 INS60 MOV25 INS25 MOV60 INS25 MOV60 INS60 INS60 INS21 INS21 INS24 INS60 INS25 INS41 INS42 INS5 INS42 INS60 INS60 MOV60 INS21 INS24 INS60 INS25 MOV41 INS42 INS42 INS41 MOV6 MOV6 INS21 UPD43 MOV21 INS41 INS21 INS21 MOV21 MOV21 UPD42 INS42 INS41 INS42 UPD66 UPD66 UPD42 UPD42 UPD42 MOV42 INS32 INS8 INS32 MOV43 INS59 INS32 INS42 INS42 INS27 INS8 INS27 INS8 INS39 INS59 INS27 INS38 INS8 UPD43 MOV27 INS8 INS83 INS5 INS83 INS5 INS59 INS39 INS59 INS32 INS32 INS7 INS27 INS7 INS8 INS39 INS59 INS27 INS8 INS9 INS39 INS85 INS39 INS59 INS27 INS83 INS5 INS39 INS59 INS39 INS32 INS7 INS27 INS7 INS8 INS39 INS59 INS27 INS8 INS9 UPD66 UPD66 MOV32 MOV32 UPD42 MOV32 INS32 MOV32 INS9 UPD42 UPD42 UPD42 UPD42 INS42 INS21 INS42 INS42 INS52 INS42 UPD42 MOV42 INS32 INS42 INS42 INS27 INS52 INS42 INS41 INS32 INS32 INS41 INS42 INS32 INS42 INS32 INS36 INS41 UPD42 UPD42 INS11 INS32 INS32 INS41 INS39 INS85 UPD42 INS3 INS39 INS85 INS42 INS3 INS42 INS32 UPD42 MOV42 INS32 INS42 UPD42 MOV42 INS34 INS42 INS27 UPD42 MOV42 INS40 MOV21 INS21 INS24 INS42 INS27 INS42 INS34 INS21 INS21 INS24 INS42 INS32 INS42 INS40 INS39 INS85 UPD42 INS3 INS42 INS34 UPD42 INS32 INS42 UPD42 MOV42 INS34 INS42 INS27 UPD42 MOV42 INS40 MOV21 INS24 INS42 INS27 INS42 INS34 INS21 INS24 UPD42 INS42 UPD42 UPD42 UPD42 UPD42 UPD42 UPD42 UPD42 UPD42 UPD42 UPD42 UPD42 UPD42 INS42 INS42 INS42 UPD43 UPD42 UPD42 MOV42 MOV42 UPD42 UPD42 INS42 INS42 INS42 MOV42 UPD42 UPD42 INS42 UPD42 UPD42 UPD42 UPD42 UPD42 UPD42 MOV32 MOV32 MOV32 UPD43 UPD42 UPD42 INS7 INS32 INS42 INS32 INS34 INS9 INS42 INS42 INS42 INS9 INS42 INS42 INS42 INS9 INS62 INS9 INS43 INS42 INS42 INS42 INS42 INS9 INS5 INS34 INS5 INS40 INS32 UPD42 MOV42 INS32 INS42 INS42 INS36 INS32 INS32 INS58 INS27 INS37 INS8 INS42 INS42 INS32 INS32 INS58 INS27 INS37 INS8 UPD42 MOV42 INS9 INS5 INS34 INS32 INS42 INS42 INS36 INS32 INS58 INS27 INS37 INS8 INS42 INS42 INS32 INS58 INS27 INS37 INS8 UPD42 UPD42 UPD42 UPD42 UPD42 UPD42 UPD42 UPD42 UPD42 UPD42 UPD42 UPD42 INS42 MOV27 UPD42 UPD42 UPD42 UPD42 UPD42 UPD42 INS42 INS42 UPD42 UPD42 UPD42 INS42 INS32 INS42 INS32 INS42 INS42 INS43 INS42 INS39 INS85 INS39 INS85 INS42 INS42 INS42 INS42 INS27 INS52 INS42 INS42 INS42 INS42 UPD42 MOV42 UPD42 MOV42 INS42 INS39 INS59 INS42 INS40 INS42 INS25 INS52 INS42 UPD42 MOV42 UPD42 MOV42 INS34 UPD42 MOV42 INS42 UPD42 MOV42 INS42 INS42 INS34 INS42 INS39 INS59 INS42 INS42 INS42 INS25 INS39 INS85 UPD42 MOV42 UPD42 MOV42 INS27 INS52 INS42 UPD42 MOV42 UPD42 MOV42 INS39 INS59 INS42 INS40 INS42 INS25 INS52 UPD42 MOV42 UPD42 MOV42 INS42 INS34 UPD42 MOV42 INS39 INS59 INS42 INS42 INS42 INS25 UPD42 UPD42 UPD42 INS32 UPD42 UPD42 INS42 INS42 INS42 INS9 INS32 INS42 INS42 INS40 INS34 INS42 INS34 INS27 INS8 INS42 INS34 INS27 INS8 INS40 INS34 INS42 INS34 INS27 INS8 INS42 INS34 INS27 INS8 UPD42 UPD42 UPD42 UPD42 UPD42 UPD42 UPD42 UPD42 UPD42 UPD42 UPD42 UPD42 UPD42 UPD42 UPD42 UPD42 MOV27 INS42 INS42 INS27 UPD42 UPD42 INS32 INS42 INS2 INS2 INS41 INS2 INS2 INS41 INS2 INS2 INS41 INS2 INS2 INS41 INS32 MOV22 INS42 INS42 MOV42 UPD42 UPD42 INS42 INS42 INS42 INS42 INS42 INS9 INS42 INS42 INS42 INS42 INS9 INS42 INS42 INS42 INS37 INS9 INS42 INS42 INS42 INS37 INS9 UPD42 UPD42 UPD43 INS42 INS42 INS27 UPD42 UPD42 INS42 INS42 UPD42 UPD42 INS22 INS42 UPD42 INS52 INS42 DEL40 DEL26 DEL42 DEL33 DEL42 DEL42 DEL33 DEL42 DEL43 DEL42 DEL42 DEL42 DEL7 DEL66 DEL66 DEL65 DEL29 DEL83 DEL42 DEL43 DEL42 DEL42 DEL32 DEL38 DEL34 DEL41 DEL8 DEL25 DEL42 DEL34 DEL42 DEL43 DEL42 DEL42 DEL43 DEL42 DEL42 DEL45 DEL32 DEL7 DEL34 DEL42 DEL33 DEL27 DEL42 DEL33 DEL27 DEL42 DEL45 DEL32 DEL7 DEL21 DEL8 DEL42 DEL43 DEL42 DEL44 DEL9 DEL7 DEL21 DEL42 DEL9 DEL7 DEL21 DEL34 DEL41 DEL8 DEL12 DEL54 DEL42 DEL7 DEL21 DEL8 DEL25 DEL8 DEL42 DEL43 DEL42 DEL43 DEL84 DEL42 DEL44 DEL42 DEL33 DEL7 DEL21 DEL42 DEL9 DEL7 DEL21 DEL34 DEL41 DEL8 DEL12 DEL54 DEL42 DEL42 DEL9 DEL32 DEL21 DEL42 DEL42 DEL7 DEL21 DEL8 DEL25 DEL42 DEL43 DEL32 DEL11 DEL41 DEL8 DEL42 DEL43 DEL42 DEL43 DEL42 DEL43 DEL84 DEL42 DEL44 DEL42 DEL33 DEL7 DEL21 DEL42 DEL33 DEL7 DEL21 DEL42 DEL9 DEL7 DEL21 DEL8 DEL12 DEL54 DEL66 DEL66 DEL66 DEL65 DEL66 DEL65 DEL29 DEL83 DEL83 DEL83 DEL43 DEL42 DEL33 DEL59 DEL23 DEL83 DEL83 DEL83 DEL43 DEL33 DEL59 DEL23 DEL83 DEL83 DEL83 DEL39 DEL42 DEL9 DEL59 DEL23 DEL66 DEL65 DEL29 DEL83 DEL83 DEL42 DEL43 DEL42 DEL39 DEL42 DEL44 DEL39 DEL42 DEL44 DEL42 DEL33 DEL27 DEL42 DEL45 DEL32 DEL7 DEL21 DEL8 DEL42 DEL43 DEL42 DEL44 DEL9 DEL7 DEL21 DEL9 DEL7 DEL21 DEL33 DEL41 DEL8 DEL12 DEL54 DEL8 DEL25 DEL42 DEL39 DEL57 DEL39 DEL57 DEL32 DEL7 DEL21 DEL8 DEL42 DEL43 DEL42 DEL43 DEL84 DEL42 DEL44 DEL42 DEL33 DEL7 DEL21 DEL42 DEL9 DEL7 DEL21 DEL33 DEL41 DEL8 DEL12 DEL54 DEL42 DEL42 DEL9 DEL32 DEL21 DEL42 DEL42 DEL7 DEL21 DEL8 DEL25 DEL42 DEL43 DEL32 DEL11 DEL41 DEL8 DEL42 DEL43 DEL42 DEL43 DEL42 DEL43 DEL42 DEL43 DEL84 DEL42 DEL44 DEL42 DEL33 DEL7 DEL21 DEL42 DEL33 DEL7 DEL21 DEL42 DEL9 DEL7 DEL21 DEL33 DEL41 DEL8 DEL12 DEL54 DEL8 DEL31 DEL83 DEL83 DEL83 DEL42 DEL43 DEL42 DEL33 DEL59 DEL23 DEL83 DEL83 DEL83 DEL39 DEL42 DEL9 DEL59 DEL23 DEL42 DEL21 DEL42 DEL42 DEL41 DEL8 DEL83 DEL39 DEL42 DEL39 DEL42 DEL44 DEL39 DEL42 DEL44 DEL42 DEL42 DEL42 DEL32 DEL41 DEL8 DEL31 DEL83 DEL39 DEL42 DEL39 DEL42 DEL44 DEL39 DEL42 DEL44 DEL39 DEL42 DEL44 DEL42 DEL43 DEL45 DEL14 DEL53 DEL8 DEL31 DEL42 DEL21 DEL41 DEL42 DEL42 DEL42 DEL32 DEL42 DEL42 DEL42 DEL42 DEL32 DEL42 DEL32 DEL41 DEL8 DEL31 DEL83 DEL42 DEL31

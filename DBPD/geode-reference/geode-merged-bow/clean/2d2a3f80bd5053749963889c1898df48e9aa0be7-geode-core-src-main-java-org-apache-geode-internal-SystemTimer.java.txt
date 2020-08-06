@@ -1,0 +1,392 @@
+GEODE-7884: server hangs due to IllegalStateException (#4822)
+
+* GEODE-7884: server hangs due to IllegalStateException
+
+Added cancellation check before scheduling an idle-timeout or
+ack-wait-threshold timer task.  I had to add a new method to
+SystemTimerTask and then noticed there were no tests for SystemTimer, so
+I cleaned up that class and added tests.
+
+* adding missing copyright header to new test
+
+* fixing LGTM issues
+
+* reinstating 'continue' when encountering a null timer during a sweep
+
+* addressing Bill's comments
+
+renamed swarm everwhere
+made the collection of timers associated with a DistributedSystem into a Set
+made timer task variables in Connection volatile
+added checks in tasks to cancel themselves if their Connection is closed
+-import java.text.SimpleDateFormat;
+-import java.util.ArrayList;
++import java.util.HashSet;
++import java.util.Set;
+-import org.apache.geode.SystemFailure;
+-import org.apache.geode.distributed.internal.InternalDistributedSystem;
++import org.apache.geode.distributed.DistributedSystem;
+- * Instances of this class are like {@link Timer}, but are associated with a "swarm", which can be
+- * cancelled as a group with {@link #cancelSwarm(Object)}.
++ * Instances of this class are like {@link Timer}, but are associated with a DistributedSystem,
++ * which can be
++ * cancelled as a group with {@link #cancelTimers(DistributedSystem)}.
+- *      TODO -- with Java 1.5, this will be a template type so that the swarm's class can be
+- *      specified.
+-   * Extra debugging for this class
+-   */
+-  // private static final boolean DEBUG = true;
+-  static final boolean DEBUG = false;
+-
+-  /**
+-  private boolean cancelled = false;
++  private volatile boolean cancelled = false;
+-   * the swarm to which this timer belongs
++   * the DistributedSystem to which this timer belongs
+-  private final Object /* T */ swarm;
++  private final DistributedSystem distributedSystem;
+-    StringBuffer sb = new StringBuffer();
+-    sb.append("SystemTimer[");
+-    sb.append("swarm = " + swarm);
+-    // sb.append("; timer = " + timer);
+-    sb.append("]");
+-    return sb.toString();
++    return "SystemTimer["
++        + "system = " + distributedSystem
++        + "]";
+-   * List of all of the swarms in the system
++   * Map of all of the timers in the system
+-  private static final HashMap allSwarms = new HashMap();
++  private static final HashMap<DistributedSystem, Set<WeakReference<SystemTimer>>> distributedSystemTimers =
++      new HashMap<>();
+-   * Add the given timer is in the given swarm. Used only by constructors.
++   * Add the given timer is in the given DistributedSystem. Used only by constructors.
+-   * @param swarm swarm to add the timer to
+-   * @param t timer to add
++   * @param system DistributedSystem to add the timer to
++   * @param systemTimer timer to add
+-  private static void addToSwarm(Object /* T */ swarm, SystemTimer t) {
+-    final boolean isDebugEnabled = logger.isTraceEnabled();
+-    // Get or add list of timers for this swarm...
+-    ArrayList /* ArrayList<WeakReference<SystemTimer>> */ swarmSet;
+-    synchronized (allSwarms) {
+-      swarmSet = (ArrayList) allSwarms.get(swarm);
+-      if (swarmSet == null) {
+-        if (isDebugEnabled) {
+-          logger.trace("SystemTimer#addToSwarm: created swarm {}", swarm);
+-        }
+-        swarmSet = new ArrayList();
+-        allSwarms.put(swarm, swarmSet);
++  private static void addTimer(DistributedSystem system, SystemTimer systemTimer) {
++    Set<WeakReference<SystemTimer>> timers;
++    synchronized (distributedSystemTimers) {
++      timers = distributedSystemTimers.get(system);
++      if (timers == null) {
++        timers = new HashSet<>();
++        distributedSystemTimers.put(system, timers);
+-    } // synchronized
+-
+-    // Add the timer to the swarm's list
+-    if (isDebugEnabled) {
+-      logger.trace("SystemTimer#addToSwarm: adding timer <{}>", t);
+-    WeakReference /* WeakReference<SystemTimer> */ wr = new WeakReference(t);
+-    synchronized (swarmSet) {
+-      swarmSet.add(wr);
+-    } // synchronized
++
++    WeakReference<SystemTimer> wr = new WeakReference<>(systemTimer);
++    synchronized (timers) {
++      timers.add(wr);
++    }
++  }
++
++  /**
++   * Return the current number of DistributedSystems with timers
++   */
++  public static int distributedSystemCount() {
++    synchronized (distributedSystemTimers) {
++      return distributedSystemTimers.size();
++    }
+-   * @see #sweepAllSwarms
++   * @see #sweepAllTimers
+-   * Interval, in milliseconds, to sweep all swarms, measured from when the last sweep finished
++   * Interval, in milliseconds, to sweep all timers, measured from when the last sweep finished
+-   * @see #sweepAllSwarms
++   * @see #sweepAllTimers
+-   * Manually garbage collect {@link #allSwarms}, if it hasn't happened in a while.
++   * Manually garbage collect {@link #distributedSystemTimers}, if it hasn't happened in a while.
+-  private static void sweepAllSwarms() {
++  private static void sweepAllTimers() {
+-    synchronized (allSwarms) {
+-      Iterator it = allSwarms.entrySet().iterator();
+-      while (it.hasNext()) { // iterate over allSwarms
+-        Map.Entry entry = (Map.Entry) it.next();
+-        ArrayList swarm = (ArrayList) entry.getValue();
+-        synchronized (swarm) {
+-          Iterator it2 = swarm.iterator();
+-          while (it2.hasNext()) { // iterate over current swarm
+-            WeakReference wr = (WeakReference) it2.next();
+-            SystemTimer st = (SystemTimer) wr.get();
+-            if (st == null) {
+-              // Remove stale reference
+-              it2.remove();
+-              continue;
++    synchronized (distributedSystemTimers) {
++      Iterator<Map.Entry<DistributedSystem, Set<WeakReference<SystemTimer>>>> allSystemsIterator =
++          distributedSystemTimers.entrySet().iterator();
++      while (allSystemsIterator.hasNext()) {
++        Map.Entry<DistributedSystem, Set<WeakReference<SystemTimer>>> entry =
++            allSystemsIterator.next();
++        Set<WeakReference<SystemTimer>> timers = entry.getValue();
++        synchronized (timers) {
++          Iterator<WeakReference<SystemTimer>> timersIterator = timers.iterator();
++          while (timersIterator.hasNext()) {
++            WeakReference<SystemTimer> wr = timersIterator.next();
++            SystemTimer st = wr.get();
++            if (st == null || st.isCancelled()) {
++              timersIterator.remove();
+-            // Get rid of a cancelled timer; it's not interesting.
+-            if (st.cancelled) {
+-              it2.remove();
+-              continue;
+-            }
+-          } // iterate over current swarm
+-          if (swarm.size() == 0) { // Remove unused swarm
+-            it.remove();
+-            if (isDebugEnabled) {
+-              logger.trace("SystemTimer#sweepAllSwarms: removed unused swarm {}", entry.getKey());
+-            }
+-          } // Remove unused swarm
+-        } // synchronized swarm
+-      } // iterate over allSwarms
+-    } // synchronized allSwarms
++          }
++          if (timers.size() == 0) {
++            allSystemsIterator.remove();
++          }
++        }
++      }
++    }
+-   * Remove given timer from the swarm.
++   * Remove given timer.
+-   * @param t timer to remove
++   * @param timerToRemove timer to remove
+-  private static void removeFromSwarm(SystemTimer t) {
+-    final boolean isDebugEnabled = logger.isTraceEnabled();
+-    synchronized (allSwarms) {
+-      // Get timer's swarm
+-      ArrayList swarmSet = (ArrayList) allSwarms.get(t.swarm);
+-      if (swarmSet == null) {
+-        if (isDebugEnabled) {
+-          logger.trace("SystemTimer#removeFromSwarm: timer already removed: {}", t);
+-        }
++  private static void removeTimer(SystemTimer timerToRemove) {
++    synchronized (distributedSystemTimers) {
++      // Get the timers for the distributed system
++      Set<WeakReference<SystemTimer>> timers =
++          distributedSystemTimers.get(timerToRemove.distributedSystem);
++      if (timers == null) {
+-      // Remove timer from swarm
+-      if (isDebugEnabled) {
+-        logger.trace("SystemTimer#removeFromSwarm: removing timer <{}>", t);
+-      }
+-      synchronized (swarmSet) {
+-        Iterator it = swarmSet.iterator();
+-        while (it.hasNext()) {
+-          WeakReference ref = (WeakReference) it.next();
+-          SystemTimer t2 = (SystemTimer) ref.get();
+-          if (t2 == null) {
+-            // Since we've discovered an empty reference, we should remove it.
+-            it.remove();
+-            continue;
+-          }
+-          if (t2 == t) {
+-            it.remove();
+-            // Don't keep sweeping once we've found it; just quit.
++      synchronized (timers) {
++        Iterator<WeakReference<SystemTimer>> timersIterator = timers.iterator();
++        while (timersIterator.hasNext()) {
++          WeakReference<SystemTimer> ref = timersIterator.next();
++          SystemTimer timer = ref.get();
++          if (timer == null) {
++            timersIterator.remove();
++          } else if (timer == timerToRemove) {
++            timersIterator.remove();
+-          }
+-          if (t2.cancelled) {
+-            // But if we happen to run across a cancelled timer,
+-            // remove it.
+-            it.remove();
+-            continue;
+-          }
+-        } // while
+-
+-        // While we're here, if the swarm has gone to zero size,
+-        // we should remove it.
+-        if (swarmSet.size() == 0) {
+-          allSwarms.remove(t.swarm); // last reference
+-          if (isDebugEnabled) {
+-            logger.trace("SystemTimer#removeFromSwarm: removed last reference to {}", t.swarm);
++          } else if (timer.isCancelled()) {
++            timersIterator.remove();
+-      } // synchronized swarmSet
+-    } // synchronized allSwarms
++        if (timers.size() == 0) {
++          distributedSystemTimers.remove(timerToRemove.distributedSystem); // last reference
++        }
++      }
++    }
+-    sweepAllSwarms(); // Occasionally check global list, use any available logger :-)
++    sweepAllTimers(); // Occasionally check global list
+-   * @param swarm the swarm to cancel
++   * @param system the DistributedSystem whose timers should be cancelled
+-  public static void cancelSwarm(Object /* T */ swarm) {
+-    Assert.assertTrue(swarm instanceof InternalDistributedSystem); // TODO
+-    // Find the swarmSet and remove it
+-    ArrayList swarmSet;
+-    synchronized (allSwarms) {
+-      swarmSet = (ArrayList) allSwarms.get(swarm);
+-      if (swarmSet == null) {
++  public static void cancelTimers(DistributedSystem system) {
++    Set<WeakReference<SystemTimer>> timers;
++    synchronized (distributedSystemTimers) {
++      timers = distributedSystemTimers.get(system);
++      if (timers == null) {
+-      allSwarms.remove(swarmSet);
++      distributedSystemTimers.remove(system);
+-    // Empty the swarmSet
+-    synchronized (swarmSet) {
+-      Iterator it = swarmSet.iterator();
+-      while (it.hasNext()) {
+-        WeakReference wr = (WeakReference) it.next();
+-        SystemTimer st = (SystemTimer) wr.get();
++    // cancel all of the timers
++    synchronized (timers) {
++      for (WeakReference<SystemTimer> wr : timers) {
++        SystemTimer st = wr.get();
+-      } // while
+-    } // synchronized
++      }
++    }
+-    if (logger.isTraceEnabled()) {
+-      logger.trace("SystemTimer#timerPurge of {}", this);
+-    }
+-
+-  // This creates a non-daemon timer thread. We don't EVER do this...
+-  // /**
+-  // * @see Timer#Timer()
+-  // *
+-  // * @param swarm the swarm this timer belongs to
+-  // */
+-  // public SystemTimer(DistributedSystem swarm) {
+-  // this.timer = new Timer();
+-  // this.swarm = swarm;
+-  // addToSwarm(swarm, this);
+-  // }
+-
+-   * @param swarm the swarm this timer belongs to, currently must be a DistributedSystem
+-   * @param isDaemon whether the timer is a daemon. Must be true for GemFire use.
++   * @param distributedSystem the DistributedSystem to which this timer belongs
+-  public SystemTimer(Object /* T */ swarm, boolean isDaemon) {
+-    Assert.assertTrue(isDaemon); // we don't currently allow non-daemon timers
+-    Assert.assertTrue(swarm instanceof InternalDistributedSystem,
+-        "Attempt to create swarm on " + swarm); // TODO allow template class?
+-    this.timer = new Timer(isDaemon);
+-    this.swarm = swarm;
+-    addToSwarm(swarm, this);
+-  }
+-
+-  /**
+-   * @param name the name to give the timer thread
+-   * @param swarm the swarm this timer belongs to, currently must be a DistributedMember
+-   * @param isDaemon whether the timer is a daemon. Must be true for GemFire use.
+-   */
+-  public SystemTimer(String name, Object /* T */ swarm, boolean isDaemon) {
+-    Assert.assertTrue(isDaemon); // we don't currently allow non-daemon timers
+-    Assert.assertTrue(swarm instanceof InternalDistributedSystem,
+-        "Attempt to create swarm on " + swarm); // TODO allow template class?
+-    this.timer = new Timer(name, isDaemon);
+-    this.swarm = swarm;
+-    addToSwarm(swarm, this);
++  public SystemTimer(DistributedSystem distributedSystem) {
++    this.timer = new Timer(true);
++    this.distributedSystem = distributedSystem;
++    addTimer(distributedSystem, this);
+-    if (logger.isTraceEnabled()) {
+-      Date tilt = new Date(System.currentTimeMillis() + delay);
+-      SimpleDateFormat sdf = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS");
+-      logger.trace("SystemTimer#schedule (long): {}: expect task {} to fire around {}", this, task,
+-          sdf.format(tilt));
+-    }
+-    if (logger.isTraceEnabled()) {
+-      SimpleDateFormat sdf = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS");
+-      logger.trace("SystemTimer#schedule (Date): {}: expect task {} to fire around {}", this, task,
+-          sdf.format(time));
+-    }
+-  // Not currently used, so don't complicate things
+-  // /**
+-  // * @see Timer#schedule(TimerTask, long, long)
+-  // */
+-  // public void schedule(SystemTimerTask task, long delay, long period) {
+-  // // TODO add debug statement
+-  // checkCancelled();
+-  // timer.schedule(task, delay, period);
+-  // }
+-
+-  // Not currently used, so don't complicate things
+-  // /**
+-  // * @see Timer#schedule(TimerTask, Date, long)
+-  // */
+-  // public void schedule(SystemTimerTask task, Date firstTime, long period) {
+-  // // TODO add debug statement
+-  // checkCancelled();
+-  // timer.schedule(task, firstTime, period);
+-  // }
+-
+-    // TODO add debug statement
+-    // TODO add debug statement
+-  // Not currently used, so don't complicate things
+-  // /**
+-  // * @see Timer#scheduleAtFixedRate(TimerTask, Date, long)
+-  // */
+-  // public void scheduleAtFixedRate(SystemTimerTask task, Date firstTime,
+-  // long period) {
+-  // // TODO add debug statement
+-  // checkCancelled();
+-  // timer.scheduleAtFixedRate(task, firstTime, period);
+-  // }
+-
+-
+-    removeFromSwarm(this);
++    removeTimer(this);
++  }
++
++  /**
++   * has this timer been cancelled?
++   */
++  public boolean isCancelled() {
++    return cancelled;
++    private volatile boolean cancelled;
++
++    public boolean isCancelled() {
++      return cancelled;
++    }
++
++    @Override
++    public boolean cancel() {
++      cancelled = true;
++      return super.cancel();
++    }
+-      final boolean isDebugEnabled = logger.isTraceEnabled();
+-      if (isDebugEnabled) {
+-        logger.trace("SystemTimer.MyTask: starting {}", this);
+-      }
+-      } catch (VirtualMachineError e) {
+-        SystemFailure.initiateFailure(e);
+-        throw e;
+-        SystemFailure.checkFailure();
+-      if (isDebugEnabled) {
+-        logger.trace("SystemTimer.MyTask: finished {}", this);
+-      }
+
+MOV26 MOV26 MOV31 UPD40 UPD40 UPD40 INS31 INS83 UPD43 INS74 UPD42 INS29 INS83 INS83 INS39 INS42 INS8 UPD42 UPD42 UPD42 INS44 MOV8 INS8 INS8 INS39 INS42 INS23 INS31 INS31 UPD66 INS66 UPD42 UPD42 INS41 MOV43 INS43 INS74 UPD42 UPD43 UPD42 UPD42 INS60 INS60 INS65 INS51 UPD42 INS43 INS42 INS60 INS51 INS51 UPD43 UPD42 MOV21 MOV21 MOV21 MOV21 UPD65 INS41 INS83 INS83 INS39 INS59 INS83 INS39 INS42 INS8 INS78 INS83 INS39 INS42 INS8 UPD66 INS27 UPD66 INS42 INS43 INS74 INS74 UPD66 UPD42 UPD66 UPD42 UPD42 INS74 MOV59 UPD42 INS74 MOV59 UPD42 INS66 INS42 INS8 UPD66 UPD42 UPD66 UPD42 UPD42 UPD42 UPD66 UPD42 MOV42 INS74 INS59 INS42 INS8 INS42 MOV8 UPD42 UPD66 UPD42 UPD66 INS42 INS42 INS41 INS42 INS21 INS41 UPD42 INS27 UPD42 MOV42 INS45 INS42 INS43 INS43 MOV43 INS43 INS74 UPD42 MOV43 INS43 INS41 UPD42 UPD42 UPD42 INS43 INS74 UPD42 MOV42 INS21 INS25 INS21 INS70 UPD42 UPD42 UPD42 UPD42 INS42 INS7 INS48 UPD43 INS45 UPD45 MOV45 INS42 INS42 INS42 INS43 INS43 INS42 INS74 UPD42 INS32 UPD42 INS74 INS74 INS59 UPD42 INS42 MOV43 INS43 INS7 INS27 MOV8 INS32 INS44 INS42 INS8 INS9 UPD42 INS42 INS9 INS42 UPD42 INS42 UPD42 MOV42 UPD42 INS32 UPD42 MOV43 UPD42 INS42 INS42 MOV43 INS74 UPD42 UPD42 INS43 INS74 INS42 INS32 UPD42 UPD42 MOV42 INS42 INS32 INS42 INS33 UPD42 MOV42 UPD42 MOV42 INS42 INS74 INS42 MOV60 MOV25 UPD42 MOV42 MOV42 UPD42 MOV42 MOV43 INS43 INS74 INS74 INS74 UPD42 UPD42 MOV42 INS43 INS43 UPD42 MOV42 MOV42 UPD40 MOV40 INS74 INS42 UPD42 MOV42 UPD42 MOV42 MOV43 MOV43 UPD42 UPD42 UPD42 UPD42 INS42 INS43 INS74 UPD42 MOV43 INS43 INS74 INS32 INS43 INS74 UPD42 MOV32 INS42 UPD42 MOV42 MOV43 INS74 UPD42 UPD42 INS25 MOV32 INS74 INS42 INS43 INS43 INS42 INS43 INS74 UPD42 MOV42 MOV42 UPD42 MOV42 INS43 INS43 INS74 MOV43 INS43 UPD42 INS74 MOV43 MOV27 MOV8 INS25 UPD42 INS43 INS42 INS42 INS42 INS43 INS43 INS42 INS42 MOV43 INS74 UPD42 UPD42 INS25 INS42 MOV43 MOV43 INS32 UPD42 MOV32 UPD42 MOV27 MOV8 INS25 UPD42 UPD40 UPD42 MOV42 INS42 INS42 MOV43 INS43 UPD42 INS74 MOV43 INS27 MOV8 UPD42 UPD42 MOV42 MOV42 UPD42 UPD42 INS32 MOV8 INS42 MOV43 MOV43 INS32 MOV32 MOV27 INS32 UPD42 UPD42 INS42 INS42 UPD42 MOV42 MOV42 UPD42 MOV42 UPD42 MOV42 UPD42 UPD42 UPD42 DEL40 DEL26 DEL66 DEL66 DEL66 DEL65 DEL29 DEL83 DEL83 DEL39 DEL42 DEL9 DEL59 DEL23 DEL42 DEL43 DEL42 DEL42 DEL43 DEL14 DEL59 DEL60 DEL42 DEL42 DEL45 DEL32 DEL21 DEL42 DEL42 DEL27 DEL32 DEL21 DEL42 DEL42 DEL45 DEL32 DEL21 DEL42 DEL42 DEL32 DEL41 DEL83 DEL39 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL43 DEL60 DEL42 DEL43 DEL32 DEL11 DEL42 DEL42 DEL42 DEL45 DEL42 DEL32 DEL21 DEL8 DEL25 DEL43 DEL42 DEL42 DEL42 DEL45 DEL42 DEL32 DEL21 DEL8 DEL25 DEL60 DEL32 DEL11 DEL43 DEL42 DEL43 DEL11 DEL32 DEL11 DEL11 DEL18 DEL32 DEL21 DEL18 DEL8 DEL25 DEL40 DEL25 DEL42 DEL42 DEL42 DEL45 DEL42 DEL42 DEL32 DEL32 DEL21 DEL8 DEL25 DEL83 DEL39 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL43 DEL42 DEL43 DEL32 DEL11 DEL59 DEL42 DEL42 DEL42 DEL45 DEL42 DEL32 DEL21 DEL8 DEL25 DEL42 DEL42 DEL42 DEL45 DEL42 DEL32 DEL21 DEL8 DEL25 DEL32 DEL11 DEL11 DEL18 DEL18 DEL25 DEL25 DEL40 DEL25 DEL42 DEL42 DEL42 DEL45 DEL40 DEL32 DEL21 DEL8 DEL25 DEL11 DEL42 DEL42 DEL42 DEL32 DEL11 DEL59 DEL60 DEL43 DEL32 DEL59 DEL60 DEL32 DEL61 DEL42 DEL43 DEL42 DEL44 DEL42 DEL42 DEL42 DEL43 DEL62 DEL32 DEL21 DEL42 DEL43 DEL42 DEL59 DEL60 DEL42 DEL42 DEL42 DEL43 DEL42 DEL42 DEL42 DEL32 DEL11 DEL7 DEL21 DEL42 DEL33 DEL27 DEL25 DEL42 DEL42 DEL42 DEL32 DEL21 DEL8 DEL51 DEL42 DEL51 DEL8 DEL42 DEL42 DEL32 DEL42 DEL42 DEL45 DEL52 DEL32 DEL21 DEL8 DEL25 DEL42 DEL66 DEL65 DEL39 DEL42 DEL44 DEL42 DEL42 DEL42 DEL32 DEL21 DEL42 DEL42 DEL42 DEL42 DEL43 DEL62 DEL45 DEL42 DEL27 DEL32 DEL21 DEL42 DEL42 DEL42 DEL32 DEL42 DEL43 DEL42 DEL42 DEL43 DEL42 DEL42 DEL32 DEL42 DEL27 DEL14 DEL59 DEL60 DEL42 DEL43 DEL42 DEL42 DEL43 DEL45 DEL14 DEL59 DEL60 DEL42 DEL42 DEL45 DEL52 DEL42 DEL42 DEL42 DEL42 DEL32 DEL32 DEL21 DEL8 DEL25 DEL8 DEL42 DEL42 DEL32 DEL42 DEL43 DEL42 DEL42 DEL43 DEL45 DEL14 DEL59 DEL60 DEL42 DEL42 DEL45 DEL52 DEL42 DEL42 DEL42 DEL42 DEL32 DEL32 DEL21 DEL8 DEL25 DEL8 DEL42 DEL66 DEL65 DEL42 DEL42 DEL66 DEL65 DEL42 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL44 DEL39 DEL42 DEL44 DEL42 DEL42 DEL42 DEL32 DEL21 DEL42 DEL42 DEL42 DEL42 DEL43 DEL62 DEL45 DEL42 DEL27 DEL32 DEL21 DEL52 DEL42 DEL22 DEL42 DEL43 DEL42 DEL42 DEL14 DEL7 DEL21 DEL52 DEL42 DEL22 DEL42 DEL7 DEL21 DEL42 DEL42 DEL52 DEL32 DEL21 DEL83 DEL39 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL42 DEL42 DEL45 DEL52 DEL32 DEL21 DEL8 DEL25 DEL42 DEL43 DEL42 DEL44 DEL42 DEL42 DEL42 DEL32 DEL21 DEL42 DEL53 DEL8 DEL12 DEL42 DEL42 DEL32 DEL21 DEL42 DEL42 DEL42 DEL45 DEL52 DEL32 DEL21 DEL8 DEL25

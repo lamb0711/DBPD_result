@@ -1,0 +1,138 @@
+Merge branch 'release/1.5.0'
+
+-import static org.apache.geode.internal.protocol.ProtocolErrorCode.INVALID_REQUEST;
+-import static org.apache.geode.internal.protocol.ProtocolErrorCode.SERVER_ERROR;
+-
+-import java.util.List;
+-import java.util.Map;
+-import java.util.stream.Collectors;
++import static org.apache.geode.internal.protocol.protobuf.v1.BasicTypes.ErrorCode.INVALID_REQUEST;
++import static org.apache.geode.internal.protocol.protobuf.v1.BasicTypes.ErrorCode.SERVER_ERROR;
++import org.apache.shiro.authz.AuthorizationException;
++import org.apache.shiro.util.ThreadState;
+-import org.apache.geode.internal.cache.InternalCache;
+-import org.apache.geode.internal.protocol.Failure;
+-import org.apache.geode.internal.protocol.MessageExecutionContext;
+-import org.apache.geode.internal.protocol.ProtocolErrorCode;
+-import org.apache.geode.internal.protocol.Result;
+-import org.apache.geode.internal.protocol.Success;
+-import org.apache.geode.internal.protocol.protobuf.v1.ClientProtocol;
++import org.apache.geode.internal.protocol.protobuf.v1.Failure;
++import org.apache.geode.internal.protocol.protobuf.v1.MessageExecutionContext;
+-import org.apache.geode.internal.protocol.protobuf.v1.utilities.ProtobufResponseUtilities;
++import org.apache.geode.internal.protocol.protobuf.v1.Result;
++import org.apache.geode.internal.protocol.protobuf.v1.Success;
++import org.apache.geode.internal.protocol.protobuf.v1.serialization.exception.DecodingException;
++import org.apache.geode.internal.protocol.protobuf.v1.serialization.exception.EncodingException;
++import org.apache.geode.internal.protocol.protobuf.v1.state.ProtobufConnectionAuthorizingStateProcessor;
+-import org.apache.geode.internal.protocol.serialization.exception.EncodingException;
++import org.apache.geode.internal.security.SecurityService;
++import org.apache.geode.security.NotAuthorizedException;
++import org.apache.geode.security.ResourcePermission;
+-  public Result<RegionAPI.GetAllResponse, ClientProtocol.ErrorResponse> process(
+-      ProtobufSerializationService serializationService, RegionAPI.GetAllRequest request,
+-      MessageExecutionContext messageExecutionContext) throws InvalidExecutionContextException {
++  public Result<RegionAPI.GetAllResponse> process(ProtobufSerializationService serializationService,
++      RegionAPI.GetAllRequest request, MessageExecutionContext messageExecutionContext)
++      throws InvalidExecutionContextException, DecodingException {
+-      logger.error("Received GetAll request for non-existing region {}", regionName);
+-      return Failure
+-          .of(ProtobufResponseUtilities.makeErrorResponse(SERVER_ERROR, "Region not found"));
++      logger.error("Received get-all request for nonexistent region: {}", regionName);
++      return Failure.of(BasicTypes.ErrorCode.SERVER_ERROR,
++          "Region \"" + regionName + "\" not found");
+-    Map<Boolean, List<Object>> resultsCollection;
+-    try {
+-      ((InternalCache) messageExecutionContext.getCache()).setReadSerializedForCurrentThread(true);
+-
+-      resultsCollection = request.getKeyList().stream()
+-          .map((key) -> processOneMessage(serializationService, region, key))
+-          .collect(Collectors.partitioningBy(x -> x instanceof BasicTypes.Entry));
+-    } finally {
+-      ((InternalCache) messageExecutionContext.getCache()).setReadSerializedForCurrentThread(false);
++    ThreadState threadState = null;
++    SecurityService securityService = messageExecutionContext.getCache().getSecurityService();
++    boolean perKeyAuthorization = false;
++    if (messageExecutionContext
++        .getConnectionStateProcessor() instanceof ProtobufConnectionAuthorizingStateProcessor) {
++      threadState = ((ProtobufConnectionAuthorizingStateProcessor) messageExecutionContext
++          .getConnectionStateProcessor()).prepareThreadForAuthorization();
++      // Check if authorized for entire region
++      try {
++        securityService.authorize(new ResourcePermission(ResourcePermission.Resource.DATA,
++            ResourcePermission.Operation.READ, regionName));
++        ((ProtobufConnectionAuthorizingStateProcessor) messageExecutionContext
++            .getConnectionStateProcessor()).restoreThreadState(threadState);
++        threadState = null;
++      } catch (NotAuthorizedException ex) {
++        // Not authorized for the region, have to check keys individually
++        perKeyAuthorization = true;
++      }
++    final boolean authorizeKeys = perKeyAuthorization; // Required for use in lambda
++
++    long startTime = messageExecutionContext.getStatistics().startOperation();
+-
+-    for (Object entry : resultsCollection.get(true)) {
+-      responseBuilder.addEntries((BasicTypes.Entry) entry);
+-    }
+-
+-    for (Object entry : resultsCollection.get(false)) {
+-      responseBuilder.addFailures((BasicTypes.KeyedError) entry);
++    try {
++      messageExecutionContext.getCache().setReadSerializedForCurrentThread(true);
++      request.getKeyList().stream().forEach((key) -> processSingleKey(responseBuilder,
++          serializationService, region, key, securityService, authorizeKeys));
++    } finally {
++      messageExecutionContext.getCache().setReadSerializedForCurrentThread(false);
++      messageExecutionContext.getStatistics().endOperation(startTime);
++      if (threadState != null) {
++        ((ProtobufConnectionAuthorizingStateProcessor) messageExecutionContext
++            .getConnectionStateProcessor()).restoreThreadState(threadState);
++      }
+-  private Object processOneMessage(ProtobufSerializationService serializationService, Region region,
+-      BasicTypes.EncodedValue key) {
++  private void processSingleKey(RegionAPI.GetAllResponse.Builder responseBuilder,
++      ProtobufSerializationService serializationService, Region region, BasicTypes.EncodedValue key,
++      SecurityService securityService, boolean authorizeKeys) {
++
++      if (decodedKey == null) {
++        responseBuilder
++            .addFailures(buildKeyedError(key, "NULL is not a valid key for get.", INVALID_REQUEST));
++        return;
++      }
++      if (authorizeKeys) {
++        securityService.authorize(new ResourcePermission(ResourcePermission.Resource.DATA,
++            ResourcePermission.Operation.READ, region.getName(), decodedKey.toString()));
++      }
+-      return ProtobufUtilities.createEntry(serializationService, decodedKey, value);
++      BasicTypes.Entry entry =
++          ProtobufUtilities.createEntry(serializationService, decodedKey, value);
++      responseBuilder.addEntries(entry);
++
++    } catch (NotAuthorizedException ex) {
++      responseBuilder.addFailures(
++          buildKeyedError(key, "Unauthorized access", BasicTypes.ErrorCode.AUTHORIZATION_FAILED));
++    } catch (DecodingException ex) {
++      logger.info("Key encoding not supported: {}", ex);
++      responseBuilder
++          .addFailures(buildKeyedError(key, "Key encoding not supported.", INVALID_REQUEST));
+-      logger.error("Encoding not supported: {}", ex);
+-      return createKeyedError(key, "Encoding not supported.", INVALID_REQUEST);
++      logger.info("Value encoding not supported: {}", ex);
++      responseBuilder
++          .addFailures(buildKeyedError(key, "Value encoding not supported.", INVALID_REQUEST));
+-      logger.error("Failure in protobuf getAll operation for key: " + key, ex);
+-      return createKeyedError(key, ex.toString(), SERVER_ERROR);
++      logger.warn("Failure in protobuf getAll operation for key: " + key, ex);
++      responseBuilder.addFailures(buildKeyedError(key, ex.toString(), SERVER_ERROR));
+-  private Object createKeyedError(BasicTypes.EncodedValue key, String errorMessage,
+-      ProtocolErrorCode errorCode) {
+-    return BasicTypes.KeyedError.newBuilder().setKey(key).setError(BasicTypes.Error.newBuilder()
+-        .setErrorCode(ProtobufUtilities.getProtobufErrorCode(errorCode)).setMessage(errorMessage))
++  private BasicTypes.KeyedError buildKeyedError(BasicTypes.EncodedValue key, String errorMessage,
++      BasicTypes.ErrorCode errorCode) {
++    return BasicTypes.KeyedError.newBuilder().setKey(key)
++        .setError(BasicTypes.Error.newBuilder().setErrorCode(errorCode).setMessage(errorMessage))
++
+
+MOV26 MOV26 MOV26 MOV26 MOV26 MOV26 MOV26 MOV26 UPD40 UPD40 UPD40 UPD40 UPD40 UPD40 UPD40 UPD40 UPD40 UPD40 UPD40 UPD40 UPD40 UPD40 UPD74 INS43 INS39 INS42 INS44 INS44 INS44 MOV43 UPD42 INS42 INS60 INS60 INS60 INS25 INS60 INS60 INS54 INS43 INS42 INS43 INS42 INS39 INS42 UPD43 INS43 INS59 INS43 INS59 INS39 MOV59 INS62 INS8 INS83 INS39 INS59 INS39 INS59 INS8 INS8 INS40 UPD42 MOV42 INS12 INS12 INS40 UPD42 MOV42 INS42 INS33 UPD42 MOV42 INS42 INS32 UPD42 INS9 INS32 INS43 INS21 INS54 INS42 INS42 INS42 INS32 INS21 MOV21 INS21 INS21 INS25 INS25 INS25 INS60 INS21 INS44 INS8 INS44 MOV44 INS8 INS32 INS42 INS42 UPD42 MOV42 INS42 INS7 INS8 INS12 INS32 INS42 INS32 INS32 INS32 INS32 INS27 INS8 INS27 INS8 INS42 INS8 MOV43 INS59 INS32 INS43 INS42 INS21 INS43 INS42 INS21 INS21 INS21 INS21 UPD45 INS40 INS27 INS42 INS42 INS42 INS32 INS21 MOV21 INS21 INS44 INS8 INS42 UPD42 MOV42 MOV32 INS42 MOV9 MOV32 INS42 INS86 MOV32 INS42 INS9 INS32 INS42 INS42 INS42 INS33 MOV21 INS42 INS33 INS21 MOV41 INS21 INS42 MOV32 INS42 INS42 INS42 INS42 INS32 INS42 INS32 INS32 INS32 INS32 INS45 INS42 INS45 INS36 UPD42 MOV42 INS32 INS7 UPD43 MOV43 UPD42 MOV42 INS21 MOV59 INS32 UPD42 MOV42 UPD42 MOV42 INS32 INS32 INS42 INS42 INS32 UPD42 UPD45 INS42 INS42 INS32 INS42 INS42 INS45 INS42 INS42 INS42 INS32 UPD42 INS42 INS42 MOV32 MOV42 INS11 UPD42 MOV42 UPD42 MOV42 INS14 UPD42 INS42 INS42 INS33 UPD42 INS7 INS42 MOV42 UPD42 MOV42 INS42 INS42 INS42 INS42 INS36 UPD42 INS42 INS42 INS42 INS32 INS42 INS42 INS14 INS42 INS42 INS45 INS40 UPD42 MOV42 MOV42 UPD45 MOV45 MOV42 INS42 INS42 INS45 INS42 UPD42 INS43 INS32 INS43 INS40 INS40 INS42 INS42 INS9 INS11 INS42 INS42 INS45 INS42 INS43 INS40 INS40 INS32 INS32 INS42 UPD42 MOV42 UPD42 MOV42 INS42 UPD43 INS32 INS43 INS32 INS42 INS42 INS42 INS42 INS42 UPD42 INS42 INS42 INS42 INS42 UPD42 MOV42 DEL40 DEL43 DEL42 DEL42 DEL42 DEL45 DEL32 DEL9 DEL43 DEL43 DEL42 DEL43 DEL42 DEL43 DEL74 DEL74 DEL60 DEL42 DEL43 DEL11 DEL36 DEL9 DEL32 DEL21 DEL42 DEL42 DEL42 DEL32 DEL86 DEL32 DEL42 DEL42 DEL59 DEL42 DEL40 DEL43 DEL62 DEL86 DEL32 DEL32 DEL7 DEL21 DEL8 DEL8 DEL54 DEL42 DEL11 DEL32 DEL42 DEL11 DEL44 DEL42 DEL32 DEL8 DEL70 DEL42 DEL43 DEL42 DEL44 DEL9 DEL32 DEL8 DEL70 DEL43 DEL42 DEL32 DEL41 DEL41 DEL42 DEL43 DEL42 DEL42 DEL42 DEL32

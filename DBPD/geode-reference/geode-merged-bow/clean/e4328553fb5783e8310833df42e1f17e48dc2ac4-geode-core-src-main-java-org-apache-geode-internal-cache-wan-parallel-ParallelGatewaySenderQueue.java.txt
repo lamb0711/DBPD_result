@@ -1,0 +1,209 @@
+GEODE-7971: Gw sender deliver TX events atomically to Gw receivers (#4928)
+
+* GEODE-7971: Gw sender deliver TX events atomically to Gw receivers
+
+A new flag is added to gateway senders: group-transaction-events.
+If set to true, events for the same transaction will not be
+spread across different batches, i.e. it is guaranteed that
+they will be delivered inside the same batch.
+
+In order to implement this behavior,
+the last event for each transaction is marked with a new flag
+and the transactionId before it is put in the sender's queue
+(new flag added to GatewaySenderEvent). That way, it is possible
+for the gateway senders to go through a
+batch ready to be sent and verify if the last event for
+each transaction is present in the batch.
+If not, the gateway sender will traverse the sender queue
+to get the missing events for the incomplete transactions
+and once they are added to the batch, the batch will be sent.
+
+This feature has the following restrictions:
+- The group-transaction-events can only be set on
+serial gateway senders with just 1 dispatcher thread
+or on parallel gateway senders.
+- In order to guarantee that the events of a transaction
+are to not spread
+across different batches, the regions involved in the
+transaction must all have the same senders with the
+group-transaction-events flag set to true configured.
+
+* GEODE-7971: small fix in gwSenderFactory + extra info on config error
+
+* GEODE-7971: Add logic for case when batches are redistributed
+
+Also added parameter for retries when not all
+events for a transaction can be read from the queue.
+
+* GEODE-7971: Undo changes on cache*.dtd files unneeded
+
+Also changed a couple of timeouts in test cases.
+
+* feature/GEODE-7971: Changes after review
+
+* feature/GEODE-7971: Simplify test JUnit test case
+
+* GEODE-7971: Update create document and refactor test case
+
+* GEODE-7971: Add check in serial gwsender creation with threads>1 and group-trans-events=true.
+
+Also corrected some documentation errors.
+
+* GEODE-7971: Add HA test cases and fix bug in SerialGatewaySenderQueue
+
+* feature/GEODE-7971: Documentation change after review and flaxy test fix
+
+* GEODE-7971: Doc changes after review
++import static org.apache.geode.cache.wan.GatewaySender.GET_TRANSACTION_EVENTS_FROM_QUEUE_RETRIES;
++import java.util.function.Predicate;
++import org.apache.geode.cache.TransactionId;
+-    int bId = -1;
++    int bId;
++    Map<TransactionId, Integer> incompleteTransactionsInBatch = new HashMap<>();
++          if (object.getTransactionId() != null) {
++            if (object.isLastEventInTransaction()) {
++              incompleteTransactionsInBatch.remove(object.getTransactionId());
++            } else {
++              incompleteTransactionsInBatch.put(object.getTransactionId(), bId);
++            }
++          }
+-          // If time to wait is -1 (don't wait) or time interval has elapsed
+-          long currentTime = System.currentTimeMillis();
+-          if (isDebugEnabled) {
+-            logger.debug("{}: Peeked object was null. Peek current time: {}", this, currentTime);
+-          }
+-          if (timeToWait == -1 || (end <= currentTime)) {
+-            if (isDebugEnabled) {
+-              logger.debug("{}: Peeked object was null.. Peek breaking", this);
+-            }
++          if (stopPeekingDueToTime(timeToWait, end)) {
+-          continue;
+-        // If time to wait is -1 (don't wait) or time interval has elapsed
+-        long currentTime = System.currentTimeMillis();
+-        if (isDebugEnabled) {
+-          logger.debug("{}: Peek current time: {}", this, currentTime);
+-        }
+-        if (timeToWait == -1 || (end <= currentTime)) {
+-          if (isDebugEnabled) {
+-            logger.debug("{}: Peek breaking", this);
+-          }
++        if (stopPeekingDueToTime(timeToWait, end)) {
++        long currentTime = System.currentTimeMillis();
+-        continue;
++
++    if (batch.size() > 0) {
++      peekEventsFromIncompleteTransactions(batch, incompleteTransactionsInBatch, prQ);
++    }
++
++
++  private boolean stopPeekingDueToTime(int timeToWait, long end) {
++    final boolean isDebugEnabled = logger.isDebugEnabled();
++    // If time to wait is -1 (don't wait) or time interval has elapsed
++    long currentTime = System.currentTimeMillis();
++    if (isDebugEnabled) {
++      logger.debug("{}: Peek current time: {}", this, currentTime);
++    }
++    if (timeToWait == -1 || (end <= currentTime)) {
++      if (isDebugEnabled) {
++        logger.debug("{}: Peek breaking", this);
++      }
++      return true;
++    }
++    return false;
++  }
++
++  protected boolean mustGroupTransactionEvents() {
++    return sender.mustGroupTransactionEvents();
++  }
++
++  private void peekEventsFromIncompleteTransactions(List<GatewaySenderEventImpl> batch,
++      Map<TransactionId, Integer> incompleteTransactionIdsInBatch, PartitionedRegion prQ) {
++    if (!mustGroupTransactionEvents()) {
++      return;
++    }
++
++    if (areAllTransactionsCompleteInBatch(incompleteTransactionIdsInBatch)) {
++      return;
++    }
++
++    for (Map.Entry<TransactionId, Integer> pendingTransaction : incompleteTransactionIdsInBatch
++        .entrySet()) {
++      TransactionId transactionId = pendingTransaction.getKey();
++      int bucketId = pendingTransaction.getValue();
++      boolean areAllEventsForTransactionInBatch = false;
++      int retries = 0;
++      while (!areAllEventsForTransactionInBatch
++          && retries++ < GET_TRANSACTION_EVENTS_FROM_QUEUE_RETRIES) {
++        List<Object> events = peekEventsWithTransactionId(prQ, bucketId, transactionId);
++        for (Object object : events) {
++          GatewaySenderEventImpl event = (GatewaySenderEventImpl) object;
++          batch.add(event);
++          peekedEvents.add(event);
++          areAllEventsForTransactionInBatch = event.isLastEventInTransaction();
++
++          if (logger.isDebugEnabled()) {
++            logger.debug(
++                "Peeking extra event: {}, bucketId: {}, isLastEventInTransaction: {}, batch size: {}",
++                event.getKey(), bucketId, event.isLastEventInTransaction(), batch.size());
++          }
++        }
++      }
++      if (!areAllEventsForTransactionInBatch) {
++        logger.warn("Not able to retrieve all events for transaction {} after {} tries",
++            transactionId, retries);
++      }
++    }
++  }
++
++  private boolean areAllTransactionsCompleteInBatch(Map incompleteTransactions) {
++    return (incompleteTransactions.size() == 0);
++  }
++
+-    long timeToSleep = Math.min(50l, ((long) (timeToWait * 0.05)));
++    long timeToSleep = Math.min(50L, ((long) (timeToWait * 0.05)));
++        // This could also be a normal case in which the batch included extra events to make
++        // sure that events for each transaction were sent in the same batch.
+-    for (int i = 0; i < batchSize; i++) {
+-      batch.add(this.peekedEventsProcessing.remove());
++    Set<TransactionId> incompleteTransactionsInBatch = new HashSet<>();
++    for (int i = 0; i < batchSize || incompleteTransactionsInBatch.size() != 0; i++) {
++      GatewaySenderEventImpl event = this.peekedEventsProcessing.remove();
++      batch.add(event);
++      if (event.getTransactionId() != null) {
++        if (event.isLastEventInTransaction()) {
++          incompleteTransactionsInBatch.remove(event.getTransactionId());
++        } else {
++          incompleteTransactionsInBatch.add(event.getTransactionId());
++        }
++      }
++        if (incompleteTransactionsInBatch.size() != 0) {
++          logger.error("A batch with incomplete transactions has been sent.");
++        }
++  protected List<Object> peekEventsWithTransactionId(PartitionedRegion prQ, int bucketId,
++      TransactionId transactionId) throws CacheException {
++    List<Object> objects;
++    BucketRegionQueue brq = getBucketRegionQueueByBucketId(prQ, bucketId);
++
++    try {
++      Predicate<GatewaySenderEventImpl> hasTransactionIdPredicate =
++          x -> x.getTransactionId().equals(transactionId);
++      Predicate<GatewaySenderEventImpl> isLastEventInTransactionPredicate =
++          x -> x.isLastEventInTransaction();
++      objects =
++          brq.getElementsMatching(hasTransactionIdPredicate, isLastEventInTransactionPredicate);
++    } catch (BucketRegionQueueUnavailableException e) {
++      // BucketRegionQueue unavailable. Can be due to the BucketRegionQueue being destroyed.
++      return Collections.emptyList();
++    }
++
++    return objects; // OFFHEAP: ok since callers are careful to do destroys on region queue after
++    // finished with peeked objects.
++  }
++
++
+-    int size = 0;
+-    private final ParallelGatewaySenderQueue parallelQueue;
+-
+-      this.parallelQueue = queue;
+
+INS26 INS26 INS26 INS40 INS40 INS40 INS31 INS31 INS31 INS31 INS31 INS83 INS39 INS42 INS44 INS44 INS8 INS83 INS39 INS42 INS8 INS83 INS39 INS42 INS44 INS44 INS44 INS8 INS83 INS39 INS42 INS44 INS8 INS83 INS74 INS42 INS44 INS44 INS44 INS43 INS8 INS60 INS25 INS39 INS42 INS39 INS42 INS60 MOV60 MOV25 MOV25 INS41 INS41 INS74 INS42 INS74 INS42 INS43 INS42 INS25 INS25 INS70 INS43 INS42 INS41 INS60 INS43 INS43 INS43 INS42 INS39 INS42 INS43 INS42 INS42 INS60 INS60 INS54 INS41 INS74 INS59 INS27 INS8 INS83 INS39 INS59 INS9 INS32 INS43 INS43 INS43 INS43 INS43 INS42 INS38 INS8 INS32 INS8 INS44 INS32 INS8 INS42 INS36 INS74 INS59 INS27 INS42 INS42 INS42 INS42 INS74 INS59 INS43 INS59 INS8 INS12 INS42 INS43 INS43 INS43 INS42 INS14 INS32 INS34 INS21 INS42 INS32 INS41 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS41 INS42 INS42 INS41 INS74 INS42 INS42 INS42 INS60 INS60 INS60 INS60 INS61 INS25 INS27 INS43 INS43 INS42 INS14 MOV27 INS27 INS60 INS25 INS43 INS43 INS42 INS42 INS42 INS32 INS60 INS60 INS21 INS44 INS8 INS42 INS42 INS42 INS74 MOV60 INS42 INS42 INS32 INS42 INS42 INS9 INS42 INS43 INS43 INS43 INS43 INS59 INS39 INS59 INS39 INS59 INS39 INS59 INS27 INS8 INS38 INS8 INS32 INS34 UPD34 INS42 INS42 INS74 INS32 INS34 INS43 INS59 INS27 INS8 INS42 INS42 INS42 INS42 INS42 INS74 INS59 INS74 INS59 INS7 INS43 INS42 INS41 INS43 INS25 INS42 INS42 INS42 INS42 INS40 INS42 INS42 INS42 INS42 INS32 INS42 INS32 INS42 INS9 INS42 INS34 INS38 INS27 INS60 INS70 INS42 INS21 INS42 INS42 INS43 INS42 INS42 INS42 INS42 MOV32 INS42 INS32 INS33 INS25 INS25 INS43 INS43 INS42 INS86 INS43 INS43 INS42 INS86 INS42 INS32 INS42 INS32 INS42 INS32 INS8 INS42 INS42 INS42 INS42 INS42 INS37 INS42 INS74 INS59 INS44 INS42 INS8 INS32 INS42 INS42 INS42 INS32 INS8 INS8 INS27 INS8 INS42 INS42 INS59 INS32 INS42 INS42 INS59 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS25 INS25 INS42 INS42 INS42 INS10 INS42 INS43 INS43 INS42 INS32 INS43 INS42 INS60 INS21 INS21 INS21 INS25 INS42 INS42 INS45 INS42 INS42 INS42 INS42 INS21 INS21 INS32 INS34 INS21 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS27 INS8 INS32 MOV8 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS43 INS59 INS32 INS32 INS7 INS32 INS8 INS32 INS32 INS42 INS42 INS32 INS42 INS42 INS32 INS33 INS25 UPD42 MOV42 INS42 INS42 INS42 INS42 INS11 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS21 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS45 INS42 INS42 INS32 INS8 INS8 INS43 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS21 INS21 INS42 INS42 INS42 INS45 INS32 INS42 INS32 INS32 INS32 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS42 DEL34 DEL38 DEL42 DEL42 DEL42 DEL45 DEL52 DEL32 DEL21 DEL8 DEL25 DEL42 DEL42 DEL42 DEL45 DEL52 DEL32 DEL21 DEL8 DEL25 DEL42 DEL34 DEL38 DEL27 DEL42 DEL42 DEL27 DEL36 DEL27 DEL25 DEL18 DEL18 DEL10 DEL39 DEL42 DEL34 DEL59 DEL60 DEL83 DEL83 DEL42 DEL43 DEL42 DEL59 DEL23 DEL52 DEL42 DEL22 DEL42 DEL7 DEL21

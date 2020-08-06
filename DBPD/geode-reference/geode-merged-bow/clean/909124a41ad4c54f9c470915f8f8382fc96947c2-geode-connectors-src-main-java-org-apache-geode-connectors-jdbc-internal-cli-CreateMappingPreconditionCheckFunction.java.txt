@@ -1,0 +1,216 @@
+GEODE-6459:  add create jdbc-mapping option to specify the PDX class file (#3249)
+
+Added a new --pdx-class-file option to gfsh create jdbc-mapping that can take a jar or class that contains the named pdx class.
+This file needs to be accessible by the gfsh process. It will be transferred to the server and used to define the pdx info in the jdbc-mapping.
+
+Co-authored-by: Darrel Schneider <dschneider@pivotal.io>
+Co-authored-by: Jianxia Chen <jchen@pivotal.io>
+
+-import java.io.ObjectInputStream;
++import java.io.File;
++import java.io.FileOutputStream;
++import java.io.IOException;
++import java.io.InputStream;
++import java.net.MalformedURLException;
++import java.net.URI;
++import java.net.URL;
++import java.net.URLClassLoader;
++import java.nio.file.Files;
++import java.nio.file.Path;
++import java.nio.file.Paths;
++import com.healthmarketscience.rmiio.RemoteInputStream;
++import com.healthmarketscience.rmiio.RemoteInputStreamClient;
++import org.apache.commons.io.FileUtils;
++import org.apache.commons.io.FilenameUtils;
++import org.apache.commons.io.IOUtils;
++
+-import org.apache.geode.connectors.jdbc.internal.SqlHandler.DataSourceFactory;
+-public class CreateMappingPreconditionCheckFunction extends CliFunction<RegionMapping> {
+-
+-  private transient DataSourceFactory dataSourceFactory;
+-  private transient ClassFactory classFactory;
+-  private transient ReflectionBasedAutoSerializerFactory reflectionBasedAutoSerializerFactory;
+-  private transient PdxWriterFactory pdxWriterFactory;
+-  private transient TableMetaDataManager tableMetaDataManager;
+-
+-  CreateMappingPreconditionCheckFunction(DataSourceFactory factory, ClassFactory classFactory,
+-      ReflectionBasedAutoSerializerFactory reflectionBasedAutoSerializerFactory,
+-      PdxWriterFactory pdxWriterFactory,
+-      TableMetaDataManager manager) {
+-    this.dataSourceFactory = factory;
+-    this.classFactory = classFactory;
+-    this.reflectionBasedAutoSerializerFactory = reflectionBasedAutoSerializerFactory;
+-    this.pdxWriterFactory = pdxWriterFactory;
+-    this.tableMetaDataManager = manager;
+-  }
+-
+-  CreateMappingPreconditionCheckFunction() {
+-    this(dataSourceName -> JNDIInvoker.getDataSource(dataSourceName),
+-        className -> ClassPathLoader.getLatest().forName(className),
+-        className -> new ReflectionBasedAutoSerializer(className),
+-        (typeRegistry, object) -> new PdxWriterImpl(typeRegistry, object, new PdxOutputStream()),
+-        new TableMetaDataManager());
+-  }
+-
+-  // used by java during deserialization
+-  private void readObject(ObjectInputStream stream) {
+-    this.dataSourceFactory = dataSourceName -> JNDIInvoker.getDataSource(dataSourceName);
+-    this.classFactory = className -> ClassPathLoader.getLatest().forName(className);
+-    this.reflectionBasedAutoSerializerFactory =
+-        className -> new ReflectionBasedAutoSerializer(className);
+-    this.pdxWriterFactory =
+-        (typeRegistry, object) -> new PdxWriterImpl(typeRegistry, object, new PdxOutputStream());
+-    this.tableMetaDataManager = new TableMetaDataManager();
+-  }
++public class CreateMappingPreconditionCheckFunction extends CliFunction<Object[]> {
+-  public CliFunctionResult executeFunction(FunctionContext<RegionMapping> context)
+-      throws Exception {
+-    RegionMapping regionMapping = context.getArguments();
++  public CliFunctionResult executeFunction(FunctionContext<Object[]> context) {
++    Object[] args = context.getArguments();
++    RegionMapping regionMapping = (RegionMapping) args[0];
++    String remoteInputStreamName = (String) args[1];
++    RemoteInputStream remoteInputStream = (RemoteInputStream) args[2];
+-    DataSource dataSource = dataSourceFactory.getDataSource(dataSourceName);
++    DataSource dataSource = getDataSource(dataSourceName);
+-    PdxType pdxType = getPdxTypeForClass(cache, typeRegistry, regionMapping.getPdxName());
++    PdxType pdxType = getPdxTypeForClass(cache, typeRegistry, regionMapping.getPdxName(),
++        remoteInputStreamName, remoteInputStream);
+-          tableMetaDataManager.getTableMetaDataView(connection, regionMapping);
++          getTableMetaDataManager().getTableMetaDataView(connection, regionMapping);
+-      String className) {
+-    Class<?> clazz = loadPdxClass(className);
++      String className, String remoteInputStreamName, RemoteInputStream remoteInputStream) {
++    Class<?> clazz = loadPdxClass(className, remoteInputStreamName, remoteInputStream);
+-          this.reflectionBasedAutoSerializerFactory.create("\\Q" + className + "\\E");
+-      PdxWriter writer = this.pdxWriterFactory.create(typeRegistry, object);
++          getReflectionBasedAutoSerializer("\\Q" + className + "\\E");
++      PdxWriter writer = createPdxWriter(typeRegistry, object);
+-  private Class<?> loadPdxClass(String className) {
++  private Class<?> loadPdxClass(String className, String remoteInputStreamName,
++      RemoteInputStream remoteInputStream) {
+-      return this.classFactory.loadClass(className);
++      if (remoteInputStream != null) {
++        return loadPdxClassFromRemoteStream(className, remoteInputStreamName, remoteInputStream);
++      } else {
++        return loadClass(className);
++      }
+-  public interface ClassFactory {
+-    public Class loadClass(String className) throws ClassNotFoundException;
++  private Class<?> loadPdxClassFromRemoteStream(String className, String remoteInputStreamName,
++      RemoteInputStream remoteInputStream) throws ClassNotFoundException {
++    Path tempDir = createTemporaryDirectory("pdx-class-dir-");
++    try {
++      File file =
++          copyRemoteInputStreamToTempFile(className, remoteInputStreamName, remoteInputStream,
++              tempDir);
++      return loadClass(className, createURL(file, tempDir));
++    } finally {
++      deleteDirectory(tempDir);
++    }
+-  public interface ReflectionBasedAutoSerializerFactory {
+-    public ReflectionBasedAutoSerializer create(String className);
++
++  Path createTemporaryDirectory(String prefix) {
++    try {
++      return createTempDirectory(prefix);
++    } catch (IOException ex) {
++      throw new JdbcConnectorException(
++          "Could not create a temporary directory with the prefix \"" + prefix + "\" because: "
++              + ex);
++    }
++
+-  public interface PdxWriterFactory {
+-    public PdxWriter create(TypeRegistry typeRegistry, Object object);
++
++  void deleteDirectory(Path tempDir) {
++    try {
++      FileUtils.deleteDirectory(tempDir.toFile());
++    } catch (IOException ioe) {
++      // ignore
++    }
++
++  private URL createURL(File file, Path tempDir) {
++    URI uri;
++    if (isJar(file.getName())) {
++      uri = file.toURI();
++    } else {
++      uri = tempDir.toUri();
++    }
++    try {
++      return uri.toURL();
++    } catch (MalformedURLException e) {
++      throw new JdbcConnectorException(
++          "Could not convert \"" + uri + "\" to a URL, because: " + e);
++    }
++  }
++
++  private boolean isJar(String fileName) {
++    String fileExtension = FilenameUtils.getExtension(fileName);
++    return fileExtension.equalsIgnoreCase("jar");
++  }
++
++  private File copyRemoteInputStreamToTempFile(String className, String remoteInputStreamName,
++      RemoteInputStream remoteInputStream, Path tempDir) {
++    if (!isJar(remoteInputStreamName) && className.contains(".")) {
++      File packageDir = new File(tempDir.toFile(), className.replace(".", "/")).getParentFile();
++      packageDir.mkdirs();
++      tempDir = packageDir.toPath();
++    }
++    try {
++      Path tempPdxClassFile = Paths.get(tempDir.toString(), remoteInputStreamName);
++      try (InputStream input = RemoteInputStreamClient.wrap(remoteInputStream);
++          FileOutputStream output = new FileOutputStream(tempPdxClassFile.toString())) {
++        copyFile(input, output);
++      }
++      return tempPdxClassFile.toFile();
++    } catch (IOException iox) {
++      throw new JdbcConnectorException(
++          "The pdx class file \"" + remoteInputStreamName
++              + "\" could not be copied to a temporary file, because: " + iox);
++    }
++  }
++
++
++  // unit test mocks this method
++  DataSource getDataSource(String dataSourceName) {
++    return JNDIInvoker.getDataSource(dataSourceName);
++  }
++
++  // unit test mocks this method
++  Class<?> loadClass(String className) throws ClassNotFoundException {
++    return ClassPathLoader.getLatest().forName(className);
++  }
++
++  // unit test mocks this method
++  Class<?> loadClass(String className, URL url) throws ClassNotFoundException {
++    return URLClassLoader.newInstance(new URL[] {url}).loadClass(className);
++  }
++
++  // unit test mocks this method
++  ReflectionBasedAutoSerializer getReflectionBasedAutoSerializer(String className) {
++    return new ReflectionBasedAutoSerializer(className);
++  }
++
++  // unit test mocks this method
++  PdxWriter createPdxWriter(TypeRegistry typeRegistry, Object object) {
++    return new PdxWriterImpl(typeRegistry, object, new PdxOutputStream());
++  }
++
++  // unit test mocks this method
++  TableMetaDataManager getTableMetaDataManager() {
++    return new TableMetaDataManager();
++  }
++
++  // unit test mocks this method
++  Path createTempDirectory(String prefix) throws IOException {
++    return Files.createTempDirectory(prefix);
++  }
++
++  // unit test mocks this method
++  void copyFile(InputStream input, FileOutputStream output) throws IOException {
++    IOUtils.copyLarge(input, output);
++  }
++
+
+MOV26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 MOV31 INS40 INS40 INS40 UPD40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 UPD40 UPD74 INS31 INS31 INS31 INS31 INS31 INS31 INS31 MOV31 INS31 MOV31 INS31 MOV31 INS31 INS5 INS44 INS44 INS44 INS44 INS83 INS74 INS42 MOV44 INS44 INS44 INS43 INS8 INS43 INS42 MOV44 INS8 INS39 INS42 MOV44 INS8 INS83 INS43 INS42 INS44 INS44 INS8 INS83 INS39 INS42 INS44 INS8 INS43 INS42 MOV44 INS44 INS44 INS43 INS42 INS44 INS8 INS74 INS42 INS44 INS43 INS8 INS74 INS44 INS44 INS8 MOV43 INS42 INS44 INS8 UPD42 INS8 MOV43 INS42 INS8 INS43 UPD42 INS44 INS43 INS8 INS39 INS42 INS44 INS44 INS43 INS8 INS43 INS85 UPD74 INS60 INS60 INS60 INS43 INS42 INS43 INS42 INS43 INS42 INS43 INS42 INS43 INS76 INS43 INS42 INS43 INS42 INS42 INS60 INS54 UPD42 MOV42 UPD43 UPD42 INS54 INS43 UPD42 INS54 INS42 INS43 INS42 INS43 INS42 INS60 INS25 INS54 INS43 INS42 INS60 INS41 INS42 INS43 INS42 UPD43 UPD42 INS43 INS42 INS25 INS54 INS42 INS43 INS42 INS41 INS43 INS76 INS43 INS42 INS42 INS41 INS43 INS76 INS43 INS42 INS43 INS42 INS41 INS43 INS42 INS41 INS41 INS41 INS42 INS43 INS42 INS42 INS41 INS43 INS42 INS43 INS42 INS42 INS21 INS42 INS5 INS5 MOV43 INS59 INS43 INS59 INS43 INS59 INS42 INS42 INS42 INS42 INS8 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 INS43 INS59 INS8 INS8 UPD42 INS8 INS12 INS42 INS8 INS12 INS42 INS42 INS43 INS59 INS32 INS8 INS8 INS8 INS12 INS42 INS43 INS59 INS32 INS42 UPD42 INS42 INS27 INS8 INS8 INS12 INS42 MOV32 INS42 INS42 MOV32 MOV42 INS42 INS42 INS32 INS42 MOV14 MOV14 MOV14 INS42 INS32 INS42 INS42 INS32 INS43 INS85 INS43 INS85 UPD42 INS42 INS11 INS42 INS42 INS11 INS42 INS42 INS11 INS25 UPD42 MOV42 INS42 INS32 INS60 INS41 INS21 INS41 INS44 INS8 MOV21 INS44 INS8 INS42 UPD42 MOV42 UPD42 MOV42 INS32 INS21 INS21 INS41 INS44 INS8 UPD42 MOV42 INS42 INS32 INS42 INS42 INS45 INS38 INS32 INS60 INS21 MOV21 INS60 INS54 INS41 INS44 INS8 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 UPD42 MOV42 INS42 MOV43 INS2 INS43 INS2 INS43 INS2 INS42 INS42 INS42 INS42 INS27 INS8 INS8 INS42 INS45 INS43 INS59 INS32 INS32 INS32 UPD43 MOV43 UPD42 MOV42 INS53 INS32 INS43 INS42 UPD42 MOV42 UPD42 MOV42 INS7 INS7 INS32 INS43 INS42 INS53 INS42 INS42 INS42 INS32 INS42 INS42 INS45 INS43 INS59 INS32 INS43 INS59 INS58 INS58 INS8 INS32 INS43 INS42 INS53 INS42 INS42 INS3 INS42 INS34 INS42 INS42 INS34 INS42 INS42 INS34 INS42 INS33 INS41 MOV41 UPD42 MOV42 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS42 INS42 UPD42 INS14 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS32 UPD42 MOV42 UPD42 MOV42 INS42 INS14 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS32 INS42 INS42 INS32 INS43 INS59 INS43 INS59 MOV21 INS42 INS42 INS42 INS14 INS5 INS4 INS32 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS43 INS27 INS42 INS42 INS42 INS42 UPD42 MOV42 UPD42 MOV42 UPD43 MOV43 INS27 INS14 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS32 INS42 UPD42 MOV42 INS14 INS32 INS43 INS27 INS43 INS85 INS42 UPD42 MOV42 INS42 UPD42 INS42 INS42 INS42 INS42 UPD42 MOV42 INS45 INS42 INS45 INS42 UPD42 INS45 INS42 INS45 INS42 INS43 INS32 INS32 INS42 INS42 INS42 INS42 INS42 INS43 INS32 INS42 INS42 INS42 INS42 INS45 INS42 INS45 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS45 INS45 INS42 INS42 INS42 DEL83 DEL83 DEL43 DEL42 DEL59 DEL23 DEL83 DEL83 DEL43 DEL42 DEL59 DEL23 DEL83 DEL83 DEL43 DEL42 DEL59 DEL23 DEL83 DEL83 DEL43 DEL42 DEL59 DEL23 DEL83 DEL83 DEL43 DEL42 DEL59 DEL23 DEL42 DEL43 DEL42 DEL44 DEL44 DEL43 DEL42 DEL44 DEL52 DEL42 DEL22 DEL42 DEL7 DEL21 DEL52 DEL42 DEL22 DEL42 DEL7 DEL21 DEL52 DEL42 DEL22 DEL42 DEL7 DEL21 DEL52 DEL42 DEL22 DEL42 DEL7 DEL21 DEL8 DEL31 DEL42 DEL59 DEL32 DEL86 DEL42 DEL59 DEL32 DEL32 DEL86 DEL42 DEL59 DEL42 DEL14 DEL86 DEL42 DEL59 DEL42 DEL59 DEL43 DEL42 DEL42 DEL42 DEL43 DEL14 DEL14 DEL86 DEL42 DEL43 DEL14 DEL17 DEL8 DEL31 DEL43 DEL42 DEL43 DEL42 DEL52 DEL42 DEL22 DEL42 DEL52 DEL42 DEL22 DEL52 DEL42 DEL22 DEL8 DEL52 DEL42 DEL22 DEL42 DEL7 DEL39 DEL42 DEL52 DEL42 DEL22 DEL42 DEL59 DEL86 DEL52 DEL42 DEL22 DEL7 DEL52 DEL42 DEL22 DEL42 DEL59 DEL86 DEL7 DEL21 DEL52 DEL42 DEL22 DEL42 DEL59 DEL86 DEL7 DEL21 DEL52 DEL42 DEL22 DEL42 DEL59 DEL59 DEL86 DEL7 DEL21 DEL83 DEL43 DEL83 DEL83 DEL83 DEL42 DEL55 DEL83 DEL42 DEL55 DEL83 DEL42 DEL55

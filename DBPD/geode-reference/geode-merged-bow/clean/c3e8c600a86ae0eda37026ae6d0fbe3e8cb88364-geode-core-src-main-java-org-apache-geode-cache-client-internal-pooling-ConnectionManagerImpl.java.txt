@@ -1,0 +1,882 @@
+Merge remote-tracking branch 'origin/develop' into geode-6400
+
++import static java.util.concurrent.TimeUnit.MILLISECONDS;
++
+-import java.util.ArrayDeque;
++import java.util.Map;
+-import java.util.concurrent.locks.Condition;
+-import java.util.concurrent.locks.ReentrantLock;
++import java.util.concurrent.atomic.AtomicBoolean;
+-import org.apache.geode.cache.GatewayConfigurationException;
++  private static final int NOT_WAITING = -1;
+-  private final ArrayDeque<PooledConnection> availableConnections = new ArrayDeque<>();
++  private final AvailableConnectionManager availableConnectionManager =
++      new AvailableConnectionManager();
+-  private final int maxConnections;
+-  protected final int minConnections;
+-  protected volatile int connectionCount;
++  private final ConnectionAccounting connectionAccounting;
+-  protected ReentrantLock lock = new ReentrantLock();
+-  protected Condition freeConnection = lock.newCondition();
+-  protected boolean havePrefillTask;
++  protected final AtomicBoolean havePrefillTask = new AtomicBoolean(false);
+-  protected volatile boolean shuttingDown;
++  protected final AtomicBoolean shuttingDown = new AtomicBoolean(false);
+-  private static final long NANOS_PER_MS = 1000000L;
+-
+-    this.maxConnections = maxConnections == -1 ? Integer.MAX_VALUE : maxConnections;
+-    this.minConnections = minConnections;
++    this.connectionAccounting = new ConnectionAccounting(minConnections,
++        maxConnections == -1 ? Integer.MAX_VALUE : maxConnections);
+-    this.lifetimeTimeoutNanos = this.lifetimeTimeout * NANOS_PER_MS;
++    this.lifetimeTimeoutNanos = MILLISECONDS.toNanos(this.lifetimeTimeout);
+-    this.idleTimeoutNanos = this.idleTimeout * NANOS_PER_MS;
++    this.idleTimeoutNanos = MILLISECONDS.toNanos(this.idleTimeout);
+-  /*
+-   * (non-Javadoc)
+-   *
+-   * @see org.apache.geode.cache.client.internal.pooling.ConnectionManager#borrowConnection(long)
+-   */
+-  @Override
+-  public Connection borrowConnection(long acquireTimeout)
+-      throws AllConnectionsInUseException, NoAvailableServersException {
++  private void destroyAndMaybePrefill() {
++    destroyAndMaybePrefill(1);
++  }
+-    long startTime = System.currentTimeMillis();
+-    long remainingTime = acquireTimeout;
+-
+-    // wait for a connection to become free
+-    lock.lock();
+-    try {
+-      while (connectionCount >= maxConnections && availableConnections.isEmpty()
+-          && remainingTime > 0 && !shuttingDown) {
+-        final long start = getPoolStats().beginConnectionWait();
+-        boolean interrupted = false;
+-        try {
+-          freeConnection.await(remainingTime, TimeUnit.MILLISECONDS);
+-        } catch (InterruptedException e) {
+-          interrupted = true;
+-          cancelCriterion.checkCancelInProgress(e);
+-          throw new AllConnectionsInUseException();
+-        } finally {
+-          if (interrupted) {
+-            Thread.currentThread().interrupt();
+-          }
+-          getPoolStats().endConnectionWait(start);
+-        }
+-        remainingTime = acquireTimeout - (System.currentTimeMillis() - startTime);
+-      }
+-      if (shuttingDown) {
+-        throw new PoolCancelledException();
+-      }
+-
+-      while (!availableConnections.isEmpty()) {
+-        PooledConnection connection = availableConnections.removeFirst();
+-        try {
+-          connection.activate();
+-          return connection;
+-        } catch (ConnectionDestroyedException ex) {
+-          // whoever destroyed it already decremented connectionCount
+-        }
+-      }
+-      if (connectionCount >= maxConnections) {
+-        throw new AllConnectionsInUseException();
+-      } else {
+-        // We need to create a connection. Reserve space for it.
+-        connectionCount++;
+-      }
+-
+-    } finally {
+-      lock.unlock();
++  private void destroyAndMaybePrefill(int count) {
++    if (connectionAccounting.destroyAndIsUnderMinimum(count)) {
++      startBackgroundPrefill();
++  }
+-    PooledConnection connection = null;
++  private PooledConnection createPooledConnection()
++      throws NoAvailableServersException, ServerOperationException {
++    return createPooledConnection(Collections.emptySet());
++  }
++
++  private PooledConnection createPooledConnection(Set<ServerLocation> excludedServers)
++      throws NoAvailableServersException, ServerOperationException {
+-      Connection plainConnection =
+-          connectionFactory.createClientToServerConnection(Collections.EMPTY_SET);
+-
+-      connection = addConnection(plainConnection);
++      return addConnection(connectionFactory.createClientToServerConnection(excludedServers));
+-    } catch (GatewayConfigurationException e) {
++    } catch (ServerRefusedConnectionException e) {
++      throw new NoAvailableServersException(e);
++    }
++  }
++
++  private PooledConnection createPooledConnection(ServerLocation serverLocation)
++      throws ServerRefusedConnectionException, GemFireSecurityException {
++    return addConnection(connectionFactory.createClientToServerConnection(serverLocation, false));
++  }
++
++  /**
++   * Always creates a connection and may cause {@link #connectionCount} to exceed
++   * {@link #maxConnections}.
++   */
++  private PooledConnection forceCreateConnection(ServerLocation serverLocation)
++      throws ServerRefusedConnectionException, ServerOperationException {
++    connectionAccounting.create();
++    try {
++      return createPooledConnection(serverLocation);
++    } catch (GemFireSecurityException e) {
+-    } catch (ServerRefusedConnectionException srce) {
+-      throw new NoAvailableServersException(srce);
+-    } finally {
+-      // if we failed, release the space we reserved for our connection
+-      if (connection == null) {
+-        lock.lock();
+-        try {
+-          --connectionCount;
+-          if (connectionCount < minConnections) {
+-            startBackgroundPrefill();
+-          }
+-        } finally {
+-          lock.unlock();
++    }
++  }
++
++  /**
++   * Always creates a connection and may cause {@link #connectionCount} to exceed
++   * {@link #maxConnections}.
++   */
++  private PooledConnection forceCreateConnection(Set<ServerLocation> excludedServers)
++      throws NoAvailableServersException, ServerOperationException {
++    connectionAccounting.create();
++    return createPooledConnection(excludedServers);
++  }
++
++  private boolean checkShutdownInterruptedOrTimeout(final long timeout)
++      throws PoolCancelledException {
++    if (shuttingDown.get()) {
++      throw new PoolCancelledException();
++    }
++
++    if (Thread.currentThread().isInterrupted()) {
++      return true;
++    }
++
++    if (timeout < System.nanoTime()) {
++      return true;
++    }
++
++    return false;
++  }
++
++  private long beginConnectionWaitStatIfNotStarted(final long waitStart) {
++    if (NOT_WAITING == waitStart) {
++      return getPoolStats().beginConnectionWait();
++    }
++
++    return waitStart;
++  }
++
++  private void endConnectionWaitStatIfStarted(final long waitStart) {
++    if (NOT_WAITING != waitStart) {
++      getPoolStats().endConnectionWait(waitStart);
++    }
++  }
++
++  @Override
++  public Connection borrowConnection(long acquireTimeout)
++      throws AllConnectionsInUseException, NoAvailableServersException, ServerOperationException {
++    long waitStart = NOT_WAITING;
++    try {
++      long timeout = System.nanoTime() + MILLISECONDS.toNanos(acquireTimeout);
++      while (true) {
++        PooledConnection connection = availableConnectionManager.useFirst();
++        if (null != connection) {
++          return connection;
++
++        if (connectionAccounting.tryCreate()) {
++          try {
++            connection = createPooledConnection();
++            if (null != connection) {
++              return connection;
++            }
++            throw new NoAvailableServersException();
++          } finally {
++            if (connection == null) {
++              connectionAccounting.cancelTryCreate();
++              if (connectionAccounting.isUnderMinimum()) {
++                startBackgroundPrefill();
++              }
++            }
++          }
++        }
++
++        if (checkShutdownInterruptedOrTimeout(timeout)) {
++          break;
++        }
++
++        waitStart = beginConnectionWaitStatIfNotStarted(waitStart);
++
++        Thread.yield();
++    } finally {
++      endConnectionWaitStatIfStarted(waitStart);
+-    if (connection == null) {
+-      this.cancelCriterion.checkCancelInProgress(null);
+-      throw new NoAvailableServersException();
+-    }
+-
+-    return connection;
++    this.cancelCriterion.checkCancelInProgress(null);
++    throw new AllConnectionsInUseException();
+-    lock.lock();
+-    try {
+-      if (shuttingDown) {
+-        throw new PoolCancelledException();
+-      }
+-      for (Iterator<PooledConnection> itr = availableConnections.iterator(); itr.hasNext();) {
+-        PooledConnection nextConnection = itr.next();
+-        try {
+-          nextConnection.activate();
+-          if (nextConnection.getServer().equals(server)) {
+-            itr.remove();
+-            return nextConnection;
+-          }
+-          nextConnection.passivate(false);
+-        } catch (ConnectionDestroyedException ex) {
+-          // someone else already destroyed this connection so ignore it
+-          // but remove it from availableConnections
+-        }
+-        // Fix for 41516. Before we let this method exceed the max connections
+-        // by creating a new connection, we need to make sure that they're
+-        // aren't bogus connections sitting in the available connection list
+-        // otherwise, the length of that list might exceed max connections,
+-        // but with some bad connections. That can cause members to
+-        // get a bad connection but have no permits to create a new connection.
+-        if (nextConnection.shouldDestroy()) {
+-          itr.remove();
+-        }
+-      }
+-
+-      if (onlyUseExistingCnx) {
+-        throw new AllConnectionsInUseException();
+-      }
+-
+-      // We need to create a connection. Reserve space for it.
+-      connectionCount++;
+-    } finally {
+-      lock.unlock();
++    PooledConnection connection =
++        availableConnectionManager.useFirst((c) -> c.getServer().equals(server));
++    if (null != connection) {
++      return connection;
+-    PooledConnection connection = null;
+-    try {
+-      Connection plainConnection = connectionFactory.createClientToServerConnection(server, false);
+-      connection = addConnection(plainConnection);
+-    } catch (GemFireSecurityException e) {
+-      throw new ServerOperationException(e);
+-    } finally {
+-      // if we failed, release the space we reserved for our connection
+-      if (connection == null) {
+-        lock.lock();
+-        try {
+-          --connectionCount;
+-          if (connectionCount < minConnections) {
+-            startBackgroundPrefill();
+-          }
+-        } finally {
+-          lock.unlock();
+-        }
+-      }
++    if (onlyUseExistingCnx) {
++      throw new AllConnectionsInUseException();
+-    if (connection == null) {
+-      throw new ServerConnectivityException(
+-          "Could not create a new connection to server " + server);
++
++    connection = forceCreateConnection(server);
++    if (null != connection) {
++      return connection;
+-    return connection;
++
++    throw new ServerConnectivityException(
++        "Could not create a new connection to server " + server);
+-  public Connection exchangeConnection(Connection oldConnection,
+-      Set/* <ServerLocation> */ excludedServers, long acquireTimeout)
++  public Connection exchangeConnection(final Connection oldConnection,
++      final Set<ServerLocation> excludedServers, final long acquireTimeout)
+-    assert oldConnection instanceof PooledConnection;
+-    PooledConnection newConnection = null;
+-    PooledConnection oldPC = (PooledConnection) oldConnection;
+-    boolean needToUndoEstimate = false;
+-    lock.lock();
+-      if (shuttingDown) {
+-        throw new PoolCancelledException();
++      PooledConnection connection = availableConnectionManager
++          .useFirst((c) -> !excludedServers.contains(c.getServer()));
++      if (null != connection) {
++        return connection;
+-      for (Iterator<PooledConnection> itr = availableConnections.iterator(); itr.hasNext();) {
+-        PooledConnection nextConnection = itr.next();
+-        if (!excludedServers.contains(nextConnection.getServer())) {
+-          itr.remove();
+-          try {
+-            nextConnection.activate();
+-            newConnection = nextConnection;
+-            if (allConnectionsMap.removeConnection(oldPC)) {
+-              --connectionCount;
+-              if (connectionCount < minConnections) {
+-                startBackgroundPrefill();
+-              }
+-            }
+-            break;
+-          } catch (ConnectionDestroyedException ex) {
+-            // someone else already destroyed this connection so ignore it
+-            // but remove it from availableConnections
+-          }
+-        }
+-      }
+-      if (newConnection == null) {
+-        if (!allConnectionsMap.removeConnection(oldPC)) {
+-          // We need to create a connection. Reserve space for it.
+-          needToUndoEstimate = true;
+-          connectionCount++;
+-        }
+-      }
+-    } finally {
+-      lock.unlock();
+-    }
+-    if (newConnection == null) {
+-      try {
+-        Connection plainConnection =
+-            connectionFactory.createClientToServerConnection(excludedServers);
+-        newConnection = addConnection(plainConnection);
+-      } catch (GemFireSecurityException e) {
+-        throw new ServerOperationException(e);
+-      } catch (ServerRefusedConnectionException srce) {
+-        throw new NoAvailableServersException(srce);
+-      } finally {
+-        if (needToUndoEstimate && newConnection == null) {
+-          lock.lock();
+-          try {
+-            --connectionCount;
+-            if (connectionCount < minConnections) {
+-              startBackgroundPrefill();
+-            }
+-          } finally {
+-            lock.unlock();
+-          }
+-        }
++      connection = forceCreateConnection(excludedServers);
++      if (null != connection) {
++        return connection;
+-    }
+-    if (newConnection == null) {
++    } finally {
++      returnConnection(oldConnection, true, true);
+-
+-    oldPC.internalDestroy();
+-
+-    return newConnection;
+-  protected/* GemStoneAddition */ String getPoolName() {
++  protected String getPoolName() {
+-          connectionCount);
++          connectionAccounting.getCount());
+-    lock.lock();
+-    try {
+-      if (allConnectionsMap.removeConnection(connection)) {
+-        if (logger.isDebugEnabled()) {
+-          logger.debug("Invalidating connection {} connection count is now {}", connection,
+-              connectionCount);
+-        }
+-
+-        if (connectionCount < minConnections) {
+-          startBackgroundPrefill();
+-        }
+-        freeConnection.signalAll();
++    if (allConnectionsMap.removeConnection(connection)) {
++      if (logger.isDebugEnabled()) {
++        logger.debug("Invalidating connection {} connection count is now {}", connection,
++            connectionAccounting.getCount());
+-      --connectionCount; // fix for bug #50333
+-    } finally {
+-      lock.unlock();
++
++      destroyAndMaybePrefill();
+-  /*
+-   * (non-Javadoc)
+-   *
+-   * @see
+-   * org.apache.geode.cache.client.internal.pooling.ConnectionManager#invalidateServer(org.apache.
+-   * geode.distributed.internal.ServerLocation)
+-   */
+-    Set badConnections = allConnectionsMap.removeEndpoint(endpoint);
++    Set<PooledConnection> badConnections = allConnectionsMap.removeEndpoint(endpoint);
+-    lock.lock();
+-    try {
+-      if (shuttingDown) {
+-        return;
+-      }
+-      if (logger.isDebugEnabled()) {
+-        logger.debug("Invalidating {} connections to server {}", badConnections.size(), endpoint);
+-      }
++    if (shuttingDown.get()) {
++      return;
++    }
+-      // mark connections for destruction now, so if anyone tries
+-      // to return a connection they'll get an exception
+-      for (Iterator itr = badConnections.iterator(); itr.hasNext();) {
+-        PooledConnection conn = (PooledConnection) itr.next();
+-        if (!conn.setShouldDestroy()) {
+-        }
++    if (logger.isDebugEnabled()) {
++      logger.debug("Invalidating {} connections to server {}", badConnections.size(), endpoint);
++    }
++
++    for (PooledConnection conn : badConnections) {
++      if (conn.internalDestroy()) {
++        destroyAndMaybePrefill();
++        availableConnectionManager.remove(conn);
+-
+-      availableConnections.removeIf(badConnections::contains);
+-
+-      connectionCount -= badConnections.size();
+-
+-      if (connectionCount < minConnections) {
+-        startBackgroundPrefill();
+-      }
+-
+-      for (Iterator itr = badConnections.iterator(); itr.hasNext();) {
+-        PooledConnection conn = (PooledConnection) itr.next();
+-        conn.internalDestroy();
+-      }
+-
+-      if (connectionCount < maxConnections) {
+-        freeConnection.signalAll();
+-      }
+-    } finally {
+-      lock.unlock();
+-  /*
+-   * (non-Javadoc)
+-   *
+-   * @see
+-   * org.apache.geode.cache.client.internal.pooling.ConnectionManager#returnConnection(org.apache.
+-   * geode.cache.client.internal.Connection)
+-   */
++    returnConnection(connection, accessed, false);
++  }
++  private void returnConnection(Connection connection, boolean accessed, boolean addLast) {
+-    boolean shouldClose = false;
+-
+-    lock.lock();
+-    try {
+-      if (pooledConn.isDestroyed()) {
+-        return;
+-      }
+-
+-      if (pooledConn.shouldDestroy()) {
+-        destroyConnection(pooledConn);
+-      } else {
+-        // thread local connections are already passive at this point
+-        if (pooledConn.isActive()) {
+-          pooledConn.passivate(accessed);
+-        }
+-
+-        // borrowConnection(ServerLocation, long) allows us to break the
+-        // connection limit in order to get a connection to a server. So we need
+-        // to get our pool back to size if we're above the limit
+-        if (connectionCount > maxConnections) {
+-          if (allConnectionsMap.removeConnection(pooledConn)) {
+-            shouldClose = true;
+-            // getPoolStats().incConCount(-1);
+-            --connectionCount;
+-          }
+-        } else {
+-          availableConnections.addFirst(pooledConn);
+-          freeConnection.signalAll();
+-        }
+-      }
+-    } finally {
+-      lock.unlock();
++    if (pooledConn.isDestroyed()) {
++      return;
+-    if (shouldClose) {
+-      try {
+-        PoolImpl localpool = (PoolImpl) PoolManagerImpl.getPMI().find(poolName);
+-        boolean durable = false;
+-        if (localpool != null) {
+-          durable = localpool.isDurableClient();
+-        }
+-        pooledConn.internalClose(durable || this.keepAlive);
+-      } catch (Exception e) {
+-        logger.warn(String.format("Error closing connection %s", pooledConn), e);
++    if (pooledConn.shouldDestroy()) {
++      destroyConnection(pooledConn);
++    } else if (!destroyIfOverLimit(pooledConn)) {
++      if (addLast) {
++        availableConnectionManager.addLast(pooledConn, accessed);
++      } else {
++        availableConnectionManager.addFirst(pooledConn, accessed);
+-  /*
+-   * (non-Javadoc)
++  /**
++   * Destroys connection if and only if {@link #connectionCount} exceeds {@link #maxConnections}.
++   *
++   * @return true if connection is destroyed, otherwise false.
++  private boolean destroyIfOverLimit(PooledConnection connection) {
++    if (connectionAccounting.tryDestroy()) {
++      if (allConnectionsMap.removeConnection(connection)) {
++        try {
++          PoolImpl localpool = (PoolImpl) PoolManagerImpl.getPMI().find(poolName);
++          boolean durable = false;
++          if (localpool != null) {
++            durable = localpool.isDurableClient();
++          }
++          connection.internalClose(durable || this.keepAlive);
++        } catch (Exception e) {
++          logger.warn(String.format("Error closing connection %s", connection), e);
++        }
++      } else {
++        // Not a pooled connection so undo the decrement.
++        connectionAccounting.cancelTryDestroy();
++      }
++
++      return true;
++    }
++
++    return false;
++  }
++
+-        LoggingExecutors.newScheduledThreadPool(name, 1/* why not 0? */, false);
++        LoggingExecutors.newScheduledThreadPool(name, 1, false);
+-    lock.lock();
+-    try {
+-      startBackgroundPrefill();
+-    } finally {
+-      lock.unlock();
+-    }
++    startBackgroundPrefill();
+-  /*
+-   * (non-Javadoc)
+-   *
+-   * @see org.apache.geode.cache.client.internal.pooling.ConnectionManager#close(boolean, long)
+-   */
+-    lock.lock();
+-    try {
+-      if (shuttingDown) {
+-        return;
+-      }
+-      shuttingDown = true;
+-    } finally {
+-      lock.unlock();
++    if (!shuttingDown.compareAndSet(false, true)) {
++      return;
+-            TimeUnit.MILLISECONDS)) {
++            MILLISECONDS)) {
+-    shuttingDown = true;
++    shuttingDown.set(true);
+-                TimeUnit.MILLISECONDS);
++                MILLISECONDS);
+-  /** Always called with lock held */
+-    if (!havePrefillTask) {
+-      havePrefillTask = true;
++    if (havePrefillTask.compareAndSet(false, true)) {
+-      while (connectionCount < minConnections) {
++      while (connectionAccounting.isUnderMinimum()) {
+-    return this.connectionCount;
++    return connectionAccounting.getCount();
++
+-    boolean createConnection = false;
+-    lock.lock();
+-    try {
+-      if (shuttingDown) {
+-        return false;
+-      }
+-      if (connectionCount < minConnections) {
+-        connectionCount++;
+-        createConnection = true;
+-      }
+-    } finally {
+-      lock.unlock();
++    if (shuttingDown.get()) {
++      return false;
+-    if (createConnection) {
++    if (connectionAccounting.tryPrefill()) {
+-        Connection plainConnection =
+-            connectionFactory.createClientToServerConnection(Collections.EMPTY_SET);
+-        if (plainConnection == null) {
++        connection = createPooledConnection();
++        if (connection == null) {
+-        connection = addConnection(plainConnection);
+-        connection.passivate(false);
++        availableConnectionManager.addLast(connection, false);
++        if (logger.isDebugEnabled()) {
++          logger.debug("Prefilled connection {} connection count is now {}", connection,
++              connectionAccounting.getCount());
++        }
++        return true;
+-        logger
+-            .info(String.format("Unable to prefill pool to minimum because: %s",
+-                ex.getMessage()));
++        logger.info(
++            String.format("Unable to prefill pool to minimum because: %s", ex.getMessage()));
+-        lock.lock();
+-        try {
+-          if (connection == null) {
+-            connectionCount--;
+-            if (logger.isDebugEnabled()) {
+-              logger.debug("Unable to prefill pool to minimum, connection count is now {}",
+-                  connectionCount);
+-            }
+-          } else {
+-            availableConnections.addFirst(connection);
+-            freeConnection.signalAll();
+-            if (logger.isDebugEnabled()) {
+-              logger.debug("Prefilled connection {} connection count is now {}", connection,
+-                  connectionCount);
+-            }
++        if (connection == null) {
++          connectionAccounting.cancelTryPrefill();
++
++          if (logger.isDebugEnabled()) {
++            logger.debug("Unable to prefill pool to minimum, connection count is now {}",
++                this::getConnectionCount);
+-        } finally {
+-          lock.unlock();
+-    return true;
++    return false;
+-        allConnectionsMap.checkIdleExpiration();
++        allConnectionsMap.expireIdleConnections();
+-
+-
+-      lock.lock();
+-      try {
+-        if (connectionCount < minConnections && !cancelCriterion.isCancelInProgress()) {
+-          try {
+-            backgroundProcessor.schedule(new PrefillConnectionsTask(), prefillRetry,
+-                TimeUnit.MILLISECONDS);
+-          } catch (RejectedExecutionException e) {
+-            // ignore, the timer has been cancelled, which means we're shutting down.
+-          }
+-        } else {
+-          havePrefillTask = false;
++      if (connectionAccounting.isUnderMinimum() && !cancelCriterion.isCancelInProgress()) {
++        try {
++          backgroundProcessor.schedule(new PrefillConnectionsTask(), prefillRetry,
++              MILLISECONDS);
++        } catch (RejectedExecutionException ignored) {
++          // ignore, the timer has been cancelled, which means we're shutting down.
+-      } finally {
+-        lock.unlock();
++      } else {
++        havePrefillTask.set(false);
+-  public boolean createLifetimeReplacementConnection(ServerLocation currentServer,
++  private boolean createLifetimeReplacementConnection(ServerLocation currentServer,
+-    HashSet excludedServers = new HashSet();
+-    ServerLocation sl = this.connectionFactory.findBestServer(currentServer, excludedServers);
+-
+-    while (sl != null) {
+-      if (sl.equals(currentServer)) {
+-        this.allConnectionsMap.extendLifeOfCnxToServer(currentServer);
++    HashSet<ServerLocation> excludedServers = new HashSet<>();
++    while (true) {
++      ServerLocation sl = connectionFactory.findBestServer(currentServer, excludedServers);
++      if (sl == null || sl.equals(currentServer)) {
++        // we didn't find a server to create a replacement cnx on so
++        // extends the currentServers life
++        allConnectionsMap.extendLifeOfCnxToServer(currentServer);
+-      } else {
+-        if (!this.allConnectionsMap.hasExpiredCnxToServer(currentServer)) {
+-          break;
+-        }
+-        Connection con = null;
+-        try {
+-          con = this.connectionFactory.createClientToServerConnection(sl, false);
+-        } catch (GemFireSecurityException e) {
+-          securityLogWriter.warning(
+-              String.format("Security exception connecting to server '%s': %s",
+-                  new Object[] {sl, e}));
+-        } catch (ServerRefusedConnectionException srce) {
+-          logger.warn("Server '{}' refused new connection: {}",
+-              new Object[] {sl, srce});
+-        }
+-        if (con == null) {
+-          excludedServers.add(sl);
+-          sl = this.connectionFactory.findBestServer(currentServer, excludedServers);
+-        } else {
++      }
++      if (!allConnectionsMap.hasExpiredCnxToServer(currentServer)) {
++        break;
++      }
++      Connection con = null;
++      try {
++        con = connectionFactory.createClientToServerConnection(sl, false);
++        if (con != null) {
+-          if (!this.allConnectionsMap.hasExpiredCnxToServer(currentServer)) {
++          if (allConnectionsMap.hasExpiredCnxToServer(currentServer)) {
++            offerReplacementConnection(con, currentServer);
++          } else {
+-            break;
+-          offerReplacementConnection(con, currentServer);
++      } catch (GemFireSecurityException e) {
++        securityLogWriter.warning(
++            String.format("Security exception connecting to server '%s': %s",
++                new Object[] {sl, e}));
++      } catch (ServerRefusedConnectionException srce) {
++        logger.warn("Server '{}' refused new connection: {}",
++            new Object[] {sl, srce});
++      excludedServers.add(sl);
+-    if (sl == null) {
+-      // we didn't find a server to create a replacement cnx on so
+-      // extends the currentServers life
+-      this.allConnectionsMap.extendLifeOfCnxToServer(currentServer);
+-    }
+-    return this.allConnectionsMap.checkForReschedule(true);
++    return allConnectionsMap.checkForReschedule(true);
+-    private final HashMap/* <Endpoint, HashSet<PooledConnection> */ map = new HashMap();
+-    private List/* <PooledConnection> */ allConnections = new LinkedList/* <PooledConnection> */(); // in
+-                                                                                                    // the
+-                                                                                                    // order
+-                                                                                                    // they
+-                                                                                                    // were
+-                                                                                                    // created
++    private final Map<Endpoint, Set<PooledConnection>> map = new HashMap<>();
++    private List<PooledConnection> allConnections = new LinkedList<>();
+-      return this.allConnections.size() > minConnections;
++      return this.allConnections.size() > connectionAccounting.getMinimum();
+-      synchronized (this) {
+-        getPoolStats().incPoolConnections(1);
++      getPoolStats().incPoolConnections(1);
+-        // we want the smallest birthDate (e.g. oldest cnx) at the front of the list
+-        this.allConnections.add(connection);
++      // we want the smallest birthDate (e.g. oldest cnx) at the front of the list
++      this.allConnections.add(connection);
+-        addToEndpointMap(connection);
++      addToEndpointMap(connection);
+-        if (isIdleExpirePossible()) {
+-          startBackgroundExpiration();
+-        }
+-        if (lifetimeTimeout != -1 && !haveLifetimeExpireConnectionsTask) {
+-          if (checkForReschedule(true)) {
+-            // something has already expired so start processing with no delay
+-            startBackgroundLifetimeExpiration(0);
+-          } else {
+-            // either no possible lifetime expires or we scheduled one
+-          }
++      if (isIdleExpirePossible()) {
++        startBackgroundExpiration();
++      }
++      if (lifetimeTimeout != -1 && !haveLifetimeExpireConnectionsTask) {
++        if (checkForReschedule(true)) {
++          // something has already expired so start processing with no delay
++          startBackgroundLifetimeExpiration(0);
++        } else {
++          // either no possible lifetime expires or we scheduled one
+-    public synchronized Set removeEndpoint(Endpoint endpoint) {
+-      final Set endpointConnections = (Set) this.map.remove(endpoint);
++    public synchronized Set<PooledConnection> removeEndpoint(Endpoint endpoint) {
++      final Set<PooledConnection> endpointConnections = this.map.remove(endpoint);
+-        for (Iterator it = this.allConnections.iterator(); it.hasNext();) {
++        for (Iterator<PooledConnection> it = this.allConnections.iterator(); it.hasNext();) {
+-    public synchronized boolean containsConnection(PooledConnection connection) {
+-      return this.allConnections.contains(connection);
+-    }
+-
+-      Set endpointConnections = (Set) map.get(connection.getEndpoint());
++      Set<PooledConnection> endpointConnections = map.get(connection.getEndpoint());
+-        endpointConnections = new HashSet();
++        endpointConnections = new HashSet<>();
+-      Set endpointConnections = (Set) this.map.get(endpoint);
++      Set<PooledConnection> endpointConnections = this.map.get(endpoint);
+-      for (Iterator it = this.allConnections.iterator(); it.hasNext();) {
+-        PooledConnection pc = (PooledConnection) it.next();
++      for (PooledConnection pc : allConnections) {
+-        for (Iterator it = this.allConnections.iterator(); it.hasNext();) {
+-          PooledConnection pc = (PooledConnection) it.next();
++        for (PooledConnection pc : allConnections) {
+-        for (Iterator it = this.allConnections.iterator(); it.hasNext();) {
+-          PooledConnection pc = (PooledConnection) it.next();
++        for (PooledConnection pc : allConnections) {
+-        for (Iterator it = this.allConnections.iterator(); it.hasNext();) {
+-          PooledConnection pc = (PooledConnection) it.next();
++        for (Iterator<PooledConnection> it = this.allConnections.iterator(); it.hasNext();) {
++          PooledConnection pc = it.next();
+-    public void checkIdleExpiration() {
++    public void expireIdleConnections() {
+-        if (shuttingDown) {
++        if (shuttingDown.get()) {
+-        // because we expire thread local connections we need to scan allConnections
+-
+-        int conCount = this.allConnections.size();
+-        if (conCount <= minConnections) {
++        if (!connectionAccounting.isOverMinimum()) {
+-        final long now = System.nanoTime();
++
+-        toClose = new ArrayList<PooledConnection>(conCount - minConnections);
+-        for (Iterator it = this.allConnections.iterator(); it.hasNext()
+-            && conCount > minConnections;) {
+-          PooledConnection pc = (PooledConnection) it.next();
++        int conCount = connectionAccounting.getCount();
++        toClose = new ArrayList<>(conCount - connectionAccounting.getMinimum());
++
++        // because we expire thread local connections we need to scan allConnections
++        for (Iterator<PooledConnection> it = allConnections.iterator(); it.hasNext()
++            && conCount > connectionAccounting.getMinimum();) {
++          PooledConnection pc = it.next();
+-            long remainingIdle = pc.doIdleTimeout(now, idleTimeoutNanos);
++            long remainingIdle = pc.doIdleTimeout(System.nanoTime(), idleTimeoutNanos);
+-        if (conCount > minConnections && minRemainingIdle < Long.MAX_VALUE) {
++        if (conCount > connectionAccounting.getMinimum()
++            && minRemainingIdle < Long.MAX_VALUE) {
+-        // do this outside the above sync
+-        lock.lock();
+-        try {
+-          connectionCount -= expireCount;
+-          freeConnection.signalAll();
+-          if (connectionCount < minConnections) {
+-            startBackgroundPrefill();
+-          }
+-        } finally {
+-          lock.unlock();
+-        }
++        destroyAndMaybePrefill(expireCount);
++
+-      // if (toClose != null) (cannot be null)
+-      {
+-        for (Iterator itr = toClose.iterator(); itr.hasNext();) {
+-          PooledConnection connection = (PooledConnection) itr.next();
+-          if (isDebugEnabled) {
+-            logger.debug("Idle connection detected. Expiring connection {}", connection);
+-          }
+-          try {
+-            connection.internalClose(false);
+-          } catch (Exception e) {
+-            logger.warn("Error expiring connection {}", connection);
+-          }
++      for (PooledConnection connection : toClose) {
++        if (isDebugEnabled) {
++          logger.debug("Idle connection detected. Expiring connection {}", connection);
++        }
++        try {
++          connection.internalClose(false);
++        } catch (Exception e) {
++          logger.warn("Error expiring connection {}", connection);
+-        if (shuttingDown) {
++        if (shuttingDown.get()) {
+-        done = true;
+-          if (shuttingDown) {
++          if (shuttingDown.get()) {
+-          for (Iterator it = this.allConnections.iterator(); it.hasNext() && life <= 0
++          for (Iterator<PooledConnection> it = this.allConnections.iterator(); it.hasNext()
++              && life <= 0
+-            PooledConnection pc = (PooledConnection) it.next();
++            PooledConnection pc = it.next();
+-          done = true; // just to be clear
++          done = true;
+-  public void activate(Connection conn) {
++  public boolean activate(Connection conn) {
+-    ((PooledConnection) conn).activate();
++    return ((PooledConnection) conn).activate();
+
+MOV26 MOV26 MOV23 MOV23 MOV23 MOV23 UPD40 UPD40 UPD40 INS23 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS83 INS39 INS43 UPD83 MOV83 MOV83 INS43 MOV59 INS83 UPD43 INS83 UPD43 INS83 INS39 INS42 INS8 INS83 INS39 INS42 INS44 MOV8 UPD83 MOV83 MOV43 UPD42 MOV42 MOV43 MOV43 INS8 INS83 MOV43 INS42 INS44 INS43 INS43 INS8 INS83 MOV43 INS42 INS44 MOV43 INS43 INS8 INS29 INS83 MOV43 INS42 INS44 INS43 INS43 INS8 INS29 INS83 MOV43 INS42 INS44 INS43 INS43 INS8 INS83 INS39 INS42 INS44 INS43 INS8 INS83 INS39 INS42 INS44 INS8 INS83 INS39 INS42 INS44 INS8 MOV78 MOV83 MOV43 MOV42 MOV44 MOV43 MOV43 INS43 INS8 MOV29 MOV78 INS83 MOV43 INS42 MOV44 MOV44 MOV44 MOV43 MOV43 INS8 MOV83 MOV39 MOV42 MOV44 INS8 MOV78 INS83 INS39 INS42 INS44 INS44 INS8 INS83 INS39 INS42 MOV44 MOV44 INS44 INS8 INS29 UPD83 UPD39 INS42 MOV44 INS8 MOV78 UPD83 MOV8 INS23 UPD39 UPD42 INS38 INS42 UPD42 INS14 INS42 UPD42 UPD42 UPD42 UPD42 UPD42 INS14 INS21 INS39 INS42 INS41 INS74 INS42 INS42 INS42 INS54 INS43 INS42 INS42 INS41 INS65 UPD43 MOV43 UPD42 MOV42 INS42 INS42 MOV21 INS54 INS65 INS74 UPD42 MOV42 INS42 UPD42 MOV42 MOV21 INS41 INS83 INS39 INS42 UPD42 MOV42 MOV25 MOV25 INS25 INS41 INS83 INS39 INS42 INS25 INS41 INS83 INS39 INS42 INS25 INS42 INS60 MOV54 MOV21 MOV53 INS60 INS25 MOV25 MOV21 MOV25 MOV53 INS83 INS83 INS74 INS83 INS54 INS25 MOV60 MOV25 MOV25 MOV25 INS70 INS43 INS42 INS39 INS42 MOV21 INS39 INS42 MOV6 MOV60 MOV25 INS25 INS65 INS65 INS25 INS41 MOV21 INS25 MOV25 INS25 INS41 INS8 INS60 INS61 INS41 MOV83 MOV83 INS74 MOV59 INS74 MOV8 INS74 UPD42 INS41 INS34 INS43 UPD43 INS9 INS43 INS9 INS32 INS32 INS32 MOV43 INS43 INS8 MOV12 MOV12 INS42 INS32 INS66 INS65 INS66 INS65 INS66 UPD42 INS32 INS8 MOV12 INS66 INS65 INS66 INS65 INS66 MOV43 INS43 INS32 INS32 INS32 MOV32 INS27 INS8 INS9 MOV27 INS8 INS42 INS27 MOV8 INS39 INS59 MOV43 INS59 INS27 INS8 UPD27 INS8 MOV43 INS43 INS8 MOV8 MOV32 INS32 MOV8 INS74 INS32 INS44 INS42 INS8 INS42 MOV32 MOV8 INS25 INS66 INS65 INS66 INS65 INS66 INS66 INS42 INS32 MOV8 INS9 INS38 MOV8 INS32 INS32 INS32 INS32 INS32 MOV8 INS9 MOV25 MOV21 MOV25 INS74 INS59 INS9 MOV8 INS32 INS43 INS43 INS74 MOV43 MOV43 MOV25 MOV43 MOV43 INS70 INS70 MOV32 INS42 UPD42 INS42 INS14 INS32 INS32 INS42 INS34 INS42 INS42 INS42 INS42 INS32 INS42 INS41 INS42 INS32 INS67 INS67 UPD42 MOV42 UPD42 MOV42 INS41 INS67 INS67 UPD42 MOV42 INS42 INS42 UPD42 MOV42 UPD42 MOV42 INS42 INS42 UPD42 INS41 INS42 INS32 INS41 UPD42 INS42 INS41 INS42 INS42 INS42 INS42 INS60 INS61 MOV42 INS32 INS33 INS42 INS41 INS33 MOV41 INS42 INS60 MOV25 MOV21 MOV25 MOV53 UPD42 MOV42 UPD42 MOV42 INS42 MOV21 MOV43 MOV43 INS42 INS42 MOV43 INS42 INS25 UPD42 INS42 INS42 INS9 INS38 INS8 INS67 INS67 INS42 INS42 INS41 INS32 INS42 INS42 INS9 INS42 INS42 INS9 INS9 INS42 INS42 INS42 INS42 UPD42 MOV42 UPD42 MOV42 MOV43 INS43 INS42 INS14 INS60 INS25 MOV25 MOV21 INS42 UPD42 MOV42 INS9 UPD42 MOV42 UPD42 MOV42 MOV43 MOV43 INS74 INS74 INS42 INS74 INS74 INS74 INS44 INS42 MOV8 MOV60 INS8 INS44 INS42 MOV8 UPD42 INS43 INS42 MOV16 INS42 INS42 MOV22 INS42 INS42 MOV22 UPD42 MOV42 UPD42 MOV42 INS32 UPD42 INS42 INS42 INS42 INS9 INS42 INS42 INS32 INS42 INS42 INS9 UPD42 MOV42 UPD42 MOV42 INS9 MOV32 INS39 INS59 INS9 INS8 INS42 INS42 INS86 INS42 UPD42 UPD42 MOV43 INS59 UPD27 MOV8 UPD27 MOV32 MOV32 INS8 INS32 INS25 INS42 INS42 MOV32 INS8 INS9 INS42 INS42 INS9 INS9 INS32 INS8 INS8 INS32 INS42 INS74 MOV43 INS59 INS27 MOV8 MOV8 MOV43 MOV43 INS32 MOV43 MOV43 MOV32 MOV43 MOV43 MOV32 MOV43 MOV43 MOV32 MOV43 INS42 INS70 INS70 INS25 MOV21 MOV21 MOV21 INS43 INS42 INS42 INS42 MOV32 UPD42 MOV42 UPD42 MOV42 UPD42 INS42 INS27 MOV60 INS25 INS25 INS25 INS21 MOV21 UPD42 UPD42 INS59 INS32 INS42 INS32 INS33 UPD42 INS41 UPD42 INS33 UPD42 INS41 UPD42 UPD42 INS9 INS9 INS32 UPD42 INS21 MOV21 UPD42 MOV42 UPD42 MOV42 INS42 MOV8 INS8 INS21 INS42 INS42 MOV21 MOV25 MOV21 MOV21 MOV25 MOV41 INS25 INS42 INS42 INS32 MOV43 INS42 INS32 MOV27 MOV32 INS10 INS25 INS42 INS42 INS44 INS42 MOV8 INS44 INS42 MOV8 MOV58 INS32 MOV8 INS38 MOV8 UPD39 INS32 UPD42 MOV42 INS32 MOV8 UPD42 INS32 INS32 INS27 MOV8 INS32 INS8 INS32 INS8 INS7 INS42 INS32 INS42 MOV42 UPD42 MOV42 UPD42 MOV42 INS86 INS42 UPD42 UPD42 INS42 UPD42 MOV42 INS42 INS32 MOV21 INS32 MOV27 MOV32 MOV27 MOV8 UPD42 INS42 INS42 INS9 INS42 UPD42 MOV42 MOV42 INS42 MOV33 INS32 INS42 INS27 INS8 MOV74 MOV14 MOV43 INS42 MOV43 INS42 MOV74 MOV60 INS42 UPD42 MOV42 INS32 UPD42 INS74 MOV60 INS42 INS42 INS42 INS42 MOV25 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 INS42 UPD42 MOV42 UPD42 INS33 INS42 UPD42 MOV42 UPD42 MOV42 INS54 INS42 INS42 INS10 INS42 INS32 UPD42 UPD42 UPD42 MOV42 UPD42 MOV42 INS59 INS38 INS32 UPD42 MOV42 UPD42 UPD42 INS42 INS42 INS42 UPD42 UPD42 INS42 UPD42 INS42 UPD42 MOV42 MOV42 INS42 INS33 MOV21 INS25 INS10 INS74 INS42 INS42 UPD42 UPD42 UPD74 INS43 INS43 INS32 INS32 INS32 MOV58 UPD42 UPD42 INS8 INS8 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 MOV32 UPD42 MOV42 INS42 UPD42 UPD42 INS42 INS42 UPD42 UPD42 INS42 INS42 INS42 UPD42 MOV32 INS42 INS42 INS32 INS8 INS8 MOV43 MOV32 INS32 MOV42 INS42 INS42 INS42 INS42 MOV32 INS42 INS42 INS42 INS42 INS74 MOV60 MOV21 INS25 MOV53 INS25 UPD42 UPD45 UPD42 INS32 UPD42 UPD42 INS42 INS42 INS42 MOV21 MOV21 MOV21 INS42 INS42 INS43 INS43 MOV43 INS7 INS27 INS8 MOV27 INS8 UPD42 INS42 INS42 MOV42 INS42 MOV32 INS42 INS32 INS33 INS42 MOV41 MOV21 MOV25 UPD42 INS42 UPD45 INS90 INS32 UPD42 MOV42 INS32 INS52 INS42 INS42 UPD42 MOV42 UPD42 UPD42 INS42 INS42 DEL40 DEL26 DEL42 DEL43 DEL74 DEL42 DEL43 DEL74 DEL14 DEL39 DEL39 DEL42 DEL59 DEL23 DEL83 DEL83 DEL39 DEL23 DEL83 DEL39 DEL42 DEL59 DEL23 DEL42 DEL42 DEL32 DEL83 DEL83 DEL39 DEL42 DEL59 DEL23 DEL83 DEL83 DEL83 DEL39 DEL42 DEL34 DEL59 DEL23 DEL52 DEL42 DEL22 DEL42 DEL7 DEL21 DEL42 DEL27 DEL42 DEL27 DEL42 DEL38 DEL21 DEL42 DEL42 DEL27 DEL42 DEL42 DEL32 DEL42 DEL27 DEL36 DEL27 DEL7 DEL42 DEL37 DEL42 DEL42 DEL21 DEL33 DEL42 DEL42 DEL32 DEL21 DEL42 DEL32 DEL9 DEL42 DEL42 DEL27 DEL42 DEL42 DEL43 DEL14 DEL53 DEL8 DEL25 DEL42 DEL32 DEL59 DEL58 DEL32 DEL42 DEL42 DEL32 DEL21 DEL32 DEL42 DEL42 DEL32 DEL42 DEL41 DEL8 DEL25 DEL8 DEL42 DEL43 DEL42 DEL44 DEL8 DEL12 DEL54 DEL32 DEL8 DEL25 DEL8 DEL24 DEL42 DEL37 DEL21 DEL33 DEL42 DEL42 DEL32 DEL21 DEL42 DEL42 DEL32 DEL21 DEL8 DEL54 DEL8 DEL39 DEL42 DEL32 DEL59 DEL60 DEL39 DEL42 DEL42 DEL59 DEL60 DEL42 DEL42 DEL32 DEL21 DEL42 DEL42 DEL27 DEL42 DEL42 DEL32 DEL27 DEL42 DEL34 DEL27 DEL27 DEL42 DEL38 DEL27 DEL83 DEL39 DEL42 DEL59 DEL60 DEL39 DEL42 DEL9 DEL59 DEL60 DEL42 DEL42 DEL42 DEL40 DEL32 DEL21 DEL8 DEL44 DEL42 DEL9 DEL7 DEL21 DEL42 DEL42 DEL42 DEL32 DEL21 DEL8 DEL12 DEL54 DEL8 DEL61 DEL32 DEL38 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL43 DEL44 DEL8 DEL12 DEL54 DEL8 DEL61 DEL42 DEL42 DEL27 DEL43 DEL14 DEL53 DEL8 DEL8 DEL25 DEL8 DEL32 DEL21 DEL8 DEL54 DEL42 DEL43 DEL42 DEL33 DEL59 DEL60 DEL43 DEL42 DEL40 DEL32 DEL59 DEL60 DEL42 DEL42 DEL42 DEL32 DEL7 DEL21 DEL8 DEL42 DEL43 DEL42 DEL44 DEL42 DEL14 DEL53 DEL8 DEL12 DEL42 DEL42 DEL32 DEL21 DEL42 DEL38 DEL21 DEL8 DEL42 DEL42 DEL32 DEL21 DEL8 DEL54 DEL8 DEL25 DEL8 DEL54 DEL8 DEL25 DEL8 DEL31 DEL42 DEL42 DEL32 DEL21 DEL42 DEL43 DEL33 DEL59 DEL60 DEL42 DEL43 DEL42 DEL9 DEL32 DEL59 DEL60 DEL8 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL14 DEL53 DEL8 DEL12 DEL8 DEL54 DEL8 DEL25 DEL8 DEL31 DEL33 DEL42 DEL9 DEL7 DEL21 DEL42 DEL37 DEL21 DEL42 DEL42 DEL42 DEL32 DEL38 DEL25 DEL8 DEL42 DEL42 DEL32 DEL21 DEL42 DEL62 DEL6 DEL42 DEL33 DEL59 DEL60 DEL42 DEL42 DEL11 DEL59 DEL60 DEL39 DEL42 DEL9 DEL59 DEL60 DEL42 DEL42 DEL32 DEL21 DEL42 DEL42 DEL43 DEL14 DEL53 DEL8 DEL25 DEL42 DEL42 DEL32 DEL59 DEL58 DEL42 DEL32 DEL42 DEL42 DEL32 DEL59 DEL60 DEL38 DEL42 DEL42 DEL32 DEL21 DEL42 DEL42 DEL32 DEL21 DEL42 DEL42 DEL7 DEL21 DEL42 DEL42 DEL42 DEL32 DEL42 DEL38 DEL21 DEL42 DEL42 DEL27 DEL42 DEL32 DEL21 DEL8 DEL25 DEL8 DEL25 DEL10 DEL8 DEL42 DEL43 DEL42 DEL44 DEL8 DEL12 DEL54 DEL8 DEL25 DEL8 DEL24 DEL8 DEL42 DEL42 DEL32 DEL21 DEL8 DEL54 DEL42 DEL33 DEL27 DEL42 DEL43 DEL42 DEL59 DEL60 DEL8 DEL42 DEL44 DEL42 DEL14 DEL53 DEL8 DEL12 DEL42 DEL42 DEL33 DEL27 DEL27 DEL42 DEL42 DEL32 DEL21 DEL42 DEL38 DEL21 DEL8 DEL54 DEL8 DEL25 DEL8 DEL54 DEL8 DEL25 DEL42 DEL33 DEL27 DEL8 DEL25 DEL42 DEL42 DEL32 DEL21 DEL42 DEL41 DEL42 DEL42 DEL27 DEL8 DEL25 DEL42 DEL42 DEL32 DEL21 DEL32 DEL21 DEL25 DEL42 DEL38 DEL21 DEL8 DEL42 DEL42 DEL32 DEL21 DEL8 DEL54 DEL42 DEL42 DEL42 DEL90 DEL42 DEL42 DEL32 DEL21 DEL42 DEL25 DEL42 DEL43 DEL42 DEL42 DEL42 DEL32 DEL59 DEL58 DEL42 DEL42 DEL32 DEL42 DEL42 DEL42 DEL32 DEL11 DEL59 DEL60 DEL42 DEL32 DEL38 DEL8 DEL25 DEL8 DEL24 DEL42 DEL42 DEL42 DEL32 DEL7 DEL21 DEL42 DEL42 DEL27 DEL8 DEL25 DEL42 DEL43 DEL42 DEL42 DEL42 DEL32 DEL59 DEL58 DEL42 DEL42 DEL32 DEL42 DEL32 DEL11 DEL59 DEL60 DEL21 DEL8 DEL24 DEL42 DEL42 DEL27 DEL25 DEL8 DEL8 DEL54 DEL8 DEL31 DEL39 DEL42 DEL9 DEL59 DEL60 DEL42 DEL42 DEL32 DEL21 DEL42 DEL42 DEL32 DEL42 DEL42 DEL42 DEL32 DEL21 DEL8 DEL25 DEL42 DEL42 DEL27 DEL42 DEL42 DEL42 DEL32 DEL42 DEL9 DEL7 DEL21 DEL42 DEL38 DEL21 DEL8 DEL25 DEL8 DEL42 DEL42 DEL42 DEL32 DEL21 DEL42 DEL42 DEL32 DEL21 DEL8 DEL25 DEL8 DEL25 DEL8 DEL42 DEL42 DEL32 DEL21 DEL8 DEL54 DEL42 DEL42 DEL42 DEL42 DEL32 DEL21 DEL8 DEL42 DEL42 DEL32 DEL21 DEL8 DEL54 DEL42 DEL42 DEL32 DEL21 DEL42 DEL9 DEL7 DEL21 DEL8 DEL42 DEL42 DEL32 DEL21 DEL8 DEL54 DEL40 DEL42 DEL9 DEL7 DEL40 DEL66 DEL65 DEL29 DEL42 DEL38 DEL42 DEL9 DEL7 DEL21 DEL42 DEL42 DEL27 DEL52 DEL42 DEL22 DEL42 DEL33 DEL27 DEL42 DEL42 DEL42 DEL43 DEL42 DEL42 DEL42 DEL40 DEL32 DEL59 DEL60 DEL8 DEL42 DEL42 DEL42 DEL32 DEL21 DEL42 DEL42 DEL42 DEL42 DEL32 DEL21 DEL42 DEL37 DEL21 DEL8 DEL25 DEL8 DEL42 DEL42 DEL32 DEL21 DEL8 DEL54 DEL8 DEL39 DEL42 DEL9 DEL59 DEL60 DEL32 DEL21 DEL42 DEL42 DEL27 DEL42 DEL37 DEL21 DEL42 DEL9 DEL7 DEL21 DEL8 DEL25 DEL8 DEL42 DEL42 DEL32 DEL21 DEL8 DEL54 DEL42 DEL25 DEL42 DEL42 DEL27 DEL40 DEL42 DEL9 DEL7 DEL42 DEL42 DEL32 DEL21 DEL8 DEL42 DEL42 DEL32 DEL21 DEL8 DEL54 DEL8 DEL42 DEL52 DEL42 DEL22 DEL42 DEL32 DEL7 DEL52 DEL42 DEL22 DEL10 DEL8 DEL52 DEL42 DEL22 DEL32 DEL38 DEL25 DEL52 DEL42 DEL22 DEL27 DEL10 DEL8 DEL25 DEL52 DEL42 DEL22 DEL42 DEL32 DEL21 DEL10 DEL8 DEL25 DEL42 DEL59 DEL60 DEL42 DEL52 DEL42 DEL22 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL33 DEL27 DEL61 DEL52 DEL42 DEL22 DEL42 DEL42 DEL32 DEL21 DEL8 DEL25 DEL52 DEL42 DEL22 DEL42 DEL9 DEL32 DEL41 DEL8 DEL43 DEL23 DEL42 DEL52 DEL51 DEL8 DEL11 DEL42 DEL43 DEL83 DEL83 DEL39 DEL42 DEL52 DEL42 DEL22 DEL42 DEL42 DEL32 DEL41 DEL8 DEL31 DEL11 DEL14 DEL11 DEL42 DEL42 DEL32 DEL24 DEL42 DEL43 DEL42 DEL52 DEL42 DEL22 DEL42 DEL32 DEL59 DEL58 DEL42 DEL42 DEL32 DEL24 DEL42 DEL42 DEL42 DEL32 DEL11 DEL59 DEL60 DEL42 DEL43 DEL42 DEL52 DEL42 DEL22 DEL42 DEL32 DEL59 DEL58 DEL42 DEL42 DEL32 DEL24 DEL42 DEL43 DEL11 DEL39 DEL42 DEL52 DEL42 DEL22 DEL32 DEL59 DEL60 DEL42 DEL42 DEL27 DEL83 DEL42 DEL43 DEL52 DEL42 DEL22 DEL42 DEL11 DEL42 DEL42 DEL43 DEL42 DEL42 DEL32 DEL11 DEL59 DEL60 DEL42 DEL42 DEL42 DEL7 DEL42 DEL42 DEL32 DEL21 DEL42 DEL42 DEL32 DEL21 DEL42 DEL42 DEL27 DEL42 DEL32 DEL21 DEL8 DEL25 DEL8 DEL42 DEL42 DEL32 DEL21 DEL8 DEL54 DEL8 DEL42 DEL43 DEL42 DEL42 DEL43 DEL42 DEL42 DEL32 DEL11 DEL59 DEL60 DEL43 DEL42 DEL42 DEL42 DEL32 DEL59 DEL58 DEL42 DEL42 DEL32 DEL24 DEL8 DEL42 DEL42 DEL9 DEL7 DEL21 DEL42 DEL42 DEL25 DEL43 DEL42 DEL43 DEL42 DEL52 DEL42 DEL22 DEL42 DEL32 DEL59 DEL58 DEL11 DEL42 DEL43 DEL42 DEL42 DEL43 DEL42 DEL42 DEL32 DEL11 DEL59 DEL60 DEL21

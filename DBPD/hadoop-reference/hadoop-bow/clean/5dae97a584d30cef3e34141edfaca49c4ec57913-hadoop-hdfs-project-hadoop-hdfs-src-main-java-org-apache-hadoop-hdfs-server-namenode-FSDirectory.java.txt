@@ -1,0 +1,173 @@
+HDFS-7723. Quota By Storage Type namenode implemenation. (Contributed by Xiaoyu Yao)
+
++import org.apache.hadoop.hdfs.protocol.BlockStoragePolicy;
++import org.apache.hadoop.hdfs.server.blockmanagement.BlockStoragePolicySuite;
++import org.apache.hadoop.hdfs.StorageType;
++import org.apache.hadoop.hdfs.util.EnumCounters;
++import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_QUOTA_BY_STORAGETYPE_ENABLED_DEFAULT;
++import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_QUOTA_BY_STORAGETYPE_ENABLED_KEY;
+-        DirectoryWithQuotaFeature.DEFAULT_NAMESPACE_QUOTA,
+-        DirectoryWithQuotaFeature.DEFAULT_DISKSPACE_QUOTA);
++        new DirectoryWithQuotaFeature.Builder().
++            nameSpaceQuota(DirectoryWithQuotaFeature.DEFAULT_NAMESPACE_QUOTA).
++            spaceQuota(DirectoryWithQuotaFeature.DEFAULT_SPACE_QUOTA).build());
++  // whether quota by storage type is allowed
++  private final boolean quotaByStorageTypeEnabled;
++    this.quotaByStorageTypeEnabled =
++        conf.getBoolean(DFS_QUOTA_BY_STORAGETYPE_ENABLED_KEY,
++                        DFS_QUOTA_BY_STORAGETYPE_ENABLED_DEFAULT);
++
++  public BlockStoragePolicySuite getBlockStoragePolicySuite() {
++    return getBlockManager().getStoragePolicySuite();
++  }
++
++  boolean isQuotaByStorageTypeEnabled() {
++    return quotaByStorageTypeEnabled;
++  }
+-      updateCount(inodesInPath, 0, fileINode.getPreferredBlockDiskspace(), true);
++      updateCount(inodesInPath, 0, fileINode.getPreferredBlockSize(),
++          fileINode.getBlockReplication(), true);
+-    updateCount(iip, 0, -fileNode.getPreferredBlockDiskspace(), true);
++    updateCount(iip, 0, -fileNode.getPreferredBlockSize(),
++        fileNode.getBlockReplication(), true);
+-   * @param dsDelta the delta change of diskspace
++   * @param dsDelta the delta change of space consumed without replication
++   * @param replication the replication factor of the block consumption change
+-  void updateSpaceConsumed(INodesInPath iip, long nsDelta, long dsDelta)
+-      throws QuotaExceededException, FileNotFoundException,
+-          UnresolvedLinkException, SnapshotAccessControlException {
++  void updateSpaceConsumed(INodesInPath iip, long nsDelta, long dsDelta, short replication)
++    throws QuotaExceededException, FileNotFoundException,
++    UnresolvedLinkException, SnapshotAccessControlException {
+-      updateCount(iip, nsDelta, dsDelta, true);
++      updateCount(iip, nsDelta, dsDelta, replication, true);
+-      Quota.Counts counts = inode.computeQuotaUsage();
+-      unprotectedUpdateCount(iip, iip.length() - 1,
+-          -counts.get(Quota.NAMESPACE), -counts.get(Quota.DISKSPACE));
++      QuotaCounts counts = inode.computeQuotaUsage(getBlockStoragePolicySuite());
++      unprotectedUpdateCount(iip, iip.length() - 1, counts.negation());
+-  void updateCount(INodesInPath iip, long nsDelta, long dsDelta,
++  /**
++   * Update usage count without replication factor change
++   */
++  void updateCount(INodesInPath iip, long nsDelta, long dsDelta, short replication,
+-    updateCount(iip, iip.length() - 1, nsDelta, dsDelta, checkQuota);
++    final INodeFile fileINode = iip.getLastINode().asFile();
++    EnumCounters<StorageType> typeSpaceDeltas =
++      getStorageTypeDeltas(fileINode.getStoragePolicyID(), dsDelta,
++          replication, replication);;
++    updateCount(iip, iip.length() - 1,
++      new QuotaCounts.Builder().nameCount(nsDelta).spaceCount(dsDelta * replication).
++          typeCounts(typeSpaceDeltas).build(),
++        checkQuota);
++  }
++
++  /**
++   * Update usage count with replication factor change due to setReplication
++   */
++  void updateCount(INodesInPath iip, long nsDelta, long dsDelta, short oldRep,
++      short newRep, boolean checkQuota) throws QuotaExceededException {
++    final INodeFile fileINode = iip.getLastINode().asFile();
++    EnumCounters<StorageType> typeSpaceDeltas =
++        getStorageTypeDeltas(fileINode.getStoragePolicyID(), dsDelta, oldRep, newRep);
++    updateCount(iip, iip.length() - 1,
++        new QuotaCounts.Builder().nameCount(nsDelta).
++            spaceCount(dsDelta * (newRep - oldRep)).
++            typeCounts(typeSpaceDeltas).build(),
++        checkQuota);
+-   * @param nsDelta the delta change of namespace
+-   * @param dsDelta the delta change of diskspace
++   * @param counts the count of space/namespace/type usage to be update
+-  private void updateCount(INodesInPath iip, int numOfINodes, 
+-                           long nsDelta, long dsDelta, boolean checkQuota)
+-                           throws QuotaExceededException {
++   void updateCount(INodesInPath iip, int numOfINodes,
++                    QuotaCounts counts, boolean checkQuota)
++                    throws QuotaExceededException {
+-      verifyQuota(iip, numOfINodes, nsDelta, dsDelta, null);
++      verifyQuota(iip, numOfINodes, counts, null);
+-    unprotectedUpdateCount(iip, numOfINodes, nsDelta, dsDelta);
++    unprotectedUpdateCount(iip, numOfINodes, counts);
+-   * See {@link #updateCount(INodesInPath, long, long, boolean)}
++   * See {@link #updateCount(INodesInPath, int, QuotaCounts, boolean)}
+-  void updateCountNoQuotaCheck(INodesInPath inodesInPath, int numOfINodes,
+-      long nsDelta, long dsDelta) {
++   void updateCountNoQuotaCheck(INodesInPath inodesInPath,
++      int numOfINodes, QuotaCounts counts) {
+-      updateCount(inodesInPath, numOfINodes, nsDelta, dsDelta, false);
++      updateCount(inodesInPath, numOfINodes, counts, false);
+-      int numOfINodes, long nsDelta, long dsDelta) {
++      int numOfINodes, QuotaCounts counts) {
+-            .addSpaceConsumed2Cache(nsDelta, dsDelta);
++            .addSpaceConsumed2Cache(counts);
+-  
++
++  public EnumCounters<StorageType> getStorageTypeDeltas(byte storagePolicyID,
++      long dsDelta, short oldRep, short newRep) {
++    EnumCounters<StorageType> typeSpaceDeltas =
++        new EnumCounters<StorageType>(StorageType.class);
++    // Storage type and its quota are only available when storage policy is set
++    if (storagePolicyID != BlockStoragePolicySuite.ID_UNSPECIFIED) {
++      BlockStoragePolicy storagePolicy = getBlockManager().getStoragePolicy(storagePolicyID);
++
++      if (oldRep != newRep) {
++        List<StorageType> oldChosenStorageTypes =
++            storagePolicy.chooseStorageTypes(oldRep);
++
++        for (StorageType t : oldChosenStorageTypes) {
++          if (!t.supportTypeQuota()) {
++            continue;
++          }
++          Preconditions.checkArgument(dsDelta > 0);
++          typeSpaceDeltas.add(t, -dsDelta);
++        }
++      }
++
++      List<StorageType> newChosenStorageTypes =
++          storagePolicy.chooseStorageTypes(newRep);
++
++      for (StorageType t : newChosenStorageTypes) {
++        if (!t.supportTypeQuota()) {
++          continue;
++        }
++        typeSpaceDeltas.add(t, dsDelta);
++      }
++    }
++    return typeSpaceDeltas;
++  }
++
+-   * @param nsDelta needed namespace
+-   * @param dsDelta needed diskspace
++   * @param deltas needed namespace, diskspace and storage types
+-  static void verifyQuota(INodesInPath iip, int pos, long nsDelta,
+-      long dsDelta, INode commonAncestor) throws QuotaExceededException {
+-    if (nsDelta <= 0 && dsDelta <= 0) {
++  static void verifyQuota(INodesInPath iip, int pos, QuotaCounts deltas,
++                          INode commonAncestor) throws QuotaExceededException {
++    if (deltas.getNameSpace() <= 0 && deltas.getDiskSpace() <= 0
++        && deltas.getTypeSpaces().allLessOrEqual(0L)) {
+-          q.verifyQuota(nsDelta, dsDelta);
++          q.verifyQuota(deltas);
+-  
++
+-    // original location becase a quota violation would cause the the item
++    // original location because a quota violation would cause the the item
+-    final Quota.Counts counts = inode.computeQuotaUsage();
+-    updateCount(existing, pos,
+-        counts.get(Quota.NAMESPACE), counts.get(Quota.DISKSPACE), checkQuota);
++    final QuotaCounts counts = inode.computeQuotaUsage(getBlockStoragePolicySuite());
++    updateCount(existing, pos, counts, checkQuota);
++
+-      updateCountNoQuotaCheck(existing, pos,
+-          -counts.get(Quota.NAMESPACE), -counts.get(Quota.DISKSPACE));
++      updateCountNoQuotaCheck(existing, pos, counts.negation());
+-      updateCountNoQuotaCheck(existing, pos,
+-          -counts.get(Quota.NAMESPACE), -counts.get(Quota.DISKSPACE));
++      updateCountNoQuotaCheck(existing, pos, counts.negation());
+-    long oldDiskspace = file.diskspaceConsumed();
++    long oldDiskspaceNoRep = file.diskspaceConsumedNoReplication();
+-    updateCount(iip, 0, file.diskspaceConsumed() - oldDiskspace, true);
++    updateCount(iip, 0, file.diskspaceConsumedNoReplication() - oldDiskspaceNoRep,
++      file.getBlockReplication(), true);
+-          .get(Quota.NAMESPACE);
++          .getNameSpace();

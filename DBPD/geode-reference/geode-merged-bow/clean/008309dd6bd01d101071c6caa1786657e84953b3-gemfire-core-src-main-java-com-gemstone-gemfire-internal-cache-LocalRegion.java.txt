@@ -1,0 +1,1153 @@
+Merge branch 'release/1.0.0-incubating.M1'
+
+-/*=========================================================================
+- * Copyright (c) 2002-2014 Pivotal Software, Inc. All Rights Reserved.
+- * This product is protected by U.S. and international copyright
+- * and intellectual property laws. Pivotal products are covered by
+- * more patents listed at http://www.pivotal.io/patents.
+- *=========================================================================
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++import static com.gemstone.gemfire.internal.offheap.annotations.OffHeapIdentifier.*;
++
++import com.gemstone.gemfire.LogWriter;
+-import com.gemstone.gemfire.cache.client.internal.BridgePoolImpl;
++import com.gemstone.gemfire.cache.hdfs.internal.HDFSBucketRegionQueue;
++import com.gemstone.gemfire.cache.hdfs.internal.HDFSIntegrationUtil;
++import com.gemstone.gemfire.cache.hdfs.internal.HoplogListenerForRegion;
++import com.gemstone.gemfire.cache.hdfs.internal.hoplog.HDFSRegionDirector;
++import com.gemstone.gemfire.cache.hdfs.internal.hoplog.HDFSRegionDirector.HdfsRegionManager;
+-import com.gemstone.gemfire.cache.query.IndexMaintenanceException;
++import com.gemstone.gemfire.cache.query.IndexMaintenanceException;
+-import com.gemstone.gemfire.cache.util.BridgeWriterException;
++import com.gemstone.gemfire.internal.cache.control.InternalResourceManager.ResourceType;
++import com.gemstone.gemfire.internal.cache.control.MemoryThresholds;
++import com.gemstone.gemfire.internal.offheap.Chunk;
++import com.gemstone.gemfire.internal.offheap.OffHeapHelper;
++import com.gemstone.gemfire.internal.offheap.ReferenceCountHelper;
++import com.gemstone.gemfire.internal.offheap.StoredObject;
++import com.gemstone.gemfire.internal.offheap.annotations.Retained;
++import com.gemstone.gemfire.internal.offheap.annotations.Unretained;
+-import com.gemstone.gemfire.internal.util.concurrent.StoppableReentrantReadWriteLock.StoppableWriteLock;
+-import com.gemstone.org.jgroups.util.StringId;
++import com.gemstone.gemfire.i18n.StringId;
+-  final boolean EXPIRY_UNITS_MS = Boolean.getBoolean(EXPIRY_MS_PROPERTY);
++  final boolean EXPIRY_UNITS_MS;
+-  public final AtomicBoolean heapThresholdReached = new AtomicBoolean(false);
++  public final AtomicBoolean memoryThresholdReached = new AtomicBoolean(false);
++  
++  
++  protected HdfsRegionManager hdfsManager;
++  protected HoplogListenerForRegion hoplogListener;
+-  static private String calcFullPath(String regionName, LocalRegion parentRegion) {
++  static String calcFullPath(String regionName, LocalRegion parentRegion) {
++    // Initialized here (and defers to parent) to fix GEODE-128
++    this.EXPIRY_UNITS_MS = parentRegion != null ? parentRegion.EXPIRY_UNITS_MS : Boolean.getBoolean(EXPIRY_MS_PROPERTY);
++
++    this.offHeap = attrs.getOffHeap() || Boolean.getBoolean(myName+":OFF_HEAP");
++    if (getOffHeap()) {
++      if (cache.getOffHeapStore() == null) {
++        throw new IllegalStateException("The region " + myName + " was configured to use off heap memory but no off heap memory was configured.");
++      }
++    }
++    this.hdfsManager = initHDFSManager();
+-    this.srp = ((this.getPoolName() != null)
+-                || isBridgeLoader(this.getCacheLoader())
+-                || isBridgeWriter(this.getCacheWriter()))
++    this.srp = (this.getPoolName() != null)
+-    // Create Listener only when Heap eviction is enabled, and BucketRegion is
+-    // created
++    
++  }
++
++  private HdfsRegionManager initHDFSManager() {
++    HdfsRegionManager hdfsMgr = null;
++    if (this.getHDFSStoreName() != null) {
++      this.hoplogListener = new HoplogListenerForRegion();
++      HDFSRegionDirector.getInstance().setCache(cache);
++      hdfsMgr = HDFSRegionDirector.getInstance().manageRegion(this, 
++          this.getHDFSStoreName(), hoplogListener);
++    }
++    return hdfsMgr;
++	if ((internalRegionArgs.isReadWriteHDFSRegion()) && this.diskRegion != null) {
++      this.diskRegion.setEntriesMapIncompatible(true);
++    }
++    attrs = cache.invokeRegionBefore(this, subregionName, attrs, internalRegionArgs);
++        String regionPath = calcFullPath(subregionName, this);
++            // create the async queue for HDFS if required. 
++            HDFSIntegrationUtil.createAndAddAsyncQueue(regionPath,
++                regionAttributes, this.cache);
++            regionAttributes = cache.setEvictionAttributesForLargeRegion(
++                regionAttributes);
+-              if(pr.isShadowPR()) {
+-                newRegion = new BucketRegionQueue(subregionName, regionAttributes,
+-                    this, this.cache, internalRegionArgs);
+-              }else {
++              if (pr.isShadowPR()) {
++                if (!pr.isShadowPRForHDFS()) {
++                    newRegion = new BucketRegionQueue(subregionName, regionAttributes,
++                      this, this.cache, internalRegionArgs);
++                }
++                else {
++                   newRegion = new HDFSBucketRegionQueue(subregionName, regionAttributes,
++                      this, this.cache, internalRegionArgs);
++                }
++                
++              } else {
+-        //register the region with resource manager to get heap events
++        //register the region with resource manager to get memory events
+-            cache.getResourceManager().addResourceListener(newRegion);
++            cache.getResourceManager().addResourceListener(ResourceType.MEMORY, newRegion);
++            
++            if (!newRegion.getOffHeap()) {
++              newRegion.initialCriticalMembers(cache.getResourceManager().getHeapMonitor().getState().isCritical(), cache
++                  .getResourceAdvisor().adviseCritialMembers());
++            } else {
++              newRegion.initialCriticalMembers(cache.getResourceManager().getHeapMonitor().getState().isCritical()
++                  || cache.getResourceManager().getOffHeapMonitor().getState().isCritical(), cache.getResourceAdvisor()
++                  .adviseCritialMembers());
++            }
+-      } catch (CancelException e) {
++      } catch (CancelException | RegionDestroyedException | RedundancyAlreadyMetException e) {
+-      } catch(RedundancyAlreadyMetException e) {
+-        //don't log this
+-        throw e;
++    cache.invokeRegionAfter(newRegion);
++    // TODO OFFHEAP: validatedCreate calls freeOffHeapResources
+-    if (event.getEventId() == null && generateEventID()) {
+-      event.setNewEventId(cache.getDistributedSystem());
+-    }
+-    //Fix for 42448 - Only make create with null a local invalidate for
+-    //normal regions. Otherwise, it will become a distributed invalidate.
+-    if(getDataPolicy() == DataPolicy.NORMAL) {
+-      event.setLocalInvalid(true);
+-    }
+-    discoverJTA();
+-    if (!basicPut(event,
+-                  true,  // ifNew
+-                  false, // ifOld
+-                  null,  // expectedOldValue
+-                  true // requireOldValue TODO txMerge why is oldValue required for create? I think so that the EntryExistsException will have it.
+-                  )) {
+-      throw new EntryExistsException(event.getKey().toString(),
+-          event.getOldValue());
+-    }
+-    else {
+-      if (! getDataView().isDeferredStats()) {
+-        getCachePerfStats().endPut(startPut, false);
++    try {
++      if (event.getEventId() == null && generateEventID()) {
++        event.setNewEventId(cache.getDistributedSystem());
++      assert event.isFetchFromHDFS() : "validatedPut() should have been called";
++      // Fix for 42448 - Only make create with null a local invalidate for
++      // normal regions. Otherwise, it will become a distributed invalidate.
++      if (getDataPolicy() == DataPolicy.NORMAL) {
++        event.setLocalInvalid(true);
++      }
++      discoverJTA();
++      if (!basicPut(event, true, // ifNew
++          false, // ifOld
++          null, // expectedOldValue
++          true // requireOldValue TODO txMerge why is oldValue required for
++               // create? I think so that the EntryExistsException will have it.
++      )) {
++        throw new EntryExistsException(event.getKey().toString(),
++            event.getOldValue());
++      } else {
++        if (!getDataView().isDeferredStats()) {
++          getCachePerfStats().endPut(startPut, false);
++        }
++      }
++    } finally {
++
++      event.release();
++
+-    return new EntryEventImpl(this, Operation.CREATE, key,
++    return EntryEventImpl.create(this, Operation.CREATE, key,
+-      return validatedDestroy(key, event);
++    return validatedDestroy(key, event);
++    // TODO OFFHEAP: validatedDestroy calls freeOffHeapResources
+-  {
+-    if (event.getEventId() == null && generateEventID()) {
+-      event.setNewEventId(cache.getDistributedSystem());
++ {
++    try {
++      if (event.getEventId() == null && generateEventID()) {
++        event.setNewEventId(cache.getDistributedSystem());
++      }
++      basicDestroy(event, true, // cacheWrite
++          null); // expectedOldValue
++      if (event.isOldValueOffHeap()) {
++        return null;
++      } else {
++        return handleNotAvailable(event.getOldValue());
++      }
++    } finally {
++      event.release();
+-    basicDestroy(event,
+-                 true,  // cacheWrite
+-                 null); // expectedOldValue
+-    return handleNotAvailable(event.getOldValue());
+-    return new EntryEventImpl(this, Operation.DESTROY, key,
++    return EntryEventImpl.create(this, Operation.DESTROY, key,
+-   * @param returnTombstones TODO
++   * @param returnTombstones whether destroyed entries should be returned
++   * @param retainResult if true then the result may be a retained off-heap reference
+-  public final Object getDeserializedValue(final KeyInfo keyInfo, final boolean updateStats, boolean disableCopyOnRead, boolean preferCD, EntryEventImpl clientEvent, boolean returnTombstones) {
++  public final Object getDeserializedValue(RegionEntry re, final KeyInfo keyInfo, final boolean updateStats, boolean disableCopyOnRead, 
++  boolean preferCD, EntryEventImpl clientEvent, boolean returnTombstones, boolean allowReadFromHDFS, boolean retainResult) {
+-      RegionEntry re = this.entries.getEntry(keyInfo.getKey());
++      if (re == null) {
++        if (allowReadFromHDFS) {
++          re = this.entries.getEntry(keyInfo.getKey());
++        } else {
++          re = this.entries.getOperationalEntryInVM(keyInfo.getKey());
++        }
++      }
+-          value = getDeserialized(re, updateStats, disableCopyOnRead, preferCD);
++          value = getDeserialized(re, updateStats, disableCopyOnRead, preferCD, retainResult);
+-        value = getDeserialized(re, updateStats, disableCopyOnRead, preferCD);
++        value = getDeserialized(re, updateStats, disableCopyOnRead, preferCD, retainResult);
++   * @param retainResult if true then the result may be a retained off-heap reference
+-  protected final Object getDeserialized(RegionEntry re, boolean updateStats, boolean disableCopyOnRead, boolean preferCD) {
++  @Retained
++  protected final Object getDeserialized(RegionEntry re, boolean updateStats, boolean disableCopyOnRead, boolean preferCD, boolean retainResult) {
++    assert !retainResult || preferCD;
+-      Object v = null;
++      @Retained Object v = null;
+-         v = re.getValue(this); // OFFHEAP: incrc, deserialize, decrc TODO: optimize if preferCD but need to track down when to decrc in that case
++        if (retainResult) {
++          v = re.getValueRetain(this);
++        } else {
++          v = re.getValue(this);
++        }
+-                v = ((CachedDeserializable)v).getDeserializedForReading();
++              v = ((CachedDeserializable)v).getDeserializedForReading();
+-    Object result = get(key, aCallbackArgument, generateCallbacks, false, false, null, clientEvent, false);
++    Object result = get(key, aCallbackArgument, generateCallbacks, false, false, null, clientEvent, false, true/*allowReadFromHDFS*/);
+-	      ClientProxyMembershipID requestingClient, EntryEventImpl clientEvent, boolean returnTombstones) throws TimeoutException, CacheLoaderException {
++	      ClientProxyMembershipID requestingClient, EntryEventImpl clientEvent, boolean returnTombstones, boolean allowReadFromHDFS) throws TimeoutException, CacheLoaderException {
+-		      generateCallbacks, disableCopyOnRead, preferCD,requestingClient, clientEvent, returnTombstones, false);
++		      generateCallbacks, disableCopyOnRead, preferCD,requestingClient, clientEvent, returnTombstones, false, allowReadFromHDFS, false);
++   * The result of this operation may be an off-heap reference that the caller must release
++   */
++  @Retained
++  public Object getRetained(Object key, Object aCallbackArgument,
++      boolean generateCallbacks, boolean disableCopyOnRead,
++      ClientProxyMembershipID requestingClient, EntryEventImpl clientEvent, boolean returnTombstones) throws TimeoutException, CacheLoaderException {
++    return getRetained(key, aCallbackArgument,
++              generateCallbacks, disableCopyOnRead, requestingClient, clientEvent, returnTombstones, false);
++  }
++
++  /**
++   * The result of this operation may be an off-heap reference that the caller must release.
++  @Retained
++  public Object getRetained(Object key, Object aCallbackArgument,
++      boolean generateCallbacks, boolean disableCopyOnRead,
++      ClientProxyMembershipID requestingClient, EntryEventImpl clientEvent, boolean returnTombstones, boolean opScopeIsLocal) throws TimeoutException, CacheLoaderException {
++    return get(key, aCallbackArgument, generateCallbacks, disableCopyOnRead, true, requestingClient, clientEvent, returnTombstones, opScopeIsLocal, true, false);
++  }
++  /**
++   * @param opScopeIsLocal if true then just check local storage for a value; if false then try to find the value if it is not local
++   * @param retainResult if true then the result may be a retained off-heap reference.
++   */
+-      ClientProxyMembershipID requestingClient, EntryEventImpl clientEvent, boolean returnTombstones, boolean opScopeIsLocal) throws TimeoutException, CacheLoaderException
++      ClientProxyMembershipID requestingClient, EntryEventImpl clientEvent, boolean returnTombstones, 
++	  boolean opScopeIsLocal, boolean allowReadFromHDFS, boolean retainResult) throws TimeoutException, CacheLoaderException
++    assert !retainResult || preferCD;
+-      Object value = getDataView().getDeserializedValue(getKeyInfo(key), this, true, disableCopyOnRead, preferCD, clientEvent, returnTombstones);
++      KeyInfo keyInfo = getKeyInfo(key, aCallbackArgument);
++      Object value = getDataView().getDeserializedValue(keyInfo, this, true, disableCopyOnRead, preferCD, clientEvent, returnTombstones, allowReadFromHDFS, retainResult);
+-            && (getScope().isDistributed()
++            && ((getScope().isDistributed() && !isHDFSRegion())
+-          value = getDataView().findObject(getKeyInfo(key, aCallbackArgument),
++          // TODO OFFHEAP OPTIMIZE: findObject can be enhanced to use the retainResult flag
++          value = getDataView().findObject(keyInfo,
+-              preferCD, requestingClient, clientEvent, returnTombstones);
++              preferCD, requestingClient, clientEvent, returnTombstones, false/*allowReadFromHDFS*/);
+-    if (re == null && !isTX()) {
++    if (re == null && !isTX() && !isHDFSRegion()) {
++   * @return true if this region has been configured for HDFS persistence
++   */
++  public boolean isHDFSRegion() {
++    return false;
++  }
++
++  /**
++   * @return true if this region is configured to read and write data from HDFS
++   */
++  public boolean isHDFSReadWriteRegion() {
++    return false;
++  }
++
++  /**
++   * @return true if this region is configured to only write to HDFS
++   */
++  protected boolean isHDFSWriteOnly() {
++    return false;
++  }
++
++  /**
++   * FOR TESTING ONLY
++   */
++  public HoplogListenerForRegion getHoplogListener() {
++    return hoplogListener;
++  }
++  
++  /**
++   * FOR TESTING ONLY
++   */
++  public HdfsRegionManager getHdfsRegionManager() {
++    return hdfsManager;
++  }
++  
++  /**
++  @Retained
+-      EntryEventImpl clientEvent, boolean returnTombstones) 
++      EntryEventImpl clientEvent, boolean returnTombstones, boolean allowReadFromHDFS) 
++    final Object key = keyInfo.getKey();
++  
+-    Object result = null;
++    @Retained Object result = null;
++           
++          //For sqlf since the deserialized value is nothing but chunk
++          // before returning the found value increase its use count
++          if(GemFireCacheImpl.sqlfSystem() && result instanceof Chunk) {
++            if(!((Chunk)result).retain()) {
++              return null;
++            }
++          }
+-    // didn't find a future, do one more getDeserialized to catch race
+-    // condition where the future was just removed by another get thread
++    // didn't find a future, do one more probe for the entry to catch a race
++    // condition where the future was just removed by another thread
+-      localValue = getDeserializedValue(keyInfo, isCreate, disableCopyOnRead, preferCD, clientEvent, false);
+-      // stats have now been updated
+-      if (localValue != null && !Token.isInvalid(localValue)) {
+-        result = localValue;
+-        return result;
+-      }
+-      isCreate = localValue == null;
++      boolean partitioned = this.getDataPolicy().withPartitioning();
++      if (!partitioned) {
++        localValue = getDeserializedValue(null, keyInfo, isCreate, disableCopyOnRead, preferCD, clientEvent, false, false/*allowReadFromHDFS*/, false);
+-      result = findObjectInSystem(keyInfo, isCreate, null, generateCallbacks,
+-          localValue, disableCopyOnRead, preferCD, null, clientEvent, returnTombstones);
+-      
++        // stats have now been updated
++        if (localValue != null && !Token.isInvalid(localValue)) {
++          result = localValue;
++          return result;
++        }
++        isCreate = localValue == null;
++        result = findObjectInSystem(keyInfo, isCreate, null, generateCallbacks,
++            localValue, disableCopyOnRead, preferCD, null, clientEvent, returnTombstones, false/*allowReadFromHDFS*/);
++
++      } else {
++        
++        // This code was moved from PartitionedRegion.nonTxnFindObject().  That method has been removed.
++        // For PRs we don't want to deserialize the value and we can't use findObjectInSystem because
++        // it can invoke code that is transactional.
++        result = getSharedDataView().findObject(keyInfo, this, true/*isCreate*/, generateCallbacks,
++            localValue, disableCopyOnRead, preferCD, null, null, false, allowReadFromHDFS);
++        // TODO why are we not passing the client event or returnTombstones in the above invokation?
++      }
++
+-      VersionTag tag = (clientEvent==null)? null : clientEvent.getVersionTag();
+-      thisFuture.set(new Object[]{result, tag});
++      if (result != null) {
++        VersionTag tag = (clientEvent==null)? null : clientEvent.getVersionTag();
++        thisFuture.set(new Object[]{result, tag});
++      } else {
++        thisFuture.set(null);
++      }
++      && ! getOffHeap()
+-      return validatedPut(event, startPut);
++     //Since Sqlfire directly calls validatedPut, the freeing is done in
++    // validatedPut
++     return validatedPut(event, startPut);
++     // TODO OFFHEAP: validatedPut calls freeOffHeapResources
++    
+-    if (event.getEventId() == null && generateEventID()) {
+-      event.setNewEventId(cache.getDistributedSystem());
+-    }
+-    Object oldValue = null;
+-    //Sqlf changes begin
+-    // see #40294.
+-    
+-    //Rahul: this has to be an update.
+-    // so executing it as an update.
+-    boolean forceUpdateForDelta = event.hasDelta();
+-    // Sqlf Changes end.
+-    if (basicPut(event,
+-                   false, // ifNew
+-                   forceUpdateForDelta, // ifOld
+-                   null,  // expectedOldValue
+-                   false // requireOldValue
+-                   )) {
+-      // don't copy it to heap just to return from put.
+-      // TODO: come up with a better way to do this.
+-      oldValue = event.getOldValue();
+-      if (!getDataView().isDeferredStats()) {
+-        getCachePerfStats().endPut(startPut, false);
++    try {
++      if (event.getEventId() == null && generateEventID()) {
++        event.setNewEventId(cache.getDistributedSystem());
++      Object oldValue = null;
++      // Sqlf changes begin
++      // see #40294.
++
++      // Rahul: this has to be an update.
++      // so executing it as an update.
++      boolean forceUpdateForDelta = event.hasDelta();
++      // Sqlf Changes end.
++      if (basicPut(event, false, // ifNew
++          forceUpdateForDelta, // ifOld
++          null, // expectedOldValue
++          false // requireOldValue
++      )) {
++        if (!event.isOldValueOffHeap()) {
++          // don't copy it to heap just to return from put.
++          // TODO: come up with a better way to do this.
++          oldValue = event.getOldValue();
++        }
++        if (!getDataView().isDeferredStats()) {
++          getCachePerfStats().endPut(startPut, false);
++        }
++      }
++      return handleNotAvailable(oldValue);
++    } finally {
++      event.release();
+-    return handleNotAvailable(oldValue);
+-    final EntryEventImpl event = new EntryEventImpl(
++    final EntryEventImpl event = EntryEventImpl.create(
++    boolean eventReturned = false;
++    try {
++    eventReturned = true;
++    } finally {
++      if (!eventReturned) event.release();
++    }
+-
++  /**
++   * Creates an EntryEventImpl that is optimized to not fetch data from HDFS.
++   * This is meant to be used by PUT dml from GemFireXD.
++   */
++  public final EntryEventImpl newPutEntryEvent(Object key, Object value,
++      Object aCallbackArgument) {
++    EntryEventImpl ev = newUpdateEntryEvent(key, value, aCallbackArgument);
++    ev.setFetchFromHDFS(false);
++    ev.setPutDML(true);
++    return ev;
++  }
+-  /**
++  protected boolean includeHDFSResults() {
++    return isUsedForPartitionedRegionBucket() 
++        && isHDFSReadWriteRegion() 
++        && getPartitionedRegion().includeHDFSResults();
++  }
++  
++
++  /** a fast estimate of total number of entries locally in the region */
++  public long getEstimatedLocalSize() {
++    RegionMap rm;
++    if (!this.isDestroyed) {
++      long size;
++      if (isHDFSReadWriteRegion() && this.initialized) {
++        // this size is not used by HDFS region iterators
++        // fixes bug 49239
++        return 0;
++      }
++      // if region has not been initialized yet, then get the estimate from
++      // disk region's recovery map if available
++      if (!this.initialized && this.diskRegion != null
++          && (rm = this.diskRegion.getRecoveredEntryMap()) != null
++          && (size = rm.size()) > 0) {
++        return size;
++      }
++      if ((rm = getRegionMap()) != null) {
++        return rm.size();
++      }
++    }
++    return 0;
++  }
++    /**
++  /**
++   * Returns true if this region is or has been closed or destroyed.
++   * Note that unlike {@link #isDestroyed()} this method will not
++   * return true if the cache is closing but has not yet started closing
++   * this region.
++   */
++  public boolean isThisRegionBeingClosedOrDestroyed() {
++    return this.isDestroyed;
++  }
++  
++        ReferenceCountHelper.skipRefCountTracking();
+-        // No need to deserialize because of Bruce's fix in r30960 for bug 42162. See bug 42732.
+-
++        if (val instanceof StoredObject) {
++          OffHeapHelper.release(val);
++          ReferenceCountHelper.unskipRefCountTracking();
++          return true;
++        }
++        ReferenceCountHelper.unskipRefCountTracking();
++        // No need to to check CachedDeserializable because of Bruce's fix in r30960 for bug 42162. See bug 42732.
+-  public int entryCount()
+-  {
++  public final int entryCount() {
++  public int entryCount(Set<Integer> buckets) {
++    return entryCount(buckets, false);
++  }
++
++  protected int entryCount( Set<Integer> buckets, boolean estimate) {
++    assert buckets == null: "unexpected buckets " + buckets + " for region "
++        + toString();
++
++    return getDataView().entryCount(this);
++  }
++
++  public int entryCountEstimate(final TXStateInterface tx, Set<Integer> buckets, boolean entryCountEstimate) {
++    return entryCount(buckets, entryCountEstimate);
++  }
++
++	if (includeHDFSResults()) {
++      return result;
++    }
+-    EntryEventImpl event = new EntryEventImpl(
++    EntryEventImpl event = EntryEventImpl.create(
++    try {
++    } finally {
++      event.release();
++    }
+-    EntryEventImpl event = new EntryEventImpl(
++    EntryEventImpl event = EntryEventImpl.create(
++    } finally {
++      event.release();
+-    EntryEventImpl event = new EntryEventImpl(
++    EntryEventImpl event = EntryEventImpl.create(
++    try {
++    } finally {
++      event.release();
++    }
+-        cache.getResourceManager().addResourceListener(this);
++        cache.getResourceManager().addResourceListener(ResourceType.MEMORY, this);
++    Set<Index> prIndexes = new HashSet<Index>();
+-                icd.getIndexImportString(), externalContext, icd.getPartitionedIndex(), !isOverflowToDisk));           
++                icd.getIndexImportString(), externalContext, icd.getPartitionedIndex(), !isOverflowToDisk));
++            prIndexes.add(icd.getPartitionedIndex());
++      //due to bug #52096, the pr index populate flags were not being set 
++      //we should revisit and clean up the index creation code paths
++      this.indexManager.setPopulateFlagForIndexes(prIndexes);
+-      this.entries.clear(null);
++      closeEntries();
++  
++  public void closeEntries() {
++    this.entries.close();
++  }
++  public Set<VersionSource> clearEntries(RegionVersionVector rvv) {
++    return this.entries.clear(rvv);
++  }
++   * This method should be called when the caller cannot locate an entry and that condition
++   * is unexpected.  This will first double check the cache and region state before throwing
++   * an EntryNotFoundException.  EntryNotFoundException should be a last resort exception.
++   * 
++   * @param entryKey the missing entry's key.
++   */
++  public void checkEntryNotFound(Object entryKey) {
++    checkReadiness();
++    // Localized string for partitioned region is generic enough for general use
++    throw new EntryNotFoundException(LocalizedStrings.PartitionedRegion_ENTRY_NOT_FOUND_FOR_KEY_0.toLocalizedString(entryKey));    
++  }
++  
++  /**
+-   * @see DistributedRegion#findObjectInSystem(KeyInfo, boolean, TXStateInterface, boolean, Object, boolean, boolean, ClientProxyMembershipID, EntryEventImpl, boolean)
++   * @see DistributedRegion#findObjectInSystem(KeyInfo, boolean, TXStateInterface, boolean, Object, boolean, boolean, ClientProxyMembershipID, EntryEventImpl, boolean, boolean )
+-      EntryEventImpl clientEvent, boolean returnTombstones)
++      EntryEventImpl clientEvent, boolean returnTombstones,  boolean allowReadFromHDFS)
+-        value = mySRP.get(key, aCallbackArgument, holder);
+-        fromServer = value != null;
++        try {
++          value = mySRP.get(key, aCallbackArgument, holder);
++          fromServer = value != null;
++        } finally {
++          holder.release();
++        }
+-    if (!fromServer) {
++    if (!fromServer || value == Token.TOMBSTONE) {
++          fromServer = false;
++    // don't allow tombstones into a client cache if it doesn't
++    // have concurrency checks enabled
++    if (fromServer && 
++        value == Token.TOMBSTONE && !this.concurrencyChecksEnabled) {
++      value = null;
++    }
+-    if (value != null && !isHeapThresholdReachedForLoad()) {
++    if (value != null && !isMemoryThresholdReachedForLoad()) {
+-        = new EntryEventImpl(this, op, key, value, aCallbackArgument,
++        = EntryEventImpl.create(this, op, key, value, aCallbackArgument,
++      try {
+-          if (fromServer && (event.getNewValue() == Token.TOMBSTONE)) {
++          if (fromServer && (event.getRawNewValue() == Token.TOMBSTONE)) {
++      } finally {     
++          event.release();        
++      }
+-  protected boolean isHeapThresholdReachedForLoad() {
+-    return this.heapThresholdReached.get();
++  protected boolean isMemoryThresholdReachedForLoad() {
++    return this.memoryThresholdReached.get();
++    @Unretained(ENTRY_EVENT_NEW_VALUE)
++        // serverPut is called by cacheWriteBeforePut so the new value will not yet be off-heap
++        // TODO OFFHEAP: verify that the above assertion is true
++  @Retained
+-      throw new EntryNotFoundException(keyInfo.getKey().toString());
++      checkEntryNotFound(keyInfo.getKey());
+-      throw new EntryNotFoundException(keyInfo.getKey().toString());
++      checkEntryNotFound(keyInfo.getKey());
+-//   public void createRegionOnServer() throws CacheWriterException
+-//   {
+-//     if (basicGetWriter() instanceof BridgeWriter) {
+-//       if (getParentRegion() != null) {
+-//         BridgeWriter bw = (BridgeWriter)basicGetWriter();
+-//         bw.createRegionOnServer(getParentRegion().getFullPath(), getName());
+-//       }
+-//       else {
+-//        throw new CacheWriterException(LocalizedStrings.LocalRegion_REGION_0_IS_A_ROOT_REGION_ONLY_NONROOT_REGIONS_CAN_BE_CREATED_ON_THE_SERVER.toLocalizedString(getFullPath()));
+-//       }
+-//     }
+-//     else {
+-//      throw new CacheWriterException(LocalizedStrings.LocalRegion_SERVER_REGION_CREATION_IS_ONLY_SUPPORTED_ON_CLIENT_SERVER_TOPOLOGIES_THE_CURRENT_CACHEWRITER_IS_0.toLocalizedString(this.cacheWriter));
+-//     }
+-//   }
+-
+-      if (proxy.getPool() instanceof BridgePoolImpl) {
+-        String msg = "Interest registration requires establishCallbackConnection to be set to true.";
+-        throw new BridgeWriterException(msg);
+-      } else {
+-        String msg = "Interest registration requires a pool whose queue is enabled.";
+-        throw new SubscriptionNotEnabledException(msg);
+-      }
++      String msg = "Interest registration requires a pool whose queue is enabled.";
++      throw new SubscriptionNotEnabledException(msg);
+-        BridgeObserver bo = BridgeObserverHolder.getInstance();
++        ClientServerObserver bo = ClientServerObserverHolder.getInstance();
+-    EntryEventImpl event = new EntryEventImpl(this, Operation.LOCAL_DESTROY,
++    EntryEventImpl event = EntryEventImpl.create(this, Operation.LOCAL_DESTROY,
++    } finally {
++      event.release();
+-            localDestroyNoCallbacks(currentKey);
+-              //TODO - shouldn't we skip this value and not put it in the region
+-              //then? I think we're putting an Exception object in the region.
++              localDestroyNoCallbacks(currentKey);
++              continue;
+-                logger.debug("refreshEntries key={} value={}", currentKey, entry);
++                logger.debug("refreshEntries key={} value={} version={}", currentKey, entry, tag);
++              }
++              if (tag == null) { // no version checks
++                localDestroyNoCallbacks(currentKey);
++  @Retained
++  if (this.hdfsStoreName != null) {
++    notifyGatewaySender(eventType, event);
++    }
+-    final EntryEventImpl event = new EntryEventImpl(this, Operation.CREATE, key,
++    final EntryEventImpl event = EntryEventImpl.create(this, Operation.CREATE, key,
++    try {
++    } finally {
++      event.release();
++    }
+-    final EntryEventImpl event = new EntryEventImpl(this, Operation.UPDATE, key,
++    final EntryEventImpl event = EntryEventImpl.create(this, Operation.UPDATE, key,
++    try {
++    } finally {
++      event.release();
++    }
+-        new EntryEventImpl(this,
++        EntryEventImpl.create(this,
++      try {
++      } finally {
++        event.release();
++      }
+-        new EntryEventImpl(this,
++        EntryEventImpl.create(this,
++      try {
++      } finally {
++        event.release();
++      }
+-    final EntryEventImpl event = new EntryEventImpl(this, Operation.DESTROY, key,
++    final EntryEventImpl event = EntryEventImpl.create(this, Operation.DESTROY, key,
++    try {
++    } finally {
++      event.release();
++    }
+-    final EntryEventImpl event = new EntryEventImpl(this, Operation.INVALIDATE, key,
++    final EntryEventImpl event = EntryEventImpl.create(this, Operation.INVALIDATE, key,
++    try {
++    } finally {
++      event.release();
++    }
+-    EntryEventImpl event = new EntryEventImpl(this, Operation.UPDATE_VERSION_STAMP, key,
++    EntryEventImpl event = EntryEventImpl.create(this, Operation.UPDATE_VERSION_STAMP, key,
++      event.release();
+-    if (!InternalResourceManager.isLowMemoryExceptionDisabled()) {
++    if (!MemoryThresholds.isLowMemoryExceptionDisabled()) {
+-        return event.getOldValue() == null;
++        return !event.hasOldValue();
+-    if (heapThresholdReached.get()) {
+-      Set<DistributedMember> htrm = getHeapThresholdReachedMembers();
++    if (memoryThresholdReached.get()) {
++      Set<DistributedMember> htrm = getMemoryThresholdReachedMembers();
+-      InternalResourceManager.getInternalResourceManager(cache).triggerMemoryEvent();
+-      
++      InternalResourceManager.getInternalResourceManager(cache).getHeapMonitor().updateStateAndSendEvent();
++
++      if (GemFireCacheImpl.internalBeforeNonTXBasicPut != null) {
++        GemFireCacheImpl.internalBeforeNonTXBasicPut.run();
++      }
++      
++    try {
++    } finally {
++      updateTimeStampEvent.release();
++    }
++   public VersionTag findVersionTagForGatewayEvent(EventID eventId) {
++     if (this.eventTracker != null) {
++       return this.eventTracker.findVersionTagForGateway(eventId);
++     }
++     return null;
++   }
++   
++  /**
++   * Returns true if this region notifies multiple serial gateways.
++   */
++  public boolean notifiesMultipleSerialGateways() {
++    if (isPdxTypesRegion()) {
++      return false;
++    }
++    int serialGatewayCount = 0;
++    Set<String> allGatewaySenderIds = getAllGatewaySenderIds();
++    if (!allGatewaySenderIds.isEmpty()) {
++      List<Integer> allRemoteDSIds = getRemoteDsIds(allGatewaySenderIds);
++      if (allRemoteDSIds != null) {
++        for (GatewaySender sender : getCache().getAllGatewaySenders()) {
++          if (allGatewaySenderIds.contains(sender.getId())) {
++            if (!sender.isParallel()) {
++              serialGatewayCount++;
++              if (serialGatewayCount > 1) {
++                return true;
++              }
++            }
++          }
++        }
++      }
++    }
++    return false;
++  }
++  
++      final LogWriter logWriter = cache.getLogger();
++      float evictionPercentage = DEFAULT_HEAPLRU_EVICTION_HEAP_PERCENTAGE;
+-      // we make sure that the EvictionHeapPercentage is enabled.
++      // we make sure that the eviction percentage is enabled.
+-      if (!rm.hasEvictionThreshold()) { // fix for bug 42130
+-        float chp = rm.getCriticalHeapPercentage();
+-        if (chp > 0.0f) {
+-          if (chp >= 10.0f) {
+-            chp -= 5.0f;
++      if (!getOffHeap()) {
++        if (!rm.getHeapMonitor().hasEvictionThreshold()) {
++          float criticalPercentage = rm.getCriticalHeapPercentage();
++          if (criticalPercentage > 0.0f) {
++            if (criticalPercentage >= 10.f) {
++              evictionPercentage = criticalPercentage - 5.0f;
++            } else {
++              evictionPercentage = criticalPercentage;
++            }
+-          rm.setEvictionHeapPercentage(chp);
+-        } else {
+-          rm.setEvictionHeapPercentage(DEFAULT_HEAPLRU_EVICTION_HEAP_PERCENTAGE);
++          rm.setEvictionHeapPercentage(evictionPercentage);
++          if (logWriter.fineEnabled()) {
++            logWriter.fine("Enabled heap eviction at " + evictionPercentage + " percent for LRU region");
++          }
++        }
++      } else {
++        if (!rm.getOffHeapMonitor().hasEvictionThreshold()) {
++          float criticalPercentage = rm.getCriticalOffHeapPercentage();
++          if (criticalPercentage > 0.0f) {
++            if (criticalPercentage >= 10.f) {
++              evictionPercentage = criticalPercentage - 5.0f;
++            } else {
++              evictionPercentage = criticalPercentage;
++            }
++          }
++          rm.setEvictionOffHeapPercentage(evictionPercentage);
++          if (logWriter.fineEnabled()) {
++            logWriter.fine("Enabled off-heap eviction at " + evictionPercentage + " percent for LRU region");
++          }
+-    
++      
+-    EntryEventImpl event = new EntryEventImpl(
++    EntryEventImpl event = EntryEventImpl.create(
++    event.setFetchFromHDFS(false);
++    return event;
++  }
++    protected EntryEventImpl generateCustomEvictDestroyEvent(final Object key) {
++    EntryEventImpl event =  EntryEventImpl.create(
++        this, Operation.CUSTOM_EVICT_DESTROY, key, null/* newValue */,
++        null, false, getMyId());
++    
++    // Fix for bug#36963
++    if (generateEventID()) {
++      event.setNewEventId(cache.getDistributedSystem());
++    }
++    event.setFetchFromHDFS(false);
++    } finally {
++      event.release();
+-
++        
++          final EventDispatcher ed = new EventDispatcher(event, op);
+-            this.cache.getEventThreadPool().execute(
+-                new EventDispatcher(event, op));
++            this.cache.getEventThreadPool().execute(ed);
++            ed.release();
++    // TODO OFFHEAP MERGE: to fix 49905 asif commented out isDestroyed being set.
++    // But in xd it was set after closeEntries was called.
++    // Here it is set before and it fixed 49555.
+-    this.entries.clear(null); //fixes bug 41333
++    closeEntries(); //fixes bug 41333
+-    Iterator it = this.entries.regionEntries().iterator();
++    Iterator it = this.entries.regionEntriesInVM().iterator();
+-        EntryEventImpl event = new EntryEventImpl(
++        EntryEventImpl event = EntryEventImpl.create(
++        try {
++        } finally {
++          event.release();
++        }
+-                               getCompressor());
++                               getCompressor(), getOffHeap());
+-      Object value = this.region.getDeserialized(getCheckedRegionEntry(), false, false, false);
++      Object value = this.region.getDeserialized(getCheckedRegionEntry(), false, false, false, false);
++  /**
++   * Used by unit tests to get access to the EntryExpiryTask
++   * of the given key. Returns null if the entry exists but
++   * does not have an expiry task.
++   * @throws EntryNotFoundException if no entry exists key.
++   */
++  public EntryExpiryTask getEntryExpiryTask(Object key) {
++    RegionEntry re = this.getRegionEntry(key);
++    if (re == null) {
++      throw new EntryNotFoundException("Entry for key " + key + " does not exist.");
++    }
++    return this.entryExpiryTasks.get(re);
++  }
++  /**
++   * Used by unit tests to get access to the RegionIdleExpiryTask
++   * of this region. Returns null if no task exists.
++   */
++  public RegionIdleExpiryTask getRegionIdleExpiryTask() {
++    return this.regionIdleExpiryTask;
++  }
++  /**
++   * Used by unit tests to get access to the RegionTTLExpiryTask
++   * of this region. Returns null if no task exists.
++   */
++  public RegionTTLExpiryTask getRegionTTLExpiryTask() {
++    return this.regionTTLExpiryTask;
++  }
++  
+-  public final TXStateInterface getTXState() {
++  public final TXStateProxy getTXState() {
++    
++    if (event.getOperation().isCreate()) {
++      if (logger.isDebugEnabled()) {
++        logger.debug("invoking listeners: " + Arrays.toString(listeners));
++      }
++    }
+-    }
++    }    
++                
++      if (LocalRegion.this.offHeap && event instanceof EntryEventImpl) {
++        // Make a copy that has its own off-heap refcount so fix bug 48837
++        event = new EntryEventImpl( (EntryEventImpl)event);   
++      }
+-      dispatchEvent(LocalRegion.this, this.event, this.op);
++      try {
++        dispatchEvent(LocalRegion.this, this.event, this.op);
++      }finally {
++        this.release();
++      }
++    }
++    
++    public void release() {
++      if (LocalRegion.this.offHeap && this.event instanceof EntryEventImpl) {
++        ((EntryEventImpl)this.event).release();
++      }      
++  
++  
+-        Object value = getDeserialized(this.basicGetEntry(), false, ignoreCopyOnRead, false);
++        Object value = getDeserialized(this.basicGetEntry(), false, ignoreCopyOnRead, false, false);
++   * returns an estimate of the number of entries in this region. This method
++   * should be prefered over size() for hdfs regions where an accurate size is
++   * not needed. This method is not supported on a client
++   * 
++   * @return the estimated size of this region
++   */
++  public int sizeEstimate() {
++    boolean isClient = this.imageState.isClient();
++    if (isClient) {
++      throw new UnsupportedOperationException(
++          "Method not supported on a client");
++    }
++    return entryCount(null, true);
++  }
++
++  /**
+-    RegionEventImpl event = new BridgeRegionEventImpl(this, Operation.REGION_DESTROY,
++    RegionEventImpl event = new ClientRegionEventImpl(this, Operation.REGION_DESTROY,
+-    RegionEventImpl event = new BridgeRegionEventImpl(this, Operation.REGION_CLEAR,
++    RegionEventImpl event = new ClientRegionEventImpl(this, Operation.REGION_CLEAR,
+-      Set<VersionSource> remainingIDs = this.entries.clear(rvv);
++      Set<VersionSource> remainingIDs = clearEntries(rvv);
++    clearHDFSData();
++    
++  /**Clear HDFS data, if present */
++  protected void clearHDFSData() {
++    //do nothing, clear is implemented for subclasses like BucketRegion.
++  }
++
++    final boolean isTraceEnabled = logger.isTraceEnabled();
+-          EntryEventImpl event = new EntryEventImpl(
++          EntryEventImpl event = EntryEventImpl.create(
++          try {
+-            if (isDebugEnabled) {
+-              logger.debug("Added remote result for getAll request: {}, {}", key, value);
++            if (isTraceEnabled) {
++              logger.trace("Added remote result for getAll request: {}, {}", key, value);
++          } finally {
++            event.release();
++          }
+-      if (!InternalResourceManager.isLowMemoryExceptionDisabled()) {
++      if (!MemoryThresholds.isLowMemoryExceptionDisabled()) {
+-    final EntryEventImpl event = new EntryEventImpl(this, Operation.PUTALL_CREATE, null,
++    final EntryEventImpl event = EntryEventImpl.create(this, Operation.PUTALL_CREATE, null,
++    try {
++    try {
++    } finally {
++      putAllOp.freeOffHeapResources();
++    }
++    } finally {
++      event.release();
++    }
+-    final EntryEventImpl event = new EntryEventImpl(this, Operation.REMOVEALL_DESTROY, null,
++    final EntryEventImpl event = EntryEventImpl.create(this, Operation.REMOVEALL_DESTROY, null,
++    try {
++    try {
++    } finally {
++      removeAllOp.freeOffHeapResources();
++    }
++    } finally {
++      event.release();
++    }
+-    EntryEventImpl event = new EntryEventImpl(this, Operation.PUTALL_CREATE,
++    EntryEventImpl event = EntryEventImpl.create(this, Operation.PUTALL_CREATE,
++    try {
++    try {
++    } finally {
++      putAllOp.freeOffHeapResources();
++    }
++    } finally {
++      event.release();
++    }
++      try {
++      } finally {
++        putAllOp.getBaseEvent().release();
++        putAllOp.freeOffHeapResources();
++      }
++      try {
++      } finally {
++        op.getBaseEvent().release();
++        op.freeOffHeapResources();
++      }
++                try {
++                } finally {
++                  tagHolder.release();
++                }
++      putAllOp.getBaseEvent().release();
++      putAllOp.freeOffHeapResources();
++      removeAllOp.getBaseEvent().release();
++      removeAllOp.freeOffHeapResources();
+-    final EntryEventImpl event = new EntryEventImpl(this,
++    final EntryEventImpl event = EntryEventImpl.create(this,
+-    return new DistributedPutAllOperation(event, map.size(), false);
++
++    event.disallowOffHeapValues();
++    DistributedPutAllOperation dpao = new DistributedPutAllOperation(event, map.size(), false);
++    return dpao;
++    public final DistributedPutAllOperation newPutAllForPUTDmlOperation(Map<?, ?> map, Object callbackArg) {
++    DistributedPutAllOperation dpao = newPutAllOperation(map, callbackArg);
++    dpao.getEvent().setFetchFromHDFS(false);
++    dpao.getEvent().setPutDML(true);
++    return dpao;
++  }
++
+-    final EntryEventImpl event = new EntryEventImpl(this, Operation.REMOVEALL_DESTROY, null,
++    final EntryEventImpl event = EntryEventImpl.create(this, Operation.REMOVEALL_DESTROY, null,
++    event.disallowOffHeapValues();
++
++    try {
++	event.setFetchFromHDFS(putallOp.getEvent().isFetchFromHDFS());
++    event.setPutDML(putallOp.getEvent().isPutDML());
++    
++    } finally {
++      event.release();
++    }
++    try {
++    } finally {
++      event.release();
++    }
+-    return (this.cache.getBridgeServers().size() > 0)
++    return (this.cache.getCacheServers().size() > 0)
+-      // send it as is to the BridgeLoader
++      // send it as is to the server
+-    if (function.optimizeForWrite() && heapThresholdReached.get() &&
+-        !InternalResourceManager.isLowMemoryExceptionDisabled()) {
+-      Set<DistributedMember> htrm = getHeapThresholdReachedMembers();
++    if (function.optimizeForWrite() && memoryThresholdReached.get() &&
++        !MemoryThresholds.isLowMemoryExceptionDisabled()) {
++      Set<DistributedMember> htrm = getMemoryThresholdReachedMembers();
+-  public Set<DistributedMember> getHeapThresholdReachedMembers() {
++  public Set<DistributedMember> getMemoryThresholdReachedMembers() {
+-    setHeapThresholdFlag(event);
++    setMemoryThresholdFlag(event);
+-  protected void setHeapThresholdFlag(MemoryEvent event) {
++  protected void setMemoryThresholdFlag(MemoryEvent event) {
+-      if (event.getType().isCriticalUp()) {
+-        //start rejecting operations
+-        heapThresholdReached.set(true);
+-      } else if (event.getType().isCriticalDown() || event.getType().isCriticalDisabled()) {
+-        //stop rejecting operations
+-        heapThresholdReached.set(false);
++      if (event.getState().isCritical()
++          && !event.getPreviousState().isCritical()
++          && (event.getType() == ResourceType.HEAP_MEMORY || (event.getType() == ResourceType.OFFHEAP_MEMORY && getOffHeap()))) {
++        // start rejecting operations
++        memoryThresholdReached.set(true);
++      } else if (!event.getState().isCritical()
++          && event.getPreviousState().isCritical()
++          && (event.getType() == ResourceType.HEAP_MEMORY || (event.getType() == ResourceType.OFFHEAP_MEMORY && getOffHeap()))) {
++        memoryThresholdReached.set(false);
+-   * called when registering using {@link InternalResourceManager#addResourceListener(ResourceListener)}.
++   * called when registering using {@link InternalResourceManager#addResourceListener(ResourceType, ResourceListener)}.
+-   * @param localHeapIsCritical true if the local heap is in a critical state
+-   * @param critialMembers set of members whose heaps are in a critical state
+-   * @see ResourceManager#setCriticalHeapPercentage(float)
++   * @param localMemoryIsCritical true if the local memory is in a critical state
++   * @param critialMembers set of members whose memory is in a critical state
++   * @see ResourceManager#setCriticalHeapPercentage(float) and ResourceManager#setCriticalOffHeapPercentage(float)
+-  public void initialCriticalMembers(boolean localHeapIsCritical,
++  public void initialCriticalMembers(boolean localMemoryIsCritical,
+-    if (localHeapIsCritical) {
+-      heapThresholdReached.set(true);
++    if (localMemoryIsCritical) {
++      memoryThresholdReached.set(true);
+-    EntryEventImpl event = new EntryEventImpl(
++    EntryEventImpl event = EntryEventImpl.create(
++    try {
++    } finally {
++      event.release();
++    }
+-     EntryEventImpl event = new EntryEventImpl(
++     EntryEventImpl event = EntryEventImpl.create(
++     } finally {
++       event.release();
+-    EntryEventImpl event = new EntryEventImpl(this,
++    EntryEventImpl event = EntryEventImpl.create(this,
++    } finally {
++      event.release();
+-    EntryEventImpl event = new EntryEventImpl(this,
++    EntryEventImpl event = EntryEventImpl.create(this,
++    } finally {
++      event.release();
+-    EntryEventImpl event = new EntryEventImpl(this,
++    EntryEventImpl event = EntryEventImpl.create(this,
++    } finally {
++      event.release();
+-    final EntryEventImpl event = new EntryEventImpl(this, Operation.PUT_IF_ABSENT, key,
++    final EntryEventImpl event = EntryEventImpl.create(this, Operation.PUT_IF_ABSENT, key,
++    try {
+-    Object oldValue = event.getRawOldValue();
++    Object oldValue = event.getRawOldValueAsHeapObject();
++    } finally {
++      event.release();
++    }
+-    final EntryEventImpl event = new EntryEventImpl(this, Operation.REPLACE, key,
++    final EntryEventImpl event = EntryEventImpl.create(this, Operation.REPLACE, key,
++    try {
++    } finally {
++      event.release();
++    }
+-    final EntryEventImpl event = new EntryEventImpl(this, Operation.REPLACE, key,
++    final EntryEventImpl event = EntryEventImpl.create(this, Operation.REPLACE, key,
++    try {
+-      Object oldValue = event.getRawOldValue();
++      Object oldValue = event.getRawOldValueAsHeapObject();
++    } finally {
++      event.release();
++    }
+-    final EntryEventImpl event = new EntryEventImpl(this, Operation.REMOVE, key,
++    final EntryEventImpl event = EntryEventImpl.create(this, Operation.REMOVE, key,
++    try {
++    } finally {
++      event.release();
++    }
++  private boolean isTest = false;
++  protected static boolean simulateClearForTests = false;
++
++  private AtomicInteger countNotFoundInLocal = null; 
++  public void setIsTest() {
++    isTest = true;
++    countNotFoundInLocal = new AtomicInteger();
++  }
++  public boolean isTest() {
++    return isTest;
++  } 
++  public void incCountNotFoundInLocal() {
++    countNotFoundInLocal.incrementAndGet();
++  }
++  
++  public Integer getCountNotFoundInLocal() {
++    return countNotFoundInLocal.get();
++  }
++  /// End of Variables and methods for test Hook for HDFS ///////
++  public void forceHDFSCompaction(boolean isMajor, Integer maxWaitTime) {
++    throw new UnsupportedOperationException(
++        LocalizedStrings.HOPLOG_DOES_NOT_USE_HDFSSTORE
++            .toLocalizedString(getName()));
++  }
++
++  public void flushHDFSQueue(int maxWaitTime) {
++    throw new UnsupportedOperationException(
++        LocalizedStrings.HOPLOG_DOES_NOT_USE_HDFSSTORE
++            .toLocalizedString(getName()));
++  }
++  
++  public long lastMajorHDFSCompaction() {
++    throw new UnsupportedOperationException();
++  }
++
++  public static void simulateClearForTests(boolean flag) {
++    simulateClearForTests = flag;
++    
++  }
++  
+
+MOV26 MOV26 MOV26 MOV26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS40 INS40 INS40 UPD40 UPD40 INS40 INS40 INS40 INS40 UPD40 INS40 INS40 INS40 INS40 INS40 UPD40 INS23 INS23 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS23 INS23 INS23 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS83 INS43 INS59 INS83 INS43 INS59 INS83 INS43 INS42 INS8 INS8 MOV43 MOV44 INS8 MOV43 MOV44 INS44 INS44 INS44 INS78 INS44 INS44 INS29 INS78 INS83 INS43 INS42 INS44 INS44 INS44 INS44 INS44 INS44 INS44 INS43 INS43 INS8 INS29 INS78 INS83 INS43 INS42 INS44 INS44 INS44 INS44 INS44 INS44 INS44 INS44 INS43 INS43 INS8 INS44 INS44 INS29 INS83 INS39 INS42 INS8 INS29 INS83 INS39 INS42 INS8 INS29 INS83 INS39 INS42 INS8 INS29 INS83 INS43 INS42 INS8 INS29 INS83 INS43 INS42 INS8 INS78 INS44 INS8 INS29 INS83 INS83 MOV43 INS42 INS44 INS44 INS44 INS8 INS83 INS39 INS42 INS8 INS29 INS83 INS39 INS42 INS8 INS29 INS83 INS39 INS42 INS8 INS83 INS83 INS39 INS42 INS44 INS8 INS83 INS39 INS42 INS44 INS44 INS8 INS83 INS39 INS42 INS44 INS44 INS44 INS8 INS83 INS39 INS42 INS8 INS83 MOV74 INS42 INS44 INS8 INS29 INS83 INS39 INS42 INS44 INS8 INS44 UPD42 INS78 MOV25 MOV60 INS78 INS83 INS43 INS42 INS44 INS8 INS29 INS83 INS39 INS42 INS8 INS83 MOV43 INS42 INS44 INS8 INS29 INS83 INS43 INS42 INS44 INS8 INS29 INS83 INS43 INS42 INS8 INS29 INS83 INS43 INS42 INS8 INS43 INS31 INS29 INS83 INS39 INS42 INS8 INS29 INS83 INS39 INS42 INS8 INS8 INS83 INS83 INS43 INS42 INS44 INS44 INS8 UPD42 UPD42 INS8 INS83 INS39 INS59 INS83 INS83 INS39 INS59 INS83 INS43 INS59 INS83 INS39 INS42 INS8 INS83 INS39 INS42 INS8 INS83 INS39 INS42 INS8 INS83 INS43 INS42 INS8 INS83 INS39 INS42 INS44 INS44 INS8 INS83 INS39 INS42 INS44 INS8 INS83 INS39 INS42 INS8 INS83 INS83 INS39 INS42 INS44 INS8 UPD42 INS42 INS42 INS42 INS42 INS21 INS21 INS25 INS21 INS42 INS60 INS25 INS41 INS25 INS21 INS21 INS54 INS54 INS65 INS43 INS42 INS39 INS42 INS39 INS42 INS65 INS42 INS39 INS42 INS6 INS39 INS42 INS65 INS42 INS42 INS43 INS42 INS43 INS42 INS39 INS42 INS39 INS42 INS43 INS42 INS43 INS42 INS39 INS42 INS42 INS42 INS41 INS65 INS65 INS42 INS42 INS43 INS42 INS43 INS42 INS39 INS42 INS39 INS42 INS43 INS42 INS43 INS42 INS39 INS42 INS39 INS42 INS42 INS42 INS41 INS65 INS39 INS42 INS39 INS42 INS6 INS65 INS41 INS65 INS41 INS65 INS41 INS65 INS42 INS41 INS65 INS42 INS41 INS42 INS39 INS42 INS60 INS54 INS60 INS54 INS65 INS43 INS42 INS43 INS42 INS43 INS42 INS60 INS21 INS21 INS41 INS41 INS65 INS60 INS25 INS41 INS65 INS41 INS74 INS42 INS41 INS74 INS42 INS39 INS42 INS6 INS41 INS83 MOV43 INS42 INS74 INS42 INS39 INS42 INS41 INS54 INS54 INS60 MOV21 INS43 INS42 INS41 INS65 INS65 INS43 INS42 INS21 INS53 INS39 INS42 INS25 INS42 MOV25 INS42 INS25 INS54 INS54 INS54 INS60 INS54 INS54 INS42 INS43 INS42 INS25 INS41 INS65 INS25 INS60 INS60 INS25 INS41 INS21 INS83 INS43 INS42 INS60 MOV25 INS21 INS41 INS65 INS65 INS42 INS43 INS42 INS60 INS25 INS41 INS65 INS42 INS41 INS65 INS42 INS41 INS42 INS25 INS8 INS83 INS39 INS42 INS8 INS65 INS65 INS60 INS25 INS41 INS21 INS65 INS60 INS54 INS54 MOV60 INS60 INS54 INS60 INS21 INS60 INS42 INS74 INS42 INS43 INS42 INS60 INS21 INS21 INS41 INS21 INS54 INS54 UPD42 INS60 INS54 INS54 INS54 INS54 INS54 INS42 INS9 INS42 INS9 INS42 INS42 INS33 INS21 INS21 INS41 INS21 INS42 INS41 INS39 INS42 INS43 INS42 INS53 INS39 INS42 INS53 INS53 INS39 INS42 INS21 INS7 INS7 INS32 INS8 INS7 INS43 INS59 INS27 INS8 INS42 INS27 INS8 INS7 INS32 MOV8 INS8 MOV8 INS8 INS32 UPD66 INS42 INS66 INS42 INS42 INS66 INS27 INS43 INS66 INS42 INS42 INS42 INS42 INS32 INS66 INS42 INS66 INS42 INS42 INS42 INS42 INS32 INS42 INS66 INS27 INS27 INS66 INS9 INS66 INS9 INS66 INS9 INS66 INS42 INS66 INS42 INS83 INS43 INS59 INS78 MOV8 INS8 INS39 INS59 INS8 INS8 INS66 INS66 INS42 INS42 INS42 MOV43 INS59 INS32 INS32 INS42 INS27 INS66 INS43 INS59 MOV38 INS8 INS34 INS66 INS66 INS65 INS66 INS66 INS66 INS22 INS43 INS43 INS32 INS43 INS43 INS27 INS27 INS32 INS43 INS43 INS32 MOV43 INS8 INS8 INS8 INS8 INS8 INS74 INS59 INS42 MOV32 INS66 INS66 INS66 INS42 INS66 INS42 INS32 INS14 INS27 INS27 INS8 INS79 MOV27 MOV32 MOV38 MOV43 INS59 INS8 INS27 INS8 MOV43 INS8 INS8 MOV43 INS8 INS8 INS8 INS8 MOV43 INS59 INS8 INS8 MOV83 MOV43 INS59 INS8 INS8 MOV43 INS8 INS8 INS42 INS27 INS8 INS33 INS66 INS32 INS8 INS39 INS59 INS74 INS59 INS38 INS8 INS9 MOV43 INS32 INS42 MOV43 INS59 INS32 INS42 INS8 INS66 INS66 INS66 INS42 INS66 INS42 INS43 INS59 INS27 INS8 INS32 INS66 INS66 INS22 INS66 INS66 INS22 INS32 INS8 INS25 INS54 INS25 INS66 INS66 INS66 INS66 INS39 INS59 INS42 INS8 INS32 MOV43 MOV43 INS32 INS66 INS83 INS39 INS59 INS8 INS8 INS8 INS8 MOV43 INS59 MOV8 INS8 INS8 INS8 MOV83 MOV43 INS59 INS32 INS43 INS59 INS42 INS43 INS76 INS76 INS42 INS43 INS59 INS32 INS32 INS42 INS32 INS8 INS8 INS8 INS8 UPD42 UPD66 UPD66 INS66 UPD42 MOV43 INS59 MOV8 INS8 MOV43 INS8 INS8 INS8 MOV43 INS8 MOV43 INS8 INS8 MOV43 INS8 INS8 MOV43 INS8 INS8 MOV43 INS8 INS8 INS7 INS7 INS42 INS32 INS32 INS42 INS14 INS14 INS14 INS7 INS22 INS16 INS22 INS27 INS42 INS25 INS22 INS32 INS42 INS42 INS33 INS32 INS33 INS21 INS21 INS21 INS36 INS27 INS21 INS42 INS32 INS42 INS42 INS42 INS6 INS21 INS32 INS25 INS21 INS42 INS42 INS52 INS40 INS42 INS33 INS42 INS9 MOV32 INS25 INS38 INS42 INS42 INS42 INS9 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS9 INS42 INS42 INS42 INS42 INS42 INS9 INS42 INS42 INS42 INS42 INS9 INS9 INS38 INS42 INS60 INS60 MOV27 INS38 INS42 INS42 INS32 INS42 INS60 INS25 INS25 INS27 INS21 INS32 INS42 INS9 MOV21 INS21 MOV41 INS25 INS42 INS32 INS42 INS42 INS9 INS42 INS42 INS9 INS32 INS32 INS32 INS42 INS42 INS60 INS25 INS25 INS25 INS68 INS52 INS42 INS42 INS42 INS42 INS42 INS9 INS42 INS42 INS42 INS33 INS45 INS42 INS45 INS32 INS32 INS42 INS52 INS42 INS42 INS42 INS42 INS42 INS25 INS32 INS25 MOV21 INS21 INS32 INS21 INS32 MOV25 MOV21 MOV21 INS21 INS43 INS43 INS42 INS14 INS21 INS21 UPD42 INS42 MOV43 INS32 INS69 MOV38 INS27 INS27 INS38 INS21 INS54 INS42 INS42 INS21 INS21 INS42 INS32 INS21 INS22 INS33 INS21 INS32 MOV21 MOV21 MOV21 MOV25 MOV25 MOV60 MOV60 MOV60 MOV60 MOV60 MOV21 MOV25 MOV41 INS21 INS32 MOV21 MOV21 MOV21 MOV21 MOV25 MOV60 MOV60 MOV60 MOV60 MOV60 MOV54 MOV21 MOV25 MOV41 INS21 MOV21 INS60 INS54 MOV21 INS60 INS54 INS42 INS32 MOV21 MOV21 MOV54 INS21 INS42 INS32 MOV21 MOV21 MOV54 INS21 INS32 INS21 UPD42 INS25 MOV21 MOV21 MOV21 MOV21 MOV21 MOV25 INS21 INS22 INS33 INS41 INS42 INS41 INS42 INS34 INS43 INS43 INS42 INS32 INS32 INS60 INS25 INS60 INS60 INS32 INS42 INS42 INS9 INS42 INS32 INS42 INS42 INS9 INS21 INS42 INS42 INS42 INS32 INS42 INS33 INS53 INS22 INS42 INS42 INS52 INS42 INS52 INS42 INS32 INS42 INS25 INS27 INS8 MOV8 INS8 INS27 INS8 INS42 INS32 INS53 INS42 INS33 INS9 INS42 INS42 INS32 INS32 MOV21 MOV60 INS54 INS21 MOV42 INS32 MOV21 MOV60 INS54 INS21 INS42 INS32 INS54 INS21 INS54 INS54 INS21 INS21 INS21 MOV21 INS21 MOV42 INS32 UPD42 MOV42 INS42 INS42 INS42 MOV14 INS42 INS42 INS42 INS32 INS32 INS42 INS9 INS32 INS42 INS9 MOV42 INS32 INS42 INS42 INS21 INS21 MOV25 MOV25 MOV21 MOV21 MOV25 INS21 MOV25 MOV25 MOV21 MOV54 MOV25 INS21 UPD42 INS42 INS32 INS21 INS32 INS21 INS32 INS21 MOV42 INS32 INS21 MOV42 INS32 INS21 INS32 MOV21 MOV21 MOV25 MOV21 MOV60 MOV60 MOV60 MOV60 MOV21 MOV21 MOV60 MOV25 MOV25 MOV41 INS21 INS32 MOV21 MOV25 MOV21 MOV60 MOV60 MOV60 MOV60 MOV21 MOV25 MOV21 MOV21 MOV41 INS21 INS32 MOV21 MOV25 MOV21 MOV60 MOV60 MOV60 MOV60 MOV21 MOV21 MOV21 MOV25 INS21 INS32 MOV21 MOV54 INS21 INS42 INS9 INS42 INS14 INS42 INS42 INS42 INS42 INS43 INS32 INS43 INS32 INS43 INS42 INS42 INS52 INS42 INS27 INS40 MOV32 INS52 INS42 INS32 INS32 INS27 INS8 INS52 INS42 INS42 MOV36 INS52 INS42 INS7 INS32 INS7 INS32 INS22 INS33 INS32 INS42 INS42 INS52 INS42 INS42 INS42 INS32 INS45 INS32 INS42 INS42 INS52 INS40 INS42 INS42 INS42 INS9 MOV32 INS32 INS8 INS8 INS32 INS27 INS8 INS42 INS78 INS8 INS9 INS42 UPD43 MOV43 INS59 MOV43 MOV59 INS32 INS42 INS42 INS39 INS59 INS38 INS8 INS8 INS27 INS8 INS8 MOV27 INS38 INS32 INS42 INS42 INS52 INS40 INS42 INS42 INS42 INS9 MOV32 INS7 INS38 INS21 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS39 INS59 INS27 INS8 INS27 INS8 INS27 INS8 INS42 INS42 INS42 INS32 INS8 INS42 INS42 INS52 INS40 INS42 INS33 INS42 INS9 MOV32 INS32 INS8 INS32 INS42 INS42 INS52 INS40 INS42 INS33 INS42 INS9 MOV32 INS32 INS42 INS42 INS52 INS40 INS42 INS33 INS42 INS9 MOV32 INS32 INS38 INS42 INS42 INS74 INS32 INS32 INS40 INS42 INS42 INS39 INS54 INS42 INS40 INS42 INS27 INS22 INS7 MOV43 INS59 INS8 INS8 UPD42 MOV32 MOV32 MOV32 MOV32 INS42 INS42 INS52 INS40 INS42 INS9 MOV32 INS9 INS9 INS32 INS52 INS42 INS32 INS42 INS42 INS52 INS40 INS42 INS42 INS42 INS9 MOV32 INS9 INS42 INS32 INS42 INS42 INS52 INS40 INS42 INS33 INS42 INS9 MOV32 INS9 INS42 INS32 MOV43 INS59 MOV8 INS8 MOV43 INS59 MOV8 INS8 INS42 INS42 INS52 INS40 INS42 INS33 INS42 INS9 MOV32 INS9 MOV32 INS32 INS42 INS42 INS52 INS40 INS42 INS33 INS42 INS9 MOV32 INS9 MOV32 INS32 INS42 INS42 INS52 INS40 INS42 INS33 INS33 INS9 MOV32 INS9 MOV32 INS32 UPD42 INS32 INS27 INS8 INS32 INS52 INS42 INS32 INS9 INS42 INS42 INS42 INS42 INS42 INS74 INS59 INS27 INS8 INS83 INS43 INS59 INS39 INS59 INS38 INS8 INS42 INS42 INS52 INS40 INS42 INS33 INS33 INS9 MOV32 INS42 INS42 INS52 INS40 INS42 INS33 INS33 INS9 MOV32 INS32 INS52 INS42 INS42 INS14 INS52 INS42 INS42 INS42 INS32 INS8 INS22 INS62 INS21 INS21 INS22 INS62 INS21 INS22 INS42 INS14 UPD43 MOV32 INS42 UPD43 MOV32 INS42 INS74 INS42 INS42 INS42 INS42 INS52 INS40 INS33 INS33 INS42 INS9 MOV32 MOV38 INS42 INS8 INS8 INS32 INS42 INS42 INS52 INS40 INS33 INS33 INS42 INS9 MOV32 INS9 INS42 INS8 INS8 INS32 INS42 INS42 INS52 INS40 INS33 INS33 INS33 INS9 MOV32 MOV38 INS8 INS8 INS32 MOV8 INS8 MOV8 INS8 MOV32 INS32 INS32 INS32 INS32 INS42 INS42 INS52 INS40 INS33 INS33 INS42 INS9 MOV32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS52 INS40 INS33 INS33 INS42 INS9 MOV32 INS32 INS32 INS32 INS32 UPD42 INS27 INS69 INS42 INS42 INS52 INS40 INS42 INS33 INS33 INS9 MOV32 INS9 INS32 INS42 INS42 INS52 INS40 INS42 INS42 INS42 INS9 MOV32 INS32 INS42 INS42 INS52 INS40 INS42 INS33 INS42 INS9 MOV32 INS32 INS42 INS42 INS52 INS40 INS42 INS42 INS42 INS9 MOV32 INS32 INS42 INS42 INS52 INS40 INS42 INS42 INS42 INS9 INS32 INS32 INS42 INS42 INS52 INS40 INS42 INS33 INS42 INS9 MOV32 INS9 INS42 MOV43 INS32 INS42 INS42 INS52 INS40 INS42 INS33 INS42 INS9 MOV32 INS9 INS42 INS32 INS42 INS42 INS52 INS40 INS42 INS33 INS42 INS9 MOV32 INS9 INS42 INS32 INS42 INS42 INS52 INS40 INS42 INS33 INS42 INS9 MOV32 INS9 MOV32 INS32 INS43 INS42 INS40 INS42 INS32 INS42 INS40 INS42 INS32 INS42 INS42 INS33 INS42 INS42 INS42 INS42 INS27 INS32 INS33 INS53 INS22 INS14 INS32 INS42 INS42 INS42 INS32 INS42 INS42 INS52 INS42 INS22 INS42 INS9 INS60 INS42 INS42 INS42 INS42 INS42 INS42 INS41 MOV41 INS42 INS42 INS42 INS33 INS25 INS42 INS25 UPD42 INS42 MOV32 INS42 INS42 INS32 INS42 MOV21 MOV25 MOV21 MOV21 INS21 INS42 INS33 MOV60 MOV21 INS21 INS32 INS25 INS42 INS42 INS42 INS9 INS42 INS32 INS42 INS42 INS32 INS22 INS41 INS27 INS27 INS41 INS36 INS33 INS41 INS21 INS25 INS21 INS42 INS41 INS42 INS21 INS42 INS42 INS42 INS42 INS42 INS42 INS22 INS43 INS43 INS22 INS42 INS42 INS42 INS8 INS8 INS42 INS40 INS52 INS42 INS42 INS33 UPD42 INS42 INS32 MOV25 MOV25 MOV54 INS21 UPD42 UPD42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS21 INS42 INS32 INS21 INS42 INS42 INS42 INS42 UPD42 MOV42 UPD42 MOV42 INS42 INS42 MOV32 INS42 INS40 INS33 INS21 INS42 INS42 INS22 INS42 INS42 INS43 INS43 INS42 INS32 INS42 INS33 INS70 INS42 INS42 INS32 INS42 INS42 INS32 INS25 INS42 INS42 UPD42 INS54 INS32 INS9 MOV43 INS27 INS42 INS42 INS21 INS52 INS42 INS42 INS43 INS7 INS32 INS52 INS42 INS22 INS43 INS32 INS9 INS52 INS42 INS43 INS45 UPD42 UPD42 INS43 INS43 INS32 MOV60 MOV21 MOV41 INS21 INS42 INS42 MOV60 MOV21 MOV41 INS21 INS42 INS42 INS42 MOV60 MOV21 MOV41 INS21 INS42 INS42 INS21 INS21 INS21 INS21 INS42 INS32 INS42 INS42 INS42 INS32 INS42 INS42 INS42 MOV42 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS42 INS42 UPD42 INS32 INS38 INS36 INS27 INS43 UPD42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 MOV42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS45 INS42 INS42 INS14 INS52 INS42 INS43 INS42 INS42 INS32 INS42 INS52 INS32 INS42 INS52 INS42 MOV43 INS59 INS84 INS33 INS42 INS8 INS8 INS42 INS8 MOV8 MOV32 UPD42 MOV42 INS42 INS42 INS32 INS42 INS7 INS32 INS42 INS38 INS8 INS42 INS42 INS42 INS52 INS42 INS34 INS27 INS27 INS36 INS34 INS42 INS7 INS32 INS32 INS62 INS8 INS32 INS42 INS32 INS52 INS42 INS42 INS42 INS52 INS42 MOV21 MOV21 INS21 INS42 INS42 INS52 INS42 INS42 INS42 INS42 INS9 MOV32 INS42 INS32 UPD43 INS42 INS42 INS52 INS40 INS42 INS33 INS42 INS9 INS42 INS32 INS42 INS42 INS52 INS40 INS42 INS33 INS42 INS9 INS42 INS32 INS38 UPD42 UPD42 INS32 INS52 INS42 INS42 INS42 INS42 INS42 INS44 INS32 INS8 INS42 INS42 INS42 MOV38 INS8 INS38 INS8 MOV43 INS8 INS8 INS42 INS45 INS42 INS45 INS32 INS42 INS42 INS42 INS14 INS52 INS42 INS42 INS52 INS42 INS42 INS36 INS42 INS42 INS42 INS42 INS42 INS42 UPD42 INS32 INS32 INS32 INS32 INS32 INS32 INS32 INS42 INS42 UPD42 MOV42 INS42 INS32 INS42 INS32 INS42 UPD42 INS32 UPD42 MOV42 INS32 MOV27 INS38 INS32 INS36 INS42 UPD42 MOV43 INS43 INS27 INS42 INS42 INS42 INS52 INS42 INS42 INS32 MOV43 INS43 MOV43 INS21 INS21 INS21 INS25 INS52 INS42 INS42 INS32 INS42 INS42 INS33 INS32 MOV21 INS38 INS27 INS36 INS33 INS7 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS43 INS21 INS21 INS41 INS42 INS42 INS42 INS42 INS32 INS40 INS32 INS21 INS42 INS42 UPD42 INS42 INS42 INS42 INS42 INS32 INS40 INS42 INS43 INS42 INS32 INS42 INS25 MOV60 INS25 INS21 INS25 INS32 INS60 INS25 MOV21 INS25 INS60 INS32 MOV21 MOV21 INS21 INS42 INS42 INS27 MOV43 INS11 INS11 INS54 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 UPD42 INS42 INS42 INS32 INS42 INS27 INS36 UPD42 INS32 INS32 INS42 INS27 INS42 INS45 INS42 INS45 INS42 INS42 INS52 INS8 INS42 INS7 INS7 INS42 INS7 INS27 INS8 INS33 INS9 INS9 INS9 INS32 INS42 INS42 INS52 INS9 INS42 INS42 INS42 INS42 INS33 INS33 INS9 INS42 INS42 INS42 INS22 INS22 INS33 INS7 INS42 INS32 INS42 INS42 INS32 INS32 INS9 INS42 INS42 INS42 INS42 INS7 UPD42 MOV42 UPD42 MOV42 INS42 INS42 INS32 INS8 INS32 INS27 INS8 INS32 INS32 INS8 INS32 INS42 INS39 INS59 MOV27 INS8 INS32 MOV8 INS83 INS43 INS59 INS42 INS42 INS52 INS42 MOV32 INS33 INS33 MOV32 MOV32 INS32 INS45 INS32 MOV43 INS42 INS43 INS22 MOV43 INS8 INS8 INS42 INS42 INS42 INS42 INS42 INS42 MOV32 INS40 INS27 INS32 INS42 INS42 INS42 INS27 INS36 UPD42 UPD42 INS21 INS21 MOV21 INS25 MOV60 MOV21 INS42 INS32 INS42 INS32 INS42 INS32 INS36 INS32 INS62 INS25 INS42 INS52 INS42 INS52 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS21 INS42 INS9 INS42 INS42 INS32 INS25 MOV42 INS42 UPD42 INS42 INS34 INS25 INS42 INS42 INS42 INS42 INS42 INS21 INS42 INS42 INS42 INS32 UPD42 MOV25 UPD42 UPD42 INS42 INS42 INS42 INS42 MOV14 INS42 INS42 INS42 INS42 INS42 INS42 INS52 INS42 INS32 MOV21 MOV21 MOV25 MOV25 INS21 INS27 MOV32 INS42 INS42 MOV32 INS40 INS27 INS32 INS7 INS38 MOV8 INS8 MOV22 MOV42 MOV32 MOV22 INS42 INS32 INS42 INS42 INS52 INS27 MOV32 INS42 INS9 INS42 INS42 INS42 INS43 INS38 INS8 INS22 INS42 INS32 INS42 INS42 INS38 INS8 INS27 INS8 INS8 INS32 INS42 INS42 INS8 INS21 INS42 INS42 INS52 INS40 INS42 INS42 INS42 INS9 MOV32 INS9 INS32 MOV32 INS40 UPD42 INS27 INS32 INS42 INS42 INS42 INS42 INS22 INS42 INS32 INS40 INS32 INS21 INS21 INS42 INS42 MOV32 INS38 INS42 INS32 INS41 INS52 INS42 INS42 INS42 INS32 INS32 INS21 INS25 INS42 INS34 INS21 INS21 INS42 INS42 INS27 UPD42 UPD34 INS21 UPD42 UPD42 INS27 INS42 INS32 INS42 INS42 INS42 INS32 INS40 INS42 INS52 INS42 INS42 INS42 INS42 INS8 INS42 INS42 INS32 INS32 INS42 INS32 INS36 INS42 INS33 INS42 INS42 MOV21 INS18 INS25 INS42 INS42 INS37 INS27 INS8 INS7 INS7 INS45 INS42 INS45 UPD7 INS7 INS45 INS42 INS45 INS42 INS42 UPD42 INS42 INS42 INS25 INS42 INS42 INS32 INS32 INS42 INS42 INS27 INS32 INS42 INS11 INS27 INS8 INS42 INS42 INS34 INS41 INS42 INS27 INS42 INS42 INS42 INS27 INS42 INS42 INS38 MOV8 INS8 INS32 INS42 INS32 INS42 INS32 INS32 INS32 INS42 INS43 INS42 UPD42 INS42 INS33 INS21 INS9 INS42 INS34 INS42 INS34 INS8 INS32 INS21 INS32 INS42 INS42 INS42 INS32 INS42 INS32 INS42 INS42 INS42 INS42 INS32 UPD42 INS54 INS42 INS42 INS7 INS32 INS42 INS32 INS42 INS32 INS42 UPD45 INS42 INS42 INS42 MOV8 INS8 INS42 INS14 INS42 INS42 INS32 INS42 INS32 INS42 INS21 INS43 INS42 INS42 INS52 INS22 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS52 INS42 INS42 INS42 DEL83 DEL42 DEL52 DEL42 DEL32 DEL32 DEL42 DEL52 DEL42 DEL32 DEL32 DEL27 DEL36 DEL42 DEL44 DEL42 DEL53 DEL8 DEL12 DEL42 DEL43 DEL52 DEL40 DEL42 DEL42 DEL42 DEL9 DEL14 DEL42 DEL43 DEL52 DEL40 DEL42 DEL33 DEL42 DEL9 DEL14 DEL42 DEL43 DEL42 DEL32 DEL59 DEL60 DEL42 DEL32 DEL60 DEL52 DEL40 DEL42 DEL42 DEL42 DEL9 DEL14 DEL42 DEL43 DEL42 DEL43 DEL52 DEL40 DEL42 DEL33 DEL42 DEL9 DEL14 DEL42 DEL43 DEL52 DEL40 DEL42 DEL33 DEL42 DEL9 DEL14 DEL52 DEL40 DEL42 DEL33 DEL42 DEL9 DEL14 DEL33 DEL42 DEL52 DEL42 DEL42 DEL42 DEL42 DEL9 DEL42 DEL14 DEL59 DEL14 DEL53 DEL14 DEL53 DEL42 DEL42 DEL32 DEL42 DEL43 DEL62 DEL42 DEL45 DEL59 DEL60 DEL42 DEL43 DEL42 DEL14 DEL53 DEL8 DEL8 DEL25 DEL42 DEL43 DEL42 DEL52 DEL40 DEL42 DEL9 DEL9 DEL9 DEL14 DEL59 DEL52 DEL40 DEL42 DEL42 DEL42 DEL9 DEL9 DEL42 DEL14 DEL42 DEL43 DEL52 DEL40 DEL42 DEL33 DEL42 DEL9 DEL9 DEL42 DEL14 DEL42 DEL43 DEL42 DEL42 DEL43 DEL52 DEL40 DEL42 DEL33 DEL42 DEL9 DEL42 DEL14 DEL59 DEL60 DEL42 DEL43 DEL42 DEL42 DEL43 DEL52 DEL40 DEL42 DEL33 DEL42 DEL9 DEL42 DEL14 DEL59 DEL60 DEL42 DEL52 DEL40 DEL42 DEL33 DEL42 DEL9 DEL9 DEL14 DEL59 DEL42 DEL52 DEL40 DEL42 DEL33 DEL42 DEL9 DEL9 DEL14 DEL59 DEL60 DEL52 DEL40 DEL42 DEL33 DEL33 DEL9 DEL9 DEL14 DEL32 DEL33 DEL27 DEL42 DEL34 DEL42 DEL8 DEL52 DEL40 DEL42 DEL33 DEL33 DEL9 DEL14 DEL42 DEL33 DEL42 DEL43 DEL52 DEL42 DEL33 DEL33 DEL14 DEL42 DEL42 DEL52 DEL40 DEL42 DEL42 DEL42 DEL9 DEL9 DEL14 DEL52 DEL40 DEL33 DEL33 DEL42 DEL9 DEL42 DEL14 DEL52 DEL40 DEL33 DEL33 DEL42 DEL9 DEL9 DEL42 DEL14 DEL42 DEL43 DEL42 DEL42 DEL43 DEL52 DEL40 DEL33 DEL33 DEL33 DEL9 DEL14 DEL59 DEL60 DEL52 DEL40 DEL33 DEL33 DEL42 DEL9 DEL14 DEL59 DEL60 DEL52 DEL40 DEL33 DEL33 DEL42 DEL9 DEL14 DEL42 DEL32 DEL32 DEL42 DEL43 DEL42 DEL52 DEL40 DEL42 DEL33 DEL33 DEL9 DEL9 DEL14 DEL59 DEL60 DEL42 DEL43 DEL52 DEL40 DEL42 DEL42 DEL42 DEL9 DEL14 DEL42 DEL43 DEL52 DEL40 DEL42 DEL33 DEL42 DEL9 DEL14 DEL42 DEL43 DEL52 DEL40 DEL42 DEL42 DEL42 DEL9 DEL14 DEL42 DEL43 DEL52 DEL40 DEL42 DEL42 DEL42 DEL9 DEL14 DEL52 DEL40 DEL42 DEL33 DEL42 DEL9 DEL9 DEL42 DEL14 DEL52 DEL40 DEL42 DEL33 DEL42 DEL9 DEL9 DEL42 DEL14 DEL52 DEL40 DEL42 DEL33 DEL42 DEL9 DEL9 DEL42 DEL14 DEL52 DEL40 DEL42 DEL33 DEL42 DEL9 DEL9 DEL14

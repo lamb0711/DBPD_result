@@ -1,0 +1,103 @@
+HDFS-3672. Expose disk-location information for blocks to enable better scheduling. Contributed by Andrew Wang.
+
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/common/trunk@1374355 13f79535-47bb-0310-9956-ffa450edef68
+
+-import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_ENCRYPT_DATA_TRANSFER_DEFAULT;
+-import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_ENCRYPT_DATA_TRANSFER_KEY;
++import java.util.LinkedHashMap;
++import org.apache.hadoop.fs.BlockStorageLocation;
++import org.apache.hadoop.fs.HdfsBlockLocation;
++import org.apache.hadoop.fs.VolumeId;
++import org.apache.hadoop.hdfs.protocol.HdfsBlocksMetadata;
+-import org.apache.hadoop.hdfs.security.token.block.DataEncryptionKey;
++import org.apache.hadoop.hdfs.security.token.block.DataEncryptionKey;
++import org.apache.hadoop.hdfs.security.token.block.InvalidBlockTokenException;
++    final boolean getHdfsBlocksMetadataEnabled;
++    final int getFileBlockStorageLocationsNumThreads;
++    final int getFileBlockStorageLocationsTimeout;
++      getHdfsBlocksMetadataEnabled = conf.getBoolean(
++          DFSConfigKeys.DFS_HDFS_BLOCKS_METADATA_ENABLED, 
++          DFSConfigKeys.DFS_HDFS_BLOCKS_METADATA_ENABLED_DEFAULT);
++      getFileBlockStorageLocationsNumThreads = conf.getInt(
++          DFSConfigKeys.DFS_CLIENT_FILE_BLOCK_STORAGE_LOCATIONS_NUM_THREADS,
++          DFSConfigKeys.DFS_CLIENT_FILE_BLOCK_STORAGE_LOCATIONS_NUM_THREADS_DEFAULT);
++      getFileBlockStorageLocationsTimeout = conf.getInt(
++          DFSConfigKeys.DFS_CLIENT_FILE_BLOCK_STORAGE_LOCATIONS_TIMEOUT,
++          DFSConfigKeys.DFS_CLIENT_FILE_BLOCK_STORAGE_LOCATIONS_TIMEOUT_DEFAULT);
+-    return DFSUtil.locatedBlocks2Locations(blocks);
++    BlockLocation[] locations =  DFSUtil.locatedBlocks2Locations(blocks);
++    HdfsBlockLocation[] hdfsLocations = new HdfsBlockLocation[locations.length];
++    for (int i = 0; i < locations.length; i++) {
++      hdfsLocations[i] = new HdfsBlockLocation(locations[i], blocks.get(i));
++    }
++    return hdfsLocations;
++  }
++  
++  /**
++   * Get block location information about a list of {@link HdfsBlockLocation}.
++   * Used by {@link DistributedFileSystem#getFileBlockStorageLocations(List)} to
++   * get {@link BlockStorageLocation}s for blocks returned by
++   * {@link DistributedFileSystem#getFileBlockLocations(org.apache.hadoop.fs.FileStatus, long, long)}
++   * .
++   * 
++   * This is done by making a round of RPCs to the associated datanodes, asking
++   * the volume of each block replica. The returned array of
++   * {@link BlockStorageLocation} expose this information as a
++   * {@link VolumeId}.
++   * 
++   * @param blockLocations
++   *          target blocks on which to query volume location information
++   * @return volumeBlockLocations original block array augmented with additional
++   *         volume location information for each replica.
++   */
++  public BlockStorageLocation[] getBlockStorageLocations(
++      List<BlockLocation> blockLocations) throws IOException,
++      UnsupportedOperationException, InvalidBlockTokenException {
++    if (!getConf().getHdfsBlocksMetadataEnabled) {
++      throw new UnsupportedOperationException("Datanode-side support for " +
++          "getVolumeBlockLocations() must also be enabled in the client " +
++          "configuration.");
++    }
++    // Downcast blockLocations and fetch out required LocatedBlock(s)
++    List<LocatedBlock> blocks = new ArrayList<LocatedBlock>();
++    for (BlockLocation loc : blockLocations) {
++      if (!(loc instanceof HdfsBlockLocation)) {
++        throw new ClassCastException("DFSClient#getVolumeBlockLocations " +
++            "expected to be passed HdfsBlockLocations");
++      }
++      HdfsBlockLocation hdfsLoc = (HdfsBlockLocation) loc;
++      blocks.add(hdfsLoc.getLocatedBlock());
++    }
++    
++    // Re-group the LocatedBlocks to be grouped by datanodes, with the values
++    // a list of the LocatedBlocks on the datanode.
++    Map<DatanodeInfo, List<LocatedBlock>> datanodeBlocks = 
++        new LinkedHashMap<DatanodeInfo, List<LocatedBlock>>();
++    for (LocatedBlock b : blocks) {
++      for (DatanodeInfo info : b.getLocations()) {
++        if (!datanodeBlocks.containsKey(info)) {
++          datanodeBlocks.put(info, new ArrayList<LocatedBlock>());
++        }
++        List<LocatedBlock> l = datanodeBlocks.get(info);
++        l.add(b);
++      }
++    }
++        
++    // Make RPCs to the datanodes to get volume locations for its replicas
++    List<HdfsBlocksMetadata> metadatas = BlockStorageLocationUtil
++        .queryDatanodesForHdfsBlocksMetadata(conf, datanodeBlocks,
++            getConf().getFileBlockStorageLocationsNumThreads,
++            getConf().getFileBlockStorageLocationsTimeout,
++            getConf().connectToDnViaHostname);
++    
++    // Regroup the returned VolumeId metadata to again be grouped by
++    // LocatedBlock rather than by datanode
++    Map<LocatedBlock, List<VolumeId>> blockVolumeIds = BlockStorageLocationUtil
++        .associateVolumeIdsWithBlocks(blocks, datanodeBlocks, metadatas);
++    
++    // Combine original BlockLocations with new VolumeId information
++    BlockStorageLocation[] volumeBlockLocations = BlockStorageLocationUtil
++        .convertToVolumeBlockLocations(blocks, blockVolumeIds);
++
++    return volumeBlockLocations;

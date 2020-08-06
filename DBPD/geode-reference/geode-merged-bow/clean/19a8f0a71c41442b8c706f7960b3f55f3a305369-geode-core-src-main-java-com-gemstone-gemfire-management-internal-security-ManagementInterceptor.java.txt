@@ -1,0 +1,389 @@
+GEODE-17: WIP adding JMX security
+
++import static com.gemstone.gemfire.management.internal.security.ResourceConstants.ACCESS_DENIED_MESSAGE;
++import static com.gemstone.gemfire.management.internal.security.ResourceConstants.GET_ATTRIBUTE;
++import static com.gemstone.gemfire.management.internal.security.ResourceConstants.GET_ATTRIBUTES;
++import static com.gemstone.gemfire.management.internal.security.ResourceConstants.GET_PREFIX;
++import static com.gemstone.gemfire.management.internal.security.ResourceConstants.PASSWORD;
++import static com.gemstone.gemfire.management.internal.security.ResourceConstants.PROCESS_COMMAND;
++import static com.gemstone.gemfire.management.internal.security.ResourceConstants.SET_ATTRIBUTE;
++import static com.gemstone.gemfire.management.internal.security.ResourceConstants.SET_ATTRIBUTES;
++import static com.gemstone.gemfire.management.internal.security.ResourceConstants.SET_PREFIX;
++import static com.gemstone.gemfire.management.internal.security.ResourceConstants.USER_NAME;
++import static com.gemstone.gemfire.management.internal.security.ResourceConstants.WRONGE_CREDENTIALS_MESSAGE;
++
++import java.lang.reflect.Method;
++import java.util.List;
++import java.util.Map.Entry;
++import java.util.concurrent.ConcurrentHashMap;
++import java.util.concurrent.ConcurrentMap;
++import javax.management.Attribute;
++import javax.management.AttributeList;
+-import com.gemstone.gemfire.internal.logging.LogService;
++import com.gemstone.gemfire.cache.Cache;
++import com.gemstone.gemfire.distributed.DistributedSystem;
++import com.gemstone.gemfire.distributed.internal.DistributionConfig;
++import com.gemstone.gemfire.internal.ClassLoadUtil;
++import com.gemstone.gemfire.internal.i18n.LocalizedStrings;
++import com.gemstone.gemfire.internal.lang.StringUtils;
++import com.gemstone.gemfire.internal.logging.InternalLogWriter;
++import com.gemstone.gemfire.management.internal.ManagementConstants;
++import com.gemstone.gemfire.security.AuthenticationFailedException;
+-@SuppressWarnings("rawtypes")
++/**
++ *
++ * ManagementInterceptor is central go-to place for all M&M Clients Authentication and Authorization
++ * requests
++ *
++ * @author tushark
++ * @since 9.0
++ *
++ */
++  // FIXME: Merged from GEODE-17. Are they necessary?
++
++  private ObjectName accessControlMBeanON;
++  private Cache cache;
++  private String authzFactoryName;
++  private String postAuthzFactoryName;
++  private String authenticatorFactoryName;
++  private ConcurrentMap<Principal, AccessControl> cachedAuthZCallback;
++  private ConcurrentMap<Principal, AccessControl> cachedPostAuthZCallback;
+-	public ManagementInterceptor(Logger logger) {
++  public ManagementInterceptor(Cache gemFireCacheImpl, Logger logger) {
++    this.cache = gemFireCacheImpl;
++    DistributedSystem system = cache.getDistributedSystem();
++    Properties sysProps = system.getProperties();
++    this.authzFactoryName = sysProps.getProperty(DistributionConfig.SECURITY_CLIENT_ACCESSOR_NAME);
++    this.postAuthzFactoryName = sysProps.getProperty(DistributionConfig.SECURITY_CLIENT_ACCESSOR_PP_NAME);
++    this.authenticatorFactoryName = sysProps.getProperty(DistributionConfig.SECURITY_CLIENT_AUTHENTICATOR_NAME);
++    this.cachedAuthZCallback = new ConcurrentHashMap<Principal, AccessControl>();
++    this.cachedPostAuthZCallback = new ConcurrentHashMap<Principal, AccessControl>();
+-		LogService.getLogger().info("Starting management interceptor");
++    logger.info("Started Management interceptor on JMX connector");
+-	private void registerAccessContorlMbean() {    
++  /**
++   * This method registers an AccessControlMBean which allows any remote JMX Client (for example Pulse) to check for
++   * access allowed for given Operation Code.
++   */
++	private void registerAccessContorlMbean() {
+-      ObjectName name = new ObjectName(OBJECT_NAME_ACCESSCONTROL);
++      accessControlMBeanON = new ObjectName(ResourceConstants.OBJECT_NAME_ACCESSCONTROL);
+-      Set<ObjectName> names = platformMBeanServer.queryNames(name, null);
++      Set<ObjectName> names = platformMBeanServer.queryNames(accessControlMBeanON, null);
+-          platformMBeanServer.registerMBean(acc, name);
+-          logger.info("Registered AccessContorlMBean on " + name);
++          platformMBeanServer.registerMBean(acc, accessControlMBeanON);
++          logger.info("Registered AccessContorlMBean on " + accessControlMBeanON);
+-      e.printStackTrace();
++      throw new GemFireConfigException("Error while configuring accesscontrol for jmx resource", e);
++  /**
++   * Delegates authentication to GemFire Authenticator
++   *
++   * @throws SecurityException
++   *           if authentication fails
++   */
+-		if (!(credentials instanceof String[])) {
+-			// Special case for null so we get a more informative message
+-			if (credentials == null) {
+-				// throw new SecurityException("Credentials required");
+-				username = "empty";
+-				password = "emptypwd";
+-			}
+-			// throw new SecurityException("Credentials should be String[]");
+-			username = "empty";
+-			password = "emptypwd";
+-			
+-			//TODO ***** Remove empty stuff
+-			
+-		} else {
++    Properties pr = new Properties();
++    if (credentials instanceof String[]) {
+-		}
+-
+-		Properties pr = new Properties();
+-		getAuthenticator(pr).authenticate(pr, null);
+-		return new Subject(true, Collections.singleton(new JMXPrincipal(username)), Collections.EMPTY_SET,
++    } else if (credentials instanceof Properties) {
++      pr = (Properties) credentials;
++    } else {
++      throw new SecurityException(WRONGE_CREDENTIALS_MESSAGE);
++    }
++
++    try {
++      Principal principal = getAuthenticator(cache.getDistributedSystem().getSecurityProperties()).authenticate(pr,
++          cache.getDistributedSystem().getDistributedMember());
++      return new Subject(true, Collections.singleton(new JMXPrincipal(principal.getName())), Collections.EMPTY_SET,
++    } catch (AuthenticationFailedException e) {
++      //wrap inside Security exception. AuthenticationFailedException is gemfire class
++      //which generic JMX client can't serialize
++      throw new SecurityException("Authentication Failed " + e.getMessage());
+-	@SuppressWarnings("unchecked")
+-	public void authorize(ObjectName name, final String methodName, Object[] params) {
++  }
+-    try {
+-      ObjectName accessControlMBean = new ObjectName(OBJECT_NAME_ACCESSCONTROL);
+-      if (name.equals(accessControlMBean)) {
+-        logger.info("Granting access to accessContorlMXBean.. name="+name);
+-        return;
++  /**
++   * Builds ResourceOperationContext for the given JMX MBean Request for delegates Authorization to
++   * gemfire AccessControl plugin with context as parameter
++   *
++   *
++   * @param name
++   * @param methodName
++   * @param params
++   *
++   * @throws SecurityException
++   *           if access is not granted
++   */
++  public ResourceOperationContext authorize(ObjectName name, final String methodName, Object[] params) {
++
++    if (StringUtils.isBlank(authzFactoryName)){
++      return com.gemstone.gemfire.management.internal.security.AccessControlContext.ACCESS_GRANTED_CONTEXT;
+-    } catch (MalformedObjectNameException e) {
+-      // TODO Auto-generated catch block
+-      // e.printStackTrace();
++
++    if (name.equals(accessControlMBeanON)) {
++      return com.gemstone.gemfire.management.internal.security.AccessControlContext.ACCESS_GRANTED_CONTEXT;
+-	  
+-	  //Only apply for gemfire domain
+-	  String domain = name.getDomain();
+-	  if(!"GemFire".equals(domain))
+-	    return;
+-	  
+-		// Retrieve Subject from current AccessControlContext
++    if (!ManagementConstants.OBJECTNAME__DEFAULTDOMAIN.equals(name.getDomain()))
++      return com.gemstone.gemfire.management.internal.security.AccessControlContext.ACCESS_GRANTED_CONTEXT;
++
+-		// Allow operations performed locally on behalf of the connector server
+-		// itself
++
++    // Allow operations performed locally on behalf of the connector server itself
+-			return;
++      return com.gemstone.gemfire.management.internal.security.AccessControlContext.ACCESS_GRANTED_CONTEXT;
+-		// Restrict access to "createMBean" and "unregisterMBean" to any user
+-		if (methodName.equals("createMBean")
+-				|| methodName.equals("unregisterMBean")) {
+-			throw new SecurityException("Access denied");
++    if (methodName.equals(ResourceConstants.CREATE_MBEAN) || methodName.equals(ResourceConstants.UNREGISTER_MBEAN)) {
++      throw new SecurityException(ACCESS_DENIED_MESSAGE);
+-		// Retrieve JMXPrincipal from Subject
+-		Set<JMXPrincipal> principals = subject
+-				.getPrincipals(JMXPrincipal.class);
+-		Set<Object> pubCredentials = subject.getPublicCredentials();
++    Set<JMXPrincipal> principals = subject.getPrincipals(JMXPrincipal.class);
+-		/*System.out.println("JMXPrincipal " + principals);
+-		System.out.println("Principals " + subject.getPrincipals());
+-		System.out.println("PubCredentials " + subject.getPublicCredentials());*/
+-		//add condition -> check if accessor is configured
+-		if (principals == null || principals.isEmpty()
+-				/*|| pubCredentials.size() < 1 */) {
+-			throw new SecurityException("Access denied");
++    if (principals == null || principals.isEmpty()) {
++      throw new SecurityException(ACCESS_DENIED_MESSAGE);
++
+-		//Give read access globally : TODO : Need to change this to map to proper getter
+-		LogService.getLogger().info("Name=" + name + " methodName=" +  methodName + " principal="+ principal.getName());
+-		if("getAttribute".equals(methodName) || "getAttributes".equals(methodName))
+-			return;	
++    if (logger.isDebugEnabled()) {
++      logger.debug("Name=" + name + " methodName=" + methodName + " principal=" + principal.getName());
++    }
+-		//TODO : if method=getAttributes params is directly availalbe
+-		//TODO : if method is operation then params is array array[0] = actual params, array[1]= signature
+-		
+-		ResourceOperationContext resourceContext = buildContext(name,methodName, params);		
+-		boolean authorized = getAccessControl(principal).authorizeOperation(null, resourceContext);
+-		LogService.getLogger().info("Name=" + name + " methodName=" +  methodName 
+-		    + " result="+authorized + " principal="+ principal.getName());
++    AccessControl accessControl = getAccessControl(principal, false);
++    String method = methodName;
++    if (methodName.equals(GET_ATTRIBUTE)) {
++      method = GET_PREFIX + (String) params[0];
++    } else if(methodName.equals(GET_ATTRIBUTES)) {
++      //Pass to first attribute getter
++      String[] attrs = (String[]) params[0];
++      method = GET_PREFIX + attrs[0];
++    } else if(methodName.equals(SET_ATTRIBUTE)) {
++      Attribute attribute = (Attribute) params[0];
++      method = SET_PREFIX + attribute.getName();
++    }
++
++    if (methodName.equals(SET_ATTRIBUTES)) {
++      AttributeList attrList = (AttributeList) params[0];
++      List<Attribute> list = attrList.asList();
++      ResourceOperationContext setterContext = null;
++      SetAttributesOperationContext resourceContext = new SetAttributesOperationContext();
++      for(int i=0;i<list.size();i++) {
++        Attribute attribute = list.get(i);
++        String setter = SET_PREFIX + attribute.getName();
++        setterContext = buildContext(name,setter,null);
++        boolean authorized = accessControl.authorizeOperation(null, setterContext);
++        if (logger.isDebugEnabled()) {
++          logger.debug("Name=" + name + " methodName=" + methodName + " result=" + authorized + " principal="
++              + principal.getName());
++        }
+-			throw new SecurityException("Access denied");
++          throw new SecurityException(ACCESS_DENIED_MESSAGE);
++        else
++          resourceContext.addAttribute(attribute.getName(), setterContext);
++      }
++      return resourceContext;
++    } else {
++      ResourceOperationContext resourceContext = buildContext(name, method, params);
++      boolean authorized = accessControl.authorizeOperation(null, resourceContext);
++      if (logger.isDebugEnabled()) {
++        logger.debug("Name=" + name + " methodName=" + methodName + " result=" + authorized + " principal="
++            + principal.getName());
++      }
++
++      if (!authorized)
++        throw new SecurityException(ACCESS_DENIED_MESSAGE);
++      return resourceContext;
++    }
+-	private static Class accessControlKlass = null;
+-	
+-	public AccessControl getAccessControl(Principal principal) {
+-		if(accessControlKlass==null) {
+-			String authorizeKlass = System.getProperty(ResourceConstants.RESORUCE_AUTH_ACCESSOR);
++  public AccessControl getAccessControl(Principal principal, boolean isPost) {
++    if (!isPost) {
++      if (cachedAuthZCallback.containsKey(principal)) {
++        return cachedAuthZCallback.get(principal);
++      } else if (!StringUtils.isBlank(authzFactoryName)) {
+-				accessControlKlass = Class.forName(authorizeKlass);
+-			} catch (ClassNotFoundException e) {
+-			  logger.error(e);
+-				throw new GemFireConfigException("Error while configuring accesscontrol for jmx resource",e);
++          Method authzMethod = ClassLoadUtil.methodFromName(authzFactoryName);
++          AccessControl authzCallback = (AccessControl) authzMethod.invoke(null, (Object[]) null);
++          authzCallback.init(principal, null, cache);
++          cachedAuthZCallback.put(principal, authzCallback);
++          return authzCallback;
++        } catch (Exception ex) {
++          throw new AuthenticationFailedException(
++              LocalizedStrings.HandShake_FAILED_TO_ACQUIRE_AUTHENTICATOR_OBJECT.toLocalizedString(), ex);
+-		
++    } else {
++      if (cachedPostAuthZCallback.containsKey(principal)) {
++        return cachedPostAuthZCallback.get(principal);
++      } else if (!StringUtils.isBlank(postAuthzFactoryName)) {
+-			AccessControl accessControl = (AccessControl) accessControlKlass.newInstance();
+-			accessControl.init(principal, null, null); //TODO pass proper params
+-			LogService.getLogger().info("Returning resource accessControl");
+-			return accessControl;
+-		} catch (InstantiationException e) {
+-		  logger.error(e);
+-			throw new GemFireConfigException("Error while configuring accesscontrol for jmx resource",e);
+-		} catch (IllegalAccessException e) {
+-		  logger.error(e);
+-			throw new GemFireConfigException("Error while configuring accesscontrol for jmx resource",e);
++          Method authzMethod = ClassLoadUtil.methodFromName(postAuthzFactoryName);
++          AccessControl postAuthzCallback = (AccessControl) authzMethod.invoke(null, (Object[]) null);
++          postAuthzCallback.init(principal, null, cache);
++          cachedPostAuthZCallback.put(principal, postAuthzCallback);
++          return postAuthzCallback;
++        } catch (Exception ex) {
++          throw new AuthenticationFailedException(
++              LocalizedStrings.HandShake_FAILED_TO_ACQUIRE_AUTHENTICATOR_OBJECT.toLocalizedString(), ex);
++    }
++    return null;
++  }
+-	private static Class authenticatorClass = null;
+-	private Authenticator getAuthenticator(Properties pr) {
+-		if(authenticatorClass==null) {
+-			String authenticatorKlass = System.getProperty(ResourceConstants.RESORUCE_AUTHENTICATOR);
++  private Authenticator getAuthenticator(Properties gfSecurityProperties) throws AuthenticationFailedException {
++    Authenticator auth;
+-				authenticatorClass = Class.forName(authenticatorKlass);
+-			} catch (ClassNotFoundException e) {	
+-			  logger.error(e);
+-				throw new GemFireConfigException("Error while configuring accesscontrol for jmx resource",e);
++      Method instanceGetter = ClassLoadUtil.methodFromName(this.authenticatorFactoryName);
++      auth = (Authenticator) instanceGetter.invoke(null, (Object[]) null);
++    } catch (Exception ex) {
++      throw new AuthenticationFailedException(
++          LocalizedStrings.HandShake_FAILED_TO_ACQUIRE_AUTHENTICATOR_OBJECT.toLocalizedString(), ex);
++    if (auth == null) {
++      throw new AuthenticationFailedException(
++          LocalizedStrings.HandShake_AUTHENTICATOR_INSTANCE_COULD_NOT_BE_OBTAINED.toLocalizedString());
+-		
+-		try {
+-			Authenticator authenticator = (Authenticator) authenticatorClass.newInstance();
+-			authenticator.init(pr, null, null); //TODO pass proper params
+-			LogService.getLogger().info("Returning resource authenticator " + authenticator);
+-			return authenticator;
+-		} catch (InstantiationException e) {
+-		  logger.error(e);
+-			throw new GemFireConfigException("Error while configuring accesscontrol for jmx resource",e);
+-		} catch (IllegalAccessException e) {
+-		  logger.error(e);
+-			throw new GemFireConfigException("Error while configuring accesscontrol for jmx resource",e);
+-		}
++    auth.init(gfSecurityProperties,(InternalLogWriter) this.cache.getLogger(), (InternalLogWriter) this.cache.getSecurityLogger());
++    return auth;
+-    if (params != null) {
+-      LogService.getLogger().info("Params length=" + params.length);
+-      for (int i = 0; i < params.length; i++) {
+-        LogService.getLogger().info("Params[" + i + "] is " + arrayString(params[i]));
+-      }
+-    }
+-
+-    // only member mbean does not have service KeyProperty
+-    if (service == null && "processCommand".equals(methodName)) {
++    if (service == null && PROCESS_COMMAND.equals(methodName)) {
+-      CLIOperationContext context = new CLIOperationContext(command);      
+-      LogService.getLogger().info("Returning CLIContext for " + methodName);
++      CLIOperationContext context = new CLIOperationContext(command);
+-      LogService.getLogger().info("Returning JMXOperationContext for " + methodName);
+-  private String arrayString(Object object) {
+-    StringBuilder sb = new StringBuilder();
+-    if (object instanceof Object[]) {
+-      Object[] array = (Object[]) object;
+-      for (Object a : array)
+-        sb.append(a).append(" ");
++  public ObjectName getAccessControlMBeanON() {
++    return accessControlMBeanON;
+-    return sb.toString();
++
++  public void postAuthorize(ObjectName name, final String methodName, ResourceOperationContext context, Object result) {
++
++    if (StringUtils.isBlank(postAuthzFactoryName)){
++      return ;
++    }
++
++    context.setPostOperationResult(result);
++
++    if (context.equals(com.gemstone.gemfire.management.internal.security.AccessControlContext.ACCESS_GRANTED_CONTEXT))
++      return;
++
++    AccessControlContext acc = AccessController.getContext();
++    Subject subject = Subject.getSubject(acc);
++    Set<JMXPrincipal> principals = subject.getPrincipals(JMXPrincipal.class);
++    if (principals == null || principals.isEmpty()) {
++      throw new SecurityException(ACCESS_DENIED_MESSAGE);
++    }
++    Principal principal = principals.iterator().next();
++    AccessControl accessControl = getAccessControl(principal, true);
++    if (context instanceof SetAttributesOperationContext) {
++      SetAttributesOperationContext setterContext = (SetAttributesOperationContext) context;
++      for (Entry<String, ResourceOperationContext> e : setterContext.getAttributesContextMap().entrySet()) {
++        //TODO : Retrieve proper values from AttributeList and set to its jmxContext
++        e.getValue().setPostOperationResult(result);
++        boolean authorized = accessControl.authorizeOperation(null, e.getValue());
++        if (!authorized)
++          throw new SecurityException(ACCESS_DENIED_MESSAGE);
++      }
++    } else {
++      boolean authorized = accessControl.authorizeOperation(null, context);
++      if (logger.isDebugEnabled()) {
++        logger.debug("postAuthorize: Name=" + name + " methodName=" + methodName + " result=" + authorized
++            + " principal=" + principal.getName());
++      }
++      if (!authorized)
++        throw new SecurityException(ACCESS_DENIED_MESSAGE);
++    }
+
+INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 UPD40 INS40 INS40 INS29 INS23 INS23 INS23 INS23 INS23 INS23 INS23 INS31 INS31 INS31 INS31 INS31 INS31 INS65 INS65 INS65 INS83 MOV43 INS59 INS83 INS43 INS59 INS83 INS43 INS59 INS83 INS43 INS59 INS83 INS43 INS59 INS83 INS74 INS59 INS83 INS74 INS59 MOV83 INS42 INS44 MOV44 INS8 INS29 INS29 MOV25 INS29 INS83 INS43 INS42 MOV44 MOV44 MOV44 INS8 INS83 MOV43 INS42 MOV44 INS44 INS8 MOV83 MOV43 MOV42 MOV44 INS43 INS8 INS83 MOV43 INS42 INS8 INS83 INS39 INS42 INS44 INS44 INS44 MOV44 INS8 INS66 INS66 INS66 INS66 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS43 INS43 INS43 INS42 INS43 INS43 INS43 INS42 INS43 INS42 INS21 MOV21 MOV21 MOV60 INS60 INS21 INS21 INS21 INS21 INS21 MOV21 MOV21 INS65 INS65 INS65 INS54 INS65 INS65 INS65 INS65 INS65 UPD42 MOV42 INS25 INS25 MOV25 MOV60 MOV60 MOV25 MOV25 MOV60 MOV25 MOV60 INS25 INS60 INS60 INS25 INS25 INS39 INS42 INS25 INS41 UPD42 INS42 INS60 INS54 INS25 INS21 MOV41 INS41 INS43 INS42 INS83 INS43 INS42 UPD43 MOV43 UPD42 MOV42 UPD42 INS25 MOV21 INS25 INS60 INS60 INS60 INS25 INS60 INS60 INS25 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS7 UPD43 INS43 INS59 INS7 INS7 INS7 INS7 INS7 INS66 INS66 INS66 INS42 INS66 MOV62 INS25 INS8 INS12 INS66 INS66 INS42 INS42 INS42 INS42 INS66 INS32 INS8 INS32 INS8 INS8 INS32 INS8 MOV43 INS59 MOV43 INS59 INS32 INS8 INS25 INS32 INS8 MOV8 INS38 INS8 INS8 INS33 MOV43 INS59 INS8 MOV12 INS27 INS8 INS32 UPD42 INS42 INS42 INS42 UPD42 INS32 MOV8 INS32 INS41 INS43 INS59 INS43 INS59 INS74 INS59 INS27 INS8 INS43 INS59 INS43 INS59 INS62 INS8 INS8 INS22 INS42 UPD42 UPD42 INS32 INS42 INS42 INS32 INS22 INS32 INS22 INS32 INS22 INS32 INS22 INS14 INS22 INS14 INS45 INS21 MOV21 MOV21 INS62 INS8 INS8 INS60 MOV41 INS44 INS8 INS42 INS42 INS42 INS41 INS42 INS42 INS42 INS41 INS40 INS41 INS42 INS42 MOV21 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS21 INS32 INS8 INS25 INS42 INS42 INS42 INS60 MOV60 INS60 INS60 INS24 INS41 INS60 INS25 INS25 INS41 INS42 INS25 INS25 INS42 MOV60 MOV21 INS42 INS33 INS53 UPD42 MOV42 MOV42 INS42 INS11 INS11 INS42 INS42 INS42 UPD42 UPD42 UPD42 INS42 INS42 INS40 INS42 INS42 INS32 INS42 INS42 INS32 INS43 INS43 INS42 INS32 INS27 INS32 MOV53 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS43 INS60 INS70 MOV60 MOV25 INS25 INS52 INS42 INS42 INS42 INS42 INS42 INS52 INS42 UPD42 MOV42 INS42 INS40 INS52 INS42 INS42 INS42 INS40 INS52 INS42 INS42 INS42 INS40 INS52 INS42 INS74 INS52 INS42 INS74 INS7 MOV43 MOV42 MOV53 INS42 INS43 MOV21 INS53 INS43 INS59 INS43 INS42 INS53 INS40 INS40 INS40 MOV32 INS40 INS40 INS40 INS42 INS42 INS9 INS7 INS42 INS42 INS42 INS60 INS21 INS32 INS8 INS43 INS59 UPD74 MOV43 INS59 INS43 INS59 MOV58 INS27 MOV37 INS8 INS42 INS43 INS39 INS59 INS32 INS8 INS38 INS53 INS42 INS32 INS8 INS25 INS32 INS8 INS25 INS43 UPD43 UPD42 INS14 INS43 INS32 INS43 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS57 INS42 INS33 INS42 INS42 INS32 INS42 INS42 INS42 INS9 INS42 INS43 INS59 INS44 INS32 INS8 INS39 INS59 INS32 INS8 INS38 INS53 INS43 INS43 INS43 INS43 INS43 INS43 INS42 INS14 MOV42 INS14 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS14 INS42 INS42 INS32 INS42 INS14 INS42 INS42 UPD42 MOV42 UPD42 INS42 INS27 INS5 INS59 INS7 INS42 INS42 INS42 INS60 INS21 INS42 INS42 INS11 UPD43 UPD43 UPD42 INS42 INS33 INS42 INS42 INS14 INS42 MOV32 INS60 INS60 INS21 MOV60 INS25 INS25 INS42 UPD42 INS42 INS32 INS42 INS42 MOV21 INS42 MOV14 INS42 INS42 INS42 INS41 INS38 INS8 INS42 INS42 INS42 INS41 INS38 INS8 INS42 UPD42 UPD42 INS11 UPD42 INS43 INS32 INS42 INS22 MOV42 INS42 INS22 INS42 INS43 UPD43 UPD42 INS42 INS42 INS42 INS42 INS11 INS74 MOV42 INS32 INS42 MOV21 INS60 INS25 INS42 INS32 INS42 INS42 INS21 INS42 INS14 INS42 INS42 INS42 INS42 INS42 INS42 INS43 INS40 UPD42 INS43 MOV45 INS42 UPD42 INS11 INS43 INS42 INS32 UPD42 MOV42 UPD42 MOV42 INS32 INS43 INS27 INS42 INS11 MOV43 INS85 INS42 INS11 INS42 INS27 INS43 INS59 INS7 INS43 INS2 UPD42 UPD42 UPD42 UPD42 INS43 UPD42 UPD42 INS43 INS59 INS43 INS59 INS7 INS32 INS8 MOV38 MOV53 INS21 UPD42 UPD42 INS42 INS42 UPD42 MOV42 UPD42 MOV42 INS33 UPD42 MOV42 UPD43 UPD42 INS32 INS32 INS54 INS32 INS32 INS54 UPD42 UPD42 INS22 MOV43 INS32 UPD43 INS32 UPD42 INS42 INS40 UPD42 MOV42 INS52 INS42 INS52 INS42 INS42 UPD42 INS43 INS42 INS43 MOV43 INS43 INS42 INS42 INS39 INS59 INS38 INS53 INS42 INS42 INS33 INS42 MOV32 INS43 INS42 MOV42 INS42 INS43 INS42 INS42 UPD42 MOV42 INS32 MOV32 UPD42 MOV42 INS32 INS42 INS45 INS32 MOV43 INS2 INS5 INS2 INS42 INS2 INS42 INS42 INS11 INS42 INS27 INS42 INS42 INS34 INS42 INS42 INS42 INS32 INS42 INS42 INS27 INS42 INS32 INS42 INS42 MOV21 INS32 UPD42 INS27 UPD42 INS42 INS42 INS42 INS42 INS42 INS42 MOV8 MOV12 INS42 INS42 INS42 INS42 INS42 INS42 INS8 INS12 INS52 INS42 UPD42 MOV42 UPD42 MOV42 INS33 INS11 UPD42 INS40 INS42 INS42 INS42 UPD42 MOV42 INS32 UPD42 INS42 INS42 INS32 INS42 INS14 UPD42 MOV42 UPD42 MOV42 INS27 INS42 INS42 INS32 UPD42 MOV42 UPD42 UPD42 INS42 INS42 INS42 INS42 INS42 INS34 INS43 INS85 INS42 INS34 INS42 INS34 INS43 INS2 INS42 INS32 INS42 INS42 INS42 INS42 MOV32 MOV42 MOV42 UPD42 MOV42 INS33 UPD42 MOV42 UPD42 INS42 INS42 INS42 INS32 INS42 INS45 INS42 INS45 INS42 INS45 INS42 INS45 INS32 INS60 INS60 INS60 MOV21 INS21 INS41 INS44 INS8 MOV5 INS33 UPD42 MOV42 UPD42 MOV42 INS42 INS42 INS33 INS32 INS43 INS42 INS45 INS42 INS45 INS42 INS45 INS42 INS45 INS32 UPD42 UPD42 MOV42 UPD42 MOV42 INS42 INS42 INS42 INS34 INS42 INS42 UPD42 UPD42 UPD42 MOV42 UPD42 INS42 INS42 INS42 INS42 INS43 MOV43 MOV59 UPD42 UPD43 UPD42 INS43 INS59 INS43 INS59 INS32 INS42 INS43 INS42 INS53 INS42 INS42 UPD42 MOV42 INS42 INS42 UPD42 INS42 UPD42 INS32 INS42 INS11 UPD42 INS42 UPD42 MOV42 UPD42 MOV42 UPD42 INS42 UPD42 INS42 INS42 INS32 UPD42 MOV42 INS42 INS11 UPD42 UPD42 INS42 INS33 UPD42 INS42 INS42 INS42 INS42 UPD42 MOV42 INS14 UPD42 MOV42 UPD42 MOV42 INS42 INS43 INS32 UPD43 INS32 UPD42 INS42 INS42 INS42 INS43 INS32 INS43 INS32 INS42 INS42 INS42 INS42 INS33 MOV11 UPD42 INS40 INS42 INS42 INS42 INS42 INS33 INS11 UPD42 MOV42 INS40 INS42 INS33 MOV5 INS33 DEL42 DEL45 DEL79 DEL42 DEL14 DEL45 DEL42 DEL27 DEL83 DEL42 DEL42 DEL42 DEL32 DEL42 DEL45 DEL32 DEL21 DEL8 DEL31 DEL43 DEL42 DEL42 DEL14 DEL59 DEL60 DEL42 DEL42 DEL32 DEL21 DEL36 DEL38 DEL42 DEL33 DEL27 DEL42 DEL45 DEL7 DEL21 DEL8 DEL25 DEL42 DEL45 DEL7 DEL21 DEL42 DEL45 DEL7 DEL21 DEL8 DEL45 DEL42 DEL42 DEL33 DEL32 DEL21 DEL45 DEL42 DEL45 DEL45 DEL45 DEL45 DEL42 DEL32 DEL45 DEL45 DEL42 DEL32 DEL42 DEL32 DEL45 DEL40 DEL42 DEL42 DEL32 DEL7 DEL21 DEL8 DEL42 DEL43 DEL42 DEL44 DEL8 DEL12 DEL54 DEL42 DEL45 DEL79 DEL39 DEL42 DEL42 DEL42 DEL32 DEL41 DEL8 DEL25 DEL8 DEL8 DEL12 DEL54 DEL42 DEL59 DEL60 DEL27 DEL41 DEL25 DEL42 DEL42 DEL32 DEL59 DEL60 DEL25 DEL8 DEL31 DEL32 DEL11 DEL42 DEL42 DEL33 DEL32 DEL45 DEL42 DEL42 DEL42 DEL32 DEL21 DEL45 DEL40 DEL42 DEL32 DEL42 DEL42 DEL42 DEL32 DEL21 DEL45 DEL83 DEL83 DEL42 DEL43 DEL42 DEL33 DEL59 DEL23 DEL83 DEL42 DEL42 DEL33 DEL27 DEL25 DEL43 DEL42 DEL44 DEL43 DEL45 DEL42 DEL14 DEL53 DEL8 DEL12 DEL54 DEL8 DEL31 DEL83 DEL83 DEL43 DEL42 DEL33 DEL59 DEL23 DEL42 DEL33 DEL27 DEL8 DEL54 DEL8 DEL25 DEL42 DEL42 DEL32 DEL11 DEL59 DEL60 DEL42 DEL33 DEL33 DEL32 DEL21 DEL42 DEL32 DEL42 DEL45 DEL42 DEL27 DEL32 DEL21 DEL8 DEL44 DEL8 DEL12 DEL43 DEL44 DEL42 DEL43 DEL45 DEL42 DEL14 DEL53 DEL8 DEL12 DEL54 DEL8 DEL31 DEL42 DEL33 DEL27 DEL42 DEL42 DEL32 DEL42 DEL45 DEL40 DEL27 DEL32 DEL21 DEL42 DEL40 DEL27 DEL42 DEL42 DEL32 DEL42 DEL45 DEL42 DEL45 DEL42 DEL42 DEL42 DEL2 DEL32 DEL27 DEL32 DEL21 DEL8 DEL24 DEL8 DEL25 DEL45 DEL42 DEL42 DEL32 DEL42 DEL45 DEL42 DEL27 DEL32 DEL21 DEL42 DEL42 DEL32 DEL42 DEL45 DEL42 DEL27 DEL32 DEL21 DEL45 DEL42 DEL43 DEL42 DEL42 DEL43 DEL14 DEL59 DEL42 DEL32 DEL42 DEL45 DEL42 DEL62 DEL60 DEL42 DEL21 DEL70 DEL8 DEL83 DEL42 DEL43 DEL42 DEL44 DEL42 DEL42 DEL32 DEL41 DEL8 DEL31

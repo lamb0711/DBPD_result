@@ -1,0 +1,212 @@
+GEODE-77 fixing LocatorDUnitTest issues
+
+Members trying to rejoin with the same inetaddr:port were causing
+issues.
+This also moves us to JGroups 3.6.6.Final
+
++import com.gemstone.gemfire.distributed.Locator;
+-  /** number of times to try joining before giving up */
+-  private static final int JOIN_ATTEMPTS = Integer.getInteger("gemfire.join-attempts", 4);
+-  
+-  /** amount of time to wait for a view to be acked by all members before performing suspect processing on non-responders */
+-  private static final int VIEW_INSTALLATION_TIMEOUT = Integer.getInteger("gemfire.view-ack-timeout", 12500);
+-
+-  public static final long MEMBER_REQUEST_COLLECTION_INTERVAL = Long.getLong("gemfire.member-request-collection-interval", 2000);
++  public static final long MEMBER_REQUEST_COLLECTION_INTERVAL = Long.getLong("gemfire.member-request-collection-interval", 500);
+-  private static final long LEAVE_MESSAGE_SLEEP_TIME = Long.getLong("gemfire.leave-message-sleep-time", 4000);
++  private static final long LEAVE_MESSAGE_SLEEP_TIME = Long.getLong("gemfire.leave-message-sleep-time", 1000);
+-  private boolean isJoined;
++  private volatile boolean isJoined;
+-    Set<InternalDistributedMember> alreadyTried = new HashSet<>();
+-    int[] lastViewIdHolder = new int[] {-1};
++    
++    SearchState state = new SearchState();
++    
++    long timeout = services.getConfig().getJoinTimeout();
++    long retrySleep =  JOIN_RETRY_SLEEP;
++    long startTime = System.currentTimeMillis();
++    long giveupTime = startTime + timeout;
+-    for (int tries=0; tries<JOIN_ATTEMPTS; tries++) {
+-      InternalDistributedMember coord = findCoordinator(alreadyTried, lastViewIdHolder);
+-      logger.debug("found possible coordinator {}", coord);
+-      if (coord != null) {
+-        if (coord.equals(this.localAddress)) {
+-          if (tries > (JOIN_ATTEMPTS/2)) {
++    for (int tries=0; !this.isJoined; tries++) {
++
++      boolean found = findCoordinator(state);
++      if (found) {
++        logger.debug("found possible coordinator {}", state.possibleCoordinator);
++        if (state.possibleCoordinator.equals(this.localAddress)) {
++          if (tries > 2 || System.currentTimeMillis() < giveupTime ) {
+-          if (attemptToJoin(coord)) {
++          if (attemptToJoin(state)) {
+-          alreadyTried.add(coord);
++          if (System.currentTimeMillis() < giveupTime) {
++            break;
++          }
++          if (!state.possibleCoordinator.equals(localAddress)) {
++            state.alreadyTried.add(state.possibleCoordinator);
++          }
++      } else {
++        if (System.currentTimeMillis() < giveupTime) {
++          break;
++        }
++        state.alreadyTried.clear();
+-        Thread.sleep(JOIN_RETRY_SLEEP);
++        Thread.sleep(retrySleep);
++        logger.debug("retry sleep interrupted - giving up on joining the distributed system");
++    
++    if (!this.isJoined) {
++      logger.debug("giving up attempting to join the distributed system after " + (System.currentTimeMillis() - startTime) + "ms");
++    }
++    
++    // to preserve old behavior we need to throw a SystemConnectException if
++    // unable to contact any of the locators
++    if (!this.isJoined && state.hasContactedALocator) {
++      throw new SystemConnectException("Unable to join the distributed system in "
++         + (System.currentTimeMillis()-startTime) + "ms");
++    }
++    
+-  private boolean attemptToJoin(InternalDistributedMember coord) {
++  private boolean attemptToJoin(SearchState state) {
++    InternalDistributedMember coord = state.possibleCoordinator;
+-          joinResponse.wait(services.getConfig().getJoinTimeout()/JOIN_ATTEMPTS);
++          // Note that if we give up waiting but a response is on
++          // the way we will get the new view and join that way.
++          // See installView()
++          long timeout = Math.max(services.getConfig().getMemberTimeout(),
++                                     services.getConfig().getJoinTimeout()/5);
++          joinResponse.wait(timeout);
++          logger.debug("join attempt was interrupted");
+-      if (response.getBecomeCoordinator()) {
+-        logger.info("I am being told to become the membership coordinator by {}", coord);
+-        this.currentView = response.getCurrentView();
+-        becomeCoordinator(response.getCurrentView().getCoordinator());
+-        return true;
+-      }
+-        GMSMember o = (GMSMember)response.getMemberID().getNetMember();
+-        me.setSplitBrainEnabled(o.isSplitBrainEnabled());
+-        me.setPreferredForCoordinator(o.preferredForCoordinator());
+-        services.getConfig().getDistributionConfig().setEnableNetworkPartitionDetection(o.isSplitBrainEnabled());
+-        services.getConfig().setNetworkPartitionDetectionEnabled(o.isSplitBrainEnabled());
++
++        if (response.getBecomeCoordinator()) {
++          logger.info("I am being told to become the membership coordinator by {}", coord);
++          this.currentView = response.getCurrentView();
++          becomeCoordinator(response.getCurrentView().getCoordinator());
++        }
++
++
++    } else {
++      logger.debug("received no join response");
+-    if (!this.localAddress.getNetMember().preferredForCoordinator() &&
+-        incomingRequest.getMemberID().getNetMember().preferredForCoordinator()) {
+-      // tell the new guy to become the coordinator
+-      
+-    }
+-    
++    
++    if (!this.localAddress.getNetMember().preferredForCoordinator() &&
++        incomingRequest.getMemberID().getNetMember().preferredForCoordinator()) {
++      JoinResponseMessage m = new JoinResponseMessage(incomingRequest.getMemberID(), currentView, true);
++      services.getMessenger().send(m);
++      return;
++    }
+-  private InternalDistributedMember findCoordinator(Set<InternalDistributedMember> alreadyTried,
+-      int[] lastViewIdHolder) {
++  private boolean findCoordinator(SearchState state) {
+-    FindCoordinatorRequest request = new FindCoordinatorRequest(this.localAddress, alreadyTried, lastViewIdHolder[0]);
++    FindCoordinatorRequest request = new FindCoordinatorRequest(this.localAddress, state.alreadyTried, state.viewId);
++    boolean flagsSet = false;
+-            if (viewId > lastViewIdHolder[0]) {
++            if (viewId > state.viewId) {
+-              alreadyTried.clear();
+-              lastViewIdHolder[0] = viewId;
++              state.alreadyTried.clear();
++              state.viewId = viewId;
+-            if (response.isFromView()) {
++            if (!flagsSet) {
++              flagsSet = true;
++              
++              boolean enabled = response.isNetworkPartitionDetectionEnabled();
++              if (!enabled && services.getConfig().isNetworkPartitionDetectionEnabled()) {
++                throw new GemFireConfigException("locator at "+addr
++                    +" does not have network-partition-detection enabled but my configuration has it enabled");
++              }
++
+-              services.getConfig().setNetworkPartitionDetectionEnabled(response.isNetworkPartitionDetectionEnabled());
+-              if (response.isUsePreferredCoordinators()
+-                  && localAddress.getVmKind() != DistributionManager.LOCATOR_DM_TYPE) {
+-                mbr.setPreferredForCoordinator(false);
++              mbr.setSplitBrainEnabled(enabled);
++              services.getConfig().setNetworkPartitionDetectionEnabled(enabled);
++              services.getConfig().getDistributionConfig().setEnableNetworkPartitionDetection(enabled);
++
++              if (response.isUsePreferredCoordinators()) {
++                logger.debug("The locator indicates that all locators should be preferred as coordinators");
++                if (services.getLocator() != null
++                    || Locator.hasLocator()
++                    || !services.getConfig().getDistributionConfig().getStartLocator().isEmpty()
++                    || localAddress.getVmKind() == DistributionManager.LOCATOR_DM_TYPE) {
++                  ((GMSMember)localAddress.getNetMember()).setPreferredForCoordinator(true);
++                }
+-        return null;
++        return false;
+-          return null;
++          return false;
++    
+-      return it.next();
+-    }
+-    InternalDistributedMember oldest = it.next();
+-    while (it.hasNext()) {
+-      InternalDistributedMember candidate = it.next();
+-      if (oldest.compareTo(candidate) > 0) {
+-        oldest = candidate;
++      state.possibleCoordinator = it.next();
++    } else {
++      InternalDistributedMember oldest = it.next();
++      while (it.hasNext()) {
++        InternalDistributedMember candidate = it.next();
++        if (oldest.compareTo(candidate) > 0) {
++          oldest = candidate;
++        }
++      state.possibleCoordinator = oldest;
+-    return oldest;
++    return true;
++      if (currentView == null && !this.isJoined) {
++        for (InternalDistributedMember mbr: newView.getMembers()) {
++          if (this.localAddress.equals(mbr)) {
++            this.birthViewId = mbr.getVmViewId();
++            this.localAddress.setVmViewId(this.birthViewId);
++            GMSMember me = (GMSMember)this.localAddress.getNetMember();
++            me.setBirthViewId(birthViewId);
++            isJoined = true;
++            break;
++          }
++        }
++      }
++      
++    boolean waitForProcessing = false;
++      stopCoordinatorServices();
+-            stopCoordinatorServices();
+-            try { Thread.sleep(LEAVE_MESSAGE_SLEEP_TIME); }
+-            catch (InterruptedException e) { Thread.currentThread().interrupt(); }
++            waitForProcessing = true;
++            waitForProcessing = true;
+-      
++    if (waitForProcessing) {
++      try {
++        Thread.sleep(LEAVE_MESSAGE_SLEEP_TIME);
++      }
++      catch (InterruptedException e) {
++        Thread.currentThread().interrupt();
++      }
++    }
++  
++  private static class SearchState {
++    Set<InternalDistributedMember> alreadyTried = new HashSet<>();
++    InternalDistributedMember possibleCoordinator;
++    int viewId = -1;
++    private boolean hasContactedALocator;
++  }

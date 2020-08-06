@@ -1,0 +1,191 @@
+GEODE-6636: Create multiple buffer pools (#4234)
+
+* GEODE-6636: Create multiple buffer pools
+
+* GEODE-6636: Remove new alerts
+
+* GEODE-6636: Bug fix
+
+* GEODE-6636: Update after review
+
+* GEODE-6636: Added SMALL, MEDIUM constants
+
+* GEODE-6636: Fix non-direct buffer added to direct buffer pool
+
+* GEODE-6636: Update after rebase
+
+* GEODE-6636: Update after rebase
++import org.apache.geode.distributed.internal.DistributionConfig;
++import org.apache.geode.internal.tcp.Connection;
+-   * A list of soft references to byte buffers.
++   * A list of soft references to small byte buffers.
+-  private final ConcurrentLinkedQueue<BBSoftReference> bufferQueue =
++  private final ConcurrentLinkedQueue<BBSoftReference> bufferSmallQueue =
++   * A list of soft references to middle byte buffers.
++   */
++  private final ConcurrentLinkedQueue<BBSoftReference> bufferMiddleQueue =
++      new ConcurrentLinkedQueue<>();
++
++  /**
++   * A list of soft references to large byte buffers.
++   */
++  private final ConcurrentLinkedQueue<BBSoftReference> bufferLargeQueue =
++      new ConcurrentLinkedQueue<>();
++
++  private final int SMALL_BUFFER_SIZE = Connection.SMALL_BUFFER_SIZE;
++
++
++  private final int MEDIUM_BUFFER_SIZE = DistributionConfig.DEFAULT_SOCKET_BUFFER_SIZE;
++
++
++  /**
++
+-      IdentityHashMap<BBSoftReference, BBSoftReference> alreadySeen = null; // keys are used like a
+-                                                                            // set
+-      BBSoftReference ref = bufferQueue.poll();
+-      while (ref != null) {
+-        ByteBuffer bb = ref.getBB();
+-        if (bb == null) {
+-          // it was garbage collected
+-          int refSize = ref.consumeSize();
+-          if (refSize > 0) {
+-            if (ref.getSend()) { // fix bug 46773
+-              stats.incSenderBufferSize(-refSize, true);
+-            } else {
+-              stats.incReceiverBufferSize(-refSize, true);
+-            }
+-          }
+-        } else if (bb.capacity() >= size) {
+-          bb.rewind();
+-          bb.limit(size);
+-          return bb;
+-        } else {
+-          // wasn't big enough so put it back in the queue
+-          Assert.assertTrue(bufferQueue.offer(ref));
+-          if (alreadySeen == null) {
+-            alreadySeen = new IdentityHashMap<>();
+-          }
+-          if (alreadySeen.put(ref, ref) != null) {
+-            // if it returns non-null then we have already seen this item
+-            // so we have worked all the way through the queue once.
+-            // So it is time to give up and allocate a new buffer.
+-            break;
+-          }
+-        }
+-        ref = bufferQueue.poll();
++      if (size <= MEDIUM_BUFFER_SIZE) {
++        return acquirePredefinedFixedBuffer(send, size);
++      } else {
++        return acquireLargeBuffer(send, size);
+-      result = ByteBuffer.allocateDirect(size);
+-    if (send) {
+-      stats.incSenderBufferSize(size, useDirectBuffers);
+-    } else {
+-      stats.incReceiverBufferSize(size, useDirectBuffers);
+-    }
++    updateBufferStats(size, send, false);
++  /**
++   * Acquire direct buffer with predefined default capacity (4096 or 32768)
++   */
++  private ByteBuffer acquirePredefinedFixedBuffer(boolean send, int size) {
++    // set
++    int defaultSize;
++    ConcurrentLinkedQueue<BBSoftReference> bufferTempQueue;
++    ByteBuffer result;
++
++    if (size <= SMALL_BUFFER_SIZE) {
++      defaultSize = SMALL_BUFFER_SIZE;
++      bufferTempQueue = bufferSmallQueue;
++    } else {
++      defaultSize = MEDIUM_BUFFER_SIZE;
++      bufferTempQueue = bufferMiddleQueue;
++    }
++
++    BBSoftReference ref = bufferTempQueue.poll();
++    while (ref != null) {
++      ByteBuffer bb = ref.getBB();
++      if (bb == null) {
++        // it was garbage collected
++        updateBufferStats(-defaultSize, ref.getSend(), true);
++      } else {
++        bb.clear();
++        if (defaultSize > size) {
++          bb.limit(size);
++        }
++        return bb;
++      }
++      ref = bufferTempQueue.poll();
++    }
++    result = ByteBuffer.allocateDirect(defaultSize);
++    updateBufferStats(defaultSize, send, true);
++    if (defaultSize > size) {
++      result.limit(size);
++    }
++    return result;
++  }
++
++  private ByteBuffer acquireLargeBuffer(boolean send, int size) {
++    // set
++    ByteBuffer result;
++    IdentityHashMap<BBSoftReference, BBSoftReference> alreadySeen = null; // keys are used like a
++    // set
++    BBSoftReference ref = bufferLargeQueue.poll();
++    while (ref != null) {
++      ByteBuffer bb = ref.getBB();
++      if (bb == null) {
++        // it was garbage collected
++        int refSize = ref.consumeSize();
++        if (refSize > 0) {
++          updateBufferStats(-refSize, ref.getSend(), true);
++        }
++      } else if (bb.capacity() >= size) {
++        bb.clear();
++        if (bb.capacity() > size) {
++          bb.limit(size);
++        }
++        return bb;
++      } else {
++        // wasn't big enough so put it back in the queue
++        Assert.assertTrue(bufferLargeQueue.offer(ref));
++        if (alreadySeen == null) {
++          alreadySeen = new IdentityHashMap<>();
++        }
++        if (alreadySeen.put(ref, ref) != null) {
++          // if it returns non-null then we have already seen this item
++          // so we have worked all the way through the queue once.
++          // So it is time to give up and allocate a new buffer.
++          break;
++        }
++      }
++      ref = bufferLargeQueue.poll();
++    }
++    result = ByteBuffer.allocateDirect(size);
++    updateBufferStats(size, send, true);
++    return result;
++  }
++
+-      bufferQueue.offer(bbRef);
+-    } else {
+-      if (send) {
+-        stats.incSenderBufferSize(-bb.capacity(), false);
++      if (bb.capacity() <= SMALL_BUFFER_SIZE) {
++        bufferSmallQueue.offer(bbRef);
++      } else if (bb.capacity() <= MEDIUM_BUFFER_SIZE) {
++        bufferMiddleQueue.offer(bbRef);
+-        stats.incReceiverBufferSize(-bb.capacity(), false);
++        bufferLargeQueue.offer(bbRef);
++    } else {
++      updateBufferStats(-bb.capacity(), send, false);
++    }
++  }
++
++  /**
++   * Update buffer stats.
++   */
++  private void updateBufferStats(int size, boolean send, boolean direct) {
++    if (send) {
++      stats.incSenderBufferSize(size, direct);
++    } else {
++      stats.incReceiverBufferSize(size, direct);
+
+INS26 INS26 MOV31 INS40 INS40 INS23 INS23 INS23 INS23 INS31 INS31 MOV44 INS31 INS29 INS83 INS83 INS74 INS59 INS29 INS83 INS83 INS74 INS59 INS83 INS83 INS39 INS59 INS83 INS83 INS39 INS59 MOV29 INS83 INS43 INS42 INS44 INS44 INS8 INS29 INS83 INS43 INS42 INS44 INS44 INS8 UPD42 MOV8 INS29 INS83 INS39 INS42 INS44 INS44 INS44 INS8 UPD42 INS65 INS43 INS43 INS42 INS14 INS65 INS43 INS43 INS42 INS14 INS42 INS40 INS42 INS40 INS42 INS39 INS42 INS39 INS42 INS60 INS25 INS21 INS41 INS65 INS42 INS39 INS42 INS39 INS42 INS60 INS60 INS60 INS25 INS60 INS61 INS21 INS21 INS25 INS41 MOV60 INS21 MOV41 INS65 INS39 INS42 INS39 INS42 INS39 INS42 INS25 UPD66 INS66 INS42 INS42 INS74 INS66 INS42 INS42 INS74 INS43 INS59 INS42 INS8 MOV8 INS32 INS42 INS66 INS39 INS59 INS74 INS59 INS43 INS59 INS27 INS8 INS8 MOV43 INS59 INS27 INS8 INS7 INS32 INS27 INS8 INS42 INS43 INS32 INS8 MOV8 INS66 INS42 INS8 INS8 INS43 INS43 INS42 INS42 INS25 INS42 INS42 INS42 INS9 INS42 INS43 INS43 INS42 INS42 INS42 INS42 INS42 INS21 INS21 INS21 INS21 INS42 INS32 INS42 INS33 INS60 INS25 INS21 INS42 INS32 INS42 INS42 INS42 INS9 INS42 INS42 INS21 INS42 INS42 INS42 INS42 INS9 MOV60 INS25 INS21 INS21 INS42 INS42 INS27 INS8 INS8 INS42 INS42 INS7 INS7 INS7 INS7 INS42 INS42 INS43 INS59 INS27 INS8 INS8 INS7 INS42 INS42 INS42 INS32 UPD42 MOV8 INS27 MOV8 INS25 MOV42 INS32 INS32 INS42 INS42 INS41 INS41 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS33 INS21 INS21 INS25 MOV41 INS42 INS32 INS42 INS42 INS42 MOV60 INS8 INS32 INS42 INS27 MOV8 INS8 UPD42 UPD42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS32 INS42 INS42 INS32 INS32 INS27 MOV8 INS42 INS42 MOV27 INS21 INS25 INS41 UPD42 INS42 INS42 INS32 INS42 INS21 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS38 MOV32 INS9 INS42 INS42 INS42 INS42 INS32 INS27 INS8 INS42 UPD42 INS42 INS42 INS32 INS42 INS42 INS42 INS32 INS42 INS21 UPD42 UPD42 UPD42 MOV42 INS42 INS42 INS42 UPD42 MOV38 INS32 INS42 INS42 INS32 UPD42 UPD42 MOV42 INS42 INS42 INS42 INS42 DEL42 DEL42 DEL32 DEL21 DEL42 DEL38 DEL42 DEL42 DEL9 DEL32 DEL21 DEL8 DEL25 DEL8 DEL42 DEL25 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL21 DEL8 DEL42 DEL42 DEL42 DEL42 DEL32 DEL21 DEL8 DEL25 DEL8 DEL42 DEL32 DEL38 DEL9 DEL42 DEL25 DEL8

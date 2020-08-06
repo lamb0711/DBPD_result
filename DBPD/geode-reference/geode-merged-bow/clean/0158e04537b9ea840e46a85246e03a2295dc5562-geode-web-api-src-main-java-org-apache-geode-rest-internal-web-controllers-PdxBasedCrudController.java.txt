@@ -1,0 +1,246 @@
+Merge pull request #4952 from jmelchio/key-query-param2
+
+GEODE-7938: added keys query param to GET, PUT, and DELETE /{region} …
++import java.net.URI;
++import org.apache.geode.rest.internal.web.controllers.support.UpdateOp;
+-  @ApiOperation(value = "create entry", notes = "Create (put-if-absent) data in region")
++  @ApiOperation(value = "create entry", notes = "Create (put-if-absent) data in region."
++      + " The key is not decoded so if the key contains special characters use PUT/{region}?keys=EncodedKey&op=CREATE.")
+-
+-    logger.debug(
+-        "Posting (creating/putIfAbsent) JSON document ({}) to Region ({}) with Key ({})...", json,
+-        region, key);
+-
++    return create(region, key, json, false);
++  }
++
++  private ResponseEntity<?> create(String region, String key, String json,
++      boolean keyInQueryParam) {
++    logger.debug("Create JSON document ({}) in Region ({}) with Key ({})...", json, region, key);
++
+-    headers.setLocation(toUri(region, key));
++    if (keyInQueryParam) {
++      headers.setLocation(toUriWithKeys(new String[] {encode(key)}, region));
++    } else {
++      headers.setLocation(toUri(region, key));
++    }
+-   * Read all or fixed number of data in a given Region
++   * For the given region either gets all the region's data (with an optional limit),
++   * or gets the region's data for the given keys (optionally ignoring missing keys).
++   * @param encodedKeys an optional comma separated list of encoded keys to read
++   * @param ignoreMissingKey if true and reading more than one key then if a key is missing ignore
+-  @ApiOperation(value = "read all data for region",
+-      notes = "Read all data for region. Use limit param to get fixed or limited number of entries.")
++  @ApiOperation(value = "read all data for region or the specified keys",
++      notes = "If reading all data for region then the limit parameter can be used to give the maximum number of values to return."
++          + " If reading specif keys then the ignoredMissingKey parameter can be used to not fail if a key is missing.")
+-          defaultValue = DEFAULT_GETALL_RESULT_LIMIT) final String limit) {
++          defaultValue = DEFAULT_GETALL_RESULT_LIMIT) final String limit,
++      @RequestParam(value = "keys", required = false) final String[] encodedKeys,
++      @RequestParam(value = "ignoreMissingKey", required = false) final String ignoreMissingKey) {
+-
++    if (encodedKeys == null || encodedKeys.length == 0) {
++      return getAllRegionData(region, limit);
++    } else {
++      String[] decodedKeys = decode(encodedKeys);
++      return getRegionKeys(region, ignoreMissingKey, decodedKeys, true);
++    }
++  }
++  private ResponseEntity<?> getAllRegionData(String region, String limit) {
++    securityService.authorize("DATA", "READ", region);
++    logger.debug("Reading all data in Region ({})...", region);
+-      keyList = StringUtils.collectionToDelimitedString(keys, ",");
++      keyList = StringUtils.collectionToCommaDelimitedString(keys);
+-        keyList = StringUtils.collectionToDelimitedString(keys.subList(0, maxLimit), ",");
++        keyList = StringUtils.collectionToCommaDelimitedString(keys.subList(0, maxLimit));
+-    headers.set("Content-Location", toUri(region, keyList).toASCIIString());
++    headers.set(HttpHeaders.CONTENT_LOCATION, toUri(region, keyList).toASCIIString());
++   * @param keys optional list of keys to read
++   * @param ignoreMissingKey if true and reading more than one key then if a key is missing ignore
+-  @RequestMapping(method = RequestMethod.GET, value = "/{region}/**",
++  @RequestMapping(method = RequestMethod.GET, value = "/{region}/{keys}",
+-      notes = "Read data for specific set of keys in a region. The keys, ** in the endpoint, are a comma separated list.")
++      notes = "Read data for specif set of keys in a region. Deprecated in favor of /{region}?keys=.")
+-      @RequestParam(value = "ignoreMissingKey", required = false) final String ignoreMissingKey,
+-      HttpServletRequest request) {
+-    String[] keys = parseKeys(request, region);
+-    securityService.authorize("READ", region, keys);
+-    logger.debug("Reading data for keys ({}) in Region ({})", ArrayUtils.toString(keys), region);
+-
+-    final HttpHeaders headers = new HttpHeaders();
++      @PathVariable("keys") final String[] keys,
++      @RequestParam(value = "ignoreMissingKey", required = false) final String ignoreMissingKey) {
++    return getRegionKeys(region, ignoreMissingKey, keys, false);
++  }
++  private ResponseEntity<?> getRegionKeys(String region, String ignoreMissingKey, String[] keys,
++      boolean keysInQueryParam) {
++    logger.debug("Reading data for keys ({}) in Region ({})", ArrayUtils.toString(keys), region);
++    securityService.authorize("READ", region, keys);
++    final HttpHeaders headers = new HttpHeaders();
+-      headers.set("Content-Location", toUri(region, keys[0]).toASCIIString());
++      URI uri;
++      if (keysInQueryParam) {
++        String[] encodedKeys = encode(keys);
++        String encodedRegion = encode(region);
++        uri = this.toUriWithKeys(encodedKeys, encodedRegion);
++      } else {
++        uri = toUri(region, keys[0]);
++      }
++      headers.set(HttpHeaders.CONTENT_LOCATION, uri.toASCIIString());
++      final Map<Object, Object> valueObjs = getValues(region, keys);
++      // valueObjs will have as its keys all of "keys".
++      // valueObjs will have a null value if the key did not exist.
++      // So if ignoreMissingKey is false we can use "null" values to detect the missing keys.
+-        List<String> unknownKeys = checkForMultipleKeysExist(region, keys);
+-        if (unknownKeys.size() > 0) {
+-          String unknownKeysAsStr = StringUtils.collectionToDelimitedString(unknownKeys, ",");
+-          String erroString = String.format("Requested keys (%1$s) not exist in region (%2$s)",
+-              StringUtils.collectionToDelimitedString(unknownKeys, ","), region);
+-          return new ResponseEntity<>(convertErrorAsJson(erroString), headers,
++        List<String> unknownKeys = new ArrayList<>();
++        // use "keys" to iterate so we get the original key ordering from user.
++        for (String key : keys) {
++          if (valueObjs.get(key) == null) {
++            unknownKeys.add(key);
++          }
++        }
++        if (!unknownKeys.isEmpty()) {
++          String unknownKeysAsStr = StringUtils.collectionToCommaDelimitedString(unknownKeys);
++          String errorString = String.format("Requested keys (%1$s) do not exist in region (%2$s)",
++              unknownKeysAsStr, region);
++          return new ResponseEntity<>(convertErrorAsJson(errorString), headers,
+-      final Map<Object, Object> valueObjs = getValues(region, keys);
++      // The dev rest api was already released with null values being returned
++      // for non-existent keys.
++      // Order the keys in the result after the array of keys given to this method.
++      // Previous code returned them in random order which the result harder to test and use.
+-      // Do we need to remove null values from Map..?
+-      // To Remove null value entries from map.
+-      // valueObjs.values().removeAll(Collections.singleton(null));
++      URI uri;
++      if (keysInQueryParam) {
++        String[] encodedKeys = encode(keys);
++        String encodedRegion = encode(region);
++        uri = this.toUriWithKeys(encodedKeys, encodedRegion);
++      } else {
++        String keyList = StringUtils.arrayToCommaDelimitedString(keys);
++        uri = toUri(region, keyList);
++      }
+-      // currently we are not removing keys having value null from the result.
+-      String keyList = StringUtils.collectionToDelimitedString(valueObjs.keySet(), ",");
+-      headers.set("Content-Location", toUri(region, keyList).toASCIIString());
++      headers.set(HttpHeaders.CONTENT_LOCATION, uri.toASCIIString());
+-      data.add(valueObjs.values());
++      // add the values in the same order as the original keys
++      // the code used to use valueObj.values() which used "hash" ordering.
++      for (String key : keys) {
++        data.add(valueObjs.get(key));
++      }
++   * @param keys comma seperated list of keys
+-  @RequestMapping(method = RequestMethod.PUT, value = "/{region}/**",
++  @RequestMapping(method = RequestMethod.PUT, value = "/{region}/{keys}",
+-          + " The keys, ** in the endpoint, are a comma separated list."
++          + " Deprecated in favor of /{region}?keys=."
++  @PreAuthorize("@securityService.authorize('WRITE', #region, #keys)")
++      @PathVariable("keys") String[] keys,
+-    String[] keys = parseKeys(request, region);
+-    securityService.authorize("WRITE", region, keys);
+-
++    if (!validOp(opValue)) {
++      String errorMessage = String.format(
++          "The op parameter (%1$s) is not valid. Valid values are PUT, REPLACE, or CAS.",
++          opValue);
++      return new ResponseEntity<>(convertErrorAsJson(errorMessage), HttpStatus.BAD_REQUEST);
++    }
+-      // putAll case
+-      return updateMultipleKeys(region, keys, json);
++      updateMultipleKeys(region, keys, json);
++      HttpHeaders headers = new HttpHeaders();
++      headers.setLocation(toUri(region, StringUtils.arrayToCommaDelimitedString(keys)));
++      return new ResponseEntity<>(headers, HttpStatus.OK);
+-      return updateSingleKey(region, keys[0], json, opValue);
++      Object existingValue = updateSingleKey(region, keys[0], json, opValue);
++      final HttpHeaders headers = new HttpHeaders();
++      headers.setLocation(toUri(region, keys[0]));
++      return new ResponseEntity<>(existingValue, headers,
++          (existingValue == null ? HttpStatus.OK : HttpStatus.CONFLICT));
++    }
++  }
++
++  private boolean validOp(String opValue) {
++    try {
++      UpdateOp.valueOf(opValue.toUpperCase());
++      return true;
++    } catch (IllegalArgumentException ex) {
++      return false;
++    }
++  }
++
++  /**
++   * Update data for a key or set of keys
++   *
++   * @param encodedRegion gemfire data region
++   * @param encodedKeys comma separated list of keys
++   * @param opValue type of update (put, replace, cas etc)
++   * @param json new data for the key(s)
++   * @return JSON document
++   */
++  @RequestMapping(method = RequestMethod.PUT, value = "/{region}",
++      consumes = {APPLICATION_JSON_UTF8_VALUE}, produces = {
++          APPLICATION_JSON_UTF8_VALUE})
++  @ApiOperation(value = "update data for key(s)",
++      notes = "Update or insert (put) data for keys in a region."
++          + " The keys are a comma separated list."
++          + " If multiple keys are given then put (create or update) the data for each key."
++          + " The op parameter is ignored if more than one key is given."
++          + " If op=PUT, the default, create or update data for the given key."
++          + " If op=CREATE, create data for the given key if and only if the key does not exit in the region."
++          + " If op=REPLACE, update (replace) data for the given key if and only if the key exists in the region."
++          + " If op=CAS, update (compare-and-set) value having key with a new value if and only if the \"@old\" value sent matches the current value for the key in the region.")
++  @ApiResponses({@ApiResponse(code = 200, message = "OK."),
++      @ApiResponse(code = 201, message = "For op=CREATE on success."),
++      @ApiResponse(code = 400, message = "Bad Request."),
++      @ApiResponse(code = 401, message = "Invalid Username or Password."),
++      @ApiResponse(code = 403, message = "Insufficient privileges for operation."),
++      @ApiResponse(code = 404,
++          message = "Region does not exist or if key is not mapped to some value for REPLACE or CAS."),
++      @ApiResponse(code = 409,
++          message = "For op=CREATE, key already exist in region. For op=CAS, @old value does not match to the current value in region."),
++      @ApiResponse(code = 500, message = "GemFire throws an error or exception.")})
++  public ResponseEntity<?> updateKeys(@PathVariable("region") final String encodedRegion,
++      @RequestParam(value = "keys") final String[] encodedKeys,
++      @RequestParam(value = "op", defaultValue = "PUT") final String opValue,
++      @RequestBody final String json) {
++
++    String decodedRegion = decode(encodedRegion);
++    String[] decodedKeys = decode(encodedKeys);
++    if (!validOp(opValue) && !opValue.equalsIgnoreCase("CREATE")) {
++      String errorMessage = String.format(
++          "The op parameter (%1$s) is not valid. Valid values are PUT, CREATE, REPLACE, or CAS.",
++          opValue);
++      return new ResponseEntity<>(convertErrorAsJson(errorMessage), HttpStatus.BAD_REQUEST);
++    }
++
++    if (decodedKeys.length > 1) {
++      // putAll case
++      logger.debug("updating keys ({}) for region ({}) op={}", decodedKeys, decodedRegion, opValue);
++      securityService.authorize("WRITE", decodedRegion, decodedKeys);
++      updateMultipleKeys(decodedRegion, decodedKeys, json);
++      HttpHeaders headers = new HttpHeaders();
++      headers.setLocation(toUriWithKeys(encodedKeys, encodedRegion));
++      return new ResponseEntity<>(headers, HttpStatus.OK);
++    } else if (opValue.equalsIgnoreCase("CREATE")) {
++      securityService.authorize("DATA", "WRITE", decodedRegion);
++      return create(decodedRegion, decodedKeys[0], json, true);
++    } else {
++      // put case
++      logger.debug("updating keys ({}) for region ({}) op={}", decodedKeys, decodedRegion, opValue);
++      securityService.authorize("WRITE", decodedRegion, decodedKeys);
++      Object existingValue = updateSingleKey(decodedRegion, decodedKeys[0], json, opValue);
++      final HttpHeaders headers = new HttpHeaders();
++      headers.setLocation(toUriWithKeys(encodedKeys, encodedRegion));
++      return new ResponseEntity<>(existingValue, headers,
++          (existingValue == null ? HttpStatus.OK : HttpStatus.CONFLICT));
+-
+
+INS26 INS26 INS40 INS40 INS31 INS31 INS31 INS31 INS31 INS8 INS83 INS74 INS42 INS44 INS44 INS44 INS44 MOV8 MOV29 MOV77 INS77 MOV79 MOV79 INS83 INS74 INS42 MOV44 MOV44 INS44 INS44 INS8 INS83 INS42 INS44 INS44 MOV29 MOV77 INS77 MOV79 INS83 INS74 INS42 MOV44 INS44 MOV44 INS8 INS83 INS42 INS44 INS44 INS44 MOV21 INS79 INS44 INS8 INS83 INS39 INS42 INS44 INS8 INS29 INS77 INS77 INS79 INS83 INS74 INS42 INS44 INS44 INS44 INS44 INS8 MOV21 MOV21 INS41 INS43 INS76 INS43 INS42 INS43 INS42 INS43 INS42 INS39 INS42 INS25 INS65 INS65 INS42 INS80 INS80 INS43 INS76 INS77 INS83 INS5 INS42 INS77 INS83 INS43 INS42 INS21 MOV21 INS25 INS43 INS42 INS43 INS42 INS21 INS65 INS65 INS42 MOV80 INS80 INS43 INS76 INS79 INS83 INS5 INS42 MOV21 INS41 MOV43 INS42 MOV43 INS42 MOV5 INS42 INS39 INS42 INS65 INS42 INS45 INS79 INS5 INS42 MOV21 MOV21 INS25 INS25 INS43 INS42 INS54 INS65 INS65 INS65 INS65 INS65 INS65 INS42 INS80 INS80 INS80 INS80 INS42 INS80 INS80 INS42 INS4 INS43 INS76 INS79 INS83 INS43 INS42 INS77 INS83 INS5 INS42 INS77 INS83 INS43 INS42 INS78 INS83 INS43 INS42 INS60 INS60 INS25 INS25 INS27 INS32 INS42 INS42 INS42 INS42 INS42 INS8 INS8 UPD66 INS66 INS42 INS66 INS42 INS66 INS42 INS45 INS42 INS27 INS42 INS42 INS80 INS80 INS43 INS85 INS42 INS80 INS80 INS42 INS32 INS27 INS8 INS8 INS42 INS42 INS32 INS42 INS66 INS42 INS66 UPD45 INS42 INS45 INS42 INS42 INS45 INS43 INS85 INS32 MOV25 INS42 INS66 UPD45 INS42 INS45 MOV43 MOV85 INS38 INS8 MOV27 INS8 MOV8 INS42 INS8 INS12 INS66 INS42 INS66 INS42 INS66 INS42 INS66 INS42 INS66 INS66 INS42 INS40 INS42 INS45 INS42 INS4 INS42 INS4 INS42 INS45 INS42 INS27 INS77 INS77 INS77 INS77 INS77 INS77 INS77 INS77 INS42 INS42 INS45 INS42 INS42 INS80 INS43 INS85 INS42 INS80 INS80 INS42 INS42 INS42 INS43 INS59 INS5 INS59 INS27 INS8 INS27 INS8 INS25 INS45 INS45 INS42 INS42 INS42 INS42 INS9 UPD45 INS21 MOV21 INS45 INS45 INS42 INS45 INS42 INS9 INS42 INS42 INS45 INS42 INS9 INS42 INS42 INS45 INS42 INS27 INS27 INS41 INS60 INS41 INS42 INS42 INS45 INS45 INS42 INS40 INS42 INS42 INS42 INS42 INS42 INS9 INS60 INS25 INS21 INS60 INS25 INS70 UPD45 INS32 INS60 INS41 INS21 INS60 MOV21 MOV41 INS60 INS60 INS21 INS21 INS41 INS44 INS8 INS42 INS42 INS45 INS45 INS45 INS45 INS45 INS45 INS45 INS45 INS42 INS80 INS80 INS42 INS80 INS80 INS42 INS80 INS80 INS42 INS80 INS80 INS42 INS80 INS80 INS42 INS80 INS80 INS42 INS80 INS80 INS42 INS80 INS80 INS42 INS45 INS42 INS42 INS45 INS42 INS45 INS42 INS42 INS32 INS43 INS85 INS42 INS32 INS38 INS38 INS60 INS41 INS40 INS34 INS21 INS21 INS21 INS60 INS21 INS41 INS32 INS8 INS8 INS32 INS42 INS33 INS40 INS34 INS32 INS5 INS59 INS32 INS43 INS59 INS42 INS8 INS8 INS32 INS43 INS59 INS42 INS8 INS8 INS44 INS42 INS8 INS42 INS42 INS43 INS59 INS14 MOV32 INS43 INS59 INS14 INS43 INS59 INS83 INS43 INS59 INS32 INS14 INS32 INS9 INS43 INS42 INS41 INS42 INS34 INS42 INS45 INS42 INS34 INS42 INS45 INS42 INS34 INS42 INS45 INS42 INS34 INS42 INS45 INS42 INS34 INS42 INS45 INS42 INS34 INS42 INS45 INS42 INS34 INS42 INS45 INS42 INS34 INS42 INS45 INS42 INS42 INS42 INS42 INS42 INS32 INS32 INS43 INS59 INS14 INS32 INS32 INS32 INS43 INS59 INS32 INS14 INS42 INS42 INS45 INS21 INS41 INS21 INS21 INS60 INS60 INS21 INS41 INS42 INS42 INS32 INS42 INS42 INS42 INS43 INS85 INS42 INS32 INS42 INS42 INS42 INS42 INS9 INS42 INS42 INS60 INS60 INS21 MOV21 INS42 INS42 INS40 INS32 INS60 INS70 INS42 INS42 INS60 INS60 INS21 MOV60 INS21 INS40 INS43 INS42 MOV21 INS42 INS42 MOV32 INS74 INS32 INS40 INS42 INS42 INS14 INS42 UPD42 INS32 INS74 INS42 INS40 INS42 INS42 MOV32 INS42 INS42 INS14 INS42 INS42 INS32 INS74 INS42 INS42 INS36 INS42 INS42 INS32 INS42 INS9 INS42 INS42 INS42 INS42 INS45 INS42 INS42 INS32 INS74 INS32 INS40 INS42 INS42 INS45 INS42 INS42 INS42 INS42 INS42 INS45 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS14 INS42 INS42 INS32 INS74 INS42 INS40 INS32 INS32 INS32 INS32 INS43 INS59 INS83 INS43 INS59 INS32 INS14 INS42 INS3 INS42 INS42 INS42 INS42 UPD42 INS5 INS59 INS43 INS59 INS7 INS7 INS42 INS42 MOV74 INS59 INS44 INS42 INS8 INS38 MOV5 INS59 INS43 INS59 INS7 INS7 UPD42 MOV42 INS42 UPD42 UPD42 INS45 UPD42 INS43 INS42 INS42 INS43 UPD42 MOV42 MOV42 INS32 INS43 INS43 INS42 INS42 INS2 INS43 INS16 INS42 INS42 INS42 INS42 INS45 INS42 INS43 INS42 INS42 INS43 INS42 INS42 INS42 INS43 INS42 INS42 INS45 INS45 INS42 INS42 INS42 INS2 INS42 INS9 INS42 INS42 INS45 INS42 INS42 INS42 INS42 INS42 INS45 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS14 INS42 INS42 INS32 INS74 INS42 INS42 INS36 INS5 INS4 INS43 INS85 INS42 INS32 INS42 INS42 INS32 INS42 INS32 INS42 MOV32 MOV42 INS14 INS43 INS42 INS25 INS32 INS43 INS85 INS42 INS32 INS42 INS42 INS32 INS42 INS32 INS42 INS32 INS42 INS42 INS42 INS42 MOV42 INS42 INS42 INS42 INS34 INS42 INS27 INS40 INS40 INS42 INS42 INS42 INS42 INS34 INS42 INS42 INS2 INS42 INS42 INS43 INS42 INS42 INS42 INS43 INS16 INS43 INS85 INS32 UPD42 INS42 INS42 INS42 INS42 INS42 INS52 INS42 INS42 INS42 INS74 INS42 INS27 INS8 MOV42 UPD42 MOV42 INS43 INS43 INS42 INS42 INS42 INS42 INS42 INS52 INS42 INS42 INS42 UPD42 UPD42 MOV42 INS42 INS42 INS42 UPD42 INS42 INS42 INS33 INS42 INS34 INS42 INS42 INS27 INS40 INS40 INS42 INS42 INS42 INS43 INS32 INS33 INS21 INS42 INS42 UPD42 INS42 INS33 INS42 INS42 INS42 INS42 INS32 UPD42 UPD45 UPD42 MOV42 UPD42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 DEL45 DEL42 DEL42 DEL45 DEL80 DEL42 DEL45 DEL80 DEL77 DEL83 DEL42 DEL45 DEL45 DEL45 DEL42 DEL42 DEL45 DEL80 DEL77 DEL83 DEL42 DEL42 DEL43 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL42 DEL45 DEL42 DEL32 DEL32 DEL32 DEL59 DEL60 DEL32 DEL34 DEL27 DEL45 DEL42 DEL42 DEL45 DEL32 DEL42 DEL32 DEL45 DEL45 DEL42 DEL42 DEL32 DEL45 DEL42 DEL59 DEL60 DEL8 DEL25 DEL8

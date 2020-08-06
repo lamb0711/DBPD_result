@@ -1,0 +1,144 @@
+GEODE-438: fix race in OffHeapMemoryMonitor
+This fix also fixes GEODE-488 and GEODE-551.
+Also fixed test to use standard locators for connectivity
+instead of an mcast-port.
+
+-  // This holds a new event as it transitions from updateStateAndSendEvent(...) to fillInProfile()
+-  private ThreadLocal<MemoryEvent> upcomingEvent = new ThreadLocal<MemoryEvent>();
+-  
+-  private OffHeapMemoryUsageListener offHeapMemoryUsageListener;
++  private final OffHeapMemoryUsageListener offHeapMemoryUsageListener;
++  /**
++   * InternalResoruceManager insists on creating a OffHeapMemoryMonitor even when it
++   * does not have off-heap memory. So we need to handle memoryAllocator being null.
++   */
+-  OffHeapMemoryMonitor(final InternalResourceManager resourceManager, final GemFireCacheImpl cache, final ResourceManagerStats stats) {
++  OffHeapMemoryMonitor(final InternalResourceManager resourceManager, final GemFireCacheImpl cache, final MemoryAllocator memoryAllocator, final ResourceManagerStats stats) {
+-    this.memoryAllocator = cache.getOffHeapStore();
+-    if (this.memoryAllocator != null) {
++    this.memoryAllocator = memoryAllocator;
++    if (memoryAllocator != null) {
++    this.offHeapMemoryUsageListener = new OffHeapMemoryUsageListener();
+-      this.offHeapMemoryUsageListener = new OffHeapMemoryUsageListener(getBytesUsed());
+-      this.offHeapMemoryUsageListener.stopRequested = true;
+-      synchronized (this.offHeapMemoryUsageListener) {
+-        this.offHeapMemoryUsageListener.notifyAll();
+-      }
++      this.offHeapMemoryUsageListener.stop();
+-    synchronized (this.offHeapMemoryUsageListener) {
+-      this.offHeapMemoryUsageListener.offHeapMemoryUsed = bytesUsed;
+-      this.offHeapMemoryUsageListener.notifyAll();
+-    }
++    this.offHeapMemoryUsageListener.deliverEvent();
++   * @return true if an event was sent
+-  public void updateStateAndSendEvent() {
+-    updateStateAndSendEvent(getBytesUsed());
++  public boolean updateStateAndSendEvent() {
++    return updateStateAndSendEvent(getBytesUsed());
++   * @return true if an event was sent
+-  public void updateStateAndSendEvent(long bytesUsed) {
++  public boolean updateStateAndSendEvent(long bytesUsed) {
++    boolean result = false;
+-        this.upcomingEvent.set(event);
+-
++        this.mostRecentEvent = event;
++        result = true;
+-        this.upcomingEvent.set(event);
++        this.mostRecentEvent = event;
++        result = true;
++    return result;
+-    final MemoryThresholds thresholds = this.thresholds;
++    final MemoryThresholds thresholds = mre.getThresholds();
+-    final MemoryEvent tempEvent = this.upcomingEvent.get();
+-    if (tempEvent != null) {
+-      this.mostRecentEvent = tempEvent;
+-      this.upcomingEvent.set(null);
+-    }
+-    
+-    volatile boolean stopRequested = false;
+-    long offHeapMemoryUsed; // In bytes
++    private boolean deliverEvent = false;
++    private boolean stopRequested = false;
+-    OffHeapMemoryUsageListener(final long offHeapMemoryUsed) {
+-      this.offHeapMemoryUsed = offHeapMemoryUsed;
++    OffHeapMemoryUsageListener() {
++    }
++    
++    public synchronized void deliverEvent() {
++      this.deliverEvent = true;
++      this.notifyAll();
++    }
++
++    public synchronized void stop() {
++      this.stopRequested = true;
++      this.notifyAll();
+-      long lastOffHeapMemoryUsed;
+-      synchronized (this) {
+-        lastOffHeapMemoryUsed = this.offHeapMemoryUsed;
+-      }
+-      while (!this.stopRequested) {
+-        updateStateAndSendEvent(lastOffHeapMemoryUsed);
++      int callsWithNoEvent = 0;
++      final int MS_TIMEOUT = 10;
++      final int MAX_CALLS_WITH_NO_EVENT = 1000/MS_TIMEOUT;
++      boolean exitRunLoop = false;
++      while (!exitRunLoop) {
++        if (!updateStateAndSendEvent()) {
++          callsWithNoEvent++;
++          if (callsWithNoEvent > MAX_CALLS_WITH_NO_EVENT) {
++            deliverNextAbnormalEvent();
++            callsWithNoEvent = 0;
++          }
++        } else {
++          callsWithNoEvent = 0;
++        }
+-          long newOffHeapMemoryUsed = this.offHeapMemoryUsed;
+-            // no need to wait since we are stopping
+-          } else if (lastOffHeapMemoryUsed != newOffHeapMemoryUsed) {
+-            // no need to wait since memory used has changed
+-            // This fixes a race like bug GEODE-500
+-            lastOffHeapMemoryUsed = newOffHeapMemoryUsed;
++            exitRunLoop = true;
++          } else if (this.deliverEvent) {
++            // No need to wait.
++            // Loop around and call updateStateAndSendEvent.
++            this.deliverEvent = false;
+-            // wait for memory used to change
++            // Wait to be notified that off-heap memory changed
++            // or for the wait to timeout.
++            // In some cases we need to generate an event even
++            // when we have not been notified (see GEODE-438).
++            // So we don't want this wait to be for very long.
+-              do {
+-                this.wait(1000);
+-                newOffHeapMemoryUsed = this.offHeapMemoryUsed;
+-                if (newOffHeapMemoryUsed == lastOffHeapMemoryUsed) {
+-                  // The wait timed out. So tell the OffHeapMemoryMonitor
+-                  // that we need an event if the state is not normal.
+-                  deliverNextAbnormalEvent();
+-                  // TODO: don't we need a "break" here?
+-                  //       As it is we set deliverNextAbnormalEvent
+-                  //       but then go back to sleep in wait.
+-                  //       We need to call updateStateAndSendEvent
+-                  //       which tests deliverNextAbnormalEvent.
+-                  // But just adding a break is probably not enough.
+-                  // We only set deliverNextAbnormalEvent if the wait
+-                  // timed out which means that the amount of offHeapMemoryUsed
+-                  // did not change.
+-                  // But in updateStateAndSendEvent we only deliver an
+-                  // abnormal event if the amount of memory changed.
+-                  // This code needs to be reviewed with Swapnil but
+-                  // it looks to Darrel like deliverNextAbnormalEvent
+-                  // can be removed.
+-                } else {
+-                  // we have been notified so exit the inner while loop
+-                  // and call updateStateAndSendEvent.
+-                  lastOffHeapMemoryUsed = newOffHeapMemoryUsed;
+-                  break;
+-                }
+-              } while (!this.stopRequested);
++              this.wait(MS_TIMEOUT);
++              this.deliverEvent = false;
++              exitRunLoop = true;
+
+MOV23 INS55 INS83 INS29 INS44 UPD39 UPD39 INS42 MOV43 MOV23 MOV23 INS31 INS31 INS31 MOV31 MOV31 INS65 INS83 INS43 INS42 INS21 MOV21 INS65 INS41 INS65 INS60 INS41 INS39 UPD83 INS42 INS8 INS83 INS83 INS39 INS42 INS8 INS83 INS83 INS39 INS42 MOV8 INS66 INS66 INS42 INS7 INS66 MOV32 INS66 INS39 INS59 INS42 INS42 INS9 INS21 INS21 INS21 INS60 INS60 INS60 INS42 INS42 MOV22 INS14 MOV22 INS42 INS42 INS9 INS32 INS7 INS32 INS32 UPD39 INS83 INS39 INS59 INS83 INS39 INS59 INS39 INS59 MOV43 INS32 INS42 INS42 INS22 INS9 INS52 INS42 INS9 INS52 INS42 UPD42 INS34 INS42 INS34 INS42 INS27 INS42 INS9 INS42 INS25 MOV22 INS42 INS21 INS52 INS42 UPD42 INS34 INS42 INS38 INS8 INS8 INS7 INS7 INS21 INS32 INS21 INS25 INS21 INS25 INS22 INS42 INS42 INS9 INS7 INS7 MOV42 INS37 INS27 MOV8 INS7 MOV22 INS8 INS25 MOV52 UPD42 MOV42 MOV22 INS42 INS42 INS9 INS42 INS42 INS42 INS21 INS42 INS34 INS21 INS22 MOV8 MOV8 INS7 INS7 MOV52 UPD42 MOV42 INS42 INS34 INS42 INS9 INS8 INS22 INS9 MOV21 MOV21 INS52 INS42 INS21 INS42 INS9 INS7 UPD42 INS42 INS9 DEL42 DEL42 DEL32 DEL52 DEL42 DEL22 DEL42 DEL32 DEL14 DEL7 DEL21 DEL42 DEL22 DEL9 DEL7 DEL52 DEL42 DEL22 DEL52 DEL42 DEL22 DEL42 DEL32 DEL21 DEL8 DEL51 DEL52 DEL42 DEL22 DEL42 DEL52 DEL42 DEL22 DEL42 DEL22 DEL42 DEL7 DEL21 DEL8 DEL51 DEL21 DEL22 DEL42 DEL42 DEL32 DEL22 DEL42 DEL42 DEL32 DEL52 DEL42 DEL22 DEL83 DEL42 DEL43 DEL42 DEL52 DEL42 DEL22 DEL42 DEL32 DEL59 DEL60 DEL42 DEL33 DEL27 DEL42 DEL7 DEL21 DEL52 DEL42 DEL22 DEL42 DEL33 DEL32 DEL21 DEL8 DEL25 DEL42 DEL43 DEL42 DEL43 DEL74 DEL42 DEL42 DEL43 DEL42 DEL43 DEL74 DEL14 DEL42 DEL52 DEL42 DEL52 DEL42 DEL22 DEL7 DEL21 DEL8 DEL51 DEL52 DEL42 DEL22 DEL42 DEL32 DEL21 DEL42 DEL42 DEL34 DEL42 DEL42 DEL42 DEL27 DEL42 DEL42 DEL7 DEL21 DEL10 DEL8 DEL25 DEL8 DEL52 DEL42 DEL22 DEL38 DEL19 DEL8 DEL39 DEL42 DEL22 DEL59 DEL60 DEL8 DEL42 DEL42 DEL27 DEL25 DEL25 DEL42 DEL39 DEL42 DEL59 DEL23 DEL42 DEL83 DEL39 DEL42 DEL44 DEL31 DEL55

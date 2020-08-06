@@ -1,0 +1,175 @@
+GEODE-77: deadlock in GMSJoinLeave
+
+This removes the stateLock read-write lock in favor of using a
+sync on viewInstallationLock, eliminating the possibility of
+inversion between the two.
+
+-  /** a lock governing GMS state */
+-  private ReadWriteLock stateLock = new ReentrantReadWriteLock();
+-  
+-  /** guarded by stateLock */
++  /** guarded by viewInstallationLock */
+-  /** the currently installed view */
++  /** the currently installed view.  Guarded by viewInstallationLock */
+-        becomeCoordinator();
++        synchronized(viewInstallationLock) {
++          becomeCoordinator();
++        }
+-              becomeCoordinator();
++              synchronized(viewInstallationLock) {
++                becomeCoordinator();
++              }
+-          this.currentView = response.getCurrentView();
+-          becomeCoordinator(null);
++          synchronized(viewInstallationLock) {
++            this.currentView = response.getCurrentView();
++            becomeCoordinator(null);
++          }
+-        becomeCoordinator(incomingRequest.getMemberID());
++        synchronized(viewInstallationLock) {
++          becomeCoordinator(incomingRequest.getMemberID());
++        }
+-        becomeCoordinator(mbr);
++        synchronized(viewInstallationLock) {
++          becomeCoordinator(mbr);
++        }
++  
++  public void becomeCoordinatorForTest() {
++    synchronized(viewInstallationLock) {
++      becomeCoordinator();
++    }
++  }
++  
++   * Transitions this member into the coordinator role.  This must
++   * be invoked under a synch on viewInstallationLock that was held
++   * at the time the decision was made to become coordinator so that
++   * the decision is atomic with actually becoming coordinator.
+-    stateLock.writeLock().lock();
+-    try {
+-      if (isCoordinator) {
+-        return;
+-      }
+-      logger.info("This member is becoming the membership coordinator with address {}", localAddress);
+-      isCoordinator = true;
+-      if (currentView == null) {
+-        // create the initial membership view
+-        NetView newView = new NetView(this.localAddress);
+-        this.localAddress.setVmViewId(0);
+-        installView(newView);
+-        isJoined = true;
+-        if (viewCreator == null || viewCreator.isShutdown()) {
+-          viewCreator = new ViewCreator("GemFire Membership View Creator", Services.getThreadGroup());
+-          viewCreator.setDaemon(true);
+-          viewCreator.start();
+-        }
+-      } else {
+-        // create and send out a new view
+-        NetView newView;
+-        Set<InternalDistributedMember> leaving = new HashSet<>();
+-        Set<InternalDistributedMember> removals;
+-        synchronized(viewInstallationLock) {
+-          int rand = testing? 0 : NetView.RANDOM.nextInt(10);
+-          int viewNumber = currentView.getViewId() + 5 + rand;
+-          if (this.localAddress.getVmViewId() < 0) {
+-            this.localAddress.setVmViewId(viewNumber);
+-          }
+-          List<InternalDistributedMember> mbrs = new ArrayList<>(currentView.getMembers());
+-          if (!mbrs.contains(localAddress)) {
+-            mbrs.add(localAddress);
+-          }
+-          synchronized(this.removedMembers) {
+-            removals = new HashSet<>(this.removedMembers);
+-          }
+-          if (oldCoordinator != null && !removals.contains(oldCoordinator)) {
+-            leaving.add(oldCoordinator);
+-          }
+-          mbrs.removeAll(removals);
+-          mbrs.removeAll(leaving);
+-          newView = new NetView(this.localAddress, viewNumber, mbrs, leaving,
+-              removals);
+-        }
+-        if (viewCreator == null || viewCreator.isShutdown()) {
+-          viewCreator = new ViewCreator("GemFire Membership View Creator", Services.getThreadGroup());
+-          viewCreator.setInitialView(newView, leaving, removals);
+-          viewCreator.setDaemon(true);
+-          viewCreator.start();
+-        }
++    assert Thread.holdsLock(viewInstallationLock);
++    
++    if (isCoordinator) {
++      return;
++    }
++    
++    logger.info("This member is becoming the membership coordinator with address {}", localAddress);
++    isCoordinator = true;
++    if (currentView == null) {
++      // create the initial membership view
++      NetView newView = new NetView(this.localAddress);
++      this.localAddress.setVmViewId(0);
++      installView(newView);
++      isJoined = true;
++      if (viewCreator == null || viewCreator.isShutdown()) {
++        viewCreator = new ViewCreator("GemFire Membership View Creator", Services.getThreadGroup());
++        viewCreator.setDaemon(true);
++        viewCreator.start();
+-    } finally {
+-      stateLock.writeLock().unlock();
++    } else {
++      // create and send out a new view
++      NetView newView;
++      Set<InternalDistributedMember> leaving = new HashSet<>();
++      Set<InternalDistributedMember> removals;
++      synchronized(viewInstallationLock) {
++        int rand = testing? 0 : NetView.RANDOM.nextInt(10);
++        int viewNumber = currentView.getViewId() + 5 + rand;
++        if (this.localAddress.getVmViewId() < 0) {
++          this.localAddress.setVmViewId(viewNumber);
++        }
++
++        List<InternalDistributedMember> mbrs = new ArrayList<>(currentView.getMembers());
++        if (!mbrs.contains(localAddress)) {
++          mbrs.add(localAddress);
++        }
++        synchronized(this.removedMembers) {
++          removals = new HashSet<>(this.removedMembers);
++        }
++        if (oldCoordinator != null && !removals.contains(oldCoordinator)) {
++          leaving.add(oldCoordinator);
++        }
++        mbrs.removeAll(removals);
++        mbrs.removeAll(leaving);
++        newView = new NetView(this.localAddress, viewNumber, mbrs, leaving,
++            removals);
++      }
++      if (viewCreator == null || viewCreator.isShutdown()) {
++        viewCreator = new ViewCreator("GemFire Membership View Creator", Services.getThreadGroup());
++        viewCreator.setInitialView(newView, leaving, removals);
++        viewCreator.setDaemon(true);
++        viewCreator.start();
++      }
+-          stateLock.writeLock().lock();
+-          try {
+-            stopCoordinatorServices();
+-            this.isCoordinator = false;
+-          } finally {
+-            stateLock.writeLock().unlock();
+-          }
++          stopCoordinatorServices();
++          this.isCoordinator = false;
+-
++        long giveUpTime = System.currentTimeMillis() + viewAckTimeout;
++          long now = System.currentTimeMillis();
+-            InternalDistributedMember mbr = future.get(viewAckTimeout, TimeUnit.MILLISECONDS);
++            InternalDistributedMember mbr = null;
++            long timeToWait = giveUpTime - now;
++            if (timeToWait <= 0) {
++              // TODO if timeToWait==0 is future.get() guaranteed to return immediately?
++              // It looks like some code paths invoke Object.wait(0), which waits forever.
++              timeToWait = 1;
++            }
++            mbr = future.get(timeToWait, TimeUnit.MILLISECONDS);
+-            // TODO should the member be removed if we can't verify it in time?
++            // timeout - member didn't pass the final check and will not be removed
++            // from the collection of members
+
+INS31 INS83 INS39 INS42 INS8 MOV8 INS51 INS65 MOV60 INS6 UPD66 UPD66 INS42 INS8 INS66 INS66 INS66 INS66 INS32 INS21 INS42 INS42 INS42 INS8 INS8 INS8 INS32 INS60 INS51 MOV41 INS51 INS51 INS42 INS39 INS59 INS42 INS8 INS42 MOV8 INS42 MOV8 INS42 INS27 INS60 MOV21 INS51 MOV8 INS32 INS42 INS39 INS59 INS42 INS8 INS42 INS42 INS42 INS32 INS60 INS60 INS25 INS21 MOV21 MOV21 INS42 INS42 MOV43 INS59 INS39 INS59 INS27 INS8 INS7 INS8 MOV42 INS33 INS42 INS27 INS42 INS34 INS21 INS42 INS32 INS51 MOV41 INS42 INS42 INS7 MOV42 MOV42 UPD42 MOV42 MOV40 INS42 INS8 INS42 INS34 MOV21 DEL66 DEL65 DEL29 DEL83 DEL42 DEL43 DEL42 DEL42 DEL43 DEL14 DEL59 DEL23 DEL8 DEL8 DEL42 DEL42 DEL32 DEL42 DEL32 DEL21 DEL42 DEL42 DEL32 DEL42 DEL32 DEL21 DEL8 DEL54 DEL8 DEL42 DEL42 DEL32 DEL42 DEL32 DEL21 DEL42 DEL42 DEL32 DEL42 DEL32 DEL21 DEL8 DEL54 DEL8 DEL32 DEL59 DEL60

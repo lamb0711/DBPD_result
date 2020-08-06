@@ -1,0 +1,156 @@
+GEODE-6897: implement CMS rebalance operation (#3820)
+
+
+-import java.util.Collections;
++import java.util.Date;
++import java.util.List;
++import java.util.Set;
+-
+-import org.apache.commons.collections.map.LRUMap;
++import java.util.concurrent.ExecutionException;
++import java.util.concurrent.TimeUnit;
++import java.util.stream.Collectors;
+-import org.apache.geode.management.api.JsonSerializable;
++import org.apache.geode.management.runtime.OperationResult;
++/**
++ * Retains references to all running and some recently-completed operations.
++ *
++ * The policy for expiring completed operations is subject to change, but may be based on age,
++ * count, when it was last accessed, or some combination thereof.
++ */
+-  private final ConcurrentMap<String, CompletableFuture> inProgressHistory;
+-  private final Map<String, CompletableFuture> completedHistory;
++  private final ConcurrentMap<String, OperationInstance> history;
++  private final long keepCompletedMillis;
++  /**
++   * set a default retention policy to keep results for 2 hours after completion
++   */
+-    this(100);
+-  }
+-
+-  @SuppressWarnings("unchecked")
+-  public OperationHistoryManager(int historySize) {
+-    inProgressHistory = new ConcurrentHashMap<>();
+-    completedHistory = Collections.synchronizedMap(new LRUMap(historySize));
++    this(2, TimeUnit.HOURS);
+-   * looks up the future for an async operation by id
++   * set a custom retention policy to keep results for X amount of time after completion
++   */
++  public OperationHistoryManager(long keepCompleted, TimeUnit timeUnit) {
++    history = new ConcurrentHashMap<>();
++    keepCompletedMillis = timeUnit.toMillis(keepCompleted);
++  }
++
++  /**
++   * look up the specified key
+-  public <V extends JsonSerializable> CompletableFuture<V> getStatus(String opId) {
+-    CompletableFuture<V> ret = inProgressHistory.get(opId);
+-    if (ret == null) {
+-      ret = completedHistory.get(opId);
+-    }
+-    return ret;
++  <A extends ClusterManagementOperation<V>, V extends OperationResult> OperationInstance<A, V> getOperationInstance(
++      String opId) {
++    expireHistory();
++    return (OperationInstance<A, V>) history.get(opId);
+-  public <A extends ClusterManagementOperation<V>, V extends JsonSerializable> OperationInstance<A, V> save(
++  private void expireHistory() {
++    final long expirationDate = now() - keepCompletedMillis;
++    Set<String> expiredKeys =
++        history.entrySet().stream().filter(e -> isExpired(expirationDate, e.getValue()))
++            .map(Map.Entry::getKey).collect(Collectors.toSet());
++    expiredKeys.forEach(history::remove);
++  }
++
++  long now() {
++    return System.currentTimeMillis();
++  }
++
++  private static boolean isExpired(long expirationDate, OperationInstance<?, ?> operationInstance) {
++    CompletableFuture<Date> futureOperationEnded = operationInstance.getFutureOperationEnded();
++
++    if (!futureOperationEnded.isDone())
++      return false; // always keep while still in-progress
++
++    final long endTime;
++    try {
++      endTime = futureOperationEnded.get().getTime();
++    } catch (ExecutionException ignore) {
++      // cannot ever happen because we've already checked isDone above
++      return false;
++    } catch (InterruptedException ignore) {
++      // cannot ever happen because we've already checked isDone above
++      Thread.currentThread().interrupt();
++      return false;
++    }
++
++    return endTime <= expirationDate;
++  }
++
++  /**
++   * Stores a new operation in the history and installs a trigger to record the operation end time.
++   */
++  public <A extends ClusterManagementOperation<V>, V extends OperationResult> OperationInstance<A, V> save(
+-    CompletableFuture<V> future = operationInstance.getFuture();
++    CompletableFuture<V> future = operationInstance.getFutureResult();
+-    inProgressHistory.put(opId, future);
++    future.whenComplete((result, exception) -> operationInstance.setOperationEnded(new Date()));
+-    CompletableFuture<V> newFuture = future.whenComplete((result, exception) -> {
+-      completedHistory.put(opId, future);
+-      inProgressHistory.remove(opId);
+-    });
++    history.put(opId, operationInstance);
++    expireHistory();
+-    // we want to replace only if still in in-progress.
+-    inProgressHistory.replace(opId, future, newFuture);
+-
+-    return new OperationInstance<>(newFuture, opId, operationInstance.getOperation());
++    return operationInstance;
+-  public static final class OperationInstance<A extends ClusterManagementOperation<V>, V extends JsonSerializable>
++  @SuppressWarnings("unchecked")
++  <A extends ClusterManagementOperation<V>, V extends OperationResult> List<OperationInstance<A, V>> listOperationInstances(
++      A opType) {
++    expireHistory();
++    return history.values().stream().filter(oi -> opType.getClass().isInstance(oi.getOperation()))
++        .map(oi -> (OperationInstance<A, V>) oi).collect(Collectors.toList());
++  }
++
++  /**
++   * struct for holding information pertinent to a specific instance of an operation
++   *
++   * all fields are immutable, however note that {@link #setOperationEnded(Date)} completes
++   * {@link #getFutureOperationEnded()}
++   */
++  public static class OperationInstance<A extends ClusterManagementOperation<V>, V extends OperationResult>
++    private final Date operationStart;
++    private final CompletableFuture<Date> futureOperationEnded;
++    private String operator;
+-    public OperationInstance(CompletableFuture<V> future, String opId, A operation) {
++    public OperationInstance(CompletableFuture<V> future, String opId, A operation,
++        Date operationStart) {
++      this.operationStart = operationStart;
++      this.futureOperationEnded = new CompletableFuture<>();
+-    public CompletableFuture<V> getFuture() {
++    public CompletableFuture<V> getFutureResult() {
++
++    public Date getOperationStart() {
++      return operationStart;
++    }
++
++    public CompletableFuture<Date> getFutureOperationEnded() {
++      return futureOperationEnded;
++    }
++
++    public void setOperationEnded(Date operationEnded) {
++      this.futureOperationEnded.complete(operationEnded);
++    }
++
++    public String getOperator() {
++      return operator;
++    }
++
++    public void setOperator(String operator) {
++      this.operator = operator;
++    }
+
+MOV26 INS26 INS26 INS26 INS26 INS40 INS40 UPD40 INS40 INS40 UPD40 UPD40 INS29 INS31 INS31 INS31 INS31 INS31 INS31 INS65 UPD74 INS39 INS29 INS29 INS44 MOV29 MOV79 INS73 MOV73 UPD74 MOV74 UPD42 MOV42 MOV44 INS8 INS83 INS39 INS42 INS8 INS39 INS42 INS8 INS83 INS83 INS39 INS42 INS44 INS44 INS8 INS29 MOV83 MOV73 MOV73 MOV74 MOV42 MOV44 INS8 MOV79 INS73 INS73 INS74 INS42 INS44 INS8 INS29 INS23 INS23 INS23 INS31 INS31 INS31 INS31 INS31 INS66 INS66 INS66 INS43 UPD42 UPD42 INS65 INS65 UPD39 UPD42 INS43 INS42 INS42 INS74 UPD43 UPD43 INS43 INS21 INS41 INS60 INS60 INS21 INS41 INS39 INS42 UPD74 MOV74 INS42 INS60 INS25 INS60 INS54 MOV41 INS65 UPD43 MOV60 MOV60 INS21 MOV21 INS21 INS41 INS42 INS74 INS42 INS43 INS43 INS74 INS43 INS42 INS21 INS41 INS65 UPD43 INS83 INS83 INS43 INS59 INS83 INS83 INS74 INS59 INS83 INS43 INS59 INS44 UPD42 INS83 INS43 INS42 INS8 INS83 INS74 INS42 INS8 INS83 INS39 INS42 INS44 INS8 INS83 INS43 INS42 INS8 INS83 INS39 INS42 INS44 INS8 INS42 INS66 UPD34 INS40 INS66 INS42 UPD66 INS43 INS43 UPD42 UPD42 INS42 INS32 INS11 INS83 INS39 INS59 INS74 INS59 INS32 INS32 INS76 INS76 INS74 INS59 INS38 INS41 INS83 INS39 INS59 INS8 INS12 INS12 INS27 INS66 UPD42 MOV74 INS32 INS32 INS42 INS43 INS43 INS42 INS42 INS43 INS43 INS43 INS42 INS32 INS32 INS66 INS66 INS65 INS66 INS65 UPD42 INS42 INS42 MOV43 INS43 INS42 INS42 INS42 INS43 INS42 INS21 INS21 INS42 INS41 INS43 INS43 INS41 INS43 INS42 INS21 INS42 INS41 INS43 INS42 INS21 UPD42 UPD42 INS42 INS42 INS42 INS74 INS32 INS42 INS27 INS43 MOV43 INS42 INS32 INS42 INS42 INS90 INS42 INS42 MOV43 INS43 INS42 INS32 INS32 INS9 INS42 MOV21 INS44 INS8 INS44 INS8 INS42 INS42 INS42 INS42 INS86 UPD42 UPD42 INS42 INS42 INS42 INS42 INS42 INS42 UPD42 MOV42 INS32 INS42 INS32 INS68 INS68 INS42 INS42 INS7 INS7 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS7 UPD42 UPD42 INS42 UPD43 MOV43 INS43 MOV43 UPD42 MOV42 MOV42 MOV42 INS32 INS42 INS42 INS32 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS43 INS42 INS41 INS43 INS42 INS21 INS41 UPD42 MOV59 MOV59 INS32 INS32 INS42 INS86 UPD42 MOV42 UPD42 MOV42 INS42 INS69 INS42 INS22 INS42 INS22 INS14 INS22 INS42 INS42 INS22 INS42 UPD42 INS42 INS42 INS32 INS42 INS90 INS42 INS42 UPD42 INS42 INS9 INS42 INS32 INS9 INS42 INS42 INS14 INS32 INS42 INS86 INS59 INS11 INS43 INS52 INS42 INS52 INS42 INS74 INS52 INS42 INS52 INS42 INS32 INS42 INS86 INS40 INS42 INS32 UPD42 INS32 INS42 INS43 INS32 UPD42 MOV42 INS59 INS32 INS42 INS74 INS42 INS42 INS43 INS32 INS42 INS59 INS32 UPD42 MOV42 MOV42 INS42 INS42 INS42 UPD42 MOV42 UPD42 MOV42 INS42 INS32 UPD42 MOV42 INS32 INS43 INS43 INS43 INS42 INS42 INS42 INS42 INS42 INS42 INS32 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 INS42 INS42 INS42 INS42 INS42 DEL42 DEL43 DEL74 DEL42 DEL43 DEL42 DEL14 DEL42 DEL42 DEL43 DEL42 DEL43 DEL74 DEL83 DEL74 DEL42 DEL32 DEL59 DEL60 DEL42 DEL33 DEL27 DEL8 DEL25 DEL8 DEL31 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL21 DEL32 DEL21 DEL8 DEL86 DEL32 DEL59 DEL60 DEL32 DEL21 DEL42 DEL42 DEL32 DEL14 DEL41 DEL8 DEL31 DEL83

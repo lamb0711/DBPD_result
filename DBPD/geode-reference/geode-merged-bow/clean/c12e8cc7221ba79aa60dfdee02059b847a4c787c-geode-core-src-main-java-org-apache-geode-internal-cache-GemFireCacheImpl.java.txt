@@ -1,0 +1,496 @@
+GEODE-7503: Block Cache.close() until everything is disconnected (#4963)
+
+Subsequent calls to GemFireCacheImpl close will now block until the
+first call to close completes instead of returning from early-outs.
+
+Use boolean argument to skip await if cache close is invoked from
+the DisconnectListener in InternalLocator.
+
+Additional changes:
+* Make cache close reentrant
+* Fixup GemFireCacheImplCloseTest flakiness
+* Remove unused class
++  private static final ThreadLocal<Thread> CLOSING_THREAD = new ThreadLocal<>();
++
++  private final CountDownLatch isClosedLatch = new CountDownLatch(1);
++
+-        close("Shut down all members", null, false, true);
++        close("Shut down all members", null, false, true, false);
+-    close(reason, null, keepAlive, keepDS);
++    close(reason, null, keepAlive, keepDS, false);
+-    close("Normal disconnect", null, keepAlive, false);
++    close("Normal disconnect", null, keepAlive, false, false);
+-    close(reason, optionalCause, false, false);
++    close(reason, optionalCause, false, false, false);
+-      boolean keepDS) {
++      boolean keepDS, boolean skipAwait) {
++      if (!skipAwait && !Thread.currentThread().equals(CLOSING_THREAD.get())) {
++        waitUntilClosed();
++      }
+-    boolean isDebugEnabled = logger.isDebugEnabled();
+-
++        if (!skipAwait && !Thread.currentThread().equals(CLOSING_THREAD.get())) {
++          waitUntilClosed();
++        }
+-      // First close the ManagementService
+-      system.handleResourceEvent(ResourceEvent.CACHE_REMOVE, this);
+-      if (resourceEventsListener != null) {
+-        system.removeResourceListener(resourceEventsListener);
+-        resourceEventsListener = null;
+-      }
+-
+-      if (systemFailureCause != null) {
+-        forcedDisconnect = systemFailureCause instanceof ForcedDisconnectException;
+-        if (forcedDisconnect) {
+-          disconnectCause = new ForcedDisconnectException(reason);
+-        } else {
+-          disconnectCause = systemFailureCause;
+-        }
+-      }
+-
+-      this.keepAlive = keepAlive;
+-      isClosing = true;
+-      logger.info("{}: Now closing.", this);
+-
+-      // we don't clear the prID map if there is a system failure. Other
+-      // threads may be hung trying to communicate with the map locked
+-      if (systemFailureCause == null) {
+-        PartitionedRegion.clearPRIdMap();
+-      }
+-
+-      TXStateProxy tx = null;
++      CLOSING_THREAD.set(Thread.currentThread());
+-        if (transactionManager != null) {
+-          tx = transactionManager.pauseTransaction();
++        boolean isDebugEnabled = logger.isDebugEnabled();
++
++        // First close the ManagementService
++        system.handleResourceEvent(ResourceEvent.CACHE_REMOVE, this);
++        if (resourceEventsListener != null) {
++          system.removeResourceListener(resourceEventsListener);
++          resourceEventsListener = null;
+-        // do this before closing regions
+-        resourceManager.close();
++        if (systemFailureCause != null) {
++          forcedDisconnect = systemFailureCause instanceof ForcedDisconnectException;
++          if (forcedDisconnect) {
++            disconnectCause = new ForcedDisconnectException(reason);
++          } else {
++            disconnectCause = systemFailureCause;
++          }
++        }
++        this.keepAlive = keepAlive;
++        isClosing = true;
++        logger.info("{}: Now closing.", this);
++
++        // we don't clear the prID map if there is a system failure. Other
++        // threads may be hung trying to communicate with the map locked
++        if (systemFailureCause == null) {
++          PartitionedRegion.clearPRIdMap();
++        }
++
++        TXStateProxy tx = null;
+-          resourceAdvisor.close();
+-        } catch (CancelException ignore) {
+-        }
+-        try {
+-          jmxAdvisor.close();
+-        } catch (CancelException ignore) {
+-        }
++          if (transactionManager != null) {
++            tx = transactionManager.pauseTransaction();
++          }
+-        for (GatewaySender sender : allGatewaySenders) {
++          // do this before closing regions
++          resourceManager.close();
++
+-            sender.stop();
+-            GatewaySenderAdvisor advisor = ((AbstractGatewaySender) sender).getSenderAdvisor();
+-            if (advisor != null) {
+-              if (isDebugEnabled) {
+-                logger.debug("Stopping the GatewaySender advisor");
+-              }
+-              advisor.close();
+-            }
++            resourceAdvisor.close();
+-        }
+-
+-        destroyGatewaySenderLockService();
+-
+-        if (eventThreadPool != null) {
+-          if (isDebugEnabled) {
+-            logger.debug("{}: stopping event thread pool...", this);
+-          }
+-          eventThreadPool.shutdown();
+-        }
+-
+-        // IMPORTANT: any operation during shut down that can time out (create a CancelException)
+-        // must be inside of this try block. If all else fails, we *must* ensure that the cache gets
+-        // closed!
+-        try {
+-          stopServers();
+-
+-          stopServices();
+-
+-          // no need to track PR instances
+-          if (isDebugEnabled) {
+-            logger.debug("{}: clearing partitioned regions...", this);
+-          }
+-          synchronized (partitionedRegions) {
+-            int prSize = -partitionedRegions.size();
+-            partitionedRegions.clear();
+-            getCachePerfStats().incPartitionedRegions(prSize);
++          try {
++            jmxAdvisor.close();
++          } catch (CancelException ignore) {
+-          prepareDiskStoresForClose();
+-
+-          Operation op;
+-          if (forcedDisconnect) {
+-            op = Operation.FORCED_DISCONNECT;
+-          } else if (isReconnecting()) {
+-            op = Operation.CACHE_RECONNECT;
+-          } else {
+-            op = Operation.CACHE_CLOSE;
+-          }
+-
+-          InternalRegion prRoot = null;
+-
+-          for (InternalRegion lr : rootRegions.values()) {
+-            if (isDebugEnabled) {
+-              logger.debug("{}: processing region {}", this, lr.getFullPath());
++          for (GatewaySender sender : allGatewaySenders) {
++            try {
++              sender.stop();
++              GatewaySenderAdvisor advisor = ((AbstractGatewaySender) sender).getSenderAdvisor();
++              if (advisor != null) {
++                if (isDebugEnabled) {
++                  logger.debug("Stopping the GatewaySender advisor");
++                }
++                advisor.close();
++              }
++            } catch (CancelException ignore) {
+-            if (PartitionedRegionHelper.PR_ROOT_REGION_NAME.equals(lr.getName())) {
+-              prRoot = lr;
++          }
++
++          destroyGatewaySenderLockService();
++
++          if (eventThreadPool != null) {
++            if (isDebugEnabled) {
++              logger.debug("{}: stopping event thread pool...", this);
++            }
++            eventThreadPool.shutdown();
++          }
++
++          // IMPORTANT: any operation during shut down that can time out (create a CancelException)
++          // must be inside of this try block. If all else fails, we *must* ensure that the cache
++          // gets
++          // closed!
++          try {
++            stopServers();
++
++            stopServices();
++
++            // no need to track PR instances
++            if (isDebugEnabled) {
++              logger.debug("{}: clearing partitioned regions...", this);
++            }
++            synchronized (partitionedRegions) {
++              int prSize = -partitionedRegions.size();
++              partitionedRegions.clear();
++              getCachePerfStats().incPartitionedRegions(prSize);
++            }
++
++            prepareDiskStoresForClose();
++
++            Operation op;
++            if (forcedDisconnect) {
++              op = Operation.FORCED_DISCONNECT;
++            } else if (isReconnecting()) {
++              op = Operation.CACHE_RECONNECT;
+-              if (lr.getName().contains(ParallelGatewaySenderQueue.QSTRING)) {
+-                // this region will be closed internally by parent region
+-                continue;
+-              }
++              op = Operation.CACHE_CLOSE;
++            }
++
++            InternalRegion prRoot = null;
++
++            for (InternalRegion lr : rootRegions.values()) {
+-                logger.debug("{}: closing region {}...", this, lr.getFullPath());
++                logger.debug("{}: processing region {}", this, lr.getFullPath());
+-              try {
+-                lr.handleCacheClose(op);
+-              } catch (RuntimeException e) {
+-                if (isDebugEnabled || !forcedDisconnect) {
+-                  logger.warn(String.format("%s: error closing region %s", this, lr.getFullPath()),
+-                      e);
++              if (PartitionedRegionHelper.PR_ROOT_REGION_NAME.equals(lr.getName())) {
++                prRoot = lr;
++              } else {
++                if (lr.getName().contains(ParallelGatewaySenderQueue.QSTRING)) {
++                  // this region will be closed internally by parent region
++                  continue;
++                }
++                if (isDebugEnabled) {
++                  logger.debug("{}: closing region {}...", this, lr.getFullPath());
++                }
++                try {
++                  lr.handleCacheClose(op);
++                } catch (RuntimeException e) {
++                  if (isDebugEnabled || !forcedDisconnect) {
++                    logger
++                        .warn(String.format("%s: error closing region %s", this, lr.getFullPath()),
++                            e);
++                  }
+-          }
+-          try {
++            try {
++              if (isDebugEnabled) {
++                logger.debug("{}: finishing partitioned region close...", this);
++              }
++              PartitionedRegion.afterRegionsClosedByCacheClose(this);
++              if (prRoot != null) {
++                // do the PR meta root region last
++                prRoot.handleCacheClose(op);
++              }
++            } catch (CancelException e) {
++              logger.warn(
++                  String.format("%s: error in last stage of PartitionedRegion cache close", this),
++                  e);
++            }
++            destroyPartitionedRegionLockService();
++
++            closeDiskStores();
++            diskMonitor.close();
++
++            // Close the CqService Handle.
++            try {
++              if (isDebugEnabled) {
++                logger.debug("{}: closing CQ service...", this);
++              }
++              cqService.close();
++            } catch (RuntimeException ignore) {
++              logger.info("Failed to get the CqService, to close during cache close (1).");
++            }
++
++            PoolManager.close(keepAlive);
++
+-              logger.debug("{}: finishing partitioned region close...", this);
++              logger.debug("{}: notifying admins of close...", this);
+-            PartitionedRegion.afterRegionsClosedByCacheClose(this);
+-            if (prRoot != null) {
+-              // do the PR meta root region last
+-              prRoot.handleCacheClose(op);
++            try {
++              SystemMemberCacheEventProcessor.send(this, Operation.CACHE_CLOSE);
++            } catch (CancelException ignore) {
++              if (logger.isDebugEnabled()) {
++                logger.debug("Ignored cancellation while notifying admins");
++              }
+-          } catch (CancelException e) {
+-            logger.warn(
+-                String.format("%s: error in last stage of PartitionedRegion cache close", this), e);
+-          }
+-          destroyPartitionedRegionLockService();
+-          closeDiskStores();
+-          diskMonitor.close();
++            if (isDebugEnabled) {
++              logger.debug("{}: stopping destroyed entries processor...", this);
++            }
++            tombstoneService.stop();
++
++            // NOTICE: the CloseCache message is the *last* message you can send!
++            DistributionManager distributionManager = null;
++            try {
++              distributionManager = system.getDistributionManager();
++              distributionManager.removeMembershipListener(transactionManager);
++            } catch (CancelException ignore) {
++            }
++
++            if (distributionManager != null) {
++              // Send CacheClosedMessage (and NOTHING ELSE) here
++              if (isDebugEnabled) {
++                logger.debug("{}: sending CloseCache to peers...", this);
++              }
++              Set<InternalDistributedMember> otherMembers =
++                  distributionManager.getOtherDistributionManagerIds();
++              ReplyProcessor21 processor = replyProcessor21Factory.create(system, otherMembers);
++              CloseCacheMessage msg = new CloseCacheMessage();
++              msg.setRecipients(otherMembers);
++              msg.setProcessorId(processor.getProcessorId());
++              distributionManager.putOutgoing(msg);
++
++              try {
++                processor.waitForReplies();
++              } catch (InterruptedException ignore) {
++                // TODO: reset interrupt flag later?
++                // Keep going, make best effort to shut down.
++              } catch (ReplyException ignore) {
++                // keep going
++              }
++              // set closed state after telling others and getting responses to avoid complications
++              // with others still in the process of sending messages
++            }
++            // NO MORE Distributed Messaging AFTER THIS POINT!!!!
++
++            ClientMetadataService cms = clientMetadataService;
++            if (cms != null) {
++              cms.close();
++            }
++            closeHeapEvictor();
++            closeOffHeapEvictor();
++          } catch (CancelException ignore) {
++            // make sure the disk stores get closed
++            closeDiskStores();
++            // NO DISTRIBUTED MESSAGING CAN BE DONE HERE!
++          }
+-            if (isDebugEnabled) {
+-              logger.debug("{}: closing CQ service...", this);
+-            }
+-            logger.info("Failed to get the CqService, to close during cache close (1).");
++            logger.info("Failed to get the CqService, to close during cache close (2).");
+-          PoolManager.close(keepAlive);
++          cachePerfStats.close();
++          TXLockService.destroyServices();
++          getEventTrackerTask().cancel();
+-          if (isDebugEnabled) {
+-            logger.debug("{}: notifying admins of close...", this);
+-          }
+-          try {
+-            SystemMemberCacheEventProcessor.send(this, Operation.CACHE_CLOSE);
+-          } catch (CancelException ignore) {
+-            if (logger.isDebugEnabled()) {
+-              logger.debug("Ignored cancellation while notifying admins");
++          synchronized (ccpTimerMutex) {
++            if (ccpTimer != null) {
++              ccpTimer.cancel();
+-          if (isDebugEnabled) {
+-            logger.debug("{}: stopping destroyed entries processor...", this);
+-          }
+-          tombstoneService.stop();
++          expirationScheduler.cancel();
+-          // NOTICE: the CloseCache message is the *last* message you can send!
+-          DistributionManager distributionManager = null;
+-          try {
+-            distributionManager = system.getDistributionManager();
+-            distributionManager.removeMembershipListener(transactionManager);
+-          } catch (CancelException ignore) {
++          // Stop QueryMonitor if running.
++          if (queryMonitor != null) {
++            queryMonitor.stopMonitoring();
+-          if (distributionManager != null) {
+-            // Send CacheClosedMessage (and NOTHING ELSE) here
+-            if (isDebugEnabled) {
+-              logger.debug("{}: sending CloseCache to peers...", this);
+-            }
+-            Set<InternalDistributedMember> otherMembers =
+-                distributionManager.getOtherDistributionManagerIds();
+-            ReplyProcessor21 processor = replyProcessor21Factory.create(system, otherMembers);
+-            CloseCacheMessage msg = new CloseCacheMessage();
+-            msg.setRecipients(otherMembers);
+-            msg.setProcessorId(processor.getProcessorId());
+-            distributionManager.putOutgoing(msg);
+-
+-            try {
+-              processor.waitForReplies();
+-            } catch (InterruptedException ignore) {
+-              // TODO: reset interrupt flag later?
+-              // Keep going, make best effort to shut down.
+-            } catch (ReplyException ignore) {
+-              // keep going
+-            }
+-            // set closed state after telling others and getting responses to avoid complications
+-            // with others still in the process of sending messages
+-          }
+-          // NO MORE Distributed Messaging AFTER THIS POINT!!!!
+-
+-          ClientMetadataService cms = clientMetadataService;
+-          if (cms != null) {
+-            cms.close();
+-          }
+-          closeHeapEvictor();
+-          closeOffHeapEvictor();
+-        } catch (CancelException ignore) {
+-          // make sure the disk stores get closed
+-          closeDiskStores();
++        } finally {
++          if (transactionManager != null) {
++            transactionManager.close();
++          }
++          ((DynamicRegionFactoryImpl) DynamicRegionFactory.get()).close();
++          if (transactionManager != null) {
++            transactionManager.unpauseTransaction(tx);
++          }
++          TXCommitMessage.getTracker().clearForCacheClose();
+-        // Close the CqService Handle.
+-        try {
+-          cqService.close();
+-        } catch (RuntimeException ignore) {
+-          logger.info("Failed to get the CqService, to close during cache close (2).");
+-        }
++        // Added to close the TransactionManager's cleanup thread
++        TransactionManagerImpl.refresh();
+-        cachePerfStats.close();
+-        TXLockService.destroyServices();
+-        getEventTrackerTask().cancel();
+-
+-        synchronized (ccpTimerMutex) {
+-          if (ccpTimer != null) {
+-            ccpTimer.cancel();
++        if (!keepDS) {
++          // keepDS is used by ShutdownAll. It will override disableDisconnectDsOnCacheClose
++          if (!disableDisconnectDsOnCacheClose) {
++            system.disconnect();
+-        expirationScheduler.cancel();
++        typeRegistryClose.run();
++        typeRegistrySetPdxSerializer.accept(null);
+-        // Stop QueryMonitor if running.
+-        if (queryMonitor != null) {
+-          queryMonitor.stopMonitoring();
++        for (CacheLifecycleListener listener : cacheLifecycleListeners) {
++          listener.cacheClosed(this);
++        SequenceLoggerImpl.signalCacheClose();
++        SystemFailure.signalCacheClose();
++
++        isClosedLatch.countDown();
+-        // NO DISTRIBUTED MESSAGING CAN BE DONE HERE!
+-        if (transactionManager != null) {
+-          transactionManager.close();
+-        }
+-        ((DynamicRegionFactoryImpl) DynamicRegionFactory.get()).close();
+-        if (transactionManager != null) {
+-          transactionManager.unpauseTransaction(tx);
+-        }
+-        TXCommitMessage.getTracker().clearForCacheClose();
++        CLOSING_THREAD.remove();
++    }
++  }
+-      // Added to close the TransactionManager's cleanup thread
+-      TransactionManagerImpl.refresh();
+-
+-      if (!keepDS) {
+-        // keepDS is used by ShutdownAll. It will override disableDisconnectDsOnCacheClose
+-        if (!disableDisconnectDsOnCacheClose) {
+-          system.disconnect();
+-        }
+-      }
+-
+-      typeRegistryClose.run();
+-      typeRegistrySetPdxSerializer.accept(null);
+-
+-      for (CacheLifecycleListener listener : cacheLifecycleListeners) {
+-        listener.cacheClosed(this);
+-      }
+-
+-      SequenceLoggerImpl.signalCacheClose();
+-      SystemFailure.signalCacheClose();
++  private void waitUntilClosed() {
++    try {
++      isClosedLatch.await();
++    } catch (InterruptedException ignore) {
++      // ignored
+
+INS23 INS23 INS31 INS83 INS83 INS83 INS74 INS59 INS83 INS83 INS43 INS59 MOV78 MOV78 INS44 INS83 INS39 INS42 INS8 INS43 INS43 INS42 INS14 INS42 INS42 INS14 INS39 INS42 INS54 INS42 INS42 INS74 INS43 INS34 MOV32 INS8 INS8 INS12 INS43 INS42 INS9 INS9 INS9 INS25 INS25 INS21 INS54 INS21 INS44 INS8 INS42 INS27 INS8 MOV32 INS8 INS32 MOV8 INS8 INS32 INS43 INS42 INS38 INS38 INS21 INS25 INS41 INS42 INS42 INS32 MOV60 INS21 INS21 INS42 INS42 INS42 INS42 INS32 INS32 INS27 INS8 INS42 INS42 INS32 INS32 INS9 INS32 INS42 INS32 INS42 INS38 INS38 INS21 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS32 INS32 INS42 INS32 INS42 INS42 INS42 INS42 INS42 DEL41 DEL8 DEL25

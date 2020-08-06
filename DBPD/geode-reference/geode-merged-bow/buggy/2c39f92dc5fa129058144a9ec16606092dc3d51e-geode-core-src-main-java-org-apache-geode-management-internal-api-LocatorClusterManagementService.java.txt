@@ -1,0 +1,208 @@
+GEODE-6861: separate static config object from runtime info in the Cl… (#3754)
+
+Co-authored-by: Joris Melchior <joris.melchior@gmail.com>
+
+* use ConfigRealizer to retrieve the runtime information for configuration on each member
+* list result would return a List of Response object which has a configuration object and a list runtime objects
+* use existing object for runtime member info and move them to geode-management module.
+
++import org.apache.geode.management.api.Response;
++import org.apache.geode.management.api.RestfulEndpoint;
+-import org.apache.geode.management.internal.cli.functions.UpdateCacheFunction;
++import org.apache.geode.management.internal.cli.functions.CacheRealizationFunction;
+-import org.apache.geode.management.internal.configuration.mutators.MemberConfigManager;
++import org.apache.geode.management.runtime.RuntimeInfo;
+-    managers.put(RegionConfig.class, new RegionConfigManager(cache));
+-    managers.put(MemberConfig.class, new MemberConfigManager(cache));
++    managers.put(RegionConfig.class, new RegionConfigManager());
+-  public <T extends CacheElement & RespondsWith<R>, R extends CacheElement> ClusterManagementResult<T> create(
+-      T config) {
++  public <T extends CacheElement> ClusterManagementResult<?, ?> create(T config) {
+-      return new ClusterManagementResult<>(false,
++      return new ClusterManagementResult(false,
+-    Set<DistributedMember> targetedMembers = memberValidator.findMembers(group);
++    Set<DistributedMember> targetedMembers = memberValidator.findServers(group);
+-    ClusterManagementResult<T> result = new ClusterManagementResult<>();
++    ClusterManagementResult result = new ClusterManagementResult();
+-        new UpdateCacheFunction(),
++        new CacheRealizationFunction(),
+-    if (result.isSuccessful()) {
+-      result.setResult(Collections.singletonList(config));
++    if (result.isSuccessful() && config instanceof RestfulEndpoint) {
++      result.setUri(((RestfulEndpoint) config).getUri());
+-  public <T extends CacheElement & RespondsWith<R>, R extends CacheElement> ClusterManagementResult<T> delete(
++  public <T extends CacheElement> ClusterManagementResult<?, ?> delete(
+-      return new ClusterManagementResult<>(false,
++      return new ClusterManagementResult(false,
+-    ClusterManagementResult<T> result = new ClusterManagementResult<>();
++    ClusterManagementResult result = new ClusterManagementResult();
+-        new UpdateCacheFunction(),
++        new CacheRealizationFunction(),
+-        memberValidator.findMembers(groupsWithThisElement));
++        memberValidator.findServers(groupsWithThisElement));
+-  public <T extends CacheElement & RespondsWith<R>, R extends CacheElement> ClusterManagementResult<T> update(
++  public <T extends CacheElement> ClusterManagementResult<?, ?> update(
+-  public <T extends CacheElement & RespondsWith<R>, R extends CacheElement> ClusterManagementResult<R> list(
++  public <T extends CacheElement & RespondsWith<R>, R extends RuntimeInfo> ClusterManagementResult<T, R> list(
+-    ConfigurationManager<T, R> manager = managers.get(filter.getClass());
++    ConfigurationManager<T> manager = managers.get(filter.getClass());
+-    ClusterManagementResult<R> result = new ClusterManagementResult<>();
+-
+-    if (filter instanceof MemberConfig) {
+-      List<R> listResults = manager.list(filter, null);
+-      result.setResult(listResults);
+-      return result;
+-    }
++    ClusterManagementResult<T, R> result = new ClusterManagementResult<>();
+-    List<R> resultList = new ArrayList<>();
+-    for (String group : persistenceService.getGroups()) {
+-      CacheConfig currentPersistedConfig = persistenceService.getCacheConfig(group, true);
+-      List<R> listInGroup = manager.list(filter, currentPersistedConfig);
+-      for (R element : listInGroup) {
+-        element.setGroup(group);
+-        resultList.add(element);
++    List<T> resultList = new ArrayList<>();
++
++    if (filter instanceof MemberConfig) {
++      resultList.add(filter);
++    } else {
++      // gather elements on all the groups, consolidate the group information and then do the filter
++      // so that when we filter by a specific group, we still show that a particular element might
++      // also belong to another group.
++      for (String group : persistenceService.getGroups()) {
++        CacheConfig currentPersistedConfig = persistenceService.getCacheConfig(group, true);
++        List<T> listInGroup = manager.list(filter, currentPersistedConfig);
++        for (T element : listInGroup) {
++          element.setGroup(group);
++          resultList.add(element);
++        }
+-    }
+-    // if empty result, return immediately
+-    if (resultList.size() == 0) {
+-      return result;
+-    }
+-
+-    // right now the list contains [{regionA, group1}, {regionA, group2}...], if the elements are
+-    // MultiGroupCacheElement, we need to consolidate the list into [{regionA, [group1, group2]}
+-
+-    List<R> consolidatedConfigList = new ArrayList<>();
+-    for (R element : resultList) {
+-      int index = consolidatedConfigList.indexOf(element);
+-      if (index >= 0) {
+-        R exist = consolidatedConfigList.get(index);
+-        exist.getGroups().add(element.getGroup());
+-      } else {
+-        consolidatedConfigList.add(element);
++      // if empty result, return immediately
++      if (resultList.size() == 0) {
++        return result;
++
++      // right now the list contains [{regionA, group1}, {regionA, group2}...], if the elements are
++      // MultiGroupCacheElement, we need to consolidate the list into [{regionA, [group1, group2]}
++      List<T> consolidatedResultList = new ArrayList<>();
++      for (T element : resultList) {
++        int index = consolidatedResultList.indexOf(element);
++        if (index >= 0) {
++          T exist = consolidatedResultList.get(index);
++          exist.addGroup(element.getGroup());
++        } else {
++          consolidatedResultList.add(element);
++        }
++      }
++      if (StringUtils.isNotBlank(filter.getGroup())) {
++        consolidatedResultList = consolidatedResultList.stream()
++            .filter(e -> (e.getGroups().contains(filter.getConfigGroup())))
++            .collect(Collectors.toList());
++      }
++      resultList = consolidatedResultList;
+-    if (StringUtils.isNotBlank(filter.getGroup())) {
+-      consolidatedConfigList = consolidatedConfigList.stream()
+-          .filter(e -> (e.getGroups().contains(filter.getConfigGroup())))
+-          .collect(Collectors.toList());
+-    }
+-    // if "cluster" is the only group, clear it
+-    for (R element : consolidatedConfigList) {
++
++    // gather the runtime info for each configuration objects
++    List<Response<T, R>> responses = new ArrayList<>();
++    boolean hasRuntimeInfo = filter.hasRuntimeInfo();
++
++    for (T element : resultList) {
++      List<String> groups = element.getGroups();
++      Response<T, R> response = new Response<>(element);
++
++      // if "cluster" is the only group, clear it, so that the returning json does not show
++      // "cluster" as a group value
++
++      responses.add(response);
++      // do not gather runtime if this type of CacheElement is RespondWith<RuntimeInfo>
++      if (!hasRuntimeInfo) {
++        continue;
++      }
++
++      Set<DistributedMember> members;
++
++      if (filter instanceof MemberConfig) {
++        members =
++            memberValidator.findMembers(filter.getId(), filter.getGroups().toArray(new String[0]));
++      } else {
++        members = memberValidator.findServers(groups.toArray(new String[0]));
++      }
++
++      // no member belongs to these groups
++      if (members.size() == 0) {
++        continue;
++      }
++
++      // if this cacheElement's runtime info only contains global info (no per member info), we will
++      // only need to issue get function on any member instead of all of them.
++      if (element.isGlobalRuntime()) {
++        members = Collections.singleton(members.iterator().next());
++      }
++
++      List<R> runtimeInfos = executeAndGetFunctionResult(new CacheRealizationFunction(),
++          Arrays.asList(element, CacheElementOperation.GET),
++          members);
++      response.setRuntimeInfo(runtimeInfos);
+-    resultList = consolidatedConfigList;
+-
+-
+-    result.setResult(resultList);
++    result.setResult(responses);
+-  public <T extends CacheElement & RespondsWith<R>, R extends CacheElement> ClusterManagementResult<R> get(
++  public <T extends CacheElement & RespondsWith<R>, R extends RuntimeInfo> ClusterManagementResult<T, R> get(
+-    ClusterManagementResult<R> list = list(config);
+-    List<R> result = list.getResult();
++    ClusterManagementResult<T, R> list = list(config);
++    List<Response<T, R>> result = list.getResult();
++
++  @SuppressWarnings("unchecked")
++  private <T extends CacheElement> ConfigurationManager<T> getConfigurationManager(
++      T config) {
++    ConfigurationManager configurationManager = managers.get(config.getClass());
++    if (configurationManager == null) {
++      throw new IllegalArgumentException(String.format("Configuration type %s is not supported",
++          config.getClass().getSimpleName()));
++    }
++
++    return configurationManager;
++  }
++
+-  List<RealizationResult> executeAndGetFunctionResult(Function function, Object args,
++  <R> List<R> executeAndGetFunctionResult(Function function, Object args,
+-    return (List<RealizationResult>) rc.getResult();
+-  }
+-
+-  @SuppressWarnings("unchecked")
+-  private <T extends CacheElement & RespondsWith<R>, R extends CacheElement> ConfigurationManager<T, R> getConfigurationManager(
+-      T config) {
+-    ConfigurationManager configurationManager = managers.get(config.getClass());
+-    if (configurationManager == null) {
+-      throw new IllegalArgumentException(String.format("Configuration type %s is not supported",
+-          config.getClass().getSimpleName()));
+-    }
+-
+-    return configurationManager;
++    return (List<R>) rc.getResult();
+
+MOV26 INS26 INS26 MOV31 INS40 INS40 UPD40 UPD40 INS74 INS74 INS74 UPD74 MOV74 UPD74 MOV74 UPD74 INS73 MOV74 UPD42 UPD43 MOV43 INS76 INS76 UPD42 UPD43 MOV43 INS76 INS76 UPD42 MOV43 INS76 INS76 UPD43 MOV43 INS25 INS60 INS60 INS70 UPD43 INS43 UPD42 INS42 UPD42 INS43 INS59 INS27 UPD42 INS43 INS59 UPD42 UPD74 MOV74 UPD74 UPD74 MOV62 MOV8 INS8 INS74 MOV59 INS39 INS59 MOV44 INS42 INS8 UPD42 INS42 INS74 UPD74 MOV42 INS42 INS14 MOV32 INS62 MOV42 INS42 INS14 MOV43 MOV43 MOV43 MOV43 MOV43 MOV70 MOV25 MOV60 MOV70 MOV25 INS21 INS43 INS74 UPD42 INS42 INS32 INS43 INS60 INS60 MOV25 INS21 INS25 INS60 INS25 INS25 INS25 INS60 INS21 UPD42 MOV43 INS43 MOV43 INS74 MOV74 UPD42 MOV43 INS42 INS43 MOV43 UPD74 MOV74 INS59 INS7 INS42 INS43 INS43 MOV43 INS42 INS42 INS42 INS74 INS59 INS74 INS59 INS32 INS38 INS8 INS74 INS59 INS62 INS8 INS8 INS27 INS8 INS32 INS8 INS74 INS59 INS32 INS42 INS43 INS43 MOV43 MOV43 UPD43 INS42 UPD42 MOV43 UPD43 UPD42 UPD42 UPD42 UPD42 INS43 INS42 INS14 UPD43 INS42 INS42 INS42 INS42 INS43 INS43 INS42 INS32 INS43 INS43 MOV43 INS42 INS14 INS42 INS42 INS42 INS42 INS18 INS43 INS43 INS42 INS42 INS43 MOV21 INS21 INS32 INS34 INS18 INS42 INS42 INS21 INS43 INS43 INS42 INS32 INS42 INS42 INS42 INS42 INS42 UPD42 INS36 INS42 UPD42 UPD74 MOV74 INS42 INS74 UPD42 INS42 INS42 INS42 INS42 INS42 INS42 INS74 INS42 INS42 INS42 INS42 INS7 INS42 INS42 INS7 INS42 INS42 INS42 INS14 INS32 INS42 INS11 INS43 UPD43 INS43 UPD42 INS43 UPD42 INS32 INS42 INS32 INS42 INS32 INS43 INS42 INS42 INS42 INS40 INS43 INS42 INS42 UPD42 INS42 UPD42 UPD43 INS42 INS42 INS42 INS32 INS32 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS42 UPD42 MOV42 UPD42 UPD42 INS42 INS42 INS32 INS42 INS3 INS42 INS42 INS3 INS32 INS42 UPD42 UPD42 INS42 INS42 INS5 INS34 INS5 INS34 INS42 INS42 INS43 INS85 INS43 INS85 INS42 INS42 DEL42 DEL42 DEL42 DEL42 DEL43 DEL57 DEL42 DEL43 DEL42 DEL14 DEL32 DEL21 DEL42 DEL42 DEL43 DEL42 DEL43 DEL74 DEL73 DEL42 DEL43 DEL74 DEL42 DEL43 DEL74 DEL14 DEL59 DEL42 DEL42 DEL42 DEL42 DEL42 DEL43 DEL42 DEL43 DEL74 DEL73 DEL74 DEL42 DEL43 DEL74 DEL42 DEL43 DEL74 DEL14 DEL59 DEL42 DEL42 DEL43 DEL42 DEL43 DEL74 DEL73 DEL74 DEL74 DEL25 DEL42 DEL43 DEL42 DEL43 DEL42 DEL43 DEL74 DEL42 DEL42 DEL42 DEL42 DEL33 DEL32 DEL59 DEL60 DEL42 DEL41 DEL42 DEL32 DEL42 DEL42 DEL8 DEL70 DEL74 DEL42 DEL42 DEL43 DEL42 DEL43 DEL42 DEL43 DEL74 DEL73 DEL42 DEL43 DEL42 DEL43 DEL74 DEL42 DEL43 DEL42 DEL43 DEL74

@@ -1,0 +1,174 @@
+GEODE-8323: Process QueueRemovalMessage after queue initialized. (#5333)
+
+
+-import static org.apache.geode.internal.cache.LocalRegion.InitializationLevel.BEFORE_INITIAL_IMAGE;
++import static org.apache.geode.util.internal.UncheckedUtils.uncheckedCast;
+-import org.apache.geode.internal.cache.LocalRegion.InitializationLevel;
+-  private List messagesList;
++  private List<Object> messagesList;
+-    this.setRecipient(ALL_RECIPIENTS);
++    setRecipient(ALL_RECIPIENTS);
+-  public void setMessagesList(List messages) {
+-    this.messagesList = messages;
++  void setMessagesList(List messages) {
++    this.messagesList = uncheckedCast(messages);
+-      Iterator iterator = this.messagesList.iterator();
+-      final InitializationLevel oldLevel =
+-          LocalRegion.setThreadInitLevelRequirement(BEFORE_INITIAL_IMAGE);
+-      try {
+-        while (iterator.hasNext()) {
+-          final String regionName = (String) iterator.next();
+-          final int size = (Integer) iterator.next();
+-          final LocalRegion region = (LocalRegion) cache.getRegion(regionName);
+-          final HARegionQueue hrq;
+-          if (region == null || !region.isInitialized()) {
+-            hrq = null;
+-          } else {
+-            HARegionQueue tmp = ((HARegion) region).getOwner();
+-            if (tmp != null && tmp.isQueueInitialized()) {
+-              hrq = tmp;
+-            } else {
+-              hrq = null;
+-            }
+-          }
+-          // we have to iterate even if the hrq isn't available since there are
+-          // a bunch of event IDs to go through
+-          for (int i = 0; i < size; i++) {
+-            final EventID id = (EventID) iterator.next();
+-            boolean interrupted = Thread.interrupted();
+-            if (hrq == null || !hrq.isQueueInitialized()) {
+-              continue;
+-            }
+-            try {
+-              // Fix for bug 39516: inline removal of events by QRM.
+-              // dm.getWaitingThreadPool().execute(new Runnable() {
+-              // public void run()
+-              // {
+-              try {
+-                if (logger.isTraceEnabled()) {
+-                  logger.trace("QueueRemovalMessage: removing dispatched events on queue {} for {}",
+-                      regionName, id);
+-                }
+-                hrq.removeDispatchedEvents(id);
+-              } catch (RegionDestroyedException ignore) {
+-                logger.info(
+-                    "Queue found destroyed while processing the last disptached sequence ID for a HARegionQueue's DACE. The event ID is {} for HARegion with name={}",
+-                    new Object[] {id, regionName});
+-              } catch (CancelException ignore) {
+-                return; // cache or DS is closing
+-              } catch (CacheException e) {
+-                logger.error(String.format(
+-                    "QueueRemovalMessage::process:Exception in processing the last disptached sequence ID for a HARegionQueue's DACE. The problem is with event ID,%s for HARegion with name=%s",
+-                    new Object[] {regionName, id}),
+-                    e);
+-              } catch (InterruptedException ignore) {
+-                return; // interrupt occurs during shutdown. this runs in an executor, so just stop
+-                        // processing
+-              }
+-            } catch (RejectedExecutionException ignore) {
+-              interrupted = true;
+-            } finally {
+-              if (interrupted) {
+-                Thread.currentThread().interrupt();
+-              }
+-            }
+-          } // if
+-        } // for
+-      } finally {
+-        LocalRegion.setThreadInitLevelRequirement(oldLevel);
++      Iterator iterator = messagesList.iterator();
++      processRegionQueues(cache, iterator);
++    }
++  }
++
++  void processRegionQueues(InternalCache cache, Iterator iterator) {
++    while (iterator.hasNext()) {
++      final String regionName = (String) iterator.next();
++      final int size = (Integer) iterator.next();
++      final LocalRegion region = (LocalRegion) cache.getRegion(regionName);
++      final HARegionQueue hrq;
++      if (region == null) {
++        if (logger.isDebugEnabled()) {
++          logger.debug("processing QRM region {} does not exist.", regionName);
++        }
++        hrq = null;
++      } else {
++        long maxWaitTimeForInitialization = 30000;
++        hrq = ((HARegion) region).getOwnerWithWait(maxWaitTimeForInitialization);
+-    } // cache != null
++      boolean succeed = processRegionQueue(iterator, regionName, size, hrq);
++      if (!succeed) {
++        return;
++      }
++    }
++  }
++
++  boolean processRegionQueue(Iterator iterator, String regionName, int size,
++      HARegionQueue hrq) {
++    // we have to iterate even if the hrq isn't available since there are
++    // a bunch of event IDs to go through
++    for (int i = 0; i < size; i++) {
++      final EventID id = (EventID) iterator.next();
++      if (hrq == null || !hrq.isQueueInitialized()) {
++        if (logger.isDebugEnabled()) {
++          logger.debug("QueueRemovalMessage: hrq is not ready when trying to remove "
++              + "dispatched event on queue {} for {}", regionName, id);
++        }
++        continue;
++      }
++
++      if (!removeQueueEvent(regionName, hrq, id)) {
++        return false;
++      }
++    }
++    return true;
++  }
++
++  boolean removeQueueEvent(String regionName, HARegionQueue hrq, EventID id) {
++    // Fix for bug 39516: inline removal of events by QRM.
++    // dm.getWaitingThreadPool().execute(new Runnable() {
++    // public void run()
++    // {
++    boolean interrupted = Thread.interrupted();
++    try {
++      if (logger.isTraceEnabled()) {
++        logger.trace("QueueRemovalMessage: removing dispatched events on queue {} for {}",
++            regionName, id);
++      }
++      hrq.removeDispatchedEvents(id);
++    } catch (RegionDestroyedException ignore) {
++      logger.info(
++          "Queue found destroyed while processing the last dispatched sequence ID for a HARegionQueue's DACE. The event ID is {} for HARegion with name={}",
++          new Object[] {id, regionName});
++    } catch (CancelException ignore) {
++      return false;
++    } catch (CacheException e) {
++      logger.error(String.format(
++          "QueueRemovalMessage::process:Exception in processing the last dispatched sequence ID for a HARegionQueue's DACE. The problem is with event ID, %s for HARegion with name=%s",
++          regionName, id),
++          e);
++    } catch (InterruptedException ignore) {
++      Thread.currentThread().interrupt();
++      return false;
++    } catch (RejectedExecutionException ignore) {
++      interrupted = true;
++    } finally {
++      if (interrupted) {
++        Thread.currentThread().interrupt();
++      }
++    }
++    return true;
+-    this.messagesList = new LinkedList();
++    messagesList = new LinkedList<>();
+-      this.messagesList.add(DataSerializer.readString(in));
+-      // read the datasize
++      messagesList.add(DataSerializer.readString(in));
++      // read the data size
+-      this.messagesList.add(eventIdSize);
++      messagesList.add(eventIdSize);
+-        this.messagesList.add(DataSerializer.readObject(in));
++        messagesList.add(DataSerializer.readObject(in));
+-    return "QueueRemovalMessage" + this.messagesList;
++    return "QueueRemovalMessage" + messagesList;
+
+MOV26 UPD40 INS31 INS31 INS31 INS31 INS74 MOV29 MOV78 MOV83 MOV39 MOV42 MOV44 INS8 INS39 INS42 INS44 INS44 INS8 INS39 INS42 INS44 INS44 INS44 INS44 INS8 INS39 INS42 INS44 INS44 INS44 MOV8 MOV43 MOV43 MOV60 INS25 INS43 INS42 INS43 INS42 INS61 UPD43 MOV43 UPD42 MOV42 INS43 INS42 INS39 INS42 MOV43 INS42 INS24 INS41 INS43 INS42 INS43 INS42 INS43 INS42 MOV60 INS41 MOV27 INS8 INS42 INS42 MOV32 INS8 UPD42 INS42 MOV58 MOV27 MOV37 INS8 INS9 INS42 INS42 INS42 MOV12 MOV8 INS9 INS32 MOV60 INS21 MOV60 MOV60 MOV60 MOV60 MOV25 INS60 INS25 MOV60 MOV25 INS25 INS8 INS42 INS42 INS42 INS42 INS32 MOV27 INS8 INS39 INS59 INS38 MOV8 INS38 INS8 INS41 INS21 INS43 INS42 INS74 INS42 INS42 INS42 INS25 MOV21 INS60 INS42 INS32 INS42 INS25 INS32 INS41 INS9 INS32 INS9 INS42 MOV43 INS42 INS42 INS42 INS32 MOV8 INS39 INS59 INS42 INS42 INS42 INS42 INS42 INS32 INS8 INS42 INS42 INS42 INS42 INS9 UPD45 INS32 INS42 UPD42 MOV42 UPD42 MOV42 INS42 INS34 MOV32 INS42 INS42 INS21 UPD45 INS42 INS42 INS42 INS42 INS42 INS32 UPD42 INS42 INS32 INS42 INS42 INS45 INS42 INS42 INS42 INS27 INS42 INS42 INS45 INS45 DEL40 DEL26 DEL52 DEL83 DEL42 DEL52 DEL42 DEL22 DEL42 DEL42 DEL7 DEL42 DEL33 DEL27 DEL32 DEL27 DEL33 DEL85 DEL5 DEL42 DEL42 DEL4 DEL3 DEL83 DEL42 DEL43 DEL42 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL42 DEL32 DEL38 DEL27 DEL8 DEL42 DEL59 DEL60 DEL8 DEL25 DEL54 DEL8 DEL24 DEL8 DEL61 DEL8 DEL42 DEL42 DEL42 DEL32 DEL21 DEL8 DEL54 DEL8 DEL25 DEL8 DEL31 DEL52 DEL42 DEL22 DEL52 DEL42 DEL22 DEL52 DEL42 DEL22 DEL52 DEL42 DEL22 DEL52 DEL42 DEL22

@@ -1,0 +1,172 @@
+GEODE-3416: Reduce synchronization blockages in SocketCloser. This now closes #702
+Remove synchronization blocks around HashMap. Replace that implementation
+with simpler ThreadPool that is not unbounded and does not grow as the
+number of remoteAddress (clients/peers) are added
+
++import org.apache.geode.SystemFailure;
++import org.apache.geode.internal.logging.LogService;
++import org.apache.geode.internal.logging.LoggingThreadGroup;
++import org.apache.logging.log4j.Logger;
++
+-import java.util.HashMap;
+-import java.util.concurrent.BlockingQueue;
++import java.util.concurrent.ConcurrentHashMap;
++import java.util.concurrent.ExecutorService;
++import java.util.concurrent.Executors;
+-import org.apache.logging.log4j.Logger;
+-
+-import org.apache.geode.SystemFailure;
+-import org.apache.geode.internal.logging.LogService;
+-import org.apache.geode.internal.logging.LoggingThreadGroup;
+-
+-      Integer.getInteger("p2p.ASYNC_CLOSE_POOL_MAX_THREADS", 8).intValue();
++      Integer.getInteger("p2p.ASYNC_CLOSE_POOL_MAX_THREADS", 4).intValue();
+-  /** map of thread pools of async close threads */
+-  private final HashMap<String, ThreadPoolExecutor> asyncCloseExecutors = new HashMap<>();
++  /**
++   * map of thread pools of async close threads
++   */
++  private final ConcurrentHashMap<String, ExecutorService> asyncCloseExecutors =
++      new ConcurrentHashMap<>();
+-  private boolean closed;
++  private Boolean closed = Boolean.FALSE;
+-  private ThreadPoolExecutor getAsyncThreadExecutor(String address) {
+-    synchronized (asyncCloseExecutors) {
+-      ThreadPoolExecutor pool = asyncCloseExecutors.get(address);
+-      if (pool == null) {
+-        final ThreadGroup tg = LoggingThreadGroup.createThreadGroup("Socket asyncClose", logger);
+-        ThreadFactory tf = new ThreadFactory() {
+-          public Thread newThread(final Runnable command) {
+-            Thread thread = new Thread(tg, command);
+-            thread.setDaemon(true);
+-            return thread;
+-          }
+-        };
+-        BlockingQueue<Runnable> workQueue = new LinkedBlockingQueue<Runnable>();
+-        pool = new ThreadPoolExecutor(this.asyncClosePoolMaxThreads, this.asyncClosePoolMaxThreads,
+-            this.asyncClosePoolKeepAliveSeconds, TimeUnit.SECONDS, workQueue, tf);
+-        pool.allowCoreThreadTimeOut(true);
+-        asyncCloseExecutors.put(address, pool);
++  private ExecutorService getAsyncThreadExecutor(String address) {
++    ExecutorService executorService = asyncCloseExecutors.get(address);
++    if (executorService == null) {
++      // To be used for pre-1.8 jdk releases.
++      // executorService = createThreadPoolExecutor();
++
++      executorService = getWorkStealingPool(asyncClosePoolMaxThreads);
++
++      ExecutorService previousThreadPoolExecutor =
++          asyncCloseExecutors.putIfAbsent(address, executorService);
++
++      if (previousThreadPoolExecutor != null) {
++        executorService.shutdownNow();
++        return previousThreadPoolExecutor;
+-      return pool;
++    return executorService;
++  }
++
++  private ExecutorService getWorkStealingPool(int maxParallelThreads) {
++    return Executors.newWorkStealingPool(maxParallelThreads);
++  }
++
++  /**
++   * @deprecated since GEODE 1.3.0. Use @link{getWorkStealingPool}
++   */
++  @Deprecated
++  private ExecutorService createThreadPoolExecutor() {
++    final ThreadGroup threadGroup =
++        LoggingThreadGroup.createThreadGroup("Socket asyncClose", logger);
++    ThreadFactory threadFactory = new ThreadFactory() {
++      public Thread newThread(final Runnable command) {
++        Thread thread = new Thread(threadGroup, command);
++        thread.setDaemon(true);
++        return thread;
++      }
++    };
++
++    return new ThreadPoolExecutor(asyncClosePoolMaxThreads, asyncClosePoolMaxThreads,
++        asyncClosePoolKeepAliveSeconds, TimeUnit.SECONDS, new LinkedBlockingQueue<>(),
++        threadFactory);
+-  public void releaseResourcesForAddress(String address) {
+-    synchronized (asyncCloseExecutors) {
+-      ThreadPoolExecutor pool = asyncCloseExecutors.get(address);
+-      if (pool != null) {
+-        pool.shutdown();
+-        asyncCloseExecutors.remove(address);
+-      }
+-    }
+-  }
+-  private boolean isClosed() {
+-    synchronized (asyncCloseExecutors) {
+-      return this.closed;
++  public void releaseResourcesForAddress(String address) {
++    ExecutorService executorService = asyncCloseExecutors.remove(address);
++    if (executorService != null) {
++      executorService.shutdown();
+-    synchronized (asyncCloseExecutors) {
++    synchronized (closed) {
+-        for (ThreadPoolExecutor pool : asyncCloseExecutors.values()) {
+-          pool.shutdown();
+-        }
+-        asyncCloseExecutors.clear();
++      } else {
++        return;
++    for (ExecutorService executorService : asyncCloseExecutors.values()) {
++      executorService.shutdown();
++    }
++    asyncCloseExecutors.clear();
+-  private void asyncExecute(String address, Runnable r) {
+-    // Waiting 50ms for the async close request to complete is what the old (close per thread)
+-    // code did. But now that we will not create a thread for every close request
+-    // it seems better to let the thread that requested the close to move on quickly.
+-    // So the default has changed to not wait. The system property p2p.ASYNC_CLOSE_WAIT_MILLISECONDS
+-    // can be set to how many milliseconds to wait.
+-    if (this.asyncCloseWaitTime == 0) {
+-      getAsyncThreadExecutor(address).execute(r);
+-    } else {
+-      Future<?> future = getAsyncThreadExecutor(address).submit(r);
+-      try {
+-        future.get(this.asyncCloseWaitTime, this.asyncCloseWaitUnits);
+-      } catch (InterruptedException | ExecutionException | TimeoutException e) {
+-        // We want this code to wait at most 50ms for the close to happen.
+-        // It is ok to ignore these exception and let the close continue
+-        // in the background.
+-      }
+-    }
++  private Future asyncExecute(String address, Runnable runnableToExecute) {
++    ExecutorService asyncThreadExecutor = getAsyncThreadExecutor(address);
++    return asyncThreadExecutor.submit(runnableToExecute);
+-   * @param sock the socket to close
++   * @param socket the socket to close
+-  public void asyncClose(final Socket sock, final String address, final Runnable extra) {
+-    if (sock == null || sock.isClosed()) {
++  public void asyncClose(final Socket socket, final String address, final Runnable extra) {
++    if (socket == null || socket.isClosed()) {
+-      synchronized (asyncCloseExecutors) {
+-        if (isClosed()) {
++      Future submittedTask = null;
++      synchronized (closed) {
++        if (closed) {
+-          asyncExecute(address, new Runnable() {
++          submittedTask = asyncExecute(address, new Runnable() {
+-                inlineClose(sock);
++                inlineClose(socket);
++      if (submittedTask != null) {
++        waitForFutureTaskWithTimeout(submittedTask);
++      }
+-      inlineClose(sock);
++      inlineClose(socket);
++  private void waitForFutureTaskWithTimeout(Future submittedTask) {
++    if (this.asyncCloseWaitTime != 0) {
++      try {
++        submittedTask.get(this.asyncCloseWaitTime, this.asyncCloseWaitUnits);
++      } catch (InterruptedException | ExecutionException | TimeoutException e) {
++        // We want this code to wait at most the asyncCloseWaitTime for the close to happen.
++        // It is ok to ignore these exception and let the close continue
++        // in the background.
++      }
++    }
++  }
++
+
+MOV26 MOV26 MOV26 MOV26 MOV26 INS26 MOV31 MOV31 UPD40 INS40 UPD40 INS31 INS31 INS31 UPD74 INS43 UPD83 INS43 INS42 MOV44 MOV83 INS43 INS42 INS44 INS8 INS29 INS78 UPD43 UPD42 MOV8 MOV29 INS83 INS39 INS42 MOV44 INS8 MOV8 INS83 INS43 INS42 MOV44 MOV44 INS8 INS42 INS44 UPD43 UPD43 INS42 INS40 INS42 MOV60 INS25 INS41 INS42 INS39 INS42 INS41 INS65 INS42 UPD42 INS41 INS60 INS25 INS51 INS70 MOV21 INS42 UPD42 INS60 MOV41 UPD42 INS43 INS42 UPD66 UPD42 UPD42 UPD74 UPD43 INS27 INS8 INS42 INS32 INS66 INS14 INS43 INS59 INS27 INS8 INS42 INS8 INS44 MOV32 INS8 INS43 INS59 INS32 UPD42 INS42 UPD27 UPD34 UPD43 UPD42 UPD42 INS42 INS33 INS21 MOV60 MOV25 INS42 INS42 INS42 UPD42 UPD42 MOV43 INS42 INS42 INS42 MOV40 MOV14 UPD42 MOV42 INS42 INS42 MOV32 INS42 INS33 INS21 MOV25 INS43 INS42 INS21 INS42 INS42 MOV32 INS42 INS42 INS42 INS60 INS25 UPD42 INS7 UPD43 UPD74 INS32 INS8 INS8 INS42 INS32 UPD42 UPD42 MOV43 INS59 UPD42 INS27 INS8 INS42 INS32 UPD42 UPD42 UPD42 INS41 INS42 INS42 MOV21 INS41 INS42 INS42 INS42 INS33 INS42 INS33 INS21 UPD42 INS42 INS42 UPD42 INS42 INS42 INS42 INS32 UPD42 UPD42 INS42 INS42 UPD42 MOV43 INS7 INS42 MOV32 MOV43 UPD42 UPD42 DEL39 DEL39 DEL42 DEL21 DEL42 DEL8 DEL51 DEL42 DEL43 DEL42 DEL43 DEL42 DEL43 DEL74 DEL42 DEL59 DEL60 DEL42 DEL52 DEL42 DEL22 DEL52 DEL42 DEL22 DEL52 DEL42 DEL22 DEL42 DEL14 DEL7 DEL21 DEL42 DEL42 DEL9 DEL32 DEL21 DEL42 DEL42 DEL42 DEL42 DEL32 DEL21 DEL42 DEL42 DEL33 DEL27 DEL25 DEL42 DEL41 DEL8 DEL51 DEL8 DEL39 DEL42 DEL42 DEL8 DEL51 DEL8 DEL31 DEL42 DEL43 DEL42 DEL44 DEL42 DEL42 DEL32 DEL21 DEL8 DEL70 DEL8 DEL42 DEL51 DEL8 DEL52 DEL42 DEL22 DEL42 DEL32 DEL42 DEL42 DEL42 DEL32 DEL21 DEL8 DEL76 DEL74 DEL42 DEL42 DEL42 DEL32 DEL42 DEL42 DEL32 DEL59 DEL60

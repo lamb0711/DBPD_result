@@ -1,0 +1,273 @@
+GEODE-7585: Create API for starting a locator in the membership package
+
+Creating a new MembershipLocator and MembershipLocatorBuilder that are used to
+create the membership locator. These classes encapsulate the TcpServer,
+PrimaryHandler, and GMSLocator that were previously held by InternalLocator.
+
+Getting rid of some intermdiate classes that wrapped the GMSLocator -
+NetLocator and GMSLocatorAdapter.
+
+Refactoring the restart logic out of PrimaryHandler. There is now a separate
+RestartHandler, and a separate collection that tracks RestartHandlers. Removing
+RestartableTcpHandler.
+
+Removing TcpServerFactory.
+
+-import java.net.ConnectException;
++import java.util.concurrent.ThreadPoolExecutor;
++import java.util.function.Supplier;
++import org.apache.geode.GemFireConfigException;
+-import org.apache.geode.distributed.internal.membership.NetLocator;
+-import org.apache.geode.distributed.internal.membership.NetLocatorFactory;
++import org.apache.geode.distributed.internal.membership.InternalDistributedMember;
++import org.apache.geode.distributed.internal.membership.adapter.ServiceConfig;
++import org.apache.geode.distributed.internal.membership.api.MemberIdentifier;
++import org.apache.geode.distributed.internal.membership.api.MembershipConfig;
++import org.apache.geode.distributed.internal.membership.api.MembershipConfigurationException;
++import org.apache.geode.distributed.internal.membership.api.MembershipLocator;
++import org.apache.geode.distributed.internal.membership.api.MembershipLocatorBuilder;
+-import org.apache.geode.distributed.internal.membership.gms.locator.PeerLocatorRequest;
+-import org.apache.geode.distributed.internal.tcpserver.TcpClient;
++import org.apache.geode.distributed.internal.tcpserver.TcpHandler;
++import org.apache.geode.internal.CopyOnWriteHashSet;
++import org.apache.geode.internal.admin.remote.RemoteTransportConfig;
+-import org.apache.geode.internal.cache.tier.sockets.TcpServerFactory;
++import org.apache.geode.internal.cache.client.protocol.ClientProtocolServiceLoader;
++import org.apache.geode.internal.logging.CoreLoggingExecutors;
++  public static final int MAX_POOL_SIZE =
++      Integer.getInteger(GEMFIRE_PREFIX + "TcpServer.MAX_POOL_SIZE", 100);
++  public static final int POOL_IDLE_TIMEOUT = 60 * 1000;
++
+-  /**
+-   * The tcp server responding to locator requests
+-   */
+-  private final TcpServer server;
+-
+-  /**
+-   * @since GemFire 5.7
+-   */
+-  private final PrimaryHandler handler;
++  private final Set<RestartHandler> restartHandlers = new CopyOnWriteHashSet<>();
++  private final MembershipLocator<InternalDistributedMember> membershipLocator;
+-  /**
+-   * the TcpHandler used for peer location
+-   */
+-  private NetLocator netLocator;
+-    this.distributionConfig = distributionConfig;
+-    if (this.distributionConfig == null) {
+-      this.distributionConfig = new DistributionConfigImpl(env);
++    if (distributionConfig == null) {
++      distributionConfig = new DistributionConfigImpl(env);
+-      env.putAll(this.distributionConfig.getProps());
++      env.putAll(distributionConfig.getProps());
++    this.distributionConfig = distributionConfig;
+-    handler = new PrimaryHandler(this, locatorListener);
+-    handler.addHandler(InfoRequest.class, new InfoRequestHandler());
+-    server = new TcpServerFactory().makeTcpServer(port, this.bindAddress,
+-        handler, new DelayedPoolStatHelper(), toString(), this);
++    InternalLocatorTcpHandler handler = new InternalLocatorTcpHandler();
++    try {
++      MembershipConfig config = new ServiceConfig(
++          new RemoteTransportConfig(distributionConfig, MemberIdentifier.LOCATOR_DM_TYPE),
++          distributionConfig);
++      Supplier<ExecutorService> executor = () -> CoreLoggingExecutors
++          .newThreadPoolWithSynchronousFeed("locator request thread ",
++              MAX_POOL_SIZE, new DelayedPoolStatHelper(),
++              POOL_IDLE_TIMEOUT,
++              new ThreadPoolExecutor.CallerRunsPolicy());
++      membershipLocator =
++          MembershipLocatorBuilder.<InternalDistributedMember>newLocatorBuilder().setPort(port)
++              .setBindAddress(bindAddress)
++              .setProtocolChecker(new ProtocolCheckerImpl(this, new ClientProtocolServiceLoader()))
++              .setExecutorServiceSupplier(
++                  executor)
++              .setSocketCreator(asTcpSocketCreator(
++                  SocketCreatorFactory
++                      .getSocketCreatorForComponent(SecurableCommunicationChannel.LOCATOR)))
++              .setObjectSerializer(
++                  InternalDataSerializer.getDSFIDSerializer().getObjectSerializer())
++              .setObjectDeserializer(
++                  InternalDataSerializer.getDSFIDSerializer().getObjectDeserializer())
++              .setFallbackHandler(handler)
++              .setLocatorsAreCoordinators(shouldLocatorsBeCoordinators())
++              .setLocatorStats(locatorStats).setWorkingDirectory(workingDirectory).setConfig(config)
++              .create();
++    } catch (MembershipConfigurationException | UnknownHostException e) {
++      throw new GemFireConfigException(e.getMessage());
++    }
++
++    membershipLocator.addHandler(InfoRequest.class, new InfoRequestHandler());
++    restartHandlers.add((ds, cache, sharedConfig) -> {
++      InternalDistributedSystem ids = (InternalDistributedSystem) ds;
++      Distribution distribution = ids.getDM().getDistribution();
++      membershipLocator.setMembership(distribution.getMembership());
++    });
+-    server.start();
++    membershipLocator.start();
++    peerLocator = true;
++    int boundPort =
++        membershipLocator
++            .start();
++    File productUseFile = workingDirectory.resolve("locator" + boundPort + "views.log").toFile();
++    productUseLog = new ProductUseLog(productUseFile);
++
++    return boundPort;
++  }
++
++  private boolean shouldLocatorsBeCoordinators() {
+-    String securityUDPDHAlgo = distributionConfig.getSecurityUDPDHAlgo();
+-
+-    final String locatorsConfigValue = distributionConfig.getLocators();
+-
+-    netLocator = NetLocatorFactory.newLocatorHandler(bindAddress, locatorsConfigValue,
+-        locatorsAreCoordinators, networkPartitionDetectionEnabled, locatorStats, securityUDPDHAlgo,
+-        workingDirectory);
+-    handler.addHandler(PeerLocatorRequest.class, netLocator);
+-    peerLocator = true;
+-    if (!server.isAlive()) {
+-      startTcpServer();
+-    }
+-    int boundPort = server.getPort();
+-    File productUseFile = workingDirectory.resolve("locator" + boundPort + "views.log").toFile();
+-    productUseLog = new ProductUseLog(productUseFile);
+-
+-    return boundPort;
++    return locatorsAreCoordinators;
+-  public NetLocator getLocatorHandler() {
+-    return netLocator;
++  public MembershipLocator getMembershipLocator() {
++    return membershipLocator;
+-        netLocator
++        membershipLocator
+-    handler.addHandler(LocatorListRequest.class, serverLocator);
+-    handler.addHandler(ClientConnectionRequest.class, serverLocator);
+-    handler.addHandler(QueueConnectionRequest.class, serverLocator);
+-    handler.addHandler(ClientReplacementRequest.class, serverLocator);
+-    handler.addHandler(GetAllServersRequest.class, serverLocator);
+-    handler.addHandler(LocatorStatusRequest.class, serverLocator);
++    restartHandlers.add(serverLocator);
++    membershipLocator.addHandler(LocatorListRequest.class, serverLocator);
++    membershipLocator.addHandler(ClientConnectionRequest.class, serverLocator);
++    membershipLocator.addHandler(QueueConnectionRequest.class, serverLocator);
++    membershipLocator.addHandler(ClientReplacementRequest.class, serverLocator);
++    membershipLocator.addHandler(GetAllServersRequest.class, serverLocator);
++    membershipLocator.addHandler(LocatorStatusRequest.class, serverLocator);
+-    if (!server.isAlive()) {
++    if (!membershipLocator.isAlive()) {
+-    if (server.isShuttingDown()) {
++    if (membershipLocator.isShuttingDown()) {
+-        if (isDebugEnabled && server.isAlive()) {
++        if (isDebugEnabled && membershipLocator.isAlive()) {
+-        while (server.isAlive() && System.currentTimeMillis() < endOfWait) {
++        while (membershipLocator.isAlive() && System.currentTimeMillis() < endOfWait) {
+-          if (server.isAlive()) {
++          if (membershipLocator.isAlive()) {
+-    if (server.isAlive()) {
+-      logger.info("Stopping {}", this);
+-      try {
+-        new TcpClient(
+-            asTcpSocketCreator(
+-                SocketCreatorFactory
+-                    .getSocketCreatorForComponent(SecurableCommunicationChannel.LOCATOR)),
+-            InternalDataSerializer.getDSFIDSerializer().getObjectSerializer(),
+-            InternalDataSerializer.getDSFIDSerializer().getObjectDeserializer())
+-                .stop(bindAddress, getPort());
+-      } catch (ConnectException ignore) {
+-        // must not be running
+-      }
+-
+-      boolean interrupted = Thread.interrupted();
+-      try {
+-        // TcpServer up to SHUTDOWN_WAIT_TIME for its executor pool to shut down.
+-        // We wait 2 * SHUTDOWN_WAIT_TIME here to account for that shutdown, and then our own.
+-        server.join(TcpServer.SHUTDOWN_WAIT_TIME * 2);
+-
+-      } catch (InterruptedException ex) {
+-        interrupted = true;
+-        logger.warn("Interrupted while stopping {}", this, ex);
+-
+-        // Continue running -- doing our best to stop everything...
+-      } finally {
+-        if (interrupted) {
+-          Thread.currentThread().interrupt();
+-        }
+-      }
+-
+-      if (server.isAlive()) {
+-        logger.fatal("Could not stop {} in 60 seconds", this);
+-      }
+-    }
++    membershipLocator.stop();
+-    return server == null || !server.isAlive();
++    return !membershipLocator.isAlive();
+-      server.join();
++      membershipLocator.waitToShutdown();
+-      handler.restarting(null, null, null);
+-      server.restarting();
++      membershipLocator.restarting();
+-      if (!server.isAlive()) {
++      if (!membershipLocator.isAlive()) {
+-      handler.restarting(newSystem, newCache, configurationPersistenceService);
+-      server.restarting();
++      restartHandlers.forEach(
++          handler -> handler.restarting(newSystem, newCache, configurationPersistenceService));
++      membershipLocator.restarting();
+-    if (!server.isAlive()) {
++    if (!membershipLocator.isAlive()) {
+-    handler.restartCompleted(newSystem);
++    restartHandlers.forEach(handler -> handler.restartCompleted(newSystem));
+-    if (server != null) {
+-      return server.getPort();
++    if (membershipLocator != null && membershipLocator.isAlive()) {
++      return membershipLocator.getPort();
+-          LocalHostUtil.getLocalHost().getCanonicalHostName() + '-' + server.getBindAddress());
++          LocalHostUtil.getLocalHost().getCanonicalHostName() + '-' + membershipLocator
++              .getBindAddress());
+-      if (!handler.isHandled(JmxManagerLocatorRequest.class)) {
+-        handler.addHandler(JmxManagerLocatorRequest.class,
+-            new JmxManagerLocator(internalCache));
++      if (!membershipLocator.isHandled(JmxManagerLocatorRequest.class)) {
++        JmxManagerLocator jmxHandler = new JmxManagerLocator(internalCache);
++        restartHandlers.add(jmxHandler);
++        membershipLocator.addHandler(JmxManagerLocatorRequest.class,
++            jmxHandler);
+-    if (!handler.isHandled(SharedConfigurationStatusRequest.class)) {
+-      handler.addHandler(SharedConfigurationStatusRequest.class,
++    if (!membershipLocator.isHandled(SharedConfigurationStatusRequest.class)) {
++      membershipLocator.addHandler(SharedConfigurationStatusRequest.class,
+-    if (!handler.isHandled(ClusterManagementServiceInfoRequest.class)) {
+-      handler.addHandler(ClusterManagementServiceInfoRequest.class,
++    if (!membershipLocator.isHandled(ClusterManagementServiceInfoRequest.class)) {
++      membershipLocator.addHandler(ClusterManagementServiceInfoRequest.class,
+-    return handler.isHandled(messageClass);
++    return membershipLocator.isHandled(messageClass);
++
++  private class InternalLocatorTcpHandler implements TcpHandler {
++    @Override
++    public Object processRequest(Object request) throws IOException {
++      return locatorListener == null ? null : locatorListener.handleRequest(request);
++    }
++
++    @Override
++    public void endRequest(Object request, long startTime) {
++
++    }
++
++    @Override
++    public void endResponse(Object request, long startTime) {
++
++    }
++
++    @Override
++    public void shutDown() {
++      handleShutdown();
++    }
++
++    @Override
++    public void init(TcpServer tcpServer) {
++      if (locatorListener != null) {
++        // This is deferred until now as the initial requested port could have been 0
++        locatorListener.setPort(tcpServer.getPort());
++      }
++    }
++  }

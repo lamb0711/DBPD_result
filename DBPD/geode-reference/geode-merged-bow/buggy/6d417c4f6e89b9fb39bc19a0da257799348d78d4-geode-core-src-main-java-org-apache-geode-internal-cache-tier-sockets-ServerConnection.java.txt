@@ -1,0 +1,268 @@
+GEODE-4678: Remove ServerHandshakeProcessor and refactor handshake creation (#1456)
+
+
+
++import static org.apache.geode.distributed.ConfigurationProperties.SECURITY_CLIENT_ACCESSOR;
++import static org.apache.geode.distributed.ConfigurationProperties.SECURITY_CLIENT_ACCESSOR_PP;
++import java.io.EOFException;
++import java.net.SocketException;
++import java.net.SocketTimeoutException;
++import org.apache.commons.lang.mutable.MutableInt;
++import org.apache.geode.cache.UnsupportedVersionException;
+-  // private static boolean useDataStream =
+-  // System.getProperty("hct.useDataStream", "false").equals("true");
++  private final ServerSideHandshakeFactory handshakeFactory = new ServerSideHandshakeFactory();
+-        // synchronized (getCleanupTable()) {
+-        boolean readHandshake =
+-            ServerHandshakeProcessor.readHandshake(this, getSecurityService(), acceptor);
+-        if (readHandshake) {
+-          // readHandshake will establish a handshake object in this ServerConnection
+-          if (this.handshake.isOK()) {
+-            try {
+-              return processHandShake();
+-            } catch (CancelException e) {
+-              if (!crHelper.isShutdown()) {
+-                logger.warn(LocalizedMessage.create(
+-                    LocalizedStrings.ServerConnection_0_UNEXPECTED_CANCELLATION, getName()), e);
+-              }
+-              cleanup();
+-              return false;
++        ServerSideHandshake readHandshake;
++        try {
++
++          readHandshake = handshakeFactory.readHandshake(getSocket(), getHandShakeTimeout(),
++              getCommunicationMode(), getDistributedSystem(), getSecurityService());
++
++        } catch (SocketTimeoutException timeout) {
++          logger.warn(LocalizedMessage.create(
++              LocalizedStrings.ServerHandShakeProcessor_0_HANDSHAKE_REPLY_CODE_TIMEOUT_NOT_RECEIVED_WITH_IN_1_MS,
++              new Object[] {getName(), Integer.valueOf(handshakeTimeout)}));
++          failConnectionAttempt();
++          return false;
++        } catch (EOFException | SocketException e) {
++          // no need to warn client just gave up on this server before we could
++          // handshake
++          logger.info("{} {}", getName(), e);
++          failConnectionAttempt();
++          return false;
++        } catch (IOException e) {
++          logger.warn(LocalizedMessage.create(
++              LocalizedStrings.ServerHandShakeProcessor_0_RECEIVED_NO_HANDSHAKE_REPLY_CODE,
++              getName()), e);
++          failConnectionAttempt();
++          return false;
++        } catch (AuthenticationRequiredException | AuthenticationFailedException ex) {
++          handleHandshakeAuthenticationException(ex);
++          return false;
++        } catch (UnsupportedVersionException uve) {
++          // Server logging
++          logger.warn("{} {}", getName(), uve.getMessage(), uve);
++          handleHandshakeException(uve);
++          return false;
++        } catch (Exception ex) {
++          logger.warn("{} {}", getName(), ex.getLocalizedMessage());
++          handleHandshakeException(ex);
++          return false;
++        }
++
++        setHandshake(readHandshake);
++        setProxyId(readHandshake.getMembershipId());
++        if (readHandshake.getVersion().compareTo(Version.GFE_65) < 0
++            || getCommunicationMode().isWAN()) {
++          try {
++            setAuthAttributes();
++
++          } catch (AuthenticationRequiredException | AuthenticationFailedException ex) {
++            handleHandshakeAuthenticationException(ex);
++            return false;
++          } catch (Exception ex) {
++            logger.warn("{} {}", getName(), ex.getLocalizedMessage());
++            handleHandshakeException(ex);
++            return false;
++          }
++        }
++
++        // readHandshake will establish a handshake object in this ServerConnection
++        if (this.handshake.isOK()) {
++          try {
++            return processHandShake();
++          } catch (CancelException e) {
++            if (!crHelper.isShutdown()) {
++              logger.warn(LocalizedMessage.create(
++                  LocalizedStrings.ServerConnection_0_UNEXPECTED_CANCELLATION, getName()), e);
+-          } else {
+-            // is this branch ever taken?
+-            this.crHelper.checkCancelInProgress(null); // bug 37113?
+-            logger.warn(LocalizedMessage
+-                .create(LocalizedStrings.ServerConnection_RECEIVED_UNKNOWN_HANDSHAKE_REPLY_CODE));
+-            refuseHandshake(LocalizedStrings.ServerConnection_RECEIVED_UNKNOWN_HANDSHAKE_REPLY_CODE
+-                .toLocalizedString(), ServerHandshakeProcessor.REPLY_INVALID);
++            cleanup();
+-          this.stats.incFailedConnectionAttempts();
+-          cleanup();
++          // is this branch ever taken?
++          this.crHelper.checkCancelInProgress(null); // bug 37113?
++          logger.warn(LocalizedMessage
++              .create(LocalizedStrings.ServerConnection_RECEIVED_UNKNOWN_HANDSHAKE_REPLY_CODE));
++          refuseHandshake(LocalizedStrings.ServerConnection_RECEIVED_UNKNOWN_HANDSHAKE_REPLY_CODE
++              .toLocalizedString(), AcceptorImpl.REPLY_INVALID);
++  private void failConnectionAttempt() {
++    stats.incFailedConnectionAttempts();
++    cleanup();
++  }
++
++  private void handleHandshakeException(Exception ex) {
++    refuseHandshake(ex.getMessage(), AcceptorImpl.REPLY_REFUSED);
++    failConnectionAttempt();
++  }
++
++  private void handleHandshakeAuthenticationException(Exception ex) {
++    if (ex instanceof AuthenticationRequiredException) {
++      AuthenticationRequiredException noauth = (AuthenticationRequiredException) ex;
++      String exStr = noauth.getLocalizedMessage();
++      if (noauth.getCause() != null) {
++        exStr += " : " + noauth.getCause().getLocalizedMessage();
++      }
++      if (securityLogWriter.warningEnabled()) {
++        securityLogWriter.warning(LocalizedStrings.ONE_ARG,
++            getName() + ": Security exception: " + exStr);
++      }
++      refuseHandshake(noauth.getMessage(), Handshake.REPLY_EXCEPTION_AUTHENTICATION_REQUIRED);
++      failConnectionAttempt();
++    } else if (ex instanceof AuthenticationFailedException) {
++      AuthenticationFailedException failed = (AuthenticationFailedException) ex;
++      String exStr = failed.getLocalizedMessage();
++      if (failed.getCause() != null) {
++        exStr += " : " + failed.getCause().getLocalizedMessage();
++      }
++      if (securityLogWriter.warningEnabled()) {
++        securityLogWriter.warning(LocalizedStrings.ONE_ARG,
++            getName() + ": Security exception: " + exStr);
++      }
++      refuseHandshake(failed.getMessage(), Handshake.REPLY_EXCEPTION_AUTHENTICATION_FAILED);
++      failConnectionAttempt();
++    } else {
++      logger.warn(
++          "Unexpected exception type in ServerConnection handleHandshakeAuthenticationException");
++      throw new RuntimeException(
++          "Invalid exception type, must be either AuthenticationRequiredException or AuthenticationFailedException",
++          ex);
++    }
++  }
++
+-    // LogWriterI18n log = InternalDistributedSystem.getLoggerI18n();
+-    // byte[] oldIdArray = proxyId.getMembershipByteArray();
+-    // log.warning(LocalizedStrings.DEBUG, "Size comparison for " + proxyId.getDistributedMember()
+-    // + " old=" + oldIdArray.length + " new=" + memberIdByteArray.length
+-    // + " diff=" + (oldIdArray.length - memberIdByteArray.length));
+-  private Map getCleanupTable() {
++  private Map<ServerSideHandshake, MutableInt> getCleanupTable() {
+-  private Map getCleanupProxyIdTable() {
++  private Map<ClientProxyMembershipID, MutableInt> getCleanupProxyIdTable() {
+-        Counter numRefs = (Counter) getCleanupTable().get(this.handshake);
++        MutableInt numRefs = getCleanupTable().get(this.handshake);
+-            numRefs.incr();
++            numRefs.increment();
+-            numRefs = new Counter();
+-            getCleanupTable().put(this.handshake, numRefs);
+-            numRefs.incr();
++            getCleanupTable().put(this.handshake, new MutableInt(1));
+-        Counter numRefs = (Counter) getCleanupProxyIdTable().get(this.proxyId);
++        MutableInt numRefs = getCleanupProxyIdTable().get(this.proxyId);
+-          numRefs.incr();
++          numRefs.increment();
+-          numRefs = new Counter();
+-          numRefs.incr();
+-          getCleanupProxyIdTable().put(this.proxyId, numRefs);
++          getCleanupProxyIdTable().put(this.proxyId, new MutableInt(1));
+-      ServerHandshakeProcessor.refuse(this.theSocket.getOutputStream(), msg, exception);
++      acceptor.refuseHandshake(this.theSocket.getOutputStream(), msg, exception);
+-  static class Counter {
+-    int cnt;
+-
+-    void incr() {
+-      ++cnt;
+-    }
+-
+-    int decr() {
+-      return --cnt;
+-    }
+-
+-    int getCnt() {
+-      return cnt;
+-    }
+-  }
+-
+-        Counter numRefs = (Counter) getCleanupTable().get(this.handshake);
++        MutableInt numRefs = getCleanupTable().get(this.handshake);
+-          numRefs.decr();
+-          if (numRefs.getCnt() <= 0) {
++          numRefs.decrement();
++          if (numRefs.toInteger() <= 0) {
+-        Counter numRefs = (Counter) getCleanupProxyIdTable().get(this.proxyId);
++        MutableInt numRefs = getCleanupProxyIdTable().get(this.proxyId);
+-          numRefs.decr();
+-          if (numRefs.getCnt() <= 0) {
++          numRefs.decrement();
++          if (numRefs.toInteger() <= 0) {
+-        uniqueId = ServerHandshakeProcessor.getUniqueId(this, (Principal) principal);
++        uniqueId = getUniqueId((Principal) principal);
+-  public MessageIdExtractor getMessageIdExtractor() {
+-    return this.messageIdExtractor;
++  void setAuthAttributes() throws Exception {
++    logger.debug("setAttributes()");
++    Object principal = getHandshake().verifyCredentials();
++
++    long uniqueId;
++    if (principal instanceof Subject) {
++      uniqueId = getClientUserAuths(getProxyID()).putSubject((Subject) principal);
++    } else {
++      // this sets principal in map as well....
++      uniqueId = getUniqueId((Principal) principal);
++      setPrincipal((Principal) principal);
++    }
++    setUserAuthId(uniqueId);
++  }
++
++  /**
++   * For legacy auth?
++   */
++  private long getUniqueId(Principal principal) throws Exception {
++    InternalLogWriter securityLogWriter = getSecurityLogWriter();
++    DistributedSystem system = getDistributedSystem();
++    Properties systemProperties = system.getProperties();
++    String authzFactoryName = systemProperties.getProperty(SECURITY_CLIENT_ACCESSOR);
++    String postAuthzFactoryName = systemProperties.getProperty(SECURITY_CLIENT_ACCESSOR_PP);
++    AuthorizeRequest authzRequest = null;
++    AuthorizeRequestPP postAuthzRequest = null;
++
++    if (authzFactoryName != null && authzFactoryName.length() > 0) {
++      if (securityLogWriter.fineEnabled())
++        securityLogWriter.fine(
++            getName() + ": Setting pre-process authorization callback to: " + authzFactoryName);
++      if (principal == null) {
++        if (securityLogWriter.warningEnabled()) {
++          securityLogWriter.warning(
++              LocalizedStrings.ServerHandShakeProcessor_0_AUTHORIZATION_ENABLED_BUT_AUTHENTICATION_CALLBACK_1_RETURNED_WITH_NULL_CREDENTIALS_FOR_PROXYID_2,
++              new Object[] {getName(), SECURITY_CLIENT_AUTHENTICATOR, getProxyID()});
++        }
++      }
++      authzRequest = new AuthorizeRequest(authzFactoryName, getProxyID(), principal, getCache());
++    }
++    if (postAuthzFactoryName != null && postAuthzFactoryName.length() > 0) {
++      if (securityLogWriter.fineEnabled())
++        securityLogWriter.fine(getName() + ": Setting post-process authorization callback to: "
++            + postAuthzFactoryName);
++      if (principal == null) {
++        if (securityLogWriter.warningEnabled()) {
++          securityLogWriter.warning(
++              LocalizedStrings.ServerHandShakeProcessor_0_POSTPROCESS_AUTHORIZATION_ENABLED_BUT_NO_AUTHENTICATION_CALLBACK_2_IS_CONFIGURED,
++              new Object[] {getName(), SECURITY_CLIENT_AUTHENTICATOR});
++        }
++      }
++      postAuthzRequest =
++          new AuthorizeRequestPP(postAuthzFactoryName, getProxyID(), principal, getCache());
++    }
++    return setUserAuthorizeAndPostAuthorizeRequest(authzRequest, postAuthzRequest);
+
+INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS23 INS31 MOV31 MOV31 MOV31 INS83 INS83 INS43 INS59 INS83 INS39 INS42 INS8 INS83 UPD42 INS44 INS83 UPD39 INS42 INS44 INS8 INS74 INS74 UPD39 INS42 INS43 INS8 INS29 UPD83 INS39 INS42 INS44 INS43 INS42 INS42 INS14 INS21 MOV21 INS43 INS42 INS21 INS43 INS42 INS25 MOV43 INS43 INS43 MOV43 INS43 INS43 INS42 INS21 INS60 INS60 INS25 INS21 INS65 INS43 INS42 INS42 INS60 INS60 INS60 INS60 INS60 INS60 INS60 INS25 INS25 INS43 INS32 INS42 INS32 INS32 INS42 INS62 INS8 INS25 INS42 INS42 INS42 INS42 UPD42 MOV42 INS32 INS43 INS59 INS39 INS59 INS62 INS8 INS8 INS32 INS66 UPD42 MOV42 INS43 INS59 INS43 INS59 INS43 INS59 INS43 INS59 INS43 INS59 INS43 INS59 INS43 INS59 INS27 INS8 INS27 INS8 INS32 INS42 INS42 INS42 INS42 INS32 INS40 INS42 INS42 INS43 INS60 INS60 INS25 INS25 INS21 INS21 INS62 INS8 INS8 INS42 INS42 INS45 INS42 INS42 INS32 INS42 INS42 INS43 INS21 INS21 INS21 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS33 INS42 INS42 INS33 INS27 INS27 INS25 INS25 INS21 INS27 INS27 INS25 INS25 INS21 INS42 INS42 INS42 INS42 INS42 INS42 INS43 INS59 INS43 INS59 INS27 INS8 INS32 INS8 INS32 INS32 INS42 INS43 INS60 INS60 INS25 INS25 INS21 INS21 INS21 INS53 INS32 INS42 INS42 INS7 INS7 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS33 INS32 INS34 INS32 INS21 INS27 INS8 INS7 INS42 INS33 INS32 INS34 INS32 INS21 INS27 INS8 INS7 INS60 INS54 INS21 INS21 MOV25 INS42 INS42 INS11 INS42 INS42 INS32 INS32 INS33 INS21 INS42 INS42 INS21 INS42 INS32 INS40 INS42 INS42 INS43 INS59 INS43 INS59 INS27 INS8 INS32 INS8 INS32 INS32 INS32 INS14 UPD42 UPD42 INS42 INS42 INS32 INS42 INS32 INS42 INS11 INS42 INS42 INS42 INS42 INS32 INS42 INS33 INS25 INS42 INS14 INS42 INS42 INS42 INS42 INS32 INS42 INS33 INS25 INS42 INS14 INS43 INS59 INS8 INS12 INS12 INS12 INS12 INS12 INS12 INS32 INS32 INS27 INS8 INS43 INS42 INS42 INS42 INS42 INS42 INS7 INS32 INS42 INS42 INS42 INS42 INS11 INS42 INS42 INS32 INS32 INS33 INS21 INS42 INS42 INS21 INS42 INS32 INS40 INS42 INS42 INS42 INS45 INS43 INS45 INS42 UPD43 UPD43 UPD43 UPD43 INS32 INS42 INS11 INS42 INS11 INS43 INS42 INS42 INS42 INS27 INS32 INS8 INS43 INS42 INS32 INS42 INS32 INS42 INS42 INS27 INS32 INS8 INS43 INS42 INS32 INS42 INS32 INS42 MOV42 INS21 INS44 INS8 INS44 INS8 INS44 INS8 INS44 INS8 INS44 INS8 INS44 INS8 INS42 INS42 INS42 INS32 INS27 INS32 INS54 INS42 INS42 INS27 INS42 INS42 INS40 INS27 INS43 INS42 INS42 INS42 INS42 INS42 INS7 INS32 INS42 INS42 INS42 UPD42 MOV32 UPD42 MOV32 UPD42 MOV32 UPD42 MOV32 INS42 INS32 INS43 INS42 INS43 INS42 INS42 INS32 INS45 INS42 INS42 INS42 INS21 INS42 INS42 INS42 INS32 INS45 INS42 INS42 INS42 INS21 INS42 INS42 INS42 INS7 INS43 INS42 INS21 INS21 INS41 INS84 INS42 INS21 INS21 MOV41 INS43 INS42 INS21 INS21 INS41 INS84 INS42 INS21 INS41 INS43 INS42 INS21 INS21 INS41 INS43 INS42 INS21 INS21 INS41 INS42 INS42 INS32 INS34 INS32 INS42 INS8 INS12 INS12 INS45 INS32 INS32 INS45 INS42 INS42 INS42 INS27 INS42 INS42 INS40 INS27 INS42 INS42 INS42 INS42 INS32 INS42 INS32 INS42 INS32 INS42 INS32 INS32 INS9 INS43 INS43 INS32 INS32 INS42 INS32 INS32 INS9 INS43 INS43 INS32 INS9 INS42 INS32 INS32 INS9 INS42 INS32 INS32 INS9 INS32 INS42 INS40 INS42 INS21 INS44 INS8 INS44 INS8 UPD40 INS32 INS42 INS42 INS45 INS32 INS32 INS45 INS42 UPD42 INS14 UPD42 UPD42 INS42 INS42 INS40 INS3 INS42 INS42 INS40 INS3 UPD42 MOV42 MOV42 INS32 INS32 INS32 INS32 MOV32 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS45 INS32 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS45 INS32 INS32 INS42 INS42 INS42 INS42 INS42 INS45 INS32 INS32 INS42 INS42 INS42 INS42 INS32 INS84 INS42 MOV21 INS41 INS43 INS42 INS21 INS21 INS41 INS42 INS42 INS32 INS42 INS42 INS43 INS34 UPD42 UPD42 INS5 INS4 INS5 INS4 UPD42 MOV42 INS42 INS42 INS42 INS42 INS42 INS40 INS3 INS42 INS42 INS42 INS40 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS43 INS43 INS9 INS42 INS32 INS32 INS9 INS42 INS42 UPD42 INS14 INS42 INS43 INS85 INS32 INS42 INS32 INS43 INS85 INS32 INS42 INS5 INS4 INS42 INS42 INS42 INS42 UPD42 INS42 INS42 INS45 INS32 INS32 INS42 INS42 INS43 INS34 INS42 INS42 INS42 INS42 INS42 INS43 INS85 INS32 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 DEL39 DEL52 DEL32 DEL59 DEL60 DEL52 DEL42 DEL22 DEL42 DEL8 DEL8 DEL42 DEL38 DEL42 DEL42 DEL38 DEL41 DEL8 DEL42 DEL43 DEL11 DEL42 DEL42 DEL43 DEL14 DEL7 DEL21 DEL42 DEL42 DEL42 DEL32 DEL21 DEL42 DEL43 DEL11 DEL42 DEL42 DEL43 DEL14 DEL7 DEL21 DEL42 DEL42 DEL32 DEL21 DEL42 DEL83 DEL42 DEL39 DEL42 DEL59 DEL23 DEL55 DEL42 DEL43 DEL11 DEL42 DEL43 DEL11 DEL42 DEL52 DEL42 DEL42 DEL41 DEL8 DEL43 DEL42 DEL52 DEL42 DEL22

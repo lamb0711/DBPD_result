@@ -1,0 +1,358 @@
+Merge branch 'release/1.0.0-incubating.M1'
+
+-/*=========================================================================
+- * Copyright (c) 2010-2014 Pivotal Software, Inc. All Rights Reserved.
+- * This product is protected by U.S. and international copyright
+- * and intellectual property laws. Pivotal products are covered by
+- * one or more patents listed at http://www.pivotal.io/patents.
+- *=========================================================================
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++import java.util.concurrent.atomic.AtomicReference;
++import com.gemstone.gemfire.GemFireIOException;
++import com.gemstone.gemfire.cache.CustomEvictionAttributes;
++import com.gemstone.gemfire.cache.EvictionCriteria;
++import com.gemstone.gemfire.cache.hdfs.HDFSIOException;
++import com.gemstone.gemfire.cache.hdfs.internal.hoplog.HoplogOrganizer;
++import com.gemstone.gemfire.internal.cache.wan.parallel.ConcurrentParallelGatewaySenderQueue;
++import com.gemstone.gemfire.internal.offheap.StoredObject;
++import com.gemstone.gemfire.internal.offheap.annotations.Unretained;
++import com.gemstone.gemfire.internal.concurrent.AtomicLong5;
++
+-  private volatile AtomicLong eventSeqNum = null;
++  private volatile AtomicLong5 eventSeqNum = null;
+-  public AtomicLong getEventSeqNum() {
++  public AtomicLong5 getEventSeqNum() {
++  protected final AtomicReference<HoplogOrganizer> hoplog = new AtomicReference<HoplogOrganizer>();
++  
+-          parentBucket.eventSeqNum = new AtomicLong(getId());
++          parentBucket.eventSeqNum = new AtomicLong5(getId());
+-        this.eventSeqNum = new AtomicLong(getId());
++        this.eventSeqNum = new AtomicLong5(getId());
+-        if (!(this instanceof BucketRegionQueue)) {
+-          forceSerialized(event);
+-        }
++        forceSerialized(event);
++  
++  public long generateTailKey() {
++    long key = this.eventSeqNum.addAndGet(this.partitionedRegion
++        .getTotalNumberOfBuckets());
++    if (key < 0
++        || key % getPartitionedRegion().getTotalNumberOfBuckets() != getId()) {
++      logger
++          .error(LocalizedMessage
++              .create(
++                  LocalizedStrings.GatewaySender_SEQUENCENUMBER_GENERATED_FOR_EVENT_IS_INVALID,
++                  new Object[] { key, getId() }));
++    }
++    if (logger.isDebugEnabled()) {
++      logger.debug("WAN: On primary bucket {}, setting the seq number as {}",
++          getId(), this.eventSeqNum.get());
++    }
++    return eventSeqNum.get();
++  }
++  
+-    if (!(this instanceof BucketRegionQueue)) {
++    if (!(this instanceof AbstractBucketRegionQueue)) {
+-  private void beginLocalWrite(EntryEventImpl event) {
++  private boolean beginLocalWrite(EntryEventImpl event) {
+-      return;
++      return false;
+-      lockedForPrimary = true;
++      return lockedForPrimary = true;
++      // increment the tailKey so that invalidate operations are written to HDFS
++      if (this.partitionedRegion.hdfsStoreName != null) {
++        /* MergeGemXDHDFSToGFE Disabled this while porting. Is this required? */
++        //assert this.partitionedRegion.isLocalParallelWanEnabled();
++        handleWANEvent(event);
++      }
++      // In GemFire EVICT_DESTROY is not distributed, so in order to remove the entry
++      // from memory, allow the destroy to proceed. fixes #49784
++      if (event.isLoadedFromHDFS() && !getBucketAdvisor().isPrimary()) {
++        if (logger.isDebugEnabled()) {
++          logger.debug("Put the destory event in HDFS queue on secondary "
++              + "and return as event is HDFS loaded " + event);
++        }
++        notifyGatewaySender(EnumListenerEvent.AFTER_DESTROY, event);
++        return;
++      }else{
++        if (logger.isDebugEnabled()) {
++          logger.debug("Going ahead with the destroy on GemFire system");
++        }
++      }
+-  
++
++  @Override
++  public boolean isHDFSRegion() {
++    return this.partitionedRegion.isHDFSRegion();
++  }
++
++  @Override
++  public boolean isHDFSReadWriteRegion() {
++    return this.partitionedRegion.isHDFSReadWriteRegion();
++  }
++
++  @Override
++  protected boolean isHDFSWriteOnly() {
++    return this.partitionedRegion.isHDFSWriteOnly();
++  }
++
++  @Override
++  public int sizeEstimate() {
++    if (isHDFSReadWriteRegion()) {
++      try {
++        checkForPrimary();
++        ConcurrentParallelGatewaySenderQueue q = getHDFSQueue();
++        if (q == null) return 0;
++        int hdfsBucketRegionSize = q.getBucketRegionQueue(
++            partitionedRegion, getId()).size();
++        int hoplogEstimate = (int) getHoplogOrganizer().sizeEstimate();
++        if (logger.isDebugEnabled()) {
++          logger.debug("for bucket " + getName() + " estimateSize returning "
++                  + (hdfsBucketRegionSize + hoplogEstimate));
++        }
++        return hdfsBucketRegionSize + hoplogEstimate;
++      } catch (ForceReattemptException e) {
++        throw new PrimaryBucketException(e.getLocalizedMessage(), e);
++      }
++    }
++    return size();
++  }
++
+-   * @see LocalRegion#getDeserializedValue(KeyInfo, boolean, boolean, boolean, EntryEventImpl, boolean)
++   * see LocalRegion#getDeserializedValue(RegionEntry, KeyInfo, boolean, boolean,  boolean, EntryEventImpl, boolean, boolean, boolean)
+-  private RawValue getSerialized(Object key, boolean updateStats, boolean doNotLockEntry, EntryEventImpl clientEvent, boolean returnTombstones) 
++  private RawValue getSerialized(Object key, boolean updateStats, boolean doNotLockEntry, EntryEventImpl clientEvent, boolean returnTombstones, boolean allowReadFromHDFS) 
+-    RegionEntry re = this.entries.getEntry(key);
++    RegionEntry re = null;
++    if (allowReadFromHDFS) {
++      re = this.entries.getEntry(key);
++    } else {
++      re = this.entries.getOperationalEntryInVM(key);
++    }
+-  public RawValue getSerialized(KeyInfo keyInfo, boolean generateCallbacks, boolean doNotLockEntry, EntryEventImpl clientEvent, boolean returnTombstones) throws IOException {
++  public RawValue getSerialized(KeyInfo keyInfo, boolean generateCallbacks, boolean doNotLockEntry, EntryEventImpl clientEvent, boolean returnTombstones, boolean allowReadFromHDFS) throws IOException {
+-      RawValue result = getSerialized(keyInfo.getKey(), true, doNotLockEntry, clientEvent, returnTombstones);
++      RawValue result = getSerialized(keyInfo.getKey(), true, doNotLockEntry, clientEvent, returnTombstones, allowReadFromHDFS);
+-              generateCallbacks, result.getRawValue(), true, true, clientEvent, false);
++              generateCallbacks, result.getRawValue(), true, true, clientEvent, false, allowReadFromHDFS);
++    boolean returned = false;
++    try {
++    returned = true;
++    } finally {
++      if (!returned) {
++        e2.release();
++      }
++    }
++    try {
++    } finally {
++      prevent.release();
++    }
++    try {
++    } finally {
++      prevent.release();
++    }
++    try {
++    } finally {
++      prevent.release();
++    }
++    try {
++    } finally {
++      prevent.release();
++    }
+-      Object rawNewValue = event.getRawNewValue();
++      @Unretained Object rawNewValue = event.getRawNewValue();
++      if (rawNewValue instanceof StoredObject && !((StoredObject) rawNewValue).isSerialized()) {
++        // it is a byte[]; not a Delta
++        return;
++      }
+-  public final int getId() {
++  public int getId() {
+-      value = ((GatewaySenderEventImpl)value).getValue();
++      return ((GatewaySenderEventImpl)value).getSerializedValueSize();
++    // Gemfire PRs don't support clear. allowing it via a hack for tests
++    else if (LocalRegion.simulateClearForTests) {
++      oldMemValue = this.bytesInMemory.getAndSet(0);
++    }
+-  protected void setHeapThresholdFlag(MemoryEvent event) {
++  protected void setMemoryThresholdFlag(MemoryEvent event) {
++  
++  public long getBytesInMemory() {
++    long result = this.bytesInMemory.get();
++    if(result == BUCKET_DESTROYED) {
++      return 0;
++    }
++    
++    return result;
++  }
++  
++  @Override
++  public void cleanupFailedInitialization()
++  {
++    this.preDestroyBucket(this.getId());
++    super.cleanupFailedInitialization();
++  }
+-  protected boolean isHeapThresholdReachedForLoad() {
++  protected boolean isMemoryThresholdReachedForLoad() {
+-    // dummy method. Can be used in future to execute code before
+-    // this bucket becomes primary. Currently used only in BucketRegionQueue
++    try {
++      createHoplogOrganizer();
++    } catch (IOException e) {
++      // 48990: when HDFS was down, gemfirexd should still start normally
++      logger.warn(LocalizedStrings.HOPLOG_NOT_STARTED_YET, e);
++    } catch(Throwable e) {
++      /*MergeGemXDHDFSToGFE changed this code to checkReadiness*/
++      // SystemFailure.checkThrowable(e);
++      this.checkReadiness();
++      //49333 - no matter what, we should elect a primary.
++      logger.error(LocalizedStrings.LocalRegion_UNEXPECTED_EXCEPTION, e);
++    }
++  }
++
++  public HoplogOrganizer<?> createHoplogOrganizer() throws IOException {
++    if (getPartitionedRegion().isHDFSRegion()) {
++      HoplogOrganizer<?> organizer = hoplog.get();
++      if (organizer != null) {
++        //  hoplog is recreated by anther thread
++        return organizer;
++      }
++
++      HoplogOrganizer hdfs = hoplog.getAndSet(getPartitionedRegion().hdfsManager.create(getId()));
++      assert hdfs == null;
++      return hoplog.get();
++    } else {
++      return null;
++    }
++  /**
++   * Invoked when a primary bucket is demoted.
++   */
++  public void beforeReleasingPrimaryLockDuringDemotion() {
++    releaseHoplogOrganizer();
++  }
++
++  protected void releaseHoplogOrganizer() {
++    // release resources during a clean transition
++    HoplogOrganizer hdfs = hoplog.getAndSet(null);
++    if (hdfs != null) {
++      getPartitionedRegion().hdfsManager.close(getId());
++    }
++  }
++  
++  public HoplogOrganizer<?> getHoplogOrganizer() throws HDFSIOException {
++    HoplogOrganizer<?> organizer = hoplog.get();
++    if (organizer == null) {
++      synchronized (getBucketAdvisor()) {
++        checkForPrimary();
++        try {
++          organizer = createHoplogOrganizer();
++        } catch (IOException e) {
++          throw new HDFSIOException("Failed to create Hoplog organizer due to ", e);
++        }
++        if (organizer == null) {
++          throw new HDFSIOException("Hoplog organizer is not available for " + this);
++        }
++      }
++    }
++    return organizer;
++  }
++
++  @Override
++  public void hdfsCalled(Object key) {
++    this.partitionedRegion.hdfsCalled(key);
++  }
++
++  @Override
++  protected void clearHDFSData() {
++    //clear the HDFS data if present
++    if (getPartitionedRegion().isHDFSReadWriteRegion()) {
++      // Clear the queue
++      ConcurrentParallelGatewaySenderQueue q = getHDFSQueue();
++      if (q == null) return;
++      q.clear(getPartitionedRegion(), this.getId());
++      HoplogOrganizer organizer = hoplog.get();
++      if (organizer != null) {
++        try {
++          organizer.clear();
++        } catch (IOException e) {
++          throw new GemFireIOException(LocalizedStrings.HOPLOG_UNABLE_TO_DELETE_HDFS_DATA.toLocalizedString(), e);
++        }
++      }
++    }
++  }
++  
++  public EvictionCriteria getEvictionCriteria() {
++    return this.partitionedRegion.getEvictionCriteria();
++  }
++  
++  public CustomEvictionAttributes getCustomEvictionAttributes() {
++    return this.partitionedRegion.getCustomEvictionAttributes();
++  }
++  
++  /**
++   * @return true if the evict destroy was done; false if it was not needed
++   */
++  public boolean customEvictDestroy(Object key)
++  {
++    checkReadiness();
++    final EntryEventImpl event = 
++          generateCustomEvictDestroyEvent(key);
++    event.setCustomEviction(true);
++    boolean locked = false;
++    try {
++      locked = beginLocalWrite(event);
++      return mapDestroy(event,
++                        false, // cacheWrite
++                        true,  // isEviction
++                        null); // expectedOldValue
++    }
++    catch (CacheWriterException error) {
++      throw new Error(LocalizedStrings.LocalRegion_CACHE_WRITER_SHOULD_NOT_HAVE_BEEN_CALLED_FOR_EVICTDESTROY.toLocalizedString(), error);
++    }
++    catch (TimeoutException anotherError) {
++      throw new Error(LocalizedStrings.LocalRegion_NO_DISTRIBUTED_LOCK_SHOULD_HAVE_BEEN_ATTEMPTED_FOR_EVICTDESTROY.toLocalizedString(), anotherError);
++    }
++    catch (EntryNotFoundException yetAnotherError) {
++      throw new Error(LocalizedStrings.LocalRegion_ENTRYNOTFOUNDEXCEPTION_SHOULD_BE_MASKED_FOR_EVICTDESTROY.toLocalizedString(), yetAnotherError);
++    } finally {
++      if (locked) {
++        endLocalWrite(event);
++      }
++      event.release();
++    }
++  }
++
++  public boolean areSecondariesPingable() {
++    
++    Set<InternalDistributedMember> hostingservers = this.partitionedRegion.getRegionAdvisor()
++        .getBucketOwners(this.getId());
++    hostingservers.remove(cache.getDistributedSystem().getDistributedMember());
++    
++    if (cache.getLoggerI18n().fineEnabled())
++      cache.getLoggerI18n().fine("Pinging secondaries of bucket " + this.getId() + " on servers "  + hostingservers);
++   
++    if (hostingservers.size() == 0)
++      return true;
++    
++     return ServerPingMessage.send(cache, hostingservers);
++    
++  }
++  
++  @Override
++  public boolean notifiesMultipleSerialGateways() {
++    return getPartitionedRegion().notifiesMultipleSerialGateways();
++  }
++  

@@ -1,0 +1,108 @@
+GEODE-212: improve off-heap + ResourceManager performance
+
+The synchronous code that notifies the async listener now does
+a quick check to see if an event might be needed. This is done
+with no synchronization. It just does two volatile reads.
+The only time the synchronized notify is now needed is if we might
+have crossed a threshold boundary or if the listener indicates it
+really wants an event.
+
+The old code called System.currentTimeMillis everytime it created
+a MemoryEvent. This timestamp was only used by off-heap to reduce
+how many notifications were done when the state is not normal.
+Heap does notifications in abnormal states every time the amount
+of memory changes. Off-heap does it when abnormal at most every second
+by using the timestamp.
+To get rid of all these currentTimeMillis calls the new code has the
+background OffHeapMemoryUsageListener times out its wait call every
+second. If it times out it will set a volatile that indicates it
+wants the next abnormal event.
+
++    if (!mightSendEvent(bytesUsed)) {
++      return;
++    }
+-   *          Number of bytes of heap memory currently used.
++   *          Number of bytes of off-heap memory currently used.
+-      MemoryState oldState = this.mostRecentEvent.getState();
+-      MemoryState newState = this.thresholds.computeNextState(oldState, bytesUsed);
++      final MemoryEvent mre = this.mostRecentEvent;
++      final MemoryState oldState = mre.getState();
++      final MemoryThresholds thresholds = this.thresholds;
++      MemoryState newState = thresholds.computeNextState(oldState, bytesUsed);
+-        MemoryEvent event = new MemoryEvent(ResourceType.OFFHEAP_MEMORY, oldState, newState, this.cache.getMyId(), bytesUsed, true,
+-            this.thresholds);
++        MemoryEvent event = new MemoryEvent(ResourceType.OFFHEAP_MEMORY, oldState, newState, this.cache.getMyId(), bytesUsed, true, thresholds);
+-      // The state didn't change.  However, if the state isn't normal and we've
+-      // been in that state for a while, send another event with the updated
+-      // memory usage.
+-      } else if (!oldState.isNormal() && (System.currentTimeMillis() - this.mostRecentEvent.getEventTime()) > 1000) {
+-        MemoryEvent event = new MemoryEvent(ResourceType.OFFHEAP_MEMORY, oldState, newState, this.cache.getMyId(), bytesUsed, true,
+-            this.thresholds);
++      } else if (!oldState.isNormal()
++          && bytesUsed != mre.getBytesUsed()
++          && this.deliverNextAbnormalEvent) {
++        this.deliverNextAbnormalEvent = false;
++        MemoryEvent event = new MemoryEvent(ResourceType.OFFHEAP_MEMORY, oldState, newState, this.cache.getMyId(), bytesUsed, true, thresholds);
++  
++  /**
++   * Return true if the given number of bytes compared to the
++   * current monitor state would generate a new memory event.
++   * 
++   * @param bytesUsed
++   *          Number of bytes of off-heap memory currently used.
++   * @return true if a new event might need to be sent
++   */
++  private boolean mightSendEvent(long bytesUsed) {
++    final MemoryEvent mre = this.mostRecentEvent;
++    final MemoryState oldState = mre.getState();
++    final MemoryThresholds thresholds = this.thresholds;
++    MemoryState newState = thresholds.computeNextState(oldState, bytesUsed);
++    if (oldState != newState) {
++      return true;
++    } else if (!oldState.isNormal()
++        && bytesUsed != mre.getBytesUsed()
++        && this.deliverNextAbnormalEvent) {
++      return true;
++    }
++    return false;
++  }
++  
++  private volatile boolean deliverNextAbnormalEvent = false;
++   
++  /**
++   * Used by the OffHeapMemoryUsageListener to tell us that
++   * the next abnormal event should be delivered even if the
++   * state does not change as long as the memory usage changed.
++   * For some reason, unknown to me, if we stay in an abnormal
++   * state for more than a second then we want to send another
++   * event to update the memory usage.
++   */
++  void deliverNextAbnormalEvent() {
++    this.deliverNextAbnormalEvent = true;
++  }
+-    volatile long offHeapMemoryUsed; // In bytes
++    long offHeapMemoryUsed; // In bytes
+-
++      long lastOffHeapMemoryUsed;
++      synchronized (this) {
++        lastOffHeapMemoryUsed = this.offHeapMemoryUsed;
++      }
+-        final long saveOffHeapMemoryUsed = this.offHeapMemoryUsed;
+-        updateStateAndSendEvent(saveOffHeapMemoryUsed);
++        updateStateAndSendEvent(lastOffHeapMemoryUsed);
+-          if (saveOffHeapMemoryUsed == this.offHeapMemoryUsed && !this.stopRequested) {
++          if (lastOffHeapMemoryUsed == this.offHeapMemoryUsed && !this.stopRequested) {
+-              this.wait();
++              do {
++                this.wait(1000);
++                if (this.offHeapMemoryUsed == lastOffHeapMemoryUsed) {
++                  // The wait timed out. So tell the OffHeapMemoryMonitor
++                  // that we need an event if the state is not normal.
++                  deliverNextAbnormalEvent();
++                } else {
++                  // we have been notified so exit the inner while loop
++                  // and call updateStateAndSendEvent.
++                  lastOffHeapMemoryUsed = this.offHeapMemoryUsed;
++                  break;
++                }
++              } while (true);

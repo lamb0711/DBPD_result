@@ -1,0 +1,225 @@
+Merge of sisbell-maven-2.1-profile branch. Removes use of project lineage from builder.
+
+git-svn-id: https://svn.apache.org/repos/asf/maven/components/trunk@693332 13f79535-47bb-0310-9956-ffa450edef68
+
+-import org.apache.maven.project.ProjectSorter;
++import org.apache.maven.model.Dependency;
++import org.apache.maven.model.Plugin;
++import org.apache.maven.model.ReportPlugin;
++import org.apache.maven.model.Extension;
++import org.codehaus.plexus.util.dag.DAG;
++import org.codehaus.plexus.util.dag.TopologicalSorter;
+-import java.util.ArrayList;
+-import java.util.HashMap;
+-import java.util.Iterator;
+-import java.util.List;
+-import java.util.Map;
++import java.util.*;
++
++    protected static class ProjectSorter
++    {
++        private final DAG dag;
++
++        private final List sortedProjects;
++
++        private MavenProject topLevelProject;
++
++        /**
++         * Sort a list of projects.
++         * <ul>
++         * <li>collect all the vertices for the projects that we want to build.</li>
++         * <li>iterate through the deps of each project and if that dep is within
++         * the set of projects we want to build then add an edge, otherwise throw
++         * the edge away because that dependency is not within the set of projects
++         * we are trying to build. we assume a closed set.</li>
++         * <li>do a topo sort on the graph that remains.</li>
++         * </ul>
++         * @throws DuplicateProjectException if any projects are duplicated by id
++         */
++        // MAVENAPI FIXME: the DAG used is NOT only used to represent the dependency relation,
++        // but also for <parent>, <build><plugin>, <reports>. We need multiple DAG's
++        // since a DAG can only handle 1 type of relationship properly.
++        // Usecase:  This is detected as a cycle:
++        // org.apache.maven:maven-plugin-api                -(PARENT)->
++        // org.apache.maven:maven                           -(inherited REPORTING)->
++        // org.apache.maven.plugins:maven-checkstyle-plugin -(DEPENDENCY)->
++        // org.apache.maven:maven-plugin-api
++        // In this case, both the verify and the report goals are called
++        // in a different lifecycle. Though the compiler-plugin has a valid usecase, although
++        // that seems to work fine. We need to take versions and lifecycle into account.
++        public ProjectSorter( List projects )
++            throws CycleDetectedException, DuplicateProjectException
++        {
++            dag = new DAG();
++
++            Map projectMap = new HashMap();
++
++            for ( Iterator i = projects.iterator(); i.hasNext(); )
++            {
++                MavenProject project = (MavenProject) i.next();
++
++                String id = ArtifactUtils.versionlessKey( project.getGroupId(), project.getArtifactId() );
++
++                if ( dag.getVertex( id ) != null )
++                {
++                    MavenProject conflictingProject = (MavenProject) projectMap.get( id );
++
++                    throw new DuplicateProjectException( id,
++                                                         conflictingProject.getFile(),
++                                                         project.getFile(),
++                                                         "Project '"
++                                                         + id
++                                                         + "' is duplicated in the reactor" );
++                }
++
++                dag.addVertex( id );
++
++                projectMap.put( id, project );
++            }
++
++            for ( Iterator i = projects.iterator(); i.hasNext(); )
++            {
++                MavenProject project = (MavenProject) i.next();
++
++                String id = ArtifactUtils.versionlessKey( project.getGroupId(), project.getArtifactId() );
++
++                for ( Iterator j = project.getDependencies().iterator(); j.hasNext(); )
++                {
++                    Dependency dependency = (Dependency) j.next();
++
++                    String dependencyId = ArtifactUtils
++                        .versionlessKey( dependency.getGroupId(), dependency.getArtifactId() );
++
++                    if ( dag.getVertex( dependencyId ) != null )
++                    {
++                        project.addProjectReference( (MavenProject) projectMap.get( dependencyId ) );
++
++                        dag.addEdge( id, dependencyId );
++                    }
++                }
++
++                MavenProject parent = project.getParent();
++                if ( parent != null )
++                {
++                    String parentId = ArtifactUtils.versionlessKey( parent.getGroupId(), parent.getArtifactId() );
++                    if ( dag.getVertex( parentId ) != null )
++                    {
++                        // Parent is added as an edge, but must not cause a cycle - so we remove any other edges it has in conflict
++                        if ( dag.hasEdge( parentId, id ) )
++                        {
++                            dag.removeEdge( parentId, id );
++                        }
++                        dag.addEdge( id, parentId );
++                    }
++                }
++
++                List buildPlugins = project.getBuildPlugins();
++                if ( buildPlugins != null )
++                {
++                    for ( Iterator j = buildPlugins.iterator(); j.hasNext(); )
++                    {
++                        Plugin plugin = (Plugin) j.next();
++                        String pluginId = ArtifactUtils.versionlessKey( plugin.getGroupId(), plugin.getArtifactId() );
++                        if ( ( dag.getVertex( pluginId ) != null ) && !pluginId.equals( id ) )
++                        {
++                            addEdgeWithParentCheck( projectMap, pluginId, project, id );
++                        }
++                    }
++                }
++
++                List reportPlugins = project.getReportPlugins();
++                if ( reportPlugins != null )
++                {
++                    for ( Iterator j = reportPlugins.iterator(); j.hasNext(); )
++                    {
++                        ReportPlugin plugin = (ReportPlugin) j.next();
++                        String pluginId = ArtifactUtils.versionlessKey( plugin.getGroupId(), plugin.getArtifactId() );
++                        if ( ( dag.getVertex( pluginId ) != null ) && !pluginId.equals( id ) )
++                        {
++                            addEdgeWithParentCheck( projectMap, pluginId, project, id );
++                        }
++                    }
++                }
++
++                for ( Iterator j = project.getBuildExtensions().iterator(); j.hasNext(); )
++                {
++                    Extension extension = (Extension) j.next();
++                    String extensionId = ArtifactUtils.versionlessKey( extension.getGroupId(), extension.getArtifactId() );
++                    if ( dag.getVertex( extensionId ) != null )
++                    {
++                        addEdgeWithParentCheck( projectMap, extensionId, project, id );
++                    }
++                }
++            }
++
++            List sortedProjects = new ArrayList();
++
++            for ( Iterator i = TopologicalSorter.sort( dag ).iterator(); i.hasNext(); )
++            {
++                String id = (String) i.next();
++
++                sortedProjects.add( projectMap.get( id ) );
++            }
++
++            this.sortedProjects = Collections.unmodifiableList( sortedProjects );
++        }
++
++        private void addEdgeWithParentCheck( Map projectMap, String projectRefId, MavenProject project, String id )
++            throws CycleDetectedException
++        {
++            MavenProject extProject = (MavenProject) projectMap.get( projectRefId );
++
++            if ( extProject == null )
++            {
++                return;
++            }
++
++            project.addProjectReference( extProject );
++
++            MavenProject extParent = extProject.getParent();
++            if ( extParent != null )
++            {
++                String parentId = ArtifactUtils.versionlessKey( extParent.getGroupId(), extParent.getArtifactId() );
++                // Don't add edge from parent to extension if a reverse edge already exists
++                if ( !dag.hasEdge( projectRefId, id ) || !parentId.equals( id ) )
++                {
++                    dag.addEdge( id, projectRefId );
++                }
++            }
++        }
++
++        // TODO: !![jc; 28-jul-2005] check this; if we're using '-r' and there are aggregator tasks, this will result in weirdness.
++        public MavenProject getTopLevelProject()
++        {
++            if ( topLevelProject == null )
++            {
++                for ( Iterator i = sortedProjects.iterator(); i.hasNext() && ( topLevelProject == null ); )
++                {
++                    MavenProject project = (MavenProject) i.next();
++                    if ( project.isExecutionRoot() )
++                    {
++                        topLevelProject = project;
++                    }
++                }
++            }
++
++            return topLevelProject;
++        }
++
++        public List getSortedProjects()
++        {
++            return sortedProjects;
++        }
++
++        public boolean hasMultipleProjects()
++        {
++            return sortedProjects.size() > 1;
++        }
++
++        private List getDependents( String id )
++        {
++            return dag.getParentLabels( id );
++        }
++    }
+
+MOV26 INS26 INS40 UPD40 UPD40 UPD40 UPD40 UPD40 UPD40 INS55 INS83 INS83 INS42 INS23 INS23 INS23 INS31 INS31 INS31 INS31 INS31 INS31 INS83 INS83 INS43 INS59 INS83 INS83 INS43 INS59 INS83 INS43 INS59 INS29 INS83 INS42 INS44 INS43 INS43 INS8 INS83 INS39 INS42 INS44 INS44 INS44 INS44 INS43 INS8 INS83 INS43 INS42 INS8 INS83 INS43 INS42 INS8 INS83 INS39 INS42 INS8 INS83 INS43 INS42 INS44 INS8 INS42 INS42 INS42 INS42 INS42 INS42 INS65 INS65 INS43 INS42 INS42 INS42 INS21 INS60 INS24 INS24 INS60 INS24 INS21 INS43 INS42 INS43 INS42 INS43 INS42 INS43 INS42 INS42 INS60 INS25 INS21 INS60 INS25 INS42 INS25 INS41 INS42 INS41 INS41 INS42 INS43 INS42 INS41 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS66 INS42 INS66 INS42 INS7 INS43 INS59 INS58 INS32 INS8 INS58 INS32 INS8 INS43 INS59 INS58 INS32 INS8 INS7 INS42 INS42 INS42 INS42 INS43 INS59 INS27 INS8 INS32 INS43 INS59 INS27 INS8 INS27 INS8 INS42 INS42 INS27 INS42 INS32 INS42 INS14 INS42 INS42 INS14 INS43 INS59 INS42 INS42 INS60 INS60 INS25 INS21 INS21 INS43 INS59 INS42 INS42 INS60 INS60 INS24 INS60 INS25 INS60 INS25 INS60 INS25 INS24 INS42 INS42 INS14 INS43 INS59 INS42 INS42 INS60 INS21 INS22 INS32 INS42 INS42 INS11 INS42 INS33 INS41 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS33 INS60 INS25 INS42 INS33 INS24 INS32 INS34 INS42 INS42 INS42 INS43 INS43 INS42 INS42 INS32 INS43 INS59 INS43 INS59 INS27 INS8 INS32 INS32 INS42 INS42 INS32 INS43 INS59 INS43 INS59 INS58 INS32 INS8 INS43 INS59 INS27 INS8 INS43 INS59 INS27 INS8 INS43 INS59 INS27 INS8 INS58 INS32 INS8 INS43 INS42 INS42 INS32 INS43 INS59 INS32 INS52 INS42 INS42 INS42 INS42 INS43 INS32 INS42 INS42 INS43 INS59 INS27 INS8 INS58 INS27 INS8 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS11 INS42 INS42 INS32 INS32 INS33 INS60 INS53 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS11 INS42 INS42 INS32 INS43 INS59 INS42 INS42 INS60 INS60 INS25 INS42 INS42 INS32 INS42 INS33 INS60 INS25 INS42 INS42 INS32 INS42 INS33 INS24 INS42 INS42 INS32 INS42 INS33 INS24 INS43 INS59 INS42 INS42 INS60 INS60 INS25 INS42 INS32 INS42 INS42 INS42 INS11 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS38 INS38 INS21 INS43 INS59 INS32 INS36 INS60 INS25 INS43 INS32 INS42 INS42 INS32 INS32 INS42 INS42 INS42 INS43 INS59 INS14 INS43 INS32 INS42 INS42 INS32 INS32 INS42 INS42 INS32 INS43 INS59 INS43 INS59 INS27 INS8 INS42 INS42 INS43 INS59 INS27 INS8 INS42 INS42 INS58 INS32 INS8 INS42 INS42 INS58 INS32 INS8 INS42 INS42 INS32 INS43 INS59 INS43 INS59 INS27 INS8 INS42 INS42 INS42 INS43 INS32 INS42 INS42 INS42 INS42 INS42 INS32 INS32 INS32 INS32 INS32 INS42 INS42 INS32 INS42 INS42 INS27 INS43 INS59 INS32 INS8 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS11 INS43 INS42 INS32 INS32 INS27 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS11 INS42 INS42 INS32 INS32 INS33 INS21 INS21 INS42 INS42 INS32 INS32 INS33 INS25 INS21 INS43 INS59 INS42 INS42 INS60 INS60 INS25 INS43 INS59 INS42 INS42 INS60 INS60 INS25 INS32 INS42 INS42 INS42 INS11 INS42 INS42 INS32 INS32 INS33 INS21 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS33 INS42 INS42 INS11 INS42 INS42 INS21 INS43 INS32 INS42 INS42 INS42 INS42 INS42 INS45 INS42 INS45 INS42 INS42 INS43 INS32 INS42 INS42 INS32 INS32 INS42 INS42 INS42 INS32 INS32 INS42 INS42 INS32 INS32 INS42 INS42 INS42 INS32 INS8 INS32 INS42 INS42 INS32 INS43 INS59 INS43 INS59 INS27 INS8 INS42 INS42 INS32 INS43 INS59 INS43 INS59 INS27 INS8 INS42 INS42 INS43 INS32 INS42 INS42 INS32 INS32 INS42 INS42 INS42 INS32 INS43 INS32 INS7 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS11 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS21 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS11 INS42 INS42 INS32 INS36 INS38 INS21 INS42 INS42 INS42 INS42 INS11 INS42 INS42 INS32 INS36 INS38 INS21 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS43 INS32 INS32 INS43 INS32 INS42 INS42 INS32 INS32 INS27 INS32 INS32 INS43 INS32 INS42 INS42 INS32 INS32 INS27 INS32 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS33 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS33 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42

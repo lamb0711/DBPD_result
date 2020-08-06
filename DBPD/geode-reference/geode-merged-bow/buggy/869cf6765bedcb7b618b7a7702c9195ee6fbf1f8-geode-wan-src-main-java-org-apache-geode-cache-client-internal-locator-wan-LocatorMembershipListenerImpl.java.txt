@@ -1,0 +1,255 @@
+GEODE-6977: Improve WAN AutoDiscovery Resilience (#3808)
+
+- Added unit tests.
+- Fixed minor warnings.
+- Added retry logic to the LocatorMembershipListenerImpl.
+- Added extra logging (WARN level) when the auto-discovery fails after
+  the configured retries.
+- Changed the timeout when sending LocatorJoinMessage from 1 second to
+  the configured member-timeout.
+-import java.util.ArrayList;
++import java.util.Arrays;
++import java.util.HashSet;
++import java.util.List;
++import java.util.concurrent.ThreadFactory;
++import org.apache.geode.internal.logging.LoggingThreadFactory;
+-
+-  private ConcurrentMap<Integer, Set<DistributionLocatorId>> allLocatorsInfo =
+-      new ConcurrentHashMap<Integer, Set<DistributionLocatorId>>();
+-
+-  private ConcurrentMap<Integer, Set<String>> allServerLocatorsInfo =
+-      new ConcurrentHashMap<Integer, Set<String>>();
+-
+-
+-  private DistributionConfig config;
+-
+-  private TcpClient tcpClient;
++  static final int LOCATOR_DISTRIBUTION_RETRY_ATTEMPTS = 3;
++  static final String LOCATORS_DISTRIBUTOR_THREAD_NAME = "LocatorsDistributorThread";
++  private static final String LISTENER_FAILURE_MESSAGE =
++      "Locator Membership listener could not exchange locator information {}:{} with {}:{} after {} retry attempts";
++  private static final String LISTENER_FINAL_FAILURE_MESSAGE =
++      "Locator Membership listener permanently failed to exchange locator information {}:{} with {}:{} after {} retry attempts";
++  private DistributionConfig config;
++  private final TcpClient tcpClient;
++  private final ConcurrentMap<Integer, Set<String>> allServerLocatorsInfo =
++      new ConcurrentHashMap<>();
++  private final ConcurrentMap<Integer, Set<DistributionLocatorId>> allLocatorsInfo =
++      new ConcurrentHashMap<>();
+-  public LocatorMembershipListenerImpl() {
++  LocatorMembershipListenerImpl() {
++  LocatorMembershipListenerImpl(TcpClient tcpClient) {
++    this.tcpClient = tcpClient;
++  }
++
++   * @param distributedSystemId Id of the joining locator.
++   * @param locator Id of the joining locator.
++   * @param sourceLocator Id of the locator that notified this locator about the new one.
+-
+-    Thread distributeLocator = new Thread(new Runnable() {
+-      @Override
+-      public void run() {
+-        ConcurrentMap<Integer, Set<DistributionLocatorId>> remoteLocators = getAllLocatorsInfo();
+-        ArrayList<DistributionLocatorId> locatorsToRemove = new ArrayList<DistributionLocatorId>();
++    // DistributionLocatorId for local locator.
++    DistributionLocatorId localLocatorId;
++    String localLocator = config.getStartLocator();
++    if (localLocator.equals(DistributionConfig.DEFAULT_START_LOCATOR)) {
++      localLocatorId = new DistributionLocatorId(port, config.getBindAddress());
++    } else {
++      localLocatorId = new DistributionLocatorId(localLocator);
++    }
+-        String localLocator = config.getStartLocator();
+-        DistributionLocatorId localLocatorId = null;
+-        if (localLocator.equals(DistributionConfig.DEFAULT_START_LOCATOR)) {
+-          localLocatorId = new DistributionLocatorId(port, config.getBindAddress());
+-        } else {
+-          localLocatorId = new DistributionLocatorId(localLocator);
+-        }
+-        locatorsToRemove.add(localLocatorId);
+-        locatorsToRemove.add(locator);
+-        locatorsToRemove.add(sourceLocator);
++    // Make a local copy of the current list of known locators.
++    ConcurrentMap<Integer, Set<DistributionLocatorId>> remoteLocators = getAllLocatorsInfo();
++    Map<Integer, Set<DistributionLocatorId>> localCopy = new HashMap<>();
++    for (Map.Entry<Integer, Set<DistributionLocatorId>> entry : remoteLocators.entrySet()) {
++      Set<DistributionLocatorId> value = new CopyOnWriteHashSet<>(entry.getValue());
++      localCopy.put(entry.getKey(), value);
++    }
+-        Map<Integer, Set<DistributionLocatorId>> localCopy =
+-            new HashMap<Integer, Set<DistributionLocatorId>>();
+-        for (Map.Entry<Integer, Set<DistributionLocatorId>> entry : remoteLocators.entrySet()) {
+-          Set<DistributionLocatorId> value =
+-              new CopyOnWriteHashSet<DistributionLocatorId>(entry.getValue());
+-          localCopy.put(entry.getKey(), value);
+-        }
+-        for (Map.Entry<Integer, Set<DistributionLocatorId>> entry : localCopy.entrySet()) {
+-          for (DistributionLocatorId removeLocId : locatorsToRemove) {
+-            if (entry.getValue().contains(removeLocId)) {
+-              entry.getValue().remove(removeLocId);
+-            }
+-          }
+-          for (DistributionLocatorId value : entry.getValue()) {
+-            try {
+-              tcpClient.requestToServer(value.getHost(),
+-                  new LocatorJoinMessage(distributedSystemId, locator, localLocatorId, ""), 1000,
+-                  false);
+-            } catch (Exception e) {
+-              if (logger.isDebugEnabled()) {
+-                logger.debug(
+-                    "Locator Membership listener could not exchange locator information {}:{} with {}:{}",
+-                    new Object[] {locator.getHostName(), locator.getPort(), value.getHostName(),
+-                        value.getPort()});
+-              }
+-            }
+-            try {
+-              tcpClient.requestToServer(locator.getHost(),
+-                  new LocatorJoinMessage(entry.getKey(), value, localLocatorId, ""), 1000, false);
+-            } catch (Exception e) {
+-              if (logger.isDebugEnabled()) {
+-                logger.debug(
+-                    "Locator Membership listener could not exchange locator information {}:{} with {}:{}",
+-                    new Object[] {value.getHostName(), value.getPort(), locator.getHostName(),
+-                        locator.getPort()});
+-              }
+-            }
+-          }
+-        }
++    // Remove locators that don't need to be notified (myself, the joining one and the one that
++    // notified myself).
++    List<DistributionLocatorId> ignoreList = Arrays.asList(locator, localLocatorId, sourceLocator);
++    for (Map.Entry<Integer, Set<DistributionLocatorId>> entry : localCopy.entrySet()) {
++      for (DistributionLocatorId removeLocId : ignoreList) {
++        entry.getValue().remove(removeLocId);
+-    });
+-    distributeLocator.setDaemon(true);
+-    distributeLocator.start();
++    }
++
++    // Launch Locators Distributor thread.
++    Runnable distributeLocatorsRunnable = new DistributeLocatorsRunnable(config.getMemberTimeout(),
++        tcpClient, localLocatorId, localCopy, locator, distributedSystemId);
++    ThreadFactory threadFactory =
++        new LoggingThreadFactory(LOCATORS_DISTRIBUTOR_THREAD_NAME, true);
++    Thread distributeLocatorsThread = threadFactory.newThread(distributeLocatorsRunnable);
++    distributeLocatorsThread.start();
++
++
++  @SuppressWarnings("unused")
++
++  private static class DistributeLocatorsRunnable implements Runnable {
++    private final int memberTimeout;
++    private final TcpClient tcpClient;
++    private final DistributionLocatorId localLocatorId;
++    private final Map<Integer, Set<DistributionLocatorId>> remoteLocators;
++    private final DistributionLocatorId joiningLocator;
++    private final int joiningLocatorDistributedSystemId;
++
++    DistributeLocatorsRunnable(int memberTimeout,
++        TcpClient tcpClient,
++        DistributionLocatorId localLocatorId,
++        Map<Integer, Set<DistributionLocatorId>> remoteLocators,
++        DistributionLocatorId joiningLocator,
++        int joiningLocatorDistributedSystemId) {
++
++      this.memberTimeout = memberTimeout;
++      this.tcpClient = tcpClient;
++      this.localLocatorId = localLocatorId;
++      this.remoteLocators = remoteLocators;
++      this.joiningLocator = joiningLocator;
++      this.joiningLocatorDistributedSystemId = joiningLocatorDistributedSystemId;
++    }
++
++    void sendMessage(DistributionLocatorId targetLocator, LocatorJoinMessage locatorJoinMessage,
++        Map<DistributionLocatorId, Set<LocatorJoinMessage>> failedMessages) {
++      DistributionLocatorId advertisedLocator = locatorJoinMessage.getLocator();
++
++      try {
++        tcpClient.requestToServer(targetLocator.getHost(), locatorJoinMessage, memberTimeout,
++            false);
++      } catch (Exception exception) {
++        if (logger.isDebugEnabled()) {
++          logger.debug(LISTENER_FAILURE_MESSAGE,
++              new Object[] {advertisedLocator.getHostName(), advertisedLocator.getPort(),
++                  targetLocator.getHostName(), targetLocator.getPort(), 1, exception});
++        }
++
++        if (!failedMessages.containsKey(targetLocator)) {
++          failedMessages.put(targetLocator, new HashSet<>());
++        }
++
++        failedMessages.get(targetLocator).add(locatorJoinMessage);
++      }
++    }
++
++    boolean retryMessage(DistributionLocatorId targetLocator, LocatorJoinMessage locatorJoinMessage,
++        int retryAttempt) {
++      DistributionLocatorId advertisedLocator = locatorJoinMessage.getLocator();
++
++      try {
++        tcpClient.requestToServer(targetLocator.getHost(), locatorJoinMessage, memberTimeout,
++            false);
++
++        return true;
++      } catch (Exception exception) {
++        if (retryAttempt == LOCATOR_DISTRIBUTION_RETRY_ATTEMPTS) {
++          logger.warn(LISTENER_FINAL_FAILURE_MESSAGE,
++              new Object[] {advertisedLocator.getHostName(), advertisedLocator.getPort(),
++                  targetLocator.getHostName(), targetLocator.getPort(), retryAttempt, exception});
++        } else {
++          if (logger.isDebugEnabled()) {
++            logger.debug(LISTENER_FAILURE_MESSAGE,
++                new Object[] {advertisedLocator.getHostName(), advertisedLocator.getPort(),
++                    targetLocator.getHostName(), targetLocator.getPort(), retryAttempt, exception});
++          }
++        }
++
++        return false;
++      }
++    }
++
++    @Override
++    public void run() {
++      Map<DistributionLocatorId, Set<LocatorJoinMessage>> failedMessages = new HashMap<>();
++      for (Map.Entry<Integer, Set<DistributionLocatorId>> entry : remoteLocators.entrySet()) {
++        for (DistributionLocatorId value : entry.getValue()) {
++          // Notify known remote locator about the advertised locator.
++          LocatorJoinMessage advertiseNewLocatorMessage = new LocatorJoinMessage(
++              joiningLocatorDistributedSystemId, joiningLocator, localLocatorId, "");
++          sendMessage(value, advertiseNewLocatorMessage, failedMessages);
++
++          // Notify the advertised locator about remote known locator.
++          LocatorJoinMessage advertiseKnownLocatorMessage =
++              new LocatorJoinMessage(entry.getKey(), value, localLocatorId, "");
++          sendMessage(joiningLocator, advertiseKnownLocatorMessage, failedMessages);
++        }
++      }
++
++      // Retry failed messages and remove those that succeed.
++      if (!failedMessages.isEmpty()) {
++        for (int attempt = 1; attempt <= LOCATOR_DISTRIBUTION_RETRY_ATTEMPTS; attempt++) {
++
++          for (Map.Entry<DistributionLocatorId, Set<LocatorJoinMessage>> entry : failedMessages
++              .entrySet()) {
++            DistributionLocatorId targetLocator = entry.getKey();
++            Set<LocatorJoinMessage> joinMessages = entry.getValue();
++
++            for (LocatorJoinMessage locatorJoinMessage : joinMessages) {
++              if (retryMessage(targetLocator, locatorJoinMessage, attempt)) {
++                joinMessages.remove(locatorJoinMessage);
++              } else {
++                // Sleep between retries.
++                try {
++                  Thread.sleep(memberTimeout);
++                } catch (InterruptedException e) {
++                  Thread.currentThread().interrupt();
++                }
++              }
++            }
++          }
++        }
++      }
++    }
++  }
+
+INS26 INS26 INS26 INS26 MOV23 MOV23 MOV23 UPD40 INS40 INS40 INS40 INS40 INS23 INS23 INS23 INS23 INS31 MOV31 INS55 INS83 INS83 INS39 INS59 INS83 INS83 MOV43 INS59 INS83 INS83 INS83 INS43 INS59 INS83 INS83 INS83 INS43 INS59 INS83 INS83 INS83 INS42 INS44 INS8 INS29 MOV78 UPD42 MOV44 MOV44 MOV44 MOV60 INS79 INS83 INS83 INS42 INS43 INS23 INS23 INS23 INS23 INS23 INS23 INS31 INS31 INS31 MOV31 INS42 INS34 INS42 INS45 INS42 INS42 INS45 INS42 INS42 INS45 INS43 INS42 INS21 MOV65 INS65 INS65 INS65 INS60 INS60 MOV70 INS60 INS60 INS60 MOV21 INS42 INS45 INS42 INS83 INS83 INS39 INS59 INS83 INS83 INS43 INS59 INS83 INS83 INS43 INS59 INS83 INS83 INS74 INS59 INS83 INS83 INS43 INS59 INS83 INS83 INS39 INS59 INS42 INS44 INS44 INS44 INS44 INS44 INS44 INS8 INS39 INS42 INS44 INS44 INS44 INS8 INS39 INS42 INS44 INS44 INS44 INS8 MOV78 INS42 INS8 UPD74 UPD74 INS42 INS7 INS42 INS66 INS42 INS66 INS42 INS66 MOV43 INS59 INS74 INS59 MOV44 MOV32 MOV43 INS59 INS43 INS59 MOV43 INS59 INS32 INS42 INS42 INS42 INS42 INS42 INS43 INS43 INS74 INS42 INS42 INS42 INS42 INS39 INS42 INS43 INS42 INS43 INS42 INS74 INS42 INS43 INS42 INS39 INS42 INS21 INS21 INS21 INS21 INS21 INS21 INS43 INS42 MOV43 INS42 INS74 INS42 INS60 INS54 INS43 INS42 INS43 INS42 INS39 INS42 INS60 INS54 INS60 INS70 INS25 INS22 INS42 UPD42 MOV42 UPD43 MOV43 MOV43 UPD42 MOV42 INS32 INS70 INS42 INS14 INS42 INS42 INS14 INS42 INS32 UPD42 MOV42 UPD42 MOV42 INS42 INS42 INS43 INS43 INS42 INS42 INS43 INS43 INS74 INS42 INS7 INS7 INS7 INS7 INS7 INS7 INS42 INS43 MOV43 UPD74 MOV74 INS43 INS59 INS8 INS12 INS42 INS42 INS43 INS59 INS8 INS12 INS74 INS59 INS44 INS32 INS8 INS38 INS8 INS52 INS42 UPD74 UPD42 UPD42 MOV42 UPD42 MOV42 MOV42 UPD42 MOV42 MOV42 MOV44 INS42 MOV8 INS43 INS32 UPD42 MOV42 MOV42 INS42 INS42 INS42 INS43 INS42 INS9 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 INS42 INS42 INS42 INS42 INS43 INS43 INS22 INS42 INS22 INS42 INS22 INS42 INS22 INS42 INS22 INS42 INS22 INS42 INS42 INS43 INS42 INS42 INS32 INS21 MOV44 INS8 INS42 INS42 INS32 INS21 INS41 MOV44 INS8 INS43 MOV43 INS74 INS42 INS14 INS74 INS42 INS42 INS42 INS70 INS32 INS24 INS42 UPD42 MOV42 UPD42 MOV42 INS42 INS42 INS42 INS52 INS42 INS52 INS42 INS52 INS42 INS52 INS42 INS52 INS42 INS52 INS42 INS42 INS42 INS42 INS32 UPD42 INS25 INS25 INS21 INS42 INS42 INS32 INS9 UPD42 INS25 INS41 INS42 INS43 INS43 INS74 INS43 INS43 INS74 MOV44 MOV32 INS8 INS42 INS42 INS58 INS27 INS37 INS8 UPD74 INS42 INS42 INS32 INS42 INS42 INS9 MOV32 INS8 INS38 INS8 INS32 INS42 INS42 INS32 INS42 INS42 INS9 INS27 INS8 INS8 INS9 INS42 INS42 INS43 INS40 INS42 INS43 INS43 MOV60 MOV21 INS60 MOV21 INS39 INS59 INS42 INS42 INS42 INS70 INS42 INS42 INS21 INS32 INS21 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS21 INS25 INS42 INS42 INS42 UPD43 INS43 INS59 INS42 INS34 INS44 INS32 INS8 INS32 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS32 MOV32 INS8 UPD42 UPD42 INS14 INS42 INS42 UPD42 UPD42 INS42 INS42 MOV14 INS42 UPD42 UPD42 INS42 INS74 INS42 INS42 INS42 INS60 INS60 INS70 INS42 INS42 INS42 INS3 INS42 INS42 INS42 INS14 INS42 INS42 INS42 INS3 INS21 INS43 INS42 INS42 INS42 INS45 INS43 INS43 INS74 INS43 INS59 INS74 INS59 INS44 INS42 INS8 MOV5 INS4 INS74 MOV5 INS4 INS32 INS42 INS40 INS42 INS43 INS43 INS42 INS42 INS32 INS43 INS43 INS42 MOV32 INS43 INS42 INS25 INS32 INS32 INS32 INS32 INS34 INS42 INS43 INS32 INS32 INS32 INS32 INS42 INS42 INS42 INS42 INS42 INS3 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS8 INS8 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS5 INS4 INS42 INS42 INS42 INS42 INS21 INS54 INS43 INS85 INS32 INS32 INS32 INS32 INS42 INS42 INS32 INS8 INS12 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS21 INS44 INS8 INS32 INS43 INS42 INS21 INS42 INS42 INS42 INS42 INS32 INS32 INS42 INS42 INS42 DEL42 DEL43 DEL42 DEL43 DEL42 DEL43 DEL42 DEL43 DEL74 DEL83 DEL42 DEL43 DEL74 DEL74 DEL14 DEL59 DEL60 DEL33 DEL59 DEL60 DEL42 DEL32 DEL21 DEL42 DEL42 DEL32 DEL21 DEL42 DEL32 DEL21 DEL42 DEL43 DEL42 DEL43 DEL42 DEL43 DEL74 DEL42 DEL42 DEL42 DEL32 DEL25 DEL42 DEL42 DEL45 DEL42 DEL42 DEL32 DEL42 DEL42 DEL32 DEL42 DEL42 DEL32 DEL32 DEL4 DEL3 DEL32 DEL42 DEL42 DEL32 DEL42 DEL45 DEL14 DEL34 DEL9 DEL32 DEL21 DEL8 DEL42 DEL42 DEL45 DEL42 DEL42 DEL32 DEL42 DEL42 DEL32 DEL42 DEL42 DEL32 DEL42 DEL42 DEL32 DEL4 DEL3 DEL32 DEL21 DEL8 DEL25 DEL8 DEL12 DEL54 DEL42 DEL32 DEL34 DEL9 DEL32 DEL21 DEL8 DEL8 DEL25 DEL8 DEL12 DEL54 DEL8 DEL70 DEL8 DEL70 DEL29 DEL1 DEL14 DEL14 DEL9 DEL42 DEL8

@@ -1,0 +1,165 @@
+GEODE-1971: fix shutDownAll hang
+
+changed to an AtomicBoolean, remove cache sync on addPartitionedRegion and requiresNotificationFromPR
+
++import java.util.concurrent.CountDownLatch;
+-  private volatile boolean isShutDownAll = false;
++  private final AtomicBoolean isShutDownAll = new AtomicBoolean();
++  private final CountDownLatch shutDownAllFinished = new CountDownLatch(1);
+-    sb.append("; isShutDownAll = " + this.isShutDownAll);
++    sb.append("; isShutDownAll = " + isCacheAtShutdownAll());
+-      initReliableMessageQueueFactory();
++      this.rmqFactory = new ReliableMessageQueueFactoryImpl();
+-    return isShutDownAll;
++    return isShutDownAll.get();
+-  public synchronized void shutDownAll() {
+-    boolean testIGE = Boolean.getBoolean("TestInternalGemFireError");
+-
+-    if (testIGE) {
+-      InternalGemFireError assErr = new InternalGemFireError(
+-          LocalizedStrings.GemFireCache_UNEXPECTED_EXCEPTION.toLocalizedString());
+-      throw assErr;
+-    }
+-    if (isCacheAtShutdownAll()) {
+-      // it's already doing shutdown by another thread
+-      return;
+-    }
++  public void shutDownAll() {
+-    this.isShutDownAll = true;
++    if (!this.isShutDownAll.compareAndSet(false, true)) {
++      // it's already doing shutdown by another thread
++      try {
++        this.shutDownAllFinished.await();
++      } catch (InterruptedException e) {
++        logger.debug(
++            "Shutdown all interrupted while waiting for another thread to do the shutDownAll");
++        Thread.currentThread().interrupt();
++      }
++      return;
++    }
++    synchronized (GemFireCacheImpl.class) {
++      try {
++        boolean testIGE = Boolean.getBoolean("TestInternalGemFireError");
+-    // bug 44031 requires multithread shutdownall should be grouped
+-    // by root region. However, shutDownAllDuringRecovery.conf test revealed that
+-    // we have to close colocated child regions first.
+-    // Now check all the PR, if anyone has colocate-with attribute, sort all the
+-    // PRs by colocation relationship and close them sequentially, otherwise still
+-    // group them by root region.
+-    TreeMap<String, Map<String, PartitionedRegion>> prTrees = getPRTrees();
+-    if (prTrees.size() > 1 && shutdownAllPoolSize != 1) {
+-      ExecutorService es = getShutdownAllExecutorService(prTrees.size());
+-      for (final Map<String, PartitionedRegion> prSubMap : prTrees.values()) {
+-        es.execute(new Runnable() {
+-          public void run() {
+-            ConnectionTable.threadWantsSharedResources();
++        if (testIGE) {
++          InternalGemFireError assErr = new InternalGemFireError(
++              LocalizedStrings.GemFireCache_UNEXPECTED_EXCEPTION.toLocalizedString());
++          throw assErr;
++        }
++
++        // bug 44031 requires multithread shutdownall should be grouped
++        // by root region. However, shutDownAllDuringRecovery.conf test revealed that
++        // we have to close colocated child regions first.
++        // Now check all the PR, if anyone has colocate-with attribute, sort all the
++        // PRs by colocation relationship and close them sequentially, otherwise still
++        // group them by root region.
++        TreeMap<String, Map<String, PartitionedRegion>> prTrees = getPRTrees();
++        if (prTrees.size() > 1 && shutdownAllPoolSize != 1) {
++          ExecutorService es = getShutdownAllExecutorService(prTrees.size());
++          for (final Map<String, PartitionedRegion> prSubMap : prTrees.values()) {
++            es.execute(new Runnable() {
++              public void run() {
++                ConnectionTable.threadWantsSharedResources();
++                shutdownSubTreeGracefully(prSubMap);
++              }
++            });
++          } // for each root
++          es.shutdown();
++          try {
++            es.awaitTermination(Integer.MAX_VALUE, TimeUnit.SECONDS);
++          } catch (InterruptedException e) {
++            logger
++                .debug("Shutdown all interrupted while waiting for PRs to be shutdown gracefully.");
++          }
++
++        } else {
++          for (final Map<String, PartitionedRegion> prSubMap : prTrees.values()) {
+-        });
+-      } // for each root
+-      es.shutdown();
+-      try {
+-        es.awaitTermination(Integer.MAX_VALUE, TimeUnit.SECONDS);
+-      } catch (InterruptedException e) {
+-        logger.debug("Shutdown all interrupted while waiting for PRs to be shutdown gracefully.");
+-      }
++        }
+-    } else {
+-      for (final Map<String, PartitionedRegion> prSubMap : prTrees.values()) {
+-        shutdownSubTreeGracefully(prSubMap);
++        close("Shut down all members", null, false, true);
++      } finally {
++        this.shutDownAllFinished.countDown();
+-
+-    close("Shut down all members", null, false, true);
+-    synchronized (GemFireCacheImpl.class) {
+-      synchronized (this.partitionedRegions) {
+-        if (r.isDestroyed()) {
+-          if (logger.isDebugEnabled()) {
+-            logger.debug("GemFireCache#addPartitionedRegion did not add destroyed {}", r);
+-          }
+-          return;
++    synchronized (this.partitionedRegions) {
++      if (r.isDestroyed()) {
++        if (logger.isDebugEnabled()) {
++          logger.debug("GemFireCache#addPartitionedRegion did not add destroyed {}", r);
+-        if (this.partitionedRegions.add(r)) {
+-          getCachePerfStats().incPartitionedRegions(1);
+-        }
++        return;
++      }
++      if (this.partitionedRegions.add(r)) {
++        getCachePerfStats().incPartitionedRegions(1);
+-    synchronized (GemFireCacheImpl.class) {
+-      boolean hasSerialSenders = hasSerialSenders(r);
+-      boolean result = hasSerialSenders;
+-      if (!result) {
+-        Iterator allCacheServersIterator = allCacheServers.iterator();
+-        while (allCacheServersIterator.hasNext()) {
+-          CacheServerImpl server = (CacheServerImpl) allCacheServersIterator.next();
+-          if (!server.getNotifyBySubscription()) {
+-            result = true;
+-            break;
+-          }
++    boolean hasSerialSenders = hasSerialSenders(r);
++    boolean result = hasSerialSenders;
++    if (!result) {
++      Iterator allCacheServersIterator = allCacheServers.iterator();
++      while (allCacheServersIterator.hasNext()) {
++        CacheServerImpl server = (CacheServerImpl) allCacheServersIterator.next();
++        if (!server.getNotifyBySubscription()) {
++          result = true;
++          break;
+-
+-      return result;
++
++    return result;
+-  private ReliableMessageQueueFactory rmqFactory;
++  private final ReliableMessageQueueFactory rmqFactory;
+-   * Initializes the reliable message queue. Needs to be called at cache creation
+-   *
+-   * @throws IllegalStateException if the factory is in use
+-   */
+-  private void initReliableMessageQueueFactory() {
+-    synchronized (GemFireCacheImpl.class) {
+-      if (this.rmqFactory != null) {
+-        this.rmqFactory.close(false);
+-      }
+-      this.rmqFactory = new ReliableMessageQueueFactoryImpl();
+-    }
+-  }
+-
+-  /**
+
+INS26 INS40 INS23 INS31 UPD83 INS43 INS83 INS83 INS43 INS59 UPD83 MOV83 UPD39 MOV39 INS42 INS8 INS8 MOV8 MOV8 INS83 INS42 INS14 INS42 INS42 INS14 INS41 MOV25 INS25 INS51 INS43 INS43 INS34 INS32 INS38 INS8 MOV57 INS8 INS42 INS42 INS42 UPD42 MOV42 INS32 INS54 INS41 INS54 MOV32 MOV7 MOV22 INS42 INS9 INS9 INS8 INS12 MOV8 INS8 INS21 INS44 INS8 INS21 INS32 INS43 INS42 INS21 INS21 INS32 INS22 INS42 INS42 INS32 INS32 INS22 INS42 INS52 INS42 INS42 INS42 INS45 INS32 INS42 INS52 INS42 INS42 INS42 DEL39 DEL9 DEL52 DEL42 DEL22 DEL42 DEL32 DEL83 DEL39 DEL42 DEL42 DEL41 DEL8 DEL31 DEL83 DEL41 DEL8 DEL25 DEL9 DEL7 DEL21 DEL51 DEL8 DEL42 DEL43 DEL57 DEL51 DEL8 DEL66 DEL65 DEL42 DEL66 DEL65 DEL29 DEL42 DEL42 DEL43 DEL57 DEL52 DEL42 DEL22 DEL33 DEL27 DEL52 DEL42 DEL22 DEL9 DEL32 DEL21 DEL8 DEL25 DEL8 DEL51 DEL8 DEL31

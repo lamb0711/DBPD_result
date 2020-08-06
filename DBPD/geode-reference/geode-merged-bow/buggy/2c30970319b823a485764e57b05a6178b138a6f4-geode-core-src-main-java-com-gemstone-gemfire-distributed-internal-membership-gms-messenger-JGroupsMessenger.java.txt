@@ -1,0 +1,184 @@
+GEODE-1372 Geode UDP communications are not secure when SSL is configured
+
+This branch contains Diffe Hellman encoding of UDP communications in Geode
+using the encryption scheme that is already available for client/server
+communications.  The current implementation uses security-client-dhalgo
+to enable encryption.
+
+Membership views hold the public keys of peers.  GMSEncrypt is a new
+object that is held by JGroupsMessenger and is used to perform the
+encryption/decryption.
+
+GMSJoinLeave is modified to send a new member's public key to the
+membership coordinator.  The coordinator sends its public key back prior
+to announcing the new membership view with the new member.  This should
+be changed to have the coordinator's public key be sent to the joining
+member and the coordinator should get the new member's public key from
+a locator as well.
+
+GMSEncrypt needs to be changed to record time spent encrypting and
+decrypting in DistributionStats as well as the number of encryptions/decryptions
+performed.
+
++  private GMSEncrypt encrypt;
++
+-    
++
++    if ( !dc.getSecurityClientDHAlgo().isEmpty() ) {
++      try {
++        this.encrypt = new GMSEncrypt(services);
++      } catch (Exception e) {
++        throw new GemFireConfigException("problem initializing encryption protocol", e);
++      }
++    }
++
++    if (encrypt != null) {
++      encrypt.installView(v);
++    }
+-    
++
++  @Override
++  public Set<InternalDistributedMember> send(DistributionMessage msg, NetView alternateView) {
++    if (this.encrypt != null) {
++      this.encrypt.installView(alternateView);
++    }
++    return send(msg, true);
++  }
++
+-      Message jmsg = createJGMessage(msg, local, Version.CURRENT_ORDINAL);
++      Message jmsg = createJGMessage(msg, local, null, Version.CURRENT_ORDINAL);
+-      List<GMSMember> calculatedMembers; // explicit list of members
++      List<InternalDistributedMember> calculatedMembers; // explicit list of members
+-        calculatedMembers = new LinkedList<>();
++        calculatedMembers = new LinkedList<InternalDistributedMember>();
+-          calculatedMembers.add((GMSMember)m.getNetMember());
++          calculatedMembers.add(m);
+-          calculatedMembers.add((GMSMember)destinations[i].getNetMember());
++          calculatedMembers.add(destinations[i]);
++
++      boolean encode = (encrypt != null);
++
+-      for (GMSMember mbr : calculatedMembers) {
+-        short version = mbr.getVersionOrdinal();
+-        if (!messages.containsKey(version)) {
+-          Message jmsg = createJGMessage(msg, local, version);
+-          messages.put(version, jmsg);
+-          if (firstMessage) {
+-            theStats.incSentBytes(jmsg.getLength());
+-            firstMessage = false;
+-          }
+-        }
+-      }
+-      theStats.endMsgSerialization(startSer);
+-      for (GMSMember mbr: calculatedMembers) {
++      for (InternalDistributedMember mbr: calculatedMembers) {
++        short version = mbr.getNetMember().getVersionOrdinal();
+-        short version = mbr.getVersionOrdinal();
+-        Message jmsg = messages.get(version);
++        Message jmsg = createJGMessage(msg, local, mbr, version);
+-          Message tmp = (i < (calculatedLen-1)) ? jmsg.copy(true) : jmsg;
+-          tmp.setDest(to);
+-          tmp.setSrc(this.jgAddress);
++          jmsg.setDest(to);
++          jmsg.setSrc(this.jgAddress);
+-          myChannel.send(tmp);
++          myChannel.send(jmsg);
+-  Message createJGMessage(DistributionMessage gfmsg, JGAddress src, short version) {
++  Message createJGMessage(DistributionMessage gfmsg, JGAddress src, InternalDistributedMember recipient, short version) {
+-      DataSerializer.writeObject(gfmsg, out_stream);
++      boolean encode = encrypt != null && recipient != null;
++      if (encode) {
++        // Coordinator doesn't know our publicKey for a JoinRequest
++        if (gfmsg.getDSFID() == JOIN_REQUEST || gfmsg.getDSFID() == JOIN_RESPONSE) {
++          encode = false;
++        }
++      }
++      if (encode) {
++        logger.info("encoding {}", gfmsg);
++        try {
++          out_stream.writeBoolean(true); // TODO we should have flag bits
++          HeapDataOutputStream out_stream2 =
++            new HeapDataOutputStream(Version.fromOrdinalOrCurrent(version));
++          DataSerializer.writeObject(gfmsg, out_stream2);
++          byte[] payload = out_stream2.toByteArray();
++          payload = encrypt.encryptData(payload, recipient);
++          DataSerializer.writeByteArray(payload, out_stream);
++        } catch (Exception e) {
++          throw new GemFireIOException("unable to send message", e);
++        }
++      } else {
++        logger.info("not encoding {}", gfmsg);
++        out_stream.writeBoolean(false);
++        DataSerializer.writeObject(gfmsg, out_stream);
++      }
+-      DataInputStream dis = new DataInputStream(new ByteArrayInputStream(buf, 
++
++      DataInputStream dis = new DataInputStream(new ByteArrayInputStream(buf,
+-      
++
++      sender = getMemberFromView(m, ordinal);
++
++      boolean encrypted = dis.readBoolean();
++
++      if (encrypted && encrypt != null) {
++        byte[] payload = DataSerializer.readByteArray(dis);
++        try {
++          payload = encrypt.decryptData(payload, sender);
++          dis = new DataInputStream(new ByteArrayInputStream(payload));
++          if (ordinal < Version.CURRENT_ORDINAL) {
++            dis = new VersionedDataInputStream(dis, Version.fromOrdinalNoThrow(
++              ordinal, true));
++          }
++        } catch (Exception e) {
++          throw new GemFireIOException("unable to receive message", e);
++        }
++      }
++
+-      } else {
+-        sender = getMemberFromView(m, ordinal);
+-    case JOIN_RESPONSE:
+-      JoinResponseMessage jrsp = (JoinResponseMessage)m;
+-      
+-      if (jrsp.getRejectionMessage() == null
+-          &&  services.getConfig().getTransport().isMcastEnabled()) {
+-        // get the multicast message digest and pass it with the join response
+-        Digest digest = (Digest)this.myChannel.getProtocolStack()
+-            .getTopProtocol().down(Event.GET_DIGEST_EVT);
+-        HeapDataOutputStream hdos = new HeapDataOutputStream(500, Version.CURRENT);
+-        try {
+-          digest.writeTo(hdos);
+-        } catch (Exception e) {
+-          logger.fatal("Unable to serialize JGroups messaging digest", e);
++      case JOIN_REQUEST:
++        if (encrypt == null) {
++          break;
+-        jrsp.setMessengerData(hdos.toByteArray());
+-      }
+-      break;
+-    default:
+-      break;
++        JoinRequestMessage joinMsg = (JoinRequestMessage)m;
++        joinMsg.setPublicKey(encrypt.getPublicKeyBytes());
++        break;
++
++      case JOIN_RESPONSE:
++        JoinResponseMessage jrsp = (JoinResponseMessage)m;
++
++        if (jrsp.getRejectionMessage() == null
++          &&  services.getConfig().getTransport().isMcastEnabled()) {
++          // get the multicast message digest and pass it with the join response
++          Digest digest = (Digest)this.myChannel.getProtocolStack()
++            .getTopProtocol().down(Event.GET_DIGEST_EVT);
++          HeapDataOutputStream hdos = new HeapDataOutputStream(500, Version.CURRENT);
++          try {
++            digest.writeTo(hdos);
++          } catch (Exception e) {
++            logger.fatal("Unable to serialize JGroups messaging digest", e);
++          }
++          jrsp.setMessengerData(hdos.toByteArray());
++        }
++        break;
++      default:
++        break;
+
+INS23 INS31 INS83 INS43 INS59 INS78 INS83 INS74 INS42 INS44 INS44 INS8 INS44 INS42 INS42 INS25 INS25 INS42 INS43 INS43 INS43 INS42 INS43 INS42 INS25 INS41 INS43 INS42 INS38 INS8 INS27 INS8 INS42 INS42 INS42 INS42 INS27 INS8 INS32 INS42 INS49 INS25 INS60 INS21 INS10 INS10 INS32 INS54 INS42 INS33 INS21 INS22 INS33 INS21 INS42 INS42 INS9 MOV60 INS60 INS25 INS25 MOV21 INS60 INS25 INS42 INS27 INS8 INS43 INS59 INS32 INS32 INS42 INS8 INS12 INS32 INS52 INS42 INS32 UPD74 UPD39 MOV60 INS39 INS59 INS42 INS8 INS42 INS8 INS8 INS39 INS59 INS27 INS8 INS42 INS33 INS10 INS42 INS42 INS11 INS42 INS42 INS32 INS42 INS42 INS21 INS44 INS8 INS42 INS42 INS42 INS22 INS42 INS42 UPD43 UPD42 INS36 UPD43 INS42 INS27 INS25 INS21 INS54 INS21 INS21 MOV21 INS42 INS32 INS42 INS27 INS60 INS54 INS43 INS42 INS42 INS42 INS7 INS43 INS42 INS53 INS52 INS42 INS33 UPD42 INS27 UPD42 MOV43 INS27 INS27 INS27 INS8 INS32 INS8 INS12 INS32 INS32 INS42 INS42 INS42 INS33 INS5 INS59 INS8 INS12 INS42 INS22 INS14 INS42 INS14 INS42 INS33 INS42 INS33 INS42 INS33 INS27 INS27 INS21 INS42 INS42 INS45 INS42 INS21 INS60 INS21 INS60 INS21 INS21 INS44 INS8 INS42 INS42 INS45 INS42 INS42 INS42 INS9 INS39 INS85 INS42 INS32 INS21 INS21 INS25 INS44 INS8 INS52 INS42 INS43 INS42 INS43 INS45 INS42 UPD74 MOV32 MOV2 INS32 UPD42 UPD42 INS42 INS42 INS32 INS42 INS32 INS42 INS7 INS32 INS43 INS59 INS32 INS5 INS59 INS7 INS32 INS43 INS42 INS53 INS42 INS42 INS42 INS7 INS7 INS27 INS8 INS43 INS42 INS53 INS42 INS42 INS43 MOV42 UPD42 INS42 MOV42 INS42 UPD42 UPD42 UPD42 INS42 INS42 INS42 INS42 INS42 INS9 INS42 INS42 INS9 INS42 INS42 INS14 INS42 INS42 INS42 INS42 INS39 INS85 INS42 INS32 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS14 INS42 INS32 INS42 INS14 INS42 INS40 INS21 INS42 INS14 INS42 INS43 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS43 INS45 INS42 INS42 INS42 INS42 INS42 INS43 INS14 INS7 INS43 INS45 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS43 INS42 INS42 INS14 INS42 INS42 INS43 INS42 INS32 INS42 INS42 INS42 INS42 INS9 DEL42 DEL43 DEL42 DEL32 DEL11 DEL42 DEL42 DEL42 DEL43 DEL11 DEL32 DEL42 DEL42 DEL32 DEL42 DEL43 DEL42 DEL44 DEL42 DEL42 DEL42 DEL42 DEL32 DEL38 DEL42 DEL43 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL42 DEL42 DEL42 DEL32 DEL21 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL32 DEL21 DEL42 DEL9 DEL7 DEL21 DEL8 DEL25 DEL8 DEL25 DEL8 DEL70 DEL42 DEL42 DEL42 DEL32 DEL21 DEL42 DEL43 DEL42 DEL42 DEL42 DEL34 DEL27 DEL36 DEL27 DEL36 DEL42 DEL42 DEL9 DEL32 DEL42 DEL16 DEL59 DEL60 DEL8 DEL10

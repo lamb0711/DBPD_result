@@ -1,0 +1,310 @@
+HADOOP-13786 Add S3A committer for zero-rename commits to S3 endpoints.
+Contributed by Steve Loughran and Ryan Blue.
+
+-import java.util.concurrent.Callable;
++import java.util.Locale;
+-import java.util.concurrent.TimeUnit;
++import java.util.concurrent.atomic.AtomicInteger;
+-import com.amazonaws.services.s3.model.CompleteMultipartUploadResult;
+-import org.apache.hadoop.io.retry.RetryPolicies;
+-import org.apache.hadoop.io.retry.RetryPolicy;
++import org.apache.hadoop.fs.StreamCapabilities;
++import org.apache.hadoop.fs.s3a.commit.CommitConstants;
++import org.apache.hadoop.fs.s3a.commit.PutTracker;
+-class S3ABlockOutputStream extends OutputStream {
++class S3ABlockOutputStream extends OutputStream implements
++    StreamCapabilities {
+-   * Retry policy for multipart commits; not all AWS SDK versions retry that.
+-   */
+-  private final RetryPolicy retryPolicy =
+-      RetryPolicies.retryUpToMaximumCountWithProportionalSleep(
+-          5,
+-          2000,
+-          TimeUnit.MILLISECONDS);
+-  /**
+-  private final S3AFileSystem.WriteOperationHelper writeOperationHelper;
++  private final WriteOperationHelper writeOperationHelper;
++
++  /**
++   * Track multipart put operation.
++   */
++  private final PutTracker putTracker;
++   * @param putTracker put tracking for commit support
+-      S3AFileSystem.WriteOperationHelper writeOperationHelper)
++      WriteOperationHelper writeOperationHelper,
++      PutTracker putTracker)
++    this.putTracker = putTracker;
+-        " output to {}", writeOperationHelper, activeBlock);
++        " output to {}", key, activeBlock);
++    if (putTracker.initialize()) {
++      LOG.debug("Put tracker requests multipart upload");
++      initMultipartUpload();
++    }
+-    if (multiPartUpload == null) {
+-      LOG.debug("Initiating Multipart upload");
+-      multiPartUpload = new MultiPartUpload();
+-    }
++    initMultipartUpload();
++   * Init multipart upload. Assumption: this is called from
++   * a synchronized block.
++   * Note that this makes a blocking HTTPS request to the far end, so
++   * can take time and potentially fail.
++   * @throws IOException failure to initialize the upload
++   */
++  private void initMultipartUpload() throws IOException {
++    if (multiPartUpload == null) {
++      LOG.debug("Initiating Multipart upload");
++      multiPartUpload = new MultiPartUpload(key);
++    }
++  }
++
++  /**
++          bytesSubmitted = bytes;
+-        // there has already been at least one block scheduled for upload;
+-        // put up the current then wait
+-        if (hasBlock && block.hasData()) {
++        // there's an MPU in progress';
++        // IF there is more data to upload, or no data has yet been uploaded,
++        // PUT the final block
++        if (hasBlock &&
++            (block.hasData() || multiPartUpload.getPartsSubmitted() == 0)) {
+-        // then complete the operation
+-        multiPartUpload.complete(partETags);
++        // then complete the operation
++        if (putTracker.aboutToComplete(multiPartUpload.getUploadId(),
++            partETags,
++            bytes)) {
++          multiPartUpload.complete(partETags);
++        } else {
++          LOG.info("File {} will be visible when the job is committed", key);
++        }
+-      LOG.debug("Upload complete for {}", writeOperationHelper);
++      if (!putTracker.outputImmediatelyVisible()) {
++        // track the number of bytes uploaded as commit operations.
++        statistics.commitUploaded(bytes);
++      }
++      LOG.debug("Upload complete to {} by {}", key, writeOperationHelper);
+-    // All end of write operations, including deleting fake parent directories
++    // Note end of write. This does not change the state of the remote FS.
+-        writeOperationHelper.newPutRequest(uploadData.getFile()) :
+-        writeOperationHelper.newPutRequest(uploadData.getUploadStream(), size);
++        writeOperationHelper.createPutObjectRequest(key, uploadData.getFile())
++        : writeOperationHelper.createPutObjectRequest(key,
++            uploadData.getUploadStream(), size);
+-        executorService.submit(new Callable<PutObjectResult>() {
+-          @Override
+-          public PutObjectResult call() throws Exception {
+-            PutObjectResult result;
+-            try {
+-              // the putObject call automatically closes the input
+-              // stream afterwards.
+-              result = writeOperationHelper.putObject(putObjectRequest);
+-            } finally {
+-              closeAll(LOG, uploadData, block);
+-            }
+-            return result;
++        executorService.submit(() -> {
++          try {
++            // the putObject call automatically closes the input
++            // stream afterwards.
++            return writeOperationHelper.putObject(putObjectRequest);
++          } finally {
++            closeAll(LOG, uploadData, block);
++   * Return the stream capabilities.
++   * This stream always returns false when queried about hflush and hsync.
++   * If asked about {@link CommitConstants#STREAM_CAPABILITY_MAGIC_OUTPUT}
++   * it will return true iff this is an active "magic" output stream.
++   * @param capability string to query the stream support for.
++   * @return true if the capability is supported by this instance.
++   */
++  @Override
++  public boolean hasCapability(String capability) {
++    switch (capability.toLowerCase(Locale.ENGLISH)) {
++
++      // does the output stream have delayed visibility
++    case CommitConstants.STREAM_CAPABILITY_MAGIC_OUTPUT:
++      return !putTracker.outputImmediatelyVisible();
++
++      // The flush/sync options are absolutely not supported
++    case "hflush":
++    case "hsync":
++      return false;
++
++    default:
++      return false;
++    }
++  }
++
++  /**
++    private int partsSubmitted;
++    private int partsUploaded;
++    private long bytesSubmitted;
+-    MultiPartUpload() throws IOException {
+-      this.uploadId = writeOperationHelper.initiateMultiPartUpload();
++    MultiPartUpload(String key) throws IOException {
++      this.uploadId = writeOperationHelper.initiateMultiPartUpload(key);
++     * Get a count of parts submitted.
++     * @return the number of parts submitted; will always be >= the
++     * value of {@link #getPartsUploaded()}
++     */
++    public int getPartsSubmitted() {
++      return partsSubmitted;
++    }
++
++    /**
++     * Count of parts actually uploaded.
++     * @return the count of successfully completed part uploads.
++     */
++    public int getPartsUploaded() {
++      return partsUploaded;
++    }
++
++    /**
++     * Get the upload ID; will be null after construction completes.
++     * @return the upload ID
++     */
++    public String getUploadId() {
++      return uploadId;
++    }
++
++    /**
++     * Get the count of bytes submitted.
++     * @return the current upload size.
++     */
++    public long getBytesSubmitted() {
++      return bytesSubmitted;
++    }
++
++    /**
+-      LOG.debug("Queueing upload of {}", block);
++      LOG.debug("Queueing upload of {} for upload {}", block, uploadId);
++      Preconditions.checkNotNull(uploadId, "Null uploadId");
++      partsSubmitted++;
++      bytesSubmitted += size;
++              key,
+-              uploadData.getFile());
++              uploadData.getFile(),
++              0L);
+-          executorService.submit(new Callable<PartETag>() {
+-            @Override
+-            public PartETag call() throws Exception {
+-              // this is the queued upload operation
+-              LOG.debug("Uploading part {} for id '{}'", currentPartNumber,
+-                  uploadId);
+-              // do the upload
+-              PartETag partETag;
+-              try {
+-                partETag = fs.uploadPart(request).getPartETag();
+-                LOG.debug("Completed upload of {} to part {}", block,
+-                    partETag.getETag());
+-                LOG.debug("Stream statistics of {}", statistics);
+-              } finally {
+-                // close the stream and block
+-                closeAll(LOG, uploadData, block);
+-              }
++          executorService.submit(() -> {
++            // this is the queued upload operation
++            // do the upload
++            try {
++              LOG.debug("Uploading part {} for id '{}'",
++                  currentPartNumber, uploadId);
++              PartETag partETag = writeOperationHelper.uploadPart(request)
++                  .getPartETag();
++              LOG.debug("Completed upload of {} to part {}",
++                  block, partETag.getETag());
++              LOG.debug("Stream statistics of {}", statistics);
++              partsUploaded++;
++            } finally {
++              // close the stream and block
++              closeAll(LOG, uploadData, block);
+-    private CompleteMultipartUploadResult complete(List<PartETag> partETags)
++    private void complete(List<PartETag> partETags)
+-      int retryCount = 0;
+-      AmazonClientException lastException;
+-      String operation =
+-          String.format("Completing multi-part upload for key '%s'," +
+-                  " id '%s' with %s partitions ",
+-              key, uploadId, partETags.size());
+-      do {
+-        try {
+-          LOG.debug(operation);
+-          return writeOperationHelper.completeMultipartUpload(
+-                  uploadId,
+-                  partETags);
+-        } catch (AmazonClientException e) {
+-          lastException = e;
+-          statistics.exceptionInMultipartComplete();
+-        }
+-      } while (shouldRetry(operation, lastException, retryCount++));
+-      // this point is only reached if the operation failed more than
+-      // the allowed retry count
+-      throw translateException(operation, key, lastException);
++      AtomicInteger errorCount = new AtomicInteger(0);
++      try {
++        writeOperationHelper.completeMPUwithRetries(key,
++            uploadId,
++            partETags,
++            bytesSubmitted,
++            errorCount);
++      } finally {
++        statistics.exceptionInMultipartComplete(errorCount.get());
++      }
+-      String operation =
+-          String.format("Aborting multi-part upload for '%s', id '%s",
+-              writeOperationHelper, uploadId);
+-      do {
+-        try {
+-          LOG.debug(operation);
+-          writeOperationHelper.abortMultipartUpload(uploadId);
+-          return;
+-        } catch (AmazonClientException e) {
+-          lastException = e;
+-          statistics.exceptionInMultipartAbort();
+-        }
+-      } while (shouldRetry(operation, lastException, retryCount++));
+-      // this point is only reached if the operation failed more than
+-      // the allowed retry count
+-      LOG.warn("Unable to abort multipart upload, you may need to purge  " +
+-          "uploaded parts", lastException);
+-    }
+-
+-    /**
+-     * Predicate to determine whether a failed operation should
+-     * be attempted again.
+-     * If a retry is advised, the exception is automatically logged and
+-     * the filesystem statistic {@link Statistic#IGNORED_ERRORS} incremented.
+-     * The method then sleeps for the sleep time suggested by the sleep policy;
+-     * if the sleep is interrupted then {@code Thread.interrupted()} is set
+-     * to indicate the thread was interrupted; then false is returned.
+-     *
+-     * @param operation operation for log message
+-     * @param e exception raised.
+-     * @param retryCount  number of retries already attempted
+-     * @return true if another attempt should be made
+-     */
+-    private boolean shouldRetry(String operation,
+-        AmazonClientException e,
+-        int retryCount) {
+-        RetryPolicy.RetryAction retryAction =
+-            retryPolicy.shouldRetry(e, retryCount, 0, true);
+-        boolean retry = retryAction == RetryPolicy.RetryAction.RETRY;
+-        if (retry) {
+-          fs.incrementStatistic(IGNORED_ERRORS);
+-          LOG.info("Retrying {} after exception ", operation, e);
+-          Thread.sleep(retryAction.delayMillis);
+-        }
+-        return retry;
+-      } catch (InterruptedException ex) {
+-        Thread.currentThread().interrupt();
+-        return false;
+-      } catch (Exception ignored) {
+-        return false;
++        writeOperationHelper.abortMultipartUpload(key, uploadId,
++            (text, e, r, i) -> statistics.exceptionInMultipartAbort());
++      } catch (IOException e) {
++        // this point is only reached if the operation failed more than
++        // the allowed retry count
++        LOG.warn("Unable to abort multipart upload,"
++            + " you may need to purge uploaded parts", e);
+-    public ProgressableListener(Progressable progress) {
++    ProgressableListener(Progressable progress) {

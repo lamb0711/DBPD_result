@@ -1,0 +1,128 @@
+GEODE-77 fixes for network failure handling & miscellaneous unit test failures
+
+Network failure handling was not properly shutting down TCPConduit, leaving threads hanging trying to send messages.  The shutdown code was calling Services.emergencyClose too soon, and the recursion back into GMSMembershipManager shutdown code caused some problems, too.
+
+GMSHealthMonitor was continually switching between two members to watch even though it had already sent suspect messages about them and had received no response.  I added a collection of IDs that are in this state and modified setNextNeighbor to avoid reusing them.
+
+GMSHealthMonitor was sending removeMember messages to the locators and a random member, but for some reason this wasn't resolving a network partition fast enough.  I've disabled that behavior for now, sending the messages to all members.  This needs to be revisited because sending the message to all members is not scalable.
+
+GMSHealthMonitor had some issues with initiating removals when it was in the process of shutting down.  I added some isStopping checks to fix this.
+
+MembershipJUnitTest and StatRecorderJUnitTest were failing in gradle runs but not under Eclipse because my Eclipse launch configuration wasn't set to enable assertions.  After fixing that I found a number of problems with these tests and fixed them.
+
+Multicast tests are now implemented in GMSMembershipManager and JGroupsMessenger.  This leverages the ping/pong messaging added for the quorum checker.
+
+GMSJoinLeave was too slow in sending out new views when there were process failures.  I added code to inform the reply processor if there are queued leave/remove requests so it wouldn't wait for these, and also added similar checks in the removeHealthyMembers method (which performs checks on members using the HealthMonitor).
+
+When there is a network partition GMSJoinLeave will now send a NetworkPartitionMessage to other members to prod them along in figuring out that they should shut down.
+
+During a forced-disconnect there can be a lot of warning/fatail log messages.  If there are alert listeners in the system this can create a lot of network traffic and extra work figuring out whether the receiver is even there or not.  GMSMembershipManager now throws away outbound alerts when a forced-disconnect is in process.
+
+Some of the forced-disconnect shutdown processing has been moved out of the membershp manager's DisconnectThread that was introduced with the quorum checker in order to set the shutdown cause, etc, as quickly as possible.
+
+I noticed a lot of TXState log messages at debug level with a Throwable stack trace.  There was no comment saying why this was being done so I commented it out.
+
+JGroups logging level is now set to FATAL by default.  The default log level was a problem during network partitions because each message send was causing a dire warning to be logged.
+
+I observed a number of threads being left behind when a locator failed to start during auto-reconnect testing.  I added a unit test to LocatorJUnitTest for this and fixed the leaks.
+
++import com.gemstone.gemfire.internal.concurrent.ConcurrentHashSet;
++  /**
++   * currentSuspects tracks members that we've already checked and
++   * did not receive a response from.  This collection keeps us from
++   * checking the same member over and over if it's already under
++   * suspicion
++   */
++  final private Set<InternalDistributedMember> currentSuspects = new ConcurrentHashSet<>();
++
++    if (currentSuspects.remove(sender)) {
++      logger.info("No longer suspecting {}", sender);
++    }
++          currentSuspects.add(mbr);
++          currentSuspects.remove(mbr);
+-    logger.debug("Suspecting {} reason=\"{}\"", mbr, reason);
++    logger.info("Sending suspect request {} reason=\"{}\"", mbr, reason);
+-            if (ts != null &&
+-                ts.getTimeStamp()
+-                  > (System.currentTimeMillis() - services.getConfig().getMemberTimeout())) {
++            if (isStopping ||
++                (ts != null &&
++                 ts.getTimeStamp()
++                  > (System.currentTimeMillis() - services.getConfig().getMemberTimeout())
++                  )) {
+-          Thread th = new Thread(Services.getThreadGroup(), r, "Member-Check Scheduler ");
++          Thread th = new Thread(Services.getThreadGroup(), r, "GemFire Member-Check Scheduler ");
+-          Thread th = new Thread(Services.getThreadGroup(), r, "Member-Check Thread " + id);
++          Thread th = new Thread(Services.getThreadGroup(), r, "GemFire Member-Check Thread " + id);
+-    setNextNeighbor(newView, null);
++    currentSuspects.clear();
++    setNextNeighbor(newView, null);
+-      nextNeighbor = allMembers.get(nextNeighborIndex);
+-      logger.trace("Next neighbour to check is {}", nextNeighbor);
++      InternalDistributedMember newNeighbor = allMembers.get(nextNeighborIndex);
++      if (currentSuspects.contains(newNeighbor)) {
++        setNextNeighbor(newView, newNeighbor);
++        return;
++      }
++      InternalDistributedMember oldNeighbor = nextNeighbor;
++      if (oldNeighbor != newNeighbor) {
++        logger.debug("Failure detection is now watching {}", newNeighbor);
++        nextNeighbor = newNeighbor;
++      }
+-    {
++    if (monitorFuture != null) {
++    }
++    if (scheduler != null) {
+-    {
+-      Collection<Response> val = requestIdVsResponse.values();
+-      for (Iterator<Response> it = val.iterator(); it.hasNext();) {
+-        Response r = it.next();
+-        synchronized (r) {
+-          r.notify();
+-        }
+-      }
++    Collection<Response> val = requestIdVsResponse.values();
++    for (Iterator<Response> it = val.iterator(); it.hasNext();) {
++      Response r = it.next();
++      synchronized (r) {
++        r.notify();
++      }
++    }
++
++    if (checkExecutor != null) {
+-    {
++
++    if (suspectRequestCollectorThread != null) {
+-    if (!cv.contains(incomingRequest.getSender())) {
++    InternalDistributedMember sender = incomingRequest.getSender();
++    int viewId = sender.getVmViewId();
++    if (cv.getViewId() >= viewId && !cv.contains(incomingRequest.getSender())) {
++      services.getJoinLeave().remove(sender, "this process is initiating suspect processing but is no longer a member");
+-    InternalDistributedMember sender = incomingRequest.getSender();
+-
+-              if (!pinged) {
++              if (!pinged && !isStopping) {
++              // whether it's alive or not, at this point we allow it to
++              // be a suspect again
++              currentSuspects.remove(mbr);
+-    HashSet<InternalDistributedMember> filter = new HashSet<InternalDistributedMember>();
+-    for (int i = 0; i < requests.size(); i++) {
+-      filter.add(requests.get(i).getSuspectMember());
+-    }
+-    List<InternalDistributedMember> recipients = currentView.getPreferredCoordinators(filter, services.getJoinLeave().getMemberID(), 5);
++    NetView v = currentView;
++    List<InternalDistributedMember> recipients;
++//    if (v.size() > 20) {
++//      // TODO this needs some rethinking - we need the guys near the
++//      // front of the membership view who aren't preferred for coordinator
++//      // to see the suspect message.
++//      HashSet<InternalDistributedMember> filter = new HashSet<InternalDistributedMember>();
++//      for (int i = 0; i < requests.size(); i++) {
++//        filter.add(requests.get(i).getSuspectMember());
++//      }
++//      recipients = currentView.getPreferredCoordinators(filter, services.getJoinLeave().getMemberID(), 5);
++//    } else {
++      recipients = currentView.getMembers();
++//    }
+
+INS26 INS40 INS23 INS29 INS83 INS83 UPD74 MOV74 INS59 MOV21 MOV8 MOV60 INS65 UPD43 INS42 INS14 INS25 INS21 MOV21 MOV21 INS25 INS25 INS25 INS25 INS60 INS60 INS21 INS66 INS66 INS66 INS66 UPD42 INS74 INS32 INS8 INS32 INS27 MOV8 INS27 INS8 INS27 INS8 INS27 MOV8 INS39 INS59 INS27 INS43 INS59 MOV74 INS59 INS7 INS43 INS42 INS42 INS42 INS21 UPD42 UPD45 INS42 INS42 INS60 INS25 INS60 INS25 INS42 INS33 INS42 INS33 MOV21 INS42 INS33 MOV21 INS42 INS33 INS42 INS32 INS27 MOV38 INS21 UPD42 MOV42 INS42 INS42 UPD42 MOV42 INS42 INS32 INS42 INS32 INS43 INS59 INS32 INS8 MOV43 INS59 INS27 INS8 INS42 INS42 INS32 INS42 INS32 MOV42 UPD42 MOV42 INS42 INS42 INS45 INS42 INS42 INS42 MOV32 INS42 INS42 INS42 MOV21 INS41 INS42 INS42 INS42 INS42 MOV21 INS21 INS42 INS42 MOV32 INS42 INS42 INS45 INS32 INS7 INS42 INS42 INS42 UPD42 UPD45 UPD42 INS42 INS42 INS8 MOV8 INS21 INS21 INS60 MOV21 MOV41 MOV60 MOV21 MOV41 INS32 INS32 INS27 MOV43 INS59 MOV43 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS36 INS42 INS14 MOV27 MOV43 MOV32 INS42 INS45 MOV43 INS27 INS45 INS42 INS21 INS27 INS32 MOV38 INS38 INS42 INS42 INS42 INS42 DEL45 DEL42 DEL42 DEL45 DEL42 DEL27 DEL14 DEL59 DEL60 DEL8 DEL42 DEL7 DEL8 DEL42 DEL43 DEL74 DEL14 DEL59 DEL39 DEL34 DEL59 DEL58 DEL42 DEL42 DEL42 DEL32 DEL27 DEL42 DEL37 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL42 DEL32 DEL32 DEL21 DEL8 DEL24 DEL42 DEL42 DEL42 DEL32 DEL34 DEL32 DEL59 DEL60

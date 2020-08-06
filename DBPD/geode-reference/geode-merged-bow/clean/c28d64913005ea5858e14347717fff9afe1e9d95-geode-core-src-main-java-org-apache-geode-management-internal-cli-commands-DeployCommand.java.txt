@@ -1,0 +1,154 @@
+Merge branch 'release/1.4.0'
+
+-import java.io.FileNotFoundException;
++import java.io.File;
++import java.io.FileInputStream;
+-import java.util.Arrays;
++import java.util.ArrayList;
++import com.healthmarketscience.rmiio.RemoteInputStream;
++import com.healthmarketscience.rmiio.SimpleRemoteInputStream;
++import com.healthmarketscience.rmiio.exporter.RemoteStreamExporter;
++import org.apache.commons.io.FilenameUtils;
++import org.apache.geode.distributed.internal.ClusterConfigurationService;
++import org.apache.geode.management.internal.ManagementAgent;
++import org.apache.geode.management.internal.SystemManagementService;
+-      @CliOption(key = {CliStrings.DEPLOY__DIR}, help = CliStrings.DEPLOY__DIR__HELP) String dir) {
++      @CliOption(key = {CliStrings.DEPLOY__DIR}, help = CliStrings.DEPLOY__DIR__HELP) String dir)
++      throws IOException {
+-    byte[][] shellBytesData = CommandExecutionContext.getBytesFromShell();
+-    String[] jarNames = CliUtil.bytesToNames(shellBytesData);
+-    byte[][] jarBytes = CliUtil.bytesToData(shellBytesData);
++    List<String> jarFullPaths = CommandExecutionContext.getFilePathFromShell();
+-
+-    if (targetMembers.size() > 0) {
++    List results = new ArrayList();
++    ManagementAgent agent = ((SystemManagementService) getManagementService()).getManagementAgent();
++    RemoteStreamExporter exporter = agent.getRemoteStreamExporter();
++
++    for (DistributedMember member : targetMembers) {
++      List<RemoteInputStream> remoteStreams = new ArrayList<>();
++      List<String> jarNames = new ArrayList<>();
++      for (String jarFullPath : jarFullPaths) {
++        remoteStreams
++            .add(exporter.export(new SimpleRemoteInputStream(new FileInputStream(jarFullPath))));
++        jarNames.add(FilenameUtils.getName(jarFullPath));
++      }
++
+-      ResultCollector<?, ?> resultCollector = CliUtil.executeFunction(this.deployFunction,
+-          new Object[] {jarNames, jarBytes}, targetMembers);
++      ResultCollector<?, ?> resultCollector =
++          executeFunction(this.deployFunction, new Object[] {jarNames, remoteStreams}, member);
+-      List<CliFunctionResult> results =
+-          CliFunctionResult.cleanResults((List<?>) resultCollector.getResult());
++      results.add(((List) resultCollector.getResult()).get(0));
+-      for (CliFunctionResult result : results) {
+-        if (result.getThrowable() != null) {
++      for (RemoteInputStream ris : remoteStreams) {
++        try {
++          ris.close(true);
++        } catch (IOException ex) {
++          // Ignored. the stream may have already been closed.
++        }
++      }
++    }
++
++    List<CliFunctionResult> cleanedResults = CliFunctionResult.cleanResults(results);
++
++    for (CliFunctionResult result : cleanedResults) {
++      if (result.getThrowable() != null) {
++        tabularData.accumulate("Member", result.getMemberIdOrName());
++        tabularData.accumulate("Deployed JAR", "");
++        tabularData.accumulate("Deployed JAR Location",
++            "ERROR: " + result.getThrowable().getClass().getName() + ": "
++                + result.getThrowable().getMessage());
++        tabularData.setStatus(Result.Status.ERROR);
++      } else {
++        String[] strings = (String[]) result.getSerializables();
++        for (int i = 0; i < strings.length; i += 2) {
+-          tabularData.accumulate("Deployed JAR", "");
+-          tabularData.accumulate("Deployed JAR Location",
+-              "ERROR: " + result.getThrowable().getClass().getName() + ": "
+-                  + result.getThrowable().getMessage());
+-          tabularData.setStatus(Result.Status.ERROR);
+-        } else {
+-          String[] strings = (String[]) result.getSerializables();
+-          for (int i = 0; i < strings.length; i += 2) {
+-            tabularData.accumulate("Member", result.getMemberIdOrName());
+-            tabularData.accumulate("Deployed JAR", strings[i]);
+-            tabularData.accumulate("Deployed JAR Location", strings[i + 1]);
+-          }
++          tabularData.accumulate("Deployed JAR", strings[i]);
++          tabularData.accumulate("Deployed JAR Location", strings[i + 1]);
+-    persistClusterConfiguration(result,
+-        () -> getSharedConfiguration().addJarsToThisLocator(jarNames, jarBytes, groups));
++    ClusterConfigurationService sc = getSharedConfiguration();
++    if (sc == null) {
++      result.setCommandPersisted(false);
++    } else {
++      sc.addJarsToThisLocator(jarFullPaths, groups);
++      result.setCommandPersisted(true);
++    }
++
+-      // 2nd argument is the jar
+-      String[] jars = (String[]) parseResult.getArguments()[1];
+-      // 3rd argument is the dir
+-      String dir = (String) parseResult.getArguments()[2];
++      String[] jars = (String[]) parseResult.getParamValue("jar");
++      String dir = (String) parseResult.getParamValue("dir");
+-      FileResult fileResult;
+-      String[] filesToUpload = jars;
+-      if (filesToUpload == null) {
+-        filesToUpload = new String[] {dir};
+-      }
+-      try {
+-
+-        fileResult = new FileResult(filesToUpload);
+-      } catch (FileNotFoundException fnfex) {
+-        return ResultBuilder
+-            .createGemFireErrorResult("'" + Arrays.toString(filesToUpload) + "' not found.");
+-      } catch (IOException ioex) {
+-        return ResultBuilder.createGemFireErrorResult("I/O error when reading jar/dir: "
+-            + ioex.getClass().getName() + ": " + ioex.getMessage());
+-      }
+-
+-      // Only do this additional check if a dir was provided
+-      if (dir != null) {
+-        String message =
+-            "\nDeploying files: " + fileResult.getFormattedFileList() + "\nTotal file size is: "
+-                + this.numFormatter.format((double) fileResult.computeFileSizeTotal() / ONE_MB)
+-                + "MB\n\nContinue? ";
+-
+-        if (readYesNo(message, Response.YES) == Response.NO) {
+-          return ResultBuilder.createShellClientAbortOperationResult(
+-              "Aborted deploy of " + Arrays.toString(filesToUpload) + ".");
++      FileResult fileResult = new FileResult();
++      if (jars != null) {
++        for (String jar : jars) {
++          File jarFile = new File(jar);
++          if (!jarFile.exists()) {
++            return ResultBuilder.createUserErrorResult(jar + " not found.");
++          }
++          fileResult.addFile(jarFile);
++        }
++      } else {
++        File fileDir = new File(dir);
++        if (!fileDir.isDirectory()) {
++          return ResultBuilder.createUserErrorResult(dir + " is not a directory");
++        }
++        File[] childJarFile = fileDir.listFiles(CliUtil.JAR_FILE_FILTER);
++        for (File file : childJarFile) {
++          fileResult.addFile(file);
++
++      // check if user wants to upload with the computed file size
++      String message =
++          "\nDeploying files: " + fileResult.getFormattedFileList() + "\nTotal file size is: "
++              + this.numFormatter.format((double) fileResult.computeFileSizeTotal() / ONE_MB)
++              + "MB\n\nContinue? ";
++
++      if (readYesNo(message, Response.YES) == Response.NO) {
++        return ResultBuilder.createShellClientAbortOperationResult(
++            "Aborted deploy of " + fileResult.getFormattedFileList() + ".");
++      }
++
+
+INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 UPD40 INS40 UPD40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS43 MOV8 UPD42 MOV42 MOV60 INS60 MOV60 MOV21 INS60 INS60 INS60 INS70 MOV60 INS60 INS25 MOV41 INS74 INS59 INS43 INS59 INS43 INS59 INS43 INS59 INS44 INS42 INS8 UPD42 INS43 INS59 INS27 INS8 INS8 INS25 MOV60 MOV25 INS43 INS43 INS42 INS32 INS42 INS42 INS14 INS42 INS42 INS32 INS42 INS42 INS32 INS43 INS42 INS60 INS60 INS70 MOV60 INS21 INS70 UPD42 INS42 INS42 MOV32 INS42 INS33 INS21 INS21 INS21 MOV5 MOV43 MOV43 INS27 INS8 INS8 INS42 INS42 INS42 INS42 INS43 INS36 INS42 INS42 INS42 INS42 UPD74 MOV74 INS59 INS74 INS59 INS44 INS42 INS8 INS32 INS44 INS42 INS8 INS42 INS32 INS32 INS32 INS14 INS42 INS33 INS70 INS60 INS25 INS60 INS70 INS42 INS11 INS43 INS42 INS14 INS43 INS43 INS42 INS14 INS43 INS42 INS21 INS21 INS42 INS42 INS32 INS43 INS42 INS54 INS42 INS42 INS9 INS42 INS42 INS42 INS42 INS42 INS42 INS9 MOV5 INS32 MOV43 INS32 MOV43 INS44 INS42 INS8 INS43 INS59 INS38 INS8 INS5 INS59 INS44 INS42 INS8 INS43 INS32 INS42 INS74 INS42 INS42 INS74 INS42 INS32 INS32 UPD42 INS36 INS42 INS34 INS42 INS8 INS12 MOV42 UPD42 MOV42 INS45 MOV42 UPD42 MOV42 INS45 INS43 INS42 MOV60 MOV25 MOV21 UPD42 MOV42 INS42 INS14 INS32 MOV41 INS43 INS85 INS42 INS32 INS43 INS42 INS21 INS42 INS42 INS43 INS43 INS42 INS42 INS32 INS42 INS42 INS32 MOV11 INS21 INS44 INS8 INS42 INS43 INS38 INS32 INS43 INS42 INS42 INS42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 INS40 INS42 INS32 INS42 INS42 INS42 INS42 INS14 INS42 INS42 INS42 UPD42 INS43 INS32 MOV43 INS42 INS42 INS42 INS14 INS32 INS41 INS42 INS42 INS42 INS42 UPD42 UPD42 MOV42 INS42 UPD42 MOV42 UPD42 UPD42 INS43 INS14 INS42 INS42 INS42 INS9 INS42 INS43 INS42 INS42 INS42 INS32 INS42 UPD45 INS42 INS43 INS42 INS42 INS42 INS42 INS27 INS42 INS42 INS45 DEL76 DEL42 DEL39 DEL85 DEL85 DEL5 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL43 DEL85 DEL5 DEL42 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL39 DEL85 DEL85 DEL5 DEL42 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL42 DEL32 DEL34 DEL27 DEL25 DEL42 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL86 DEL32 DEL21 DEL8 DEL42 DEL43 DEL85 DEL5 DEL42 DEL43 DEL85 DEL5 DEL32 DEL34 DEL2 DEL32 DEL34 DEL2 DEL42 DEL42 DEL42 DEL33 DEL27 DEL42 DEL42 DEL4 DEL3 DEL7 DEL21 DEL42 DEL42 DEL14 DEL7 DEL45 DEL42 DEL42 DEL42 DEL32 DEL42 DEL8 DEL43 DEL42 DEL44 DEL8 DEL12 DEL42 DEL44 DEL45 DEL42 DEL42 DEL32 DEL42 DEL32 DEL45 DEL32 DEL27 DEL32 DEL41 DEL8 DEL12 DEL54 DEL42 DEL33 DEL27 DEL8 DEL25

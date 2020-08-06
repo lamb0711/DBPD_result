@@ -1,0 +1,334 @@
+GEODE-3637: Reimplement client queue initialization. Adding shutdown logic
+
+Reimplementing the logic to perform client queue initialization in a separate thread 
+than the handshake thread, to avoid blocking the limited number of handshake 
+threads.
+
+Shutting down the new threadpool when the cache server is shutdown.
+
++  private static final int HANDSHAKER_DEFAULT_POOL_SIZE = 4;
++  public static final int CLIENT_QUEUE_INITIALIZATION_POOL_SIZE = 16;
++   * A pool used to process client-queue-initializations.
++   */
++  private final ThreadPoolExecutor clientQueueInitPool;
++
++  /**
+-    {
+-      ThreadPoolExecutor tmp_pool = null;
+-      String gName = "ServerConnection "
+-          // + serverSock.getInetAddress()
+-          + "on port " + this.localPort;
+-      final ThreadGroup socketThreadGroup = LoggingThreadGroup.createThreadGroup(gName, logger);
+-
+-      ThreadFactory socketThreadFactory = new ThreadFactory() {
+-        int connNum = -1;
+-
+-        public Thread newThread(final Runnable command) {
+-          int tnum;
+-          synchronized (this) {
+-            tnum = ++connNum;
+-          }
+-          String tName = socketThreadGroup.getName() + " Thread " + tnum;
+-          getStats().incConnectionThreadsCreated();
+-          Runnable r = new Runnable() {
+-            public void run() {
+-              try {
+-                command.run();
+-              } catch (CancelException e) { // bug 39463
+-                // ignore
+-              } finally {
+-                ConnectionTable.releaseThreadsSockets();
+-              }
+-            }
+-          };
+-          return new Thread(socketThreadGroup, r, tName);
+-        }
+-      };
+-      try {
+-        if (isSelector()) {
+-          tmp_pool = new PooledExecutorWithDMStats(new LinkedBlockingQueue(), this.maxThreads,
+-              getStats().getCnxPoolHelper(), socketThreadFactory, Integer.MAX_VALUE);
+-        } else {
+-          tmp_pool = new ThreadPoolExecutor(MINIMUM_MAX_CONNECTIONS, this.maxConnections, 0L,
+-              TimeUnit.MILLISECONDS, new SynchronousQueue(), socketThreadFactory);
+-        }
+-      } catch (IllegalArgumentException poolInitException) {
+-        this.stats.close();
+-        this.serverSock.close();
+-        throw poolInitException;
+-      }
+-      this.pool = tmp_pool;
+-    }
+-    {
+-      ThreadPoolExecutor tmp_hsPool = null;
+-      String gName = "Handshaker " + serverSock.getInetAddress() + ":" + this.localPort;
+-      final ThreadGroup socketThreadGroup = LoggingThreadGroup.createThreadGroup(gName, logger);
+-
+-      ThreadFactory socketThreadFactory = new ThreadFactory() {
+-        int connNum = -1;
+-
+-        public Thread newThread(Runnable command) {
+-          int tnum;
+-          synchronized (this) {
+-            tnum = ++connNum;
+-          }
+-          String tName = socketThreadGroup.getName() + " Thread " + tnum;
+-          getStats().incAcceptThreadsCreated();
+-          return new Thread(socketThreadGroup, command, tName);
+-        }
+-      };
+-      try {
+-        final BlockingQueue bq = new SynchronousQueue();
+-        final RejectedExecutionHandler reh = new RejectedExecutionHandler() {
+-          public void rejectedExecution(Runnable r, ThreadPoolExecutor pool) {
+-            try {
+-              bq.put(r);
+-            } catch (InterruptedException ex) {
+-              Thread.currentThread().interrupt(); // preserve the state
+-              throw new RejectedExecutionException(
+-                  LocalizedStrings.AcceptorImpl_INTERRUPTED.toLocalizedString(), ex);
+-            }
+-          }
+-        };
+-        tmp_hsPool = new ThreadPoolExecutor(1, HANDSHAKE_POOL_SIZE, 60, TimeUnit.SECONDS, bq,
+-            socketThreadFactory, reh);
+-      } catch (IllegalArgumentException poolInitException) {
+-        this.stats.close();
+-        this.serverSock.close();
+-        this.pool.shutdownNow();
+-        throw poolInitException;
+-      }
+-      this.hsPool = tmp_hsPool;
+-    }
++    pool = initializeServerConnectionThreadPool();
++    hsPool = initializeHandshakerThreadPool();
++    clientQueueInitPool = initializeClientQueueInitializerThreadPool();
++  private ThreadPoolExecutor initializeHandshakerThreadPool() throws IOException {
++    String gName = "Handshaker " + serverSock.getInetAddress() + ":" + this.localPort;
++    final ThreadGroup socketThreadGroup = LoggingThreadGroup.createThreadGroup(gName, logger);
++
++    ThreadFactory socketThreadFactory = new ThreadFactory() {
++      AtomicInteger connNum = new AtomicInteger(-1);
++
++      @Override
++      public Thread newThread(Runnable command) {
++        String threadName = socketThreadGroup.getName() + " Thread " + connNum.incrementAndGet();
++        getStats().incAcceptThreadsCreated();
++        return new Thread(socketThreadGroup, command, threadName);
++      }
++    };
++    try {
++      final BlockingQueue blockingQueue = new SynchronousQueue();
++      final RejectedExecutionHandler rejectedExecutionHandler = new RejectedExecutionHandler() {
++        public void rejectedExecution(Runnable r, ThreadPoolExecutor pool) {
++          try {
++            blockingQueue.put(r);
++          } catch (InterruptedException ex) {
++            Thread.currentThread().interrupt(); // preserve the state
++            throw new RejectedExecutionException(
++                LocalizedStrings.AcceptorImpl_INTERRUPTED.toLocalizedString(), ex);
++          }
++        }
++      };
++      logger.warn("Handshaker max Pool size: " + HANDSHAKE_POOL_SIZE);
++      return new ThreadPoolExecutor(1, HANDSHAKE_POOL_SIZE, 60, TimeUnit.SECONDS, blockingQueue,
++          socketThreadFactory, rejectedExecutionHandler);
++    } catch (IllegalArgumentException poolInitException) {
++      this.stats.close();
++      this.serverSock.close();
++      this.pool.shutdownNow();
++      throw poolInitException;
++    }
++  }
++
++  private ThreadPoolExecutor initializeClientQueueInitializerThreadPool() throws IOException {
++    final ThreadGroup clientQueueThreadGroup =
++        LoggingThreadGroup.createThreadGroup("Client Queue Initialization ", logger);
++
++    ThreadFactory clientQueueThreadFactory = new ThreadFactory() {
++      AtomicInteger connNum = new AtomicInteger(-1);
++
++      @Override
++      public Thread newThread(final Runnable command) {
++        String threadName =
++            clientQueueThreadGroup.getName() + " Thread " + connNum.incrementAndGet();
++        Runnable runnable = new Runnable() {
++          public void run() {
++            try {
++              command.run();
++            } catch (CancelException e) {
++              logger.debug("Client Queue Initialization was canceled.", e);
++            }
++          }
++        };
++        return new Thread(clientQueueThreadGroup, runnable, threadName);
++      }
++    };
++    return new PooledExecutorWithDMStats(new SynchronousQueue(),
++        CLIENT_QUEUE_INITIALIZATION_POOL_SIZE, getStats().getCnxPoolHelper(),
++        clientQueueThreadFactory, 60000);
++  }
++
++  private ThreadPoolExecutor initializeServerConnectionThreadPool() throws IOException {
++    String gName = "ServerConnection "
++        // + serverSock.getInetAddress()
++        + "on port " + this.localPort;
++    final ThreadGroup socketThreadGroup = LoggingThreadGroup.createThreadGroup(gName, logger);
++
++    ThreadFactory socketThreadFactory = new ThreadFactory() {
++      AtomicInteger connNum = new AtomicInteger(-1);
++
++      @Override
++      public Thread newThread(final Runnable command) {
++        String tName = socketThreadGroup.getName() + " Thread " + connNum.incrementAndGet();
++        getStats().incConnectionThreadsCreated();
++        Runnable r = new Runnable() {
++          public void run() {
++            try {
++              command.run();
++            } catch (CancelException e) { // bug 39463
++              // ignore
++            } finally {
++              ConnectionTable.releaseThreadsSockets();
++            }
++          }
++        };
++        return new Thread(socketThreadGroup, r, tName);
++      }
++    };
++    try {
++      if (isSelector()) {
++        return new PooledExecutorWithDMStats(new LinkedBlockingQueue(), this.maxThreads,
++            getStats().getCnxPoolHelper(), socketThreadFactory, Integer.MAX_VALUE);
++      } else {
++        return new ThreadPoolExecutor(MINIMUM_MAX_CONNECTIONS, this.maxConnections, 0L,
++            TimeUnit.MILLISECONDS, new SynchronousQueue(), socketThreadFactory);
++      }
++    } catch (IllegalArgumentException poolInitException) {
++      this.stats.close();
++      this.serverSock.close();
++      throw poolInitException;
++    }
++  }
++
+-  private static final int DEPRECATED_SELECTOR_POOL_SIZE =
++  private final int DEPRECATED_SELECTOR_POOL_SIZE =
+-  private static final int HANDSHAKE_POOL_SIZE =
+-      Integer.getInteger("BridgeServer.HANDSHAKE_POOL_SIZE", 4).intValue();
++  private final int HANDSHAKE_POOL_SIZE = Integer
++      .getInteger("BridgeServer.HANDSHAKE_POOL_SIZE", HANDSHAKER_DEFAULT_POOL_SIZE).intValue();
+-    if (emergencyClassesLoaded)
++    if (emergencyClassesLoaded) {
++    }
+-    if (!WORKAROUND_SELECTOR_BUG)
++    if (!WORKAROUND_SELECTOR_BUG) {
++    }
+-      if (sc == null)
++      if (sc == null) {
++      }
+-          // zeroEventsCount++;
+-          // if (zeroEventsCount > 0) {
+-          // zeroEventsCount = 0;
+-
+-          // try {
+-          // this.selector.close(); // this selector is sick!
+-          // } catch (IOException ignore) {
+-          // }
+-          // this.selector = Selector.open();
+-          // {
+-          // Iterator it = selectorRegistrations.iterator();
+-          // while (it.hasNext()) {
+-          // ServerConnection sc = (ServerConnection)it.next();
+-          // sc.registerWithSelector2(this.selector);
+-          // }
+-          // }
+-          // }
+-          // ArrayList al = new ArrayList();
+-          // Iterator keysIt = this.selector.keys().iterator();
+-          // while (keysIt.hasNext()) {
+-          // SelectionKey sk = (SelectionKey)keysIt.next();
+-          // al.add(sk.attachment());
+-          // sk.cancel();
+-          // }
+-          // events = this.selector.selectNow();
+-          // Iterator alIt = al.iterator();
+-          // while (alIt.hasNext()) {
+-          // ServerConnection sc = (ServerConnection)alIt.next();
+-          // sc.registerWithSelector2(this.selector);
+-          // }
+-          // events = this.selector.select();
+-          // } else {
+-          // zeroEventsCount = 0;
+-                // } else if (key.isValid() && key.isConnectable()) {
+-                // logger.info("DEBUG isConnectable and isValid key=" + key);
+-                // finishCon(sc);
+-                  // } else {
+-                  // logger.info("DEBUG !isValid key=" + key);
++  public boolean isNotifyBySubscription() {
++    return notifyBySubscription;
++  }
++
+-    if (communicationMode.isSubscriptionFeed()) {
+-      boolean primary = communicationMode == CommunicationMode.PrimaryServerToClient;
+-      logger.debug(":Bridge server: Initializing {} server-to-client communication socket: {}",
+-          primary ? "primary" : "secondary", socket);
+-      AcceptorImpl.this.clientNotifier.registerClient(socket, primary, this.acceptorId,
+-          this.notifyBySubscription);
++    // GEODE-3637 - If the communicationMode is client Subscriptions, hand-off the client queue
++    // initialization to be done in another threadPool
++    if (handOffQueueInitialization(socket, communicationMode)) {
++  private boolean handOffQueueInitialization(Socket socket, CommunicationMode communicationMode) {
++    if (communicationMode.isSubscriptionFeed()) {
++      boolean isPrimaryServerToClient =
++          communicationMode == CommunicationMode.PrimaryServerToClient;
++      clientQueueInitPool
++          .execute(new ClientQueueInitializerTask(socket, isPrimaryServerToClient, this));
++      return true;
++    }
++    return false;
++  }
++
++    this.clientQueueInitPool.shutdownNow();
++        && (clientQueueInitPool == null || clientQueueInitPool.isShutdown())
+-   *
+-   *
++
++  private class ClientQueueInitializerTask implements Runnable {
++    private final Socket socket;
++    private final boolean isPrimaryServerToClient;
++    private final AcceptorImpl acceptor;
++
++    public ClientQueueInitializerTask(Socket socket, boolean isPrimaryServerToClient,
++        AcceptorImpl acceptor) {
++      this.socket = socket;
++      this.acceptor = acceptor;
++      this.isPrimaryServerToClient = isPrimaryServerToClient;
++    }
++
++    @Override
++    public void run() {
++      logger.info(":Bridge server: Initializing {} server-to-client communication socket: {}",
++          isPrimaryServerToClient ? "primary" : "secondary", socket);
++      try {
++        acceptor.getCacheClientNotifier().registerClient(socket, isPrimaryServerToClient,
++            acceptor.getAcceptorId(), acceptor.isNotifyBySubscription());
++      } catch (IOException ex) {
++        closeSocket(socket);
++        if (isRunning()) {
++          if (!acceptor.loggedAcceptError) {
++            acceptor.loggedAcceptError = true;
++            if (ex instanceof SocketTimeoutException) {
++              logger.warn(LocalizedMessage.create(
++                  LocalizedStrings.AcceptorImpl_CACHE_SERVER_FAILED_ACCEPTING_CLIENT_CONNECTION_DUE_TO_SOCKET_TIMEOUT));
++            } else {
++              logger.warn(LocalizedMessage.create(
++                  LocalizedStrings.AcceptorImpl_CACHE_SERVER_FAILED_ACCEPTING_CLIENT_CONNECTION__0,
++                  ex), ex);
++            }
++          }
++        }
++      }
++    }
++  }
+
+INS23 INS23 INS23 INS31 INS31 INS31 INS23 INS31 INS31 INS55 MOV83 MOV83 MOV83 MOV39 INS59 INS83 INS83 INS83 INS39 INS59 INS29 INS83 INS83 INS43 INS59 INS83 MOV43 INS42 INS43 MOV8 INS83 MOV43 INS42 INS43 INS8 INS83 INS43 INS42 INS43 MOV8 INS83 INS83 INS39 MOV59 INS83 INS39 INS42 INS8 INS83 INS39 INS42 INS44 INS44 INS8 INS83 INS42 INS43 INS23 INS23 INS23 INS31 INS31 INS42 INS34 INS42 INS34 INS65 INS42 INS42 INS21 INS21 INS21 INS42 INS42 INS60 INS60 INS41 INS42 INS42 INS41 INS43 INS42 INS43 INS42 INS25 INS41 INS21 INS42 INS83 INS83 INS43 INS59 INS83 INS83 INS39 INS59 INS83 INS83 INS43 INS59 INS83 INS42 INS44 INS44 INS44 INS8 INS78 INS83 INS39 INS42 INS8 INS66 INS7 INS7 INS7 INS83 INS43 INS59 INS43 INS59 INS14 INS8 INS8 INS42 INS32 INS8 INS42 INS42 MOV32 INS8 INS9 INS32 INS42 INS42 INS42 INS42 INS42 INS43 INS42 INS39 INS42 INS43 INS42 INS21 INS21 INS21 INS42 INS21 INS54 INS42 INS32 INS42 INS32 INS42 INS32 INS21 INS41 INS42 INS42 INS32 INS42 INS42 INS14 INS43 INS14 INS42 INS32 INS42 INS34 INS42 INS41 INS41 INS42 MOV42 INS42 MOV41 MOV60 INS21 INS41 INS22 INS42 INS36 INS42 INS42 INS7 INS7 INS7 INS32 INS8 INS12 INS42 INS42 INS42 INS32 INS14 INS42 INS42 INS45 INS42 INS43 INS1 INS42 INS43 INS32 INS42 INS8 INS32 INS9 INS52 INS42 INS27 INS22 INS42 INS22 INS42 INS22 INS42 INS42 INS42 INS45 INS16 INS42 INS21 INS44 INS8 UPD42 UPD42 INS42 INS42 INS27 MOV43 MOV34 MOV42 MOV34 MOV40 UPD42 MOV42 MOV42 UPD42 MOV42 INS42 INS23 INS31 INS42 INS42 INS41 INS41 INS18 UPD42 INS42 INS42 INS14 INS27 INS32 INS52 INS42 INS52 INS42 INS52 INS42 INS42 INS45 INS45 INS32 INS43 INS42 INS21 INS25 INS43 INS78 INS45 INS42 INS43 INS59 INS78 INS83 INS43 INS42 INS44 INS8 INS43 INS78 MOV14 MOV14 INS43 INS42 INS42 INS52 INS42 INS33 INS42 INS42 INS32 INS42 INS42 INS42 INS32 INS32 INS42 INS32 INS32 INS8 INS42 INS14 INS42 MOV60 INS42 INS42 INS14 INS42 INS42 INS83 INS43 INS42 INS60 INS60 INS41 INS42 INS14 INS42 INS60 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS25 INS43 MOV38 INS43 MOV38 INS42 MOV43 INS59 INS43 INS59 INS14 INS43 INS38 INS43 INS59 INS38 INS8 INS42 UPD42 UPD42 INS42 INS42 INS27 INS42 INS42 INS14 INS43 INS42 INS42 INS42 INS42 INS34 INS42 INS42 INS27 INS40 INS21 INS25 INS32 INS32 INS45 INS32 INS43 INS1 INS42 MOV32 INS45 INS32 INS7 INS62 INS8 INS8 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS31 INS42 INS42 INS40 INS9 INS42 INS43 INS21 INS21 INS83 INS39 INS42 INS8 INS42 INS32 INS32 UPD42 INS54 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS8 INS12 INS42 INS42 INS40 INS42 INS42 INS40 INS42 INS21 INS44 INS8 INS32 INS43 INS42 INS21 INS42 INS42 INS42 INS32 INS42 INS42 INS45 INS42 DEL42 DEL33 DEL59 DEL60 DEL39 DEL42 DEL39 DEL42 DEL59 DEL60 DEL52 DEL42 DEL42 DEL38 DEL7 DEL21 DEL8 DEL51 DEL42 DEL45 DEL42 DEL27 DEL59 DEL60 DEL42 DEL14 DEL7 DEL21 DEL52 DEL42 DEL22 DEL42 DEL7 DEL21 DEL42 DEL33 DEL59 DEL60 DEL39 DEL39 DEL42 DEL59 DEL60 DEL52 DEL42 DEL42 DEL38 DEL7 DEL21 DEL8 DEL51 DEL42 DEL7 DEL21 DEL42 DEL7 DEL21 DEL52 DEL42 DEL22 DEL42 DEL7 DEL21 DEL83 DEL34 DEL23 DEL41 DEL41 DEL18 DEL42 DEL42 DEL45 DEL42 DEL45 DEL45 DEL16 DEL42 DEL32 DEL21 DEL42 DEL52 DEL42 DEL22 DEL42 DEL42 DEL52 DEL42 DEL22 DEL52 DEL42 DEL22 DEL32 DEL21 DEL8

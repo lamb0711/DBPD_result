@@ -1,0 +1,1492 @@
+GEODE-3961: Refactor ShowMetricsCommand to handle --categories uniformly
+
+* GEODE-3961: Refactor ShowMetricsCommand to behave uniformly when --categories is provided.
+
+* The ShowMetricsCommand has been almost entirely refactored, but with minimal change to existing behavior.
+* The category "cache-server" has been renamed to "cacheserver"
+* The "query" category now only lists once instead of twice.
+* Category checking is now performed by the client, not the server.
+* Alphabetized excludedClasses.txt
+
+-import java.util.Collections;
+-import java.util.HashMap;
++import java.util.Arrays;
+-import java.util.Map;
++import java.util.List;
++import java.util.stream.Collectors;
++import java.util.stream.Stream;
+-import org.apache.logging.log4j.Logger;
++import org.apache.commons.lang.ArrayUtils;
++import org.apache.commons.lang.StringUtils;
+-import org.apache.geode.internal.logging.LogService;
+-import org.apache.geode.management.internal.cli.AbstractCliAroundInterceptor;
+-import org.apache.geode.management.internal.cli.GfshParseResult;
+-  private static final Logger logger = LogService.getLogger();
++  enum Category {
++    cache,
++    cacheserver,
++    callback,
++    cluster,
++    communication,
++    diskstore,
++    distribution,
++    eviction,
++    function,
++    jvm,
++    lock,
++    offheap,
++    member,
++    notification,
++    partition,
++    query,
++    region,
++    serialization,
++    transaction
++  }
++
++  static final List<Category> REGION_METRIC_CATEGORIES = Arrays.asList(Category.callback,
++      Category.diskstore, Category.eviction, Category.partition, Category.region);
++
++  static final List<Category> SYSTEM_METRIC_CATEGORIES =
++      Arrays.asList(Category.cache, Category.cluster, Category.diskstore, Category.query);
++
++  static final List<Category> SYSTEM_REGION_METRIC_CATEGORIES = Arrays.asList(Category.callback,
++      Category.cluster, Category.diskstore, Category.eviction, Category.partition, Category.region);
++
++  static final List<Category> MEMBER_METRIC_CATEGORIES =
++      Arrays.asList(Category.communication, Category.diskstore, Category.distribution,
++          Category.eviction, Category.function, Category.jvm, Category.lock, Category.member,
++          Category.offheap, Category.region, Category.serialization, Category.transaction);
++
++  static final List<Category> MEMBER_WITH_PORT_METRIC_CATEGORIES =
++      Arrays.asList(Category.cacheserver, Category.communication, Category.diskstore,
++          Category.distribution, Category.eviction, Category.function, Category.jvm, Category.lock,
++          Category.member, Category.notification, Category.offheap, Category.query, Category.region,
++          Category.serialization, Category.transaction);
+-      interceptor = "org.apache.geode.management.internal.cli.commands.ShowMetricsCommand$Interceptor")
++      interceptor = "org.apache.geode.management.internal.cli.commands.ShowMetricsInterceptor")
+-          help = CliStrings.SHOW_METRICS__CACHESERVER__PORT__HELP) String cacheServerPortString,
++          help = CliStrings.SHOW_METRICS__CACHESERVER__PORT__HELP) Integer rawCacheServerPort,
+-    Result result;
+-    DistributedMember member = null;
+-    if (memberNameOrId != null) {
+-      member = getMember(memberNameOrId);
+-    }
++    DistributedMember member = memberNameOrId == null ? null : getMember(memberNameOrId);
++    StringBuilder csvBuilder =
++        StringUtils.isEmpty(export_to_report_to) ? null : prepareCsvBuilder();
+-    if (regionName != null) {
+-      if (memberNameOrId != null) {
+-        result = ResultBuilder.buildResult(
+-            getRegionMetricsFromMember(regionName, member, export_to_report_to, categories));
+-      } else {
+-        result = ResultBuilder
+-            .buildResult(getDistributedRegionMetrics(regionName, export_to_report_to, categories));
+-      }
++    ResultData resultData;
++    if (regionName != null && memberNameOrId != null) {
++      resultData = getRegionMetricsFromMember(regionName, member, export_to_report_to, categories,
++          csvBuilder);
++    } else if (regionName != null) {
++      resultData =
++          getDistributedRegionMetrics(regionName, export_to_report_to, categories, csvBuilder);
+-      int cacheServerPort = -1;
+-      if (cacheServerPortString != null) {
+-        cacheServerPort = Integer.parseInt(cacheServerPortString);
+-      }
+-      result = ResultBuilder
+-          .buildResult(getMemberMetrics(member, export_to_report_to, categories, cacheServerPort));
++      int cacheServerPort = rawCacheServerPort == null ? -1 : rawCacheServerPort;
++      resultData =
++          getMemberMetrics(member, export_to_report_to, categories, cacheServerPort, csvBuilder);
+-      result = ResultBuilder.buildResult(getSystemWideMetrics(export_to_report_to, categories));
++      resultData = getSystemWideMetrics(export_to_report_to, categories, csvBuilder);
+-    return result;
+-  }
+-
+-  public static class Interceptor extends AbstractCliAroundInterceptor {
+-    @Override
+-    public Result preExecution(GfshParseResult parseResult) {
+-      String export_to_report_to = parseResult.getParamValueAsString(CliStrings.SHOW_METRICS__FILE);
+-      if (export_to_report_to != null && !export_to_report_to.endsWith(".csv")) {
+-        return ResultBuilder
+-            .createUserErrorResult(CliStrings.format(CliStrings.INVALID_FILE_EXTENSION, ".csv"));
+-      }
+-
+-      String regionName = parseResult.getParamValueAsString(CliStrings.SHOW_METRICS__REGION);
+-      String port = parseResult.getParamValueAsString(CliStrings.SHOW_METRICS__CACHESERVER__PORT);
+-
+-      if (port != null) {
+-        try {
+-          Integer.parseInt(port);
+-        } catch (NumberFormatException nfe) {
+-          return ResultBuilder.createUserErrorResult("Invalid port");
+-        }
+-      }
+-
+-      if (regionName != null && port != null) {
+-        return ResultBuilder.createUserErrorResult(
+-            CliStrings.SHOW_METRICS__CANNOT__USE__REGION__WITH__CACHESERVERPORT);
+-      }
+-
+-      String member = parseResult.getParamValueAsString(CliStrings.MEMBER);
+-      if (port != null && member == null) {
+-        return ResultBuilder
+-            .createUserErrorResult(CliStrings.SHOW_METRICS__CANNOT__USE__CACHESERVERPORT);
+-      }
+-
+-      return ResultBuilder.createInfoResult("OK");
+-    }
++    return ResultBuilder.buildResult(resultData);
+-  private ResultData getSystemWideMetrics(String export_to_report_to, String[] categoriesArr) {
++  private ResultData getSystemWideMetrics(String export_to_report_to, String[] categoriesArr,
++      StringBuilder csvBuilder) {
+-    StringBuilder csvBuilder = null;
+-    if (dsMxBean != null) {
+-
+-      if (export_to_report_to != null && !export_to_report_to.isEmpty()) {
+-        csvBuilder = new StringBuilder();
+-        csvBuilder.append("Category");
+-        csvBuilder.append(',');
+-        csvBuilder.append(CliStrings.SHOW_METRICS__METRIC__HEADER);
+-        csvBuilder.append(',');
+-        csvBuilder.append(CliStrings.SHOW_METRICS__VALUE__HEADER);
+-        csvBuilder.append('\n');
+-      }
+-
+-      CompositeResultData crd = ResultBuilder.createCompositeResultData();
+-      CompositeResultData.SectionResultData section = crd.addSection();
+-      TabularResultData metricsTable = section.addTable();
+-      Map<String, Boolean> categoriesMap = getSystemMetricsCategories();
+-
+-      if (categoriesArr != null && categoriesArr.length != 0) {
+-        Set<String> categories = createSet(categoriesArr);
+-        Set<String> checkSet = new HashSet<>(categoriesMap.keySet());
+-        Set<String> userCategories = getSetDifference(categories, checkSet);
+-
+-        // Checking if the categories specified by the user are valid or not
+-
+-        if (userCategories.isEmpty()) {
+-          for (String category : checkSet) {
+-            categoriesMap.put(category, false);
+-          }
+-          for (String category : categories) {
+-            categoriesMap.put(category.toLowerCase(), true);
+-          }
+-        } else {
+-          StringBuilder sb = new StringBuilder();
+-          sb.append("Invalid Categories\n");
+-
+-          for (String category : userCategories) {
+-            sb.append(category);
+-            sb.append('\n');
+-          }
+-          return ResultBuilder.createErrorResultData().addLine(sb.toString());
+-        }
+-      }
+-      metricsTable.setHeader("Cluster-wide Metrics");
+-
+-      if (categoriesMap.get("cluster")) {
+-        writeToTableAndCsv(metricsTable, "cluster", "totalHeapSize", dsMxBean.getTotalHeapSize(),
+-            csvBuilder);
+-      }
+-
+-      if (categoriesMap.get("cache")) {
+-        writeToTableAndCsv(metricsTable, "cache", "totalRegionEntryCount",
+-            dsMxBean.getTotalRegionEntryCount(), csvBuilder);
+-        writeToTableAndCsv(metricsTable, "", "totalRegionCount", dsMxBean.getTotalRegionCount(),
+-            csvBuilder);
+-        writeToTableAndCsv(metricsTable, "", "totalMissCount", dsMxBean.getTotalMissCount(),
+-            csvBuilder);
+-        writeToTableAndCsv(metricsTable, "", "totalHitCount", dsMxBean.getTotalHitCount(),
+-            csvBuilder);
+-      }
+-
+-      if (categoriesMap.get("diskstore")) {
+-        writeToTableAndCsv(metricsTable, "diskstore", "totalDiskUsage",
+-            dsMxBean.getTotalDiskUsage(), csvBuilder); // deadcoded to workaround bug 46397
+-        writeToTableAndCsv(metricsTable, ""/* 46608 */, "diskReadsRate",
+-            dsMxBean.getDiskReadsRate(), csvBuilder);
+-        writeToTableAndCsv(metricsTable, "", "diskWritesRate", dsMxBean.getDiskWritesRate(),
+-            csvBuilder);
+-        writeToTableAndCsv(metricsTable, "", "flushTimeAvgLatency",
+-            dsMxBean.getDiskFlushAvgLatency(), csvBuilder);
+-        writeToTableAndCsv(metricsTable, "", "totalBackupInProgress",
+-            dsMxBean.getTotalBackupInProgress(), csvBuilder);
+-      }
+-
+-      if (categoriesMap.get("query")) {
+-        writeToTableAndCsv(metricsTable, "query", "activeCQCount", dsMxBean.getActiveCQCount(),
+-            csvBuilder);
+-        writeToTableAndCsv(metricsTable, "", "queryRequestRate", dsMxBean.getQueryRequestRate(),
+-            csvBuilder);
+-      }
+-      if (export_to_report_to != null && !export_to_report_to.isEmpty()) {
+-        crd.addAsFile(export_to_report_to, csvBuilder.toString(),
+-            "Cluster wide metrics exported to {0}.", false);
+-      }
+-
+-      return crd;
+-    } else {
++    if (dsMxBean == null) {
++
++    CompositeResultData crd = ResultBuilder.createCompositeResultData();
++    CompositeResultData.SectionResultData section = crd.addSection();
++    TabularResultData metricsTable = section.addTable();
++
++    Set<Category> categoriesToDisplay = ArrayUtils.isNotEmpty(categoriesArr)
++        ? getCategorySet(categoriesArr) : new HashSet<>(SYSTEM_METRIC_CATEGORIES);
++
++    metricsTable.setHeader("Cluster-wide Metrics");
++
++    writeSystemWideMetricValues(dsMxBean, csvBuilder, metricsTable, categoriesToDisplay);
++    if (StringUtils.isNotEmpty(export_to_report_to)) {
++      crd.addAsFile(export_to_report_to, csvBuilder.toString(),
++          "Cluster wide metrics exported to {0}.", false);
++    }
++
++    return crd;
+-      String export_to_report_to, String[] categoriesArr, int cacheServerPort)
+-      throws ResultDataException {
++      String export_to_report_to, String[] categoriesArr, int cacheServerPort,
++      StringBuilder csvBuilder) throws ResultDataException {
+-    if (memberMxBean != null) {
+-
+-      if (cacheServerPort != -1) {
+-        csMxBeanName =
+-            managementService.getCacheServerMBeanName(cacheServerPort, distributedMember);
+-        csMxBean = managementService.getMBeanInstance(csMxBeanName, CacheServerMXBean.class);
+-
+-        if (csMxBean == null) {
+-          ErrorResultData erd = ResultBuilder.createErrorResultData();
+-          erd.addLine(CliStrings.format(CliStrings.SHOW_METRICS__CACHE__SERVER__NOT__FOUND,
+-              cacheServerPort, MBeanJMXAdapter.getMemberNameOrId(distributedMember)));
+-          return erd;
+-        }
+-      }
+-
+-      JVMMetrics jvmMetrics = memberMxBean.showJVMMetrics();
+-
+-      CompositeResultData crd = ResultBuilder.createCompositeResultData();
+-      CompositeResultData.SectionResultData section = crd.addSection();
+-      TabularResultData metricsTable = section.addTable();
+-      metricsTable.setHeader("Member Metrics");
+-      StringBuilder csvBuilder = null;
+-
+-      if (export_to_report_to != null && !export_to_report_to.isEmpty()) {
+-        csvBuilder = new StringBuilder();
+-        csvBuilder.append("Category");
+-        csvBuilder.append(',');
+-        csvBuilder.append(CliStrings.SHOW_METRICS__METRIC__HEADER);
+-        csvBuilder.append(',');
+-        csvBuilder.append(CliStrings.SHOW_METRICS__VALUE__HEADER);
+-        csvBuilder.append('\n');
+-      }
+-
+-      Map<String, Boolean> categoriesMap = getMemberMetricsCategories();
+-
+-      if (categoriesArr != null && categoriesArr.length != 0) {
+-        Set<String> categories = createSet(categoriesArr);
+-        Set<String> checkSet = new HashSet<>(categoriesMap.keySet());
+-        Set<String> userCategories = getSetDifference(categories, checkSet);
+-
+-        // Checking if the categories specified by the user are valid or not
+-        if (userCategories.isEmpty()) {
+-          for (String category : checkSet) {
+-            categoriesMap.put(category, false);
+-          }
+-          for (String category : categories) {
+-            categoriesMap.put(category.toLowerCase(), true);
+-          }
+-        } else {
+-          StringBuilder sb = new StringBuilder();
+-          sb.append("Invalid Categories\n");
+-
+-          for (String category : userCategories) {
+-            sb.append(category);
+-            sb.append('\n');
+-          }
+-          return ResultBuilder.createErrorResultData().addLine(sb.toString());
+-        }
+-      }
+-
+-      /*
+-       * Member Metrics
+-       */
+-      // member, jvm, region, serialization, communication, function, transaction, diskstore, lock,
+-      // eviction, distribution
+-      if (categoriesMap.get("member")) {
+-        writeToTableAndCsv(metricsTable, "member", "upTime", memberMxBean.getMemberUpTime(),
+-            csvBuilder);
+-        writeToTableAndCsv(metricsTable, "", "cpuUsage", memberMxBean.getCpuUsage(), csvBuilder);
+-        writeToTableAndCsv(metricsTable, "", "currentHeapSize", memberMxBean.getCurrentHeapSize(),
+-            csvBuilder);
+-        writeToTableAndCsv(metricsTable, "", "maximumHeapSize", memberMxBean.getMaximumHeapSize(),
+-            csvBuilder);
+-      }
+-      /*
+-       * JVM Metrics
+-       */
+-      if (categoriesMap.get("jvm")) {
+-        writeToTableAndCsv(metricsTable, "jvm ", "jvmThreads ", jvmMetrics.getTotalThreads(),
+-            csvBuilder);
+-        writeToTableAndCsv(metricsTable, "", "fileDescriptorLimit",
+-            memberMxBean.getFileDescriptorLimit(), csvBuilder);
+-        writeToTableAndCsv(metricsTable, "", "totalFileDescriptorOpen",
+-            memberMxBean.getTotalFileDescriptorOpen(), csvBuilder);
+-      }
+-      /*
+-       * Member wide region metrics
+-       */
+-      if (categoriesMap.get("region")) {
+-        writeToTableAndCsv(metricsTable, "region ", "totalRegionCount ",
+-            memberMxBean.getTotalRegionCount(), csvBuilder);
+-        String[] regionNames = memberMxBean.listRegions();
+-        if (regionNames != null) {
+-          for (int i = 0; i < regionNames.length; i++) {
+-            if (i == 0) {
+-              writeToTableAndCsv(metricsTable, "listOfRegions", regionNames[i].substring(1),
+-                  csvBuilder);
+-            } else {
+-              writeToTableAndCsv(metricsTable, "", regionNames[i].substring(1), csvBuilder);
+-            }
+-          }
+-        }
+-
+-        String[] rootRegionNames = memberMxBean.getRootRegionNames();
+-        if (rootRegionNames != null) {
+-          for (int i = 0; i < rootRegionNames.length; i++) {
+-            if (i == 0) {
+-              writeToTableAndCsv(metricsTable, "rootRegions", rootRegionNames[i], csvBuilder);
+-            } else {
+-              writeToTableAndCsv(metricsTable, "", rootRegionNames[i], csvBuilder);
+-            }
+-          }
+-        }
+-        writeToTableAndCsv(metricsTable, "", "totalRegionEntryCount",
+-            memberMxBean.getTotalRegionEntryCount(), csvBuilder);
+-        writeToTableAndCsv(metricsTable, "", "totalBucketCount", memberMxBean.getTotalBucketCount(),
+-            csvBuilder);
+-        writeToTableAndCsv(metricsTable, "", "totalPrimaryBucketCount",
+-            memberMxBean.getTotalPrimaryBucketCount(), csvBuilder);
+-        writeToTableAndCsv(metricsTable, "", "getsAvgLatency", memberMxBean.getGetsAvgLatency(),
+-            csvBuilder);
+-        writeToTableAndCsv(metricsTable, "", "putsAvgLatency", memberMxBean.getPutsAvgLatency(),
+-            csvBuilder);
+-        writeToTableAndCsv(metricsTable, "", "createsRate", memberMxBean.getCreatesRate(),
+-            csvBuilder);
+-        writeToTableAndCsv(metricsTable, "", "destroyRate", memberMxBean.getDestroysRate(),
+-            csvBuilder);
+-        writeToTableAndCsv(metricsTable, "", "putAllAvgLatency", memberMxBean.getPutAllAvgLatency(),
+-            csvBuilder);
+-        writeToTableAndCsv(metricsTable, "", "totalMissCount", memberMxBean.getTotalMissCount(),
+-            csvBuilder);
+-        writeToTableAndCsv(metricsTable, "", "totalHitCount", memberMxBean.getTotalHitCount(),
+-            csvBuilder);
+-        writeToTableAndCsv(metricsTable, "", "getsRate", memberMxBean.getGetsRate(), csvBuilder);
+-        writeToTableAndCsv(metricsTable, "", "putsRate", memberMxBean.getPutsRate(), csvBuilder);
+-        writeToTableAndCsv(metricsTable, "", "cacheWriterCallsAvgLatency",
+-            memberMxBean.getCacheWriterCallsAvgLatency(), csvBuilder);
+-        writeToTableAndCsv(metricsTable, "", "cacheListenerCallsAvgLatency",
+-            memberMxBean.getCacheListenerCallsAvgLatency(), csvBuilder);
+-        writeToTableAndCsv(metricsTable, "", "totalLoadsCompleted",
+-            memberMxBean.getTotalLoadsCompleted(), csvBuilder);
+-      }
+-
+-      /*
+-       * SERIALIZATION
+-       */
+-      if (categoriesMap.get("serialization")) {
+-        writeToTableAndCsv(metricsTable, "serialization", "serializationRate",
+-            memberMxBean.getSerializationRate(), csvBuilder);
+-        writeToTableAndCsv(metricsTable, "", "serializationLatency",
+-            memberMxBean.getSerializationRate(), csvBuilder);
+-        writeToTableAndCsv(metricsTable, "", "deserializationRate",
+-            memberMxBean.getDeserializationRate(), csvBuilder);
+-        writeToTableAndCsv(metricsTable, "", "deserializationLatency",
+-            memberMxBean.getDeserializationLatency(), csvBuilder);
+-        writeToTableAndCsv(metricsTable, "", "deserializationAvgLatency",
+-            memberMxBean.getDeserializationAvgLatency(), csvBuilder);
+-        writeToTableAndCsv(metricsTable, "", "PDXDeserializationAvgLatency",
+-            memberMxBean.getPDXDeserializationAvgLatency(), csvBuilder);
+-        writeToTableAndCsv(metricsTable, "", "PDXDeserializationRate",
+-            memberMxBean.getPDXDeserializationRate(), csvBuilder);
+-      }
+-
+-      /*
+-       * Communication Metrics
+-       */
+-      if (categoriesMap.get("communication")) {
+-        writeToTableAndCsv(metricsTable, "communication", "bytesSentRate",
+-            memberMxBean.getBytesSentRate(), csvBuilder);
+-        writeToTableAndCsv(metricsTable, "", "bytesReceivedRate",
+-            memberMxBean.getBytesReceivedRate(), csvBuilder);
+-        String[] connectedGatewayReceivers = memberMxBean.listConnectedGatewayReceivers();
+-        writeToTableAndCsv(metricsTable, "connectedGatewayReceivers", connectedGatewayReceivers,
+-            csvBuilder);
+-
+-        String[] connectedGatewaySenders = memberMxBean.listConnectedGatewaySenders();
+-        writeToTableAndCsv(metricsTable, "connectedGatewaySenders", connectedGatewaySenders,
+-            csvBuilder);
+-      }
+-
+-      /*
+-       * Member wide function metrics
+-       */
+-      if (categoriesMap.get("function")) {
+-        writeToTableAndCsv(metricsTable, "function", "numRunningFunctions",
+-            memberMxBean.getNumRunningFunctions(), csvBuilder);
+-        writeToTableAndCsv(metricsTable, "", "functionExecutionRate",
+-            memberMxBean.getFunctionExecutionRate(), csvBuilder);
+-        writeToTableAndCsv(metricsTable, "", "numRunningFunctionsHavingResults",
+-            memberMxBean.getNumRunningFunctionsHavingResults(), csvBuilder);
+-      }
+-
+-      /*
+-       * totalTransactionsCount currentTransactionalThreadIds transactionCommitsAvgLatency
+-       * transactionCommittedTotalCount transactionRolledBackTotalCount transactionCommitsRate
+-       */
+-      if (categoriesMap.get("transaction")) {
+-        writeToTableAndCsv(metricsTable, "transaction", "totalTransactionsCount",
+-            memberMxBean.getTotalTransactionsCount(), csvBuilder);
+-
+-        writeToTableAndCsv(metricsTable, "", "transactionCommitsAvgLatency",
+-            memberMxBean.getTransactionCommitsAvgLatency(), csvBuilder);
+-        writeToTableAndCsv(metricsTable, "", "transactionCommittedTotalCount",
+-            memberMxBean.getTransactionCommittedTotalCount(), csvBuilder);
+-        writeToTableAndCsv(metricsTable, "", "transactionRolledBackTotalCount",
+-            memberMxBean.getTransactionRolledBackTotalCount(), csvBuilder);
+-        writeToTableAndCsv(metricsTable, "", "transactionCommitsRate",
+-            memberMxBean.getTransactionCommitsRate(), csvBuilder);
+-      }
+-      /*
+-       * Member wide disk metrics
+-       */
+-      if (categoriesMap.get("diskstore")) {
+-        writeToTableAndCsv(metricsTable, "diskstore", "totalDiskUsage",
+-            memberMxBean.getTotalDiskUsage(), csvBuilder); // deadcoded to workaround bug 46397
+-        writeToTableAndCsv(metricsTable, ""/* 46608 */, "diskReadsRate",
+-            memberMxBean.getDiskReadsRate(), csvBuilder);
+-        writeToTableAndCsv(metricsTable, "", "diskWritesRate", memberMxBean.getDiskWritesRate(),
+-            csvBuilder);
+-        writeToTableAndCsv(metricsTable, "", "flushTimeAvgLatency",
+-            memberMxBean.getDiskFlushAvgLatency(), csvBuilder);
+-        writeToTableAndCsv(metricsTable, "", "totalQueueSize",
+-            memberMxBean.getTotalDiskTasksWaiting(), csvBuilder); // deadcoded to workaround bug
+-        // 46397
+-        writeToTableAndCsv(metricsTable, "", "totalBackupInProgress",
+-            memberMxBean.getTotalBackupInProgress(), csvBuilder);
+-      }
+-      /*
+-       * Member wide Lock
+-       */
+-      if (categoriesMap.get("lock")) {
+-        writeToTableAndCsv(metricsTable, "lock", "lockWaitsInProgress",
+-            memberMxBean.getLockWaitsInProgress(), csvBuilder);
+-        writeToTableAndCsv(metricsTable, "", "totalLockWaitTime",
+-            memberMxBean.getTotalLockWaitTime(), csvBuilder);
+-        writeToTableAndCsv(metricsTable, "", "totalNumberOfLockService",
+-            memberMxBean.getTotalNumberOfLockService(), csvBuilder);
+-        writeToTableAndCsv(metricsTable, "", "requestQueues", memberMxBean.getLockRequestQueues(),
+-            csvBuilder);
+-      }
+-      /*
+-       * Eviction
+-       */
+-      if (categoriesMap.get("eviction")) {
+-        writeToTableAndCsv(metricsTable, "eviction", "lruEvictionRate",
+-            memberMxBean.getLruEvictionRate(), csvBuilder);
+-        writeToTableAndCsv(metricsTable, "", "lruDestroyRate", memberMxBean.getLruDestroyRate(),
+-            csvBuilder);
+-      }
+-      /*
+-       * Distribution
+-       */
+-      if (categoriesMap.get("distribution")) {
+-        writeToTableAndCsv(metricsTable, "distribution", "getInitialImagesInProgress",
+-            memberMxBean.getInitialImagesInProgress(), csvBuilder);
+-        writeToTableAndCsv(metricsTable, "", "getInitialImageTime",
+-            memberMxBean.getInitialImageTime(), csvBuilder);
+-        writeToTableAndCsv(metricsTable, "", "getInitialImageKeysReceived",
+-            memberMxBean.getInitialImageKeysReceived(), csvBuilder);
+-      }
+-
+-      /*
+-       * OffHeap
+-       */
+-      if (categoriesMap.get("offheap")) {
+-        writeToTableAndCsv(metricsTable, "offheap", "maxMemory", memberMxBean.getOffHeapMaxMemory(),
+-            csvBuilder);
+-        writeToTableAndCsv(metricsTable, "", "freeMemory", memberMxBean.getOffHeapFreeMemory(),
+-            csvBuilder);
+-        writeToTableAndCsv(metricsTable, "", "usedMemory", memberMxBean.getOffHeapUsedMemory(),
+-            csvBuilder);
+-        writeToTableAndCsv(metricsTable, "", "objects", memberMxBean.getOffHeapObjects(),
+-            csvBuilder);
+-        writeToTableAndCsv(metricsTable, "", "fragmentation",
+-            memberMxBean.getOffHeapFragmentation(), csvBuilder);
+-        writeToTableAndCsv(metricsTable, "", "compactionTime",
+-            memberMxBean.getOffHeapCompactionTime(), csvBuilder);
+-      }
+-
+-      /*
+-       * CacheServer stats
+-       */
+-      if (csMxBean != null) {
+-        writeToTableAndCsv(metricsTable, "cache-server", "clientConnectionCount",
+-            csMxBean.getClientConnectionCount(), csvBuilder);
+-        writeToTableAndCsv(metricsTable, "hostnameForClients", csMxBean.getHostNameForClients(),
+-            csvBuilder);
+-        writeToTableAndCsv(metricsTable, "", "getRequestAvgLatency",
+-            csMxBean.getGetRequestAvgLatency(), csvBuilder);
+-        writeToTableAndCsv(metricsTable, "", "putRequestAvgLatency",
+-            csMxBean.getPutRequestAvgLatency(), csvBuilder);
+-        writeToTableAndCsv(metricsTable, "", "totalConnectionsTimedOut",
+-            csMxBean.getTotalConnectionsTimedOut(), csvBuilder);
+-        writeToTableAndCsv(metricsTable, "", "threadQueueSize", csMxBean.getPutRequestAvgLatency(),
+-            csvBuilder);
+-        writeToTableAndCsv(metricsTable, "", "connectionThreads", csMxBean.getConnectionThreads(),
+-            csvBuilder);
+-        writeToTableAndCsv(metricsTable, "", "connectionLoad", csMxBean.getConnectionLoad(),
+-            csvBuilder);
+-        writeToTableAndCsv(metricsTable, "", "loadPerConnection", csMxBean.getLoadPerConnection(),
+-            csvBuilder);
+-        writeToTableAndCsv(metricsTable, "", "queueLoad", csMxBean.getQueueLoad(), csvBuilder);
+-        writeToTableAndCsv(metricsTable, "", "loadPerQueue", csMxBean.getLoadPerQueue(),
+-            csvBuilder);
+-        writeToTableAndCsv(metricsTable, "", "getRequestRate", csMxBean.getGetRequestRate(),
+-            csvBuilder);
+-        writeToTableAndCsv(metricsTable, "", "putRequestRate", csMxBean.getPutRequestRate(),
+-            csvBuilder);
+-
+-        /*
+-         * Notification
+-         */
+-        writeToTableAndCsv(metricsTable, "notification", "numClientNotificationRequests",
+-            csMxBean.getNumClientNotificationRequests(), csvBuilder);
+-        writeToTableAndCsv(metricsTable, "", "clientNotificationRate",
+-            csMxBean.getClientNotificationRate(), csvBuilder);
+-        writeToTableAndCsv(metricsTable, "", "clientNotificationAvgLatency",
+-            csMxBean.getClientNotificationAvgLatency(), csvBuilder);
+-
+-        /*
+-         * Query
+-         */
+-        writeToTableAndCsv(metricsTable, "query", "activeCQCount", csMxBean.getActiveCQCount(),
+-            csvBuilder);
+-        writeToTableAndCsv(metricsTable, "query", "queryRequestRate",
+-            csMxBean.getQueryRequestRate(), csvBuilder);
+-
+-        writeToTableAndCsv(metricsTable, "", "indexCount", csMxBean.getIndexCount(), csvBuilder);
+-
+-        String[] indexList = csMxBean.getIndexList();
+-        writeToTableAndCsv(metricsTable, "index list", indexList, csvBuilder);
+-        writeToTableAndCsv(metricsTable, "", "totalIndexMaintenanceTime",
+-            csMxBean.getTotalIndexMaintenanceTime(), csvBuilder);
+-      }
+-
+-      if (export_to_report_to != null && !export_to_report_to.isEmpty()) {
+-        crd.addAsFile(export_to_report_to, csvBuilder != null ? csvBuilder.toString() : null,
+-            "Member metrics exported to {0}.", false);
+-      }
+-      return crd;
+-
+-    } else {
++    if (memberMxBean == null) {
++
++    if (cacheServerPort != -1) {
++      csMxBeanName = managementService.getCacheServerMBeanName(cacheServerPort, distributedMember);
++      csMxBean = managementService.getMBeanInstance(csMxBeanName, CacheServerMXBean.class);
++
++      if (csMxBean == null) {
++        ErrorResultData erd = ResultBuilder.createErrorResultData();
++        erd.addLine(CliStrings.format(CliStrings.SHOW_METRICS__CACHE__SERVER__NOT__FOUND,
++            cacheServerPort, MBeanJMXAdapter.getMemberNameOrId(distributedMember)));
++        return erd;
++      }
++    }
++
++    JVMMetrics jvmMetrics = memberMxBean.showJVMMetrics();
++
++    CompositeResultData crd = ResultBuilder.createCompositeResultData();
++    CompositeResultData.SectionResultData section = crd.addSection();
++    TabularResultData metricsTable = section.addTable();
++    metricsTable.setHeader("Member Metrics");
++
++    List<Category> fullCategories =
++        csMxBean != null ? MEMBER_WITH_PORT_METRIC_CATEGORIES : MEMBER_METRIC_CATEGORIES;
++    Set<Category> categoriesToDisplay = ArrayUtils.isNotEmpty(categoriesArr)
++        ? getCategorySet(categoriesArr) : new HashSet<>(fullCategories);
++
++    writeMemberMetricValues(memberMxBean, jvmMetrics, metricsTable, csvBuilder,
++        categoriesToDisplay);
++    if (csMxBean != null) {
++      writeCacheServerMetricValues(csMxBean, metricsTable, csvBuilder, categoriesToDisplay);
++    }
++
++    if (StringUtils.isNotEmpty(export_to_report_to)) {
++      crd.addAsFile(export_to_report_to, csvBuilder != null ? csvBuilder.toString() : null,
++          "Member metrics exported to {0}.", false);
++    }
++    return crd;
++
+-      String[] categoriesArr) throws ResultDataException {
++      String[] categoriesArr, StringBuilder csvBuilder) throws ResultDataException {
+-    if (regionMxBean != null) {
+-      CompositeResultData crd = ResultBuilder.createCompositeResultData();
+-      CompositeResultData.SectionResultData section = crd.addSection();
+-      TabularResultData metricsTable = section.addTable();
+-      metricsTable.setHeader("Cluster-wide Region Metrics");
+-      StringBuilder csvBuilder = null;
+-
+-      if (export_to_report_to != null && !export_to_report_to.isEmpty()) {
+-        csvBuilder = new StringBuilder();
+-        csvBuilder.append("Category");
+-        csvBuilder.append(',');
+-        csvBuilder.append(CliStrings.SHOW_METRICS__METRIC__HEADER);
+-        csvBuilder.append(',');
+-        csvBuilder.append(CliStrings.SHOW_METRICS__VALUE__HEADER);
+-        csvBuilder.append('\n');
+-      }
+-
+-      Map<String, Boolean> categoriesMap = getSystemRegionMetricsCategories();
+-
+-      if (categoriesArr != null && categoriesArr.length != 0) {
+-        Set<String> categories = createSet(categoriesArr);
+-        Set<String> checkSet = new HashSet<>(categoriesMap.keySet());
+-        Set<String> userCategories = getSetDifference(categories, checkSet);
+-
+-        // Checking if the categories specified by the user are valid or not
+-        if (userCategories.isEmpty()) {
+-          for (String category : checkSet) {
+-            categoriesMap.put(category, false);
+-          }
+-          for (String category : categories) {
+-            categoriesMap.put(category.toLowerCase(), true);
+-          }
+-        } else {
+-          StringBuilder sb = new StringBuilder();
+-          sb.append("Invalid Categories\n");
+-
+-          for (String category : userCategories) {
+-            sb.append(category);
+-            sb.append('\n');
+-          }
+-          return ResultBuilder.createErrorResultData().addLine(sb.toString());
+-        }
+-      }
+-      /*
+-       * General System metrics
+-       */
+-      // cluster, region, partition , diskstore, callback, eviction
+-      if (categoriesMap.get("cluster")) {
+-        writeToTableAndCsv(metricsTable, "cluster", "member count", regionMxBean.getMemberCount(),
+-            csvBuilder);
+-        writeToTableAndCsv(metricsTable, "", "region entry count",
+-            regionMxBean.getSystemRegionEntryCount(), csvBuilder);
+-      }
+-
+-      if (categoriesMap.get("region")) {
+-        writeToTableAndCsv(metricsTable, "region", "lastModifiedTime",
+-            regionMxBean.getLastModifiedTime(), csvBuilder);
+-        writeToTableAndCsv(metricsTable, "", "lastAccessedTime", regionMxBean.getLastAccessedTime(),
+-            csvBuilder);
+-        writeToTableAndCsv(metricsTable, "", "missCount", regionMxBean.getMissCount(), csvBuilder);
+-        writeToTableAndCsv(metricsTable, "", "hitCount", regionMxBean.getHitCount(), csvBuilder);
+-        writeToTableAndCsv(metricsTable, "", "hitRatio", regionMxBean.getHitRatio(), csvBuilder);
+-        writeToTableAndCsv(metricsTable, "", "getsRate", regionMxBean.getGetsRate(), csvBuilder);
+-        writeToTableAndCsv(metricsTable, "", "putsRate", regionMxBean.getPutsRate(), csvBuilder);
+-        writeToTableAndCsv(metricsTable, "", "createsRate", regionMxBean.getCreatesRate(),
+-            csvBuilder);
+-        writeToTableAndCsv(metricsTable, "", "destroyRate", regionMxBean.getDestroyRate(),
+-            csvBuilder);
+-        writeToTableAndCsv(metricsTable, "", "putAllRate", regionMxBean.getPutAllRate(),
+-            csvBuilder);
+-      }
+-
+-      if (categoriesMap.get("partition")) {
+-        writeToTableAndCsv(metricsTable, "partition", "putLocalRate",
+-            regionMxBean.getPutLocalRate(), csvBuilder);
+-        writeToTableAndCsv(metricsTable, "", "putRemoteRate", regionMxBean.getPutRemoteRate(),
+-            csvBuilder);
+-        writeToTableAndCsv(metricsTable, "", "putRemoteLatency", regionMxBean.getPutRemoteLatency(),
+-            csvBuilder);
+-        writeToTableAndCsv(metricsTable, "", "putRemoteAvgLatency",
+-            regionMxBean.getPutRemoteAvgLatency(), csvBuilder);
+-
+-        writeToTableAndCsv(metricsTable, "", "bucketCount", regionMxBean.getBucketCount(),
+-            csvBuilder);
+-        writeToTableAndCsv(metricsTable, "", "primaryBucketCount",
+-            regionMxBean.getPrimaryBucketCount(), csvBuilder);
+-        writeToTableAndCsv(metricsTable, "", "numBucketsWithoutRedundancy",
+-            regionMxBean.getNumBucketsWithoutRedundancy(), csvBuilder);
+-        writeToTableAndCsv(metricsTable, "", "totalBucketSize", regionMxBean.getTotalBucketSize(),
+-            csvBuilder);
+-        writeToTableAndCsv(metricsTable, "", "averageBucketSize", regionMxBean.getAvgBucketSize(),
+-            csvBuilder);
+-      }
+-      /*
+-       * Disk store
+-       */
+-      if (categoriesMap.get("diskstore")) {
+-        writeToTableAndCsv(metricsTable, "diskstore", "totalEntriesOnlyOnDisk",
+-            regionMxBean.getTotalEntriesOnlyOnDisk(), csvBuilder);
+-        writeToTableAndCsv(metricsTable, "", "diskReadsRate", regionMxBean.getDiskReadsRate(),
+-            csvBuilder);
+-        writeToTableAndCsv(metricsTable, "", "diskWritesRate", regionMxBean.getDiskWritesRate(),
+-            csvBuilder);
+-        writeToTableAndCsv(metricsTable, "", "totalDiskWriteInProgress",
+-            regionMxBean.getTotalDiskWritesProgress(), csvBuilder);
+-        writeToTableAndCsv(metricsTable, "", "diskTaskWaiting", regionMxBean.getDiskTaskWaiting(),
+-            csvBuilder);
+-
+-      }
+-      /*
+-       * LISTENER
+-       */
+-      if (categoriesMap.get("callback")) {
+-        writeToTableAndCsv(metricsTable, "callback", "cacheWriterCallsAvgLatency",
+-            regionMxBean.getCacheWriterCallsAvgLatency(), csvBuilder);
+-        writeToTableAndCsv(metricsTable, "", "cacheListenerCallsAvgLatency",
+-            regionMxBean.getCacheListenerCallsAvgLatency(), csvBuilder);
+-      }
+-
+-      /*
+-       * Eviction
+-       */
+-      if (categoriesMap.get("eviction")) {
+-        writeToTableAndCsv(metricsTable, "eviction", "lruEvictionRate",
+-            regionMxBean.getLruEvictionRate(), csvBuilder);
+-        writeToTableAndCsv(metricsTable, "", "lruDestroyRate", regionMxBean.getLruDestroyRate(),
+-            csvBuilder);
+-      }
+-
+-      if (export_to_report_to != null && !export_to_report_to.isEmpty()) {
+-        crd.addAsFile(export_to_report_to, csvBuilder != null ? csvBuilder.toString() : null,
+-            "Aggregate Region Metrics exported to {0}.", false);
+-      }
+-
+-      return crd;
+-    } else {
++    if (regionMxBean == null) {
++
++    CompositeResultData crd = ResultBuilder.createCompositeResultData();
++    CompositeResultData.SectionResultData section = crd.addSection();
++    TabularResultData metricsTable = section.addTable();
++    metricsTable.setHeader("Cluster-wide Region Metrics");
++
++    Set<Category> categoriesToDisplay = ArrayUtils.isNotEmpty(categoriesArr)
++        ? getCategorySet(categoriesArr) : new HashSet<>(SYSTEM_REGION_METRIC_CATEGORIES);
++
++    writeSystemRegionMetricValues(regionMxBean, metricsTable, csvBuilder, categoriesToDisplay);
++
++    if (StringUtils.isNotEmpty(export_to_report_to)) {
++      crd.addAsFile(export_to_report_to, csvBuilder != null ? csvBuilder.toString() : null,
++          "Aggregate Region Metrics exported to {0}.", false);
++    }
++
++    return crd;
+-      DistributedMember distributedMember, String export_to_report_to, String[] categoriesArr)
+-      throws ResultDataException {
++      DistributedMember distributedMember, String export_to_report_to, String[] categoriesArr,
++      StringBuilder csvBuilder) throws ResultDataException {
+-    if (regionMxBean != null) {
+-      CompositeResultData crd = ResultBuilder.createCompositeResultData();
+-      CompositeResultData.SectionResultData section = crd.addSection();
+-      TabularResultData metricsTable = section.addTable();
+-      metricsTable.setHeader("Metrics for region:" + regionName + " On Member "
+-          + MBeanJMXAdapter.getMemberNameOrId(distributedMember));
+-      StringBuilder csvBuilder = null;
+-
+-      if (export_to_report_to != null && !export_to_report_to.isEmpty()) {
+-        csvBuilder = new StringBuilder();
+-        csvBuilder.append("Category");
+-        csvBuilder.append(',');
+-        csvBuilder.append(CliStrings.SHOW_METRICS__METRIC__HEADER);
+-        csvBuilder.append(',');
+-        csvBuilder.append(CliStrings.SHOW_METRICS__VALUE__HEADER);
+-        csvBuilder.append('\n');
+-      }
+-
+-      /*
+-       * Region Metrics
+-       */
+-      Map<String, Boolean> categoriesMap = getRegionMetricsCategories();
+-
+-      if (categoriesArr != null && categoriesArr.length != 0) {
+-        Set<String> categories = createSet(categoriesArr);
+-        Set<String> checkSet = new HashSet<>(categoriesMap.keySet());
+-        Set<String> userCategories = getSetDifference(categories, checkSet);
+-
+-        // Checking if the categories specified by the user are valid or not
+-        if (userCategories.isEmpty()) {
+-          for (String category : checkSet) {
+-            categoriesMap.put(category, false);
+-          }
+-          for (String category : categories) {
+-            categoriesMap.put(category.toLowerCase(), true);
+-          }
+-        } else {
+-          StringBuilder sb = new StringBuilder();
+-          sb.append("Invalid Categories\n");
+-
+-          for (String category : userCategories) {
+-            sb.append(category);
+-            sb.append('\n');
+-          }
+-          return ResultBuilder.createErrorResultData().addLine(sb.toString());
+-        }
+-      }
+-
+-      if (categoriesMap.get("region")) {
+-        writeToTableAndCsv(metricsTable, "region", "lastModifiedTime",
+-            regionMxBean.getLastModifiedTime(), csvBuilder);
+-        writeToTableAndCsv(metricsTable, "", "lastAccessedTime", regionMxBean.getLastAccessedTime(),
+-            csvBuilder);
+-        writeToTableAndCsv(metricsTable, "", "missCount", regionMxBean.getMissCount(), csvBuilder);
+-        writeToTableAndCsv(metricsTable, "", "hitCount", regionMxBean.getHitCount(), csvBuilder);
+-        writeToTableAndCsv(metricsTable, "", "hitRatio", regionMxBean.getHitRatio(), csvBuilder);
+-        writeToTableAndCsv(metricsTable, "", "getsRate", regionMxBean.getGetsRate(), csvBuilder);
+-        writeToTableAndCsv(metricsTable, "", "putsRate", regionMxBean.getPutsRate(), csvBuilder);
+-        writeToTableAndCsv(metricsTable, "", "createsRate", regionMxBean.getCreatesRate(),
+-            csvBuilder);
+-        writeToTableAndCsv(metricsTable, "", "destroyRate", regionMxBean.getDestroyRate(),
+-            csvBuilder);
+-        writeToTableAndCsv(metricsTable, "", "putAllRate", regionMxBean.getPutAllRate(),
+-            csvBuilder);
+-      }
+-
+-      if (categoriesMap.get("partition")) {
+-        writeToTableAndCsv(metricsTable, "partition", "putLocalRate",
+-            regionMxBean.getPutLocalRate(), csvBuilder);
+-        writeToTableAndCsv(metricsTable, "", "putRemoteRate", regionMxBean.getPutRemoteRate(),
+-            csvBuilder);
+-        writeToTableAndCsv(metricsTable, "", "putRemoteLatency", regionMxBean.getPutRemoteLatency(),
+-            csvBuilder);
+-        writeToTableAndCsv(metricsTable, "", "putRemoteAvgLatency",
+-            regionMxBean.getPutRemoteAvgLatency(), csvBuilder);
+-
+-        writeToTableAndCsv(metricsTable, "", "bucketCount", regionMxBean.getBucketCount(),
+-            csvBuilder);
+-        writeToTableAndCsv(metricsTable, "", "primaryBucketCount",
+-            regionMxBean.getPrimaryBucketCount(), csvBuilder);
+-        writeToTableAndCsv(metricsTable, "", "configuredRedundancy",
+-            regionMxBean.getConfiguredRedundancy(), csvBuilder);
+-        writeToTableAndCsv(metricsTable, "", "actualRedundancy", regionMxBean.getActualRedundancy(),
+-            csvBuilder);
+-        writeToTableAndCsv(metricsTable, "", "numBucketsWithoutRedundancy",
+-            regionMxBean.getNumBucketsWithoutRedundancy(), csvBuilder);
+-        writeToTableAndCsv(metricsTable, "", "totalBucketSize", regionMxBean.getTotalBucketSize(),
+-            csvBuilder);
+-      }
+-      /*
+-       * Disk store
+-       */
+-      if (categoriesMap.get("diskstore")) {
+-        writeToTableAndCsv(metricsTable, "diskstore", "totalEntriesOnlyOnDisk",
+-            regionMxBean.getTotalEntriesOnlyOnDisk(), csvBuilder);
+-        writeToTableAndCsv(metricsTable, "diskReadsRate", "" + regionMxBean.getDiskReadsRate(),
+-            csvBuilder);
+-        writeToTableAndCsv(metricsTable, "", "diskWritesRate", regionMxBean.getDiskWritesRate(),
+-            csvBuilder);
+-        writeToTableAndCsv(metricsTable, "", "totalDiskWriteInProgress",
+-            regionMxBean.getTotalDiskWritesProgress(), csvBuilder);
+-        writeToTableAndCsv(metricsTable, "", "diskTaskWaiting", regionMxBean.getDiskTaskWaiting(),
+-            csvBuilder);
+-      }
+-      /*
+-       * LISTENER
+-       */
+-      if (categoriesMap.get("callback")) {
+-        writeToTableAndCsv(metricsTable, "callback", "cacheWriterCallsAvgLatency",
+-            regionMxBean.getCacheWriterCallsAvgLatency(), csvBuilder);
+-        writeToTableAndCsv(metricsTable, "", "cacheListenerCallsAvgLatency",
+-            regionMxBean.getCacheListenerCallsAvgLatency(), csvBuilder);
+-      }
+-
+-      /*
+-       * Eviction
+-       */
+-      if (categoriesMap.get("eviction")) {
+-        writeToTableAndCsv(metricsTable, "eviction", "lruEvictionRate",
+-            regionMxBean.getLruEvictionRate(), csvBuilder);
+-        writeToTableAndCsv(metricsTable, "", "lruDestroyRate", regionMxBean.getLruDestroyRate(),
+-            csvBuilder);
+-      }
+-      if (export_to_report_to != null && !export_to_report_to.isEmpty()) {
+-        crd.addAsFile(export_to_report_to, csvBuilder != null ? csvBuilder.toString() : null,
+-            "Region Metrics exported to {0}.", false);
+-      }
+-
+-      return crd;
+-    } else {
++    if (regionMxBean == null) {
++
++    CompositeResultData crd = ResultBuilder.createCompositeResultData();
++    CompositeResultData.SectionResultData section = crd.addSection();
++    TabularResultData metricsTable = section.addTable();
++    metricsTable.setHeader("Metrics for region:" + regionName + " On Member "
++        + MBeanJMXAdapter.getMemberNameOrId(distributedMember));
++
++    Set<Category> categoriesToDisplay = ArrayUtils.isNotEmpty(categoriesArr)
++        ? getCategorySet(categoriesArr) : new HashSet<>(REGION_METRIC_CATEGORIES);
++
++    writeRegionMetricValues(regionMxBean, metricsTable, csvBuilder, categoriesToDisplay);
++    if (StringUtils.isNotEmpty(export_to_report_to)) {
++      crd.addAsFile(export_to_report_to, csvBuilder != null ? csvBuilder.toString() : null,
++          "Region Metrics exported to {0}.", false);
++    }
++
++    return crd;
+-  /***
+-   * Writes an entry to a TabularResultData and writes a comma separated entry to a string builder
+-   */
++  private void writeSystemWideMetricValues(DistributedSystemMXBean dsMxBean,
++      StringBuilder csvBuilder, TabularResultData metricsTable, Set<Category> categoriesToDisplay) {
++    if (categoriesToDisplay.contains(Category.cluster)) {
++      writeToTableAndCsv(metricsTable, "cluster", "totalHeapSize", dsMxBean.getTotalHeapSize(),
++          csvBuilder);
++    }
++    if (categoriesToDisplay.contains(Category.cache)) {
++      writeToTableAndCsv(metricsTable, "cache", "totalRegionEntryCount",
++          dsMxBean.getTotalRegionEntryCount(), csvBuilder);
++      writeToTableAndCsv(metricsTable, "", "totalRegionCount", dsMxBean.getTotalRegionCount(),
++          csvBuilder);
++      writeToTableAndCsv(metricsTable, "", "totalMissCount", dsMxBean.getTotalMissCount(),
++          csvBuilder);
++      writeToTableAndCsv(metricsTable, "", "totalHitCount", dsMxBean.getTotalHitCount(),
++          csvBuilder);
++    }
++    if (categoriesToDisplay.contains(Category.diskstore)) {
++      writeToTableAndCsv(metricsTable, "diskstore", "totalDiskUsage", dsMxBean.getTotalDiskUsage(),
++          csvBuilder);
++      writeToTableAndCsv(metricsTable, "", "diskReadsRate", dsMxBean.getDiskReadsRate(),
++          csvBuilder);
++      writeToTableAndCsv(metricsTable, "", "diskWritesRate", dsMxBean.getDiskWritesRate(),
++          csvBuilder);
++      writeToTableAndCsv(metricsTable, "", "flushTimeAvgLatency", dsMxBean.getDiskFlushAvgLatency(),
++          csvBuilder);
++      writeToTableAndCsv(metricsTable, "", "totalBackupInProgress",
++          dsMxBean.getTotalBackupInProgress(), csvBuilder);
++    }
++    if (categoriesToDisplay.contains(Category.query)) {
++      writeToTableAndCsv(metricsTable, "query", "activeCQCount", dsMxBean.getActiveCQCount(),
++          csvBuilder);
++      writeToTableAndCsv(metricsTable, "", "queryRequestRate", dsMxBean.getQueryRequestRate(),
++          csvBuilder);
++    }
++  }
++
++  private void writeMemberMetricValues(MemberMXBean memberMxBean, JVMMetrics jvmMetrics,
++      TabularResultData metricsTable, StringBuilder csvBuilder, Set<Category> categoriesToDisplay) {
++    if (categoriesToDisplay.contains(Category.member)) {
++      writeToTableAndCsv(metricsTable, "member", "upTime", memberMxBean.getMemberUpTime(),
++          csvBuilder);
++      writeToTableAndCsv(metricsTable, "", "cpuUsage", memberMxBean.getCpuUsage(), csvBuilder);
++      writeToTableAndCsv(metricsTable, "", "currentHeapSize", memberMxBean.getCurrentHeapSize(),
++          csvBuilder);
++      writeToTableAndCsv(metricsTable, "", "maximumHeapSize", memberMxBean.getMaximumHeapSize(),
++          csvBuilder);
++    }
++    if (categoriesToDisplay.contains(Category.jvm)) {
++      writeToTableAndCsv(metricsTable, "jvm", "jvmThreads ", jvmMetrics.getTotalThreads(),
++          csvBuilder);
++      writeToTableAndCsv(metricsTable, "", "fileDescriptorLimit",
++          memberMxBean.getFileDescriptorLimit(), csvBuilder);
++      writeToTableAndCsv(metricsTable, "", "totalFileDescriptorOpen",
++          memberMxBean.getTotalFileDescriptorOpen(), csvBuilder);
++    }
++    if (categoriesToDisplay.contains(Category.region)) {
++      writeToTableAndCsv(metricsTable, "region", "totalRegionCount ",
++          memberMxBean.getTotalRegionCount(), csvBuilder);
++      writeToTableAndCsv(metricsTable, "", "listOfRegions",
++          Arrays.stream(memberMxBean.listRegions()).map(s -> s.substring(1)).toArray(String[]::new),
++          csvBuilder);
++
++      writeToTableAndCsv(metricsTable, "", "rootRegions", memberMxBean.getRootRegionNames(),
++          csvBuilder);
++
++      writeToTableAndCsv(metricsTable, "", "totalRegionEntryCount",
++          memberMxBean.getTotalRegionEntryCount(), csvBuilder);
++      writeToTableAndCsv(metricsTable, "", "totalBucketCount", memberMxBean.getTotalBucketCount(),
++          csvBuilder);
++      writeToTableAndCsv(metricsTable, "", "totalPrimaryBucketCount",
++          memberMxBean.getTotalPrimaryBucketCount(), csvBuilder);
++      writeToTableAndCsv(metricsTable, "", "getsAvgLatency", memberMxBean.getGetsAvgLatency(),
++          csvBuilder);
++      writeToTableAndCsv(metricsTable, "", "putsAvgLatency", memberMxBean.getPutsAvgLatency(),
++          csvBuilder);
++      writeToTableAndCsv(metricsTable, "", "createsRate", memberMxBean.getCreatesRate(),
++          csvBuilder);
++      writeToTableAndCsv(metricsTable, "", "destroyRate", memberMxBean.getDestroysRate(),
++          csvBuilder);
++      writeToTableAndCsv(metricsTable, "", "putAllAvgLatency", memberMxBean.getPutAllAvgLatency(),
++          csvBuilder);
++      writeToTableAndCsv(metricsTable, "", "totalMissCount", memberMxBean.getTotalMissCount(),
++          csvBuilder);
++      writeToTableAndCsv(metricsTable, "", "totalHitCount", memberMxBean.getTotalHitCount(),
++          csvBuilder);
++      writeToTableAndCsv(metricsTable, "", "getsRate", memberMxBean.getGetsRate(), csvBuilder);
++      writeToTableAndCsv(metricsTable, "", "putsRate", memberMxBean.getPutsRate(), csvBuilder);
++      writeToTableAndCsv(metricsTable, "", "cacheWriterCallsAvgLatency",
++          memberMxBean.getCacheWriterCallsAvgLatency(), csvBuilder);
++      writeToTableAndCsv(metricsTable, "", "cacheListenerCallsAvgLatency",
++          memberMxBean.getCacheListenerCallsAvgLatency(), csvBuilder);
++      writeToTableAndCsv(metricsTable, "", "totalLoadsCompleted",
++          memberMxBean.getTotalLoadsCompleted(), csvBuilder);
++    }
++    if (categoriesToDisplay.contains(Category.serialization)) {
++      writeToTableAndCsv(metricsTable, "serialization", "serializationRate",
++          memberMxBean.getSerializationRate(), csvBuilder);
++      writeToTableAndCsv(metricsTable, "", "serializationLatency",
++          memberMxBean.getSerializationRate(), csvBuilder);
++      writeToTableAndCsv(metricsTable, "", "deserializationRate",
++          memberMxBean.getDeserializationRate(), csvBuilder);
++      writeToTableAndCsv(metricsTable, "", "deserializationLatency",
++          memberMxBean.getDeserializationLatency(), csvBuilder);
++      writeToTableAndCsv(metricsTable, "", "deserializationAvgLatency",
++          memberMxBean.getDeserializationAvgLatency(), csvBuilder);
++      writeToTableAndCsv(metricsTable, "", "PDXDeserializationAvgLatency",
++          memberMxBean.getPDXDeserializationAvgLatency(), csvBuilder);
++      writeToTableAndCsv(metricsTable, "", "PDXDeserializationRate",
++          memberMxBean.getPDXDeserializationRate(), csvBuilder);
++    }
++    if (categoriesToDisplay.contains(Category.communication)) {
++      writeToTableAndCsv(metricsTable, "communication", "bytesSentRate",
++          memberMxBean.getBytesSentRate(), csvBuilder);
++      writeToTableAndCsv(metricsTable, "", "bytesReceivedRate", memberMxBean.getBytesReceivedRate(),
++          csvBuilder);
++      writeToTableAndCsv(metricsTable, "", "connectedGatewayReceivers",
++          memberMxBean.listConnectedGatewayReceivers(), csvBuilder);
++
++      writeToTableAndCsv(metricsTable, "", "connectedGatewaySenders",
++          memberMxBean.listConnectedGatewaySenders(), csvBuilder);
++    }
++    if (categoriesToDisplay.contains(Category.function)) {
++      writeToTableAndCsv(metricsTable, "function", "numRunningFunctions",
++          memberMxBean.getNumRunningFunctions(), csvBuilder);
++      writeToTableAndCsv(metricsTable, "", "functionExecutionRate",
++          memberMxBean.getFunctionExecutionRate(), csvBuilder);
++      writeToTableAndCsv(metricsTable, "", "numRunningFunctionsHavingResults",
++          memberMxBean.getNumRunningFunctionsHavingResults(), csvBuilder);
++    }
++    if (categoriesToDisplay.contains(Category.transaction)) {
++      writeToTableAndCsv(metricsTable, "transaction", "totalTransactionsCount",
++          memberMxBean.getTotalTransactionsCount(), csvBuilder);
++
++      writeToTableAndCsv(metricsTable, "", "transactionCommitsAvgLatency",
++          memberMxBean.getTransactionCommitsAvgLatency(), csvBuilder);
++      writeToTableAndCsv(metricsTable, "", "transactionCommittedTotalCount",
++          memberMxBean.getTransactionCommittedTotalCount(), csvBuilder);
++      writeToTableAndCsv(metricsTable, "", "transactionRolledBackTotalCount",
++          memberMxBean.getTransactionRolledBackTotalCount(), csvBuilder);
++      writeToTableAndCsv(metricsTable, "", "transactionCommitsRate",
++          memberMxBean.getTransactionCommitsRate(), csvBuilder);
++    }
++    if (categoriesToDisplay.contains(Category.diskstore)) {
++      writeToTableAndCsv(metricsTable, "diskstore", "totalDiskUsage",
++          memberMxBean.getTotalDiskUsage(), csvBuilder);
++      writeToTableAndCsv(metricsTable, "", "diskReadsRate", memberMxBean.getDiskReadsRate(),
++          csvBuilder);
++      writeToTableAndCsv(metricsTable, "", "diskWritesRate", memberMxBean.getDiskWritesRate(),
++          csvBuilder);
++      writeToTableAndCsv(metricsTable, "", "flushTimeAvgLatency",
++          memberMxBean.getDiskFlushAvgLatency(), csvBuilder);
++      writeToTableAndCsv(metricsTable, "", "totalQueueSize",
++          memberMxBean.getTotalDiskTasksWaiting(), csvBuilder);
++      writeToTableAndCsv(metricsTable, "", "totalBackupInProgress",
++          memberMxBean.getTotalBackupInProgress(), csvBuilder);
++    }
++    if (categoriesToDisplay.contains(Category.lock)) {
++      writeToTableAndCsv(metricsTable, "lock", "lockWaitsInProgress",
++          memberMxBean.getLockWaitsInProgress(), csvBuilder);
++      writeToTableAndCsv(metricsTable, "", "totalLockWaitTime", memberMxBean.getTotalLockWaitTime(),
++          csvBuilder);
++      writeToTableAndCsv(metricsTable, "", "totalNumberOfLockService",
++          memberMxBean.getTotalNumberOfLockService(), csvBuilder);
++      writeToTableAndCsv(metricsTable, "", "requestQueues", memberMxBean.getLockRequestQueues(),
++          csvBuilder);
++    }
++    if (categoriesToDisplay.contains(Category.eviction)) {
++      writeToTableAndCsv(metricsTable, "eviction", "lruEvictionRate",
++          memberMxBean.getLruEvictionRate(), csvBuilder);
++      writeToTableAndCsv(metricsTable, "", "lruDestroyRate", memberMxBean.getLruDestroyRate(),
++          csvBuilder);
++    }
++    if (categoriesToDisplay.contains(Category.distribution)) {
++      writeToTableAndCsv(metricsTable, "distribution", "getInitialImagesInProgress",
++          memberMxBean.getInitialImagesInProgress(), csvBuilder);
++      writeToTableAndCsv(metricsTable, "", "getInitialImageTime",
++          memberMxBean.getInitialImageTime(), csvBuilder);
++      writeToTableAndCsv(metricsTable, "", "getInitialImageKeysReceived",
++          memberMxBean.getInitialImageKeysReceived(), csvBuilder);
++    }
++    if (categoriesToDisplay.contains(Category.offheap)) {
++      writeToTableAndCsv(metricsTable, "offheap", "maxMemory", memberMxBean.getOffHeapMaxMemory(),
++          csvBuilder);
++      writeToTableAndCsv(metricsTable, "", "freeMemory", memberMxBean.getOffHeapFreeMemory(),
++          csvBuilder);
++      writeToTableAndCsv(metricsTable, "", "usedMemory", memberMxBean.getOffHeapUsedMemory(),
++          csvBuilder);
++      writeToTableAndCsv(metricsTable, "", "objects", memberMxBean.getOffHeapObjects(), csvBuilder);
++      writeToTableAndCsv(metricsTable, "", "fragmentation", memberMxBean.getOffHeapFragmentation(),
++          csvBuilder);
++      writeToTableAndCsv(metricsTable, "", "compactionTime",
++          memberMxBean.getOffHeapCompactionTime(), csvBuilder);
++    }
++  }
++
++  private void writeCacheServerMetricValues(CacheServerMXBean csMxBean,
++      TabularResultData metricsTable, StringBuilder csvBuilder, Set<Category> categoriesToDisplay) {
++    if (categoriesToDisplay.contains(Category.cacheserver)) {
++
++      writeToTableAndCsv(metricsTable, "cacheserver", "clientConnectionCount",
++          csMxBean.getClientConnectionCount(), csvBuilder);
++      writeToTableAndCsv(metricsTable, "", "hostnameForClients", csMxBean.getHostNameForClients(),
++          csvBuilder);
++      writeToTableAndCsv(metricsTable, "", "getRequestAvgLatency",
++          csMxBean.getGetRequestAvgLatency(), csvBuilder);
++      writeToTableAndCsv(metricsTable, "", "putRequestAvgLatency",
++          csMxBean.getPutRequestAvgLatency(), csvBuilder);
++      writeToTableAndCsv(metricsTable, "", "totalConnectionsTimedOut",
++          csMxBean.getTotalConnectionsTimedOut(), csvBuilder);
++      writeToTableAndCsv(metricsTable, "", "threadQueueSize", csMxBean.getPutRequestAvgLatency(),
++          csvBuilder);
++      writeToTableAndCsv(metricsTable, "", "connectionThreads", csMxBean.getConnectionThreads(),
++          csvBuilder);
++      writeToTableAndCsv(metricsTable, "", "connectionLoad", csMxBean.getConnectionLoad(),
++          csvBuilder);
++      writeToTableAndCsv(metricsTable, "", "loadPerConnection", csMxBean.getLoadPerConnection(),
++          csvBuilder);
++      writeToTableAndCsv(metricsTable, "", "queueLoad", csMxBean.getQueueLoad(), csvBuilder);
++      writeToTableAndCsv(metricsTable, "", "loadPerQueue", csMxBean.getLoadPerQueue(), csvBuilder);
++      writeToTableAndCsv(metricsTable, "", "getRequestRate", csMxBean.getGetRequestRate(),
++          csvBuilder);
++      writeToTableAndCsv(metricsTable, "", "putRequestRate", csMxBean.getPutRequestRate(),
++          csvBuilder);
++    }
++    if (categoriesToDisplay.contains(Category.notification)) {
++      writeToTableAndCsv(metricsTable, "notification", "numClientNotificationRequests",
++          csMxBean.getNumClientNotificationRequests(), csvBuilder);
++      writeToTableAndCsv(metricsTable, "", "clientNotificationRate",
++          csMxBean.getClientNotificationRate(), csvBuilder);
++      writeToTableAndCsv(metricsTable, "", "clientNotificationAvgLatency",
++          csMxBean.getClientNotificationAvgLatency(), csvBuilder);
++    }
++    if (categoriesToDisplay.contains(Category.query)) {
++      writeToTableAndCsv(metricsTable, "query", "activeCQCount", csMxBean.getActiveCQCount(),
++          csvBuilder);
++      writeToTableAndCsv(metricsTable, "", "queryRequestRate", csMxBean.getQueryRequestRate(),
++          csvBuilder);
++
++      writeToTableAndCsv(metricsTable, "", "indexCount", csMxBean.getIndexCount(), csvBuilder);
++
++      writeToTableAndCsv(metricsTable, "", "index list", csMxBean.getIndexList(), csvBuilder);
++      writeToTableAndCsv(metricsTable, "", "totalIndexMaintenanceTime",
++          csMxBean.getTotalIndexMaintenanceTime(), csvBuilder);
++    }
++  }
++
++  private void writeSystemRegionMetricValues(DistributedRegionMXBean regionMxBean,
++      TabularResultData metricsTable, StringBuilder csvBuilder, Set<Category> categoriesToDisplay) {
++    if (categoriesToDisplay.contains(Category.cluster)) {
++      writeToTableAndCsv(metricsTable, "cluster", "member count", regionMxBean.getMemberCount(),
++          csvBuilder);
++      writeToTableAndCsv(metricsTable, "", "region entry count",
++          regionMxBean.getSystemRegionEntryCount(), csvBuilder);
++    }
++    if (categoriesToDisplay.contains(Category.region)) {
++      writeToTableAndCsv(metricsTable, "region", "lastModifiedTime",
++          regionMxBean.getLastModifiedTime(), csvBuilder);
++      writeToTableAndCsv(metricsTable, "", "lastAccessedTime", regionMxBean.getLastAccessedTime(),
++          csvBuilder);
++      writeToTableAndCsv(metricsTable, "", "missCount", regionMxBean.getMissCount(), csvBuilder);
++      writeToTableAndCsv(metricsTable, "", "hitCount", regionMxBean.getHitCount(), csvBuilder);
++      writeToTableAndCsv(metricsTable, "", "hitRatio", regionMxBean.getHitRatio(), csvBuilder);
++      writeToTableAndCsv(metricsTable, "", "getsRate", regionMxBean.getGetsRate(), csvBuilder);
++      writeToTableAndCsv(metricsTable, "", "putsRate", regionMxBean.getPutsRate(), csvBuilder);
++      writeToTableAndCsv(metricsTable, "", "createsRate", regionMxBean.getCreatesRate(),
++          csvBuilder);
++      writeToTableAndCsv(metricsTable, "", "destroyRate", regionMxBean.getDestroyRate(),
++          csvBuilder);
++      writeToTableAndCsv(metricsTable, "", "putAllRate", regionMxBean.getPutAllRate(), csvBuilder);
++    }
++    if (categoriesToDisplay.contains(Category.partition)) {
++      writeToTableAndCsv(metricsTable, "partition", "putLocalRate", regionMxBean.getPutLocalRate(),
++          csvBuilder);
++      writeToTableAndCsv(metricsTable, "", "putRemoteRate", regionMxBean.getPutRemoteRate(),
++          csvBuilder);
++      writeToTableAndCsv(metricsTable, "", "putRemoteLatency", regionMxBean.getPutRemoteLatency(),
++          csvBuilder);
++      writeToTableAndCsv(metricsTable, "", "putRemoteAvgLatency",
++          regionMxBean.getPutRemoteAvgLatency(), csvBuilder);
++
++      writeToTableAndCsv(metricsTable, "", "bucketCount", regionMxBean.getBucketCount(),
++          csvBuilder);
++      writeToTableAndCsv(metricsTable, "", "primaryBucketCount",
++          regionMxBean.getPrimaryBucketCount(), csvBuilder);
++      writeToTableAndCsv(metricsTable, "", "numBucketsWithoutRedundancy",
++          regionMxBean.getNumBucketsWithoutRedundancy(), csvBuilder);
++      writeToTableAndCsv(metricsTable, "", "totalBucketSize", regionMxBean.getTotalBucketSize(),
++          csvBuilder);
++      writeToTableAndCsv(metricsTable, "", "averageBucketSize", regionMxBean.getAvgBucketSize(),
++          csvBuilder);
++    }
++    if (categoriesToDisplay.contains(Category.diskstore)) {
++      writeToTableAndCsv(metricsTable, "diskstore", "totalEntriesOnlyOnDisk",
++          regionMxBean.getTotalEntriesOnlyOnDisk(), csvBuilder);
++      writeToTableAndCsv(metricsTable, "", "diskReadsRate", regionMxBean.getDiskReadsRate(),
++          csvBuilder);
++      writeToTableAndCsv(metricsTable, "", "diskWritesRate", regionMxBean.getDiskWritesRate(),
++          csvBuilder);
++      writeToTableAndCsv(metricsTable, "", "totalDiskWriteInProgress",
++          regionMxBean.getTotalDiskWritesProgress(), csvBuilder);
++      writeToTableAndCsv(metricsTable, "", "diskTaskWaiting", regionMxBean.getDiskTaskWaiting(),
++          csvBuilder);
++
++    }
++    if (categoriesToDisplay.contains(Category.callback)) {
++      writeToTableAndCsv(metricsTable, "callback", "cacheWriterCallsAvgLatency",
++          regionMxBean.getCacheWriterCallsAvgLatency(), csvBuilder);
++      writeToTableAndCsv(metricsTable, "", "cacheListenerCallsAvgLatency",
++          regionMxBean.getCacheListenerCallsAvgLatency(), csvBuilder);
++    }
++    if (categoriesToDisplay.contains(Category.eviction)) {
++      writeToTableAndCsv(metricsTable, "eviction", "lruEvictionRate",
++          regionMxBean.getLruEvictionRate(), csvBuilder);
++      writeToTableAndCsv(metricsTable, "", "lruDestroyRate", regionMxBean.getLruDestroyRate(),
++          csvBuilder);
++    }
++  }
++
++  private void writeRegionMetricValues(RegionMXBean regionMxBean, TabularResultData metricsTable,
++      StringBuilder csvBuilder, Set<Category> categoriesToDisplay) {
++    if (categoriesToDisplay.contains(Category.region)) {
++      writeToTableAndCsv(metricsTable, "region", "lastModifiedTime",
++          regionMxBean.getLastModifiedTime(), csvBuilder);
++      writeToTableAndCsv(metricsTable, "", "lastAccessedTime", regionMxBean.getLastAccessedTime(),
++          csvBuilder);
++      writeToTableAndCsv(metricsTable, "", "missCount", regionMxBean.getMissCount(), csvBuilder);
++      writeToTableAndCsv(metricsTable, "", "hitCount", regionMxBean.getHitCount(), csvBuilder);
++      writeToTableAndCsv(metricsTable, "", "hitRatio", regionMxBean.getHitRatio(), csvBuilder);
++      writeToTableAndCsv(metricsTable, "", "getsRate", regionMxBean.getGetsRate(), csvBuilder);
++      writeToTableAndCsv(metricsTable, "", "putsRate", regionMxBean.getPutsRate(), csvBuilder);
++      writeToTableAndCsv(metricsTable, "", "createsRate", regionMxBean.getCreatesRate(),
++          csvBuilder);
++      writeToTableAndCsv(metricsTable, "", "destroyRate", regionMxBean.getDestroyRate(),
++          csvBuilder);
++      writeToTableAndCsv(metricsTable, "", "putAllRate", regionMxBean.getPutAllRate(), csvBuilder);
++    }
++    if (categoriesToDisplay.contains(Category.partition)) {
++      writeToTableAndCsv(metricsTable, "partition", "putLocalRate", regionMxBean.getPutLocalRate(),
++          csvBuilder);
++      writeToTableAndCsv(metricsTable, "", "putRemoteRate", regionMxBean.getPutRemoteRate(),
++          csvBuilder);
++      writeToTableAndCsv(metricsTable, "", "putRemoteLatency", regionMxBean.getPutRemoteLatency(),
++          csvBuilder);
++      writeToTableAndCsv(metricsTable, "", "putRemoteAvgLatency",
++          regionMxBean.getPutRemoteAvgLatency(), csvBuilder);
++
++      writeToTableAndCsv(metricsTable, "", "bucketCount", regionMxBean.getBucketCount(),
++          csvBuilder);
++      writeToTableAndCsv(metricsTable, "", "primaryBucketCount",
++          regionMxBean.getPrimaryBucketCount(), csvBuilder);
++      writeToTableAndCsv(metricsTable, "", "configuredRedundancy",
++          regionMxBean.getConfiguredRedundancy(), csvBuilder);
++      writeToTableAndCsv(metricsTable, "", "actualRedundancy", regionMxBean.getActualRedundancy(),
++          csvBuilder);
++      writeToTableAndCsv(metricsTable, "", "numBucketsWithoutRedundancy",
++          regionMxBean.getNumBucketsWithoutRedundancy(), csvBuilder);
++      writeToTableAndCsv(metricsTable, "", "totalBucketSize", regionMxBean.getTotalBucketSize(),
++          csvBuilder);
++    }
++    if (categoriesToDisplay.contains(Category.diskstore)) {
++      writeToTableAndCsv(metricsTable, "diskstore", "totalEntriesOnlyOnDisk",
++          regionMxBean.getTotalEntriesOnlyOnDisk(), csvBuilder);
++      writeToTableAndCsv(metricsTable, "", "diskReadsRate", "" + regionMxBean.getDiskReadsRate(),
++          csvBuilder);
++      writeToTableAndCsv(metricsTable, "", "diskWritesRate", regionMxBean.getDiskWritesRate(),
++          csvBuilder);
++      writeToTableAndCsv(metricsTable, "", "totalDiskWriteInProgress",
++          regionMxBean.getTotalDiskWritesProgress(), csvBuilder);
++      writeToTableAndCsv(metricsTable, "", "diskTaskWaiting", regionMxBean.getDiskTaskWaiting(),
++          csvBuilder);
++    }
++    if (categoriesToDisplay.contains(Category.callback)) {
++      writeToTableAndCsv(metricsTable, "callback", "cacheWriterCallsAvgLatency",
++          regionMxBean.getCacheWriterCallsAvgLatency(), csvBuilder);
++      writeToTableAndCsv(metricsTable, "", "cacheListenerCallsAvgLatency",
++          regionMxBean.getCacheListenerCallsAvgLatency(), csvBuilder);
++    }
++    if (categoriesToDisplay.contains(Category.eviction)) {
++      writeToTableAndCsv(metricsTable, "eviction", "lruEvictionRate",
++          regionMxBean.getLruEvictionRate(), csvBuilder);
++      writeToTableAndCsv(metricsTable, "", "lruDestroyRate", regionMxBean.getLruDestroyRate(),
++          csvBuilder);
++    }
++  }
++
+-      long metricValue, StringBuilder csvBuilder) {
++      String metricValue, StringBuilder csvBuilder) {
+-    if (csvBuilder != null) {
+-      csvBuilder.append(type);
+-      csvBuilder.append(',');
+-      csvBuilder.append(metricName);
+-      csvBuilder.append(',');
+-      csvBuilder.append(metricValue);
+-      csvBuilder.append('\n');
++    writeToCsvIfNecessary(type, metricName, String.valueOf(metricValue), csvBuilder);
++  }
++
++  private void writeToTableAndCsv(TabularResultData metricsTable, String type, String metricName,
++      String[] metricValue, StringBuilder csvBuilder) {
++    if (ArrayUtils.isEmpty(metricValue)) {
++      return;
++
++    for (int i = 0; i < metricValue.length; i++) {
++      if (i == 0) {
++        writeToTableAndCsv(metricsTable, type, metricName, metricValue[i], csvBuilder);
++      } else {
++        writeToTableAndCsv(metricsTable, "", "", metricValue[i], csvBuilder);
++      }
++    }
++  }
++
++  private void writeToTableAndCsv(TabularResultData metricsTable, String type, String metricName,
++      long metricValue, StringBuilder csvBuilder) {
++    writeToTableAndCsv(metricsTable, type, metricName, String.valueOf(metricValue), csvBuilder);
+-    metricsTable.accumulate(CliStrings.SHOW_METRICS__TYPE__HEADER, type);
+-    metricsTable.accumulate(CliStrings.SHOW_METRICS__METRIC__HEADER, metricName);
+-    metricsTable.accumulate(CliStrings.SHOW_METRICS__VALUE__HEADER, metricValue);
++    writeToTableAndCsv(metricsTable, type, metricName, String.valueOf(metricValue), csvBuilder);
++  }
++  private StringBuilder prepareCsvBuilder() {
++    StringBuilder csvBuilder = new StringBuilder();
++    csvBuilder.append(CliStrings.SHOW_METRICS__TYPE__HEADER);
++    csvBuilder.append(',');
++    csvBuilder.append(CliStrings.SHOW_METRICS__METRIC__HEADER);
++    csvBuilder.append(',');
++    csvBuilder.append(CliStrings.SHOW_METRICS__VALUE__HEADER);
++    csvBuilder.append('\n');
++    return csvBuilder;
++  }
++
++  private void writeToCsvIfNecessary(String type, String metricName, String metricValue,
++      StringBuilder csvBuilder) {
+-  private Set<String> createSet(String[] categories) {
+-    Set<String> categoriesSet = new HashSet<>();
+-    Collections.addAll(categoriesSet, categories);
+-    return categoriesSet;
+-  }
+-
+-  private Set<String> getSetDifference(Set<String> set1, Set<String> set2) {
+-    Set<String> setDifference = new HashSet<>();
+-    for (String element : set1) {
+-      if (!(set2.contains(element.toLowerCase()))) {
+-        setDifference.add(element);
+-      }
+-    }
+-    return setDifference;
+-  }
+-
+-  private void writeToTableAndCsv(TabularResultData metricsTable, String metricName,
+-      String[] metricValue, StringBuilder csvBuilder) {
+-    if (metricValue != null) {
+-      for (int i = 0; i < metricValue.length; i++) {
+-        if (i == 0) {
+-          writeToTableAndCsv(metricsTable, metricName, metricValue[i], csvBuilder);
+-        } else {
+-          writeToTableAndCsv(metricsTable, "", metricValue[i], csvBuilder);
+-        }
+-      }
+-    }
+-  }
+-
+-  /**
+-   * Writes to a TabularResultData and also appends a CSV string to a String builder
+-   */
+-  private void writeToTableAndCsv(TabularResultData metricsTable, String metricName,
+-      String metricValue, StringBuilder csvBuilder) {
+-    metricsTable.accumulate(CliStrings.SHOW_METRICS__TYPE__HEADER, "");
+-    metricsTable.accumulate(CliStrings.SHOW_METRICS__METRIC__HEADER, metricName);
+-    metricsTable.accumulate(CliStrings.SHOW_METRICS__VALUE__HEADER, metricValue);
+-
+-    if (csvBuilder != null) {
+-      csvBuilder.append("");
+-      csvBuilder.append(',');
+-      csvBuilder.append(metricName);
+-      csvBuilder.append(',');
+-      csvBuilder.append(metricValue);
+-      csvBuilder.append('\n');
+-    }
+-  }
+-
+-  /**
+-   * Defines and returns map of categories for Region Metrics
+-   *
+-   * @return map with categories for region metrics and display flag set to true
+-   */
+-  private Map<String, Boolean> getRegionMetricsCategories() {
+-    Map<String, Boolean> categories = new HashMap<>();
+-
+-    categories.put("region", true);
+-    categories.put("partition", true);
+-    categories.put("diskstore", true);
+-    categories.put("callback", true);
+-    categories.put("gatewayreceiver", true);
+-    categories.put("distribution", true);
+-    categories.put("query", true);
+-    categories.put("eviction", true);
+-    return categories;
+-  }
+-
+-  /**
+-   * Defines and returns map of categories for System metrics.
+-   *
+-   * @return map with categories for system metrics and display flag set to true
+-   */
+-  private Map<String, Boolean> getSystemMetricsCategories() {
+-    Map<String, Boolean> categories = new HashMap<>();
+-    categories.put("cluster", true);
+-    categories.put("cache", true);
+-    categories.put("diskstore", true);
+-    categories.put("query", true);
+-    return categories;
+-  }
+-
+-  /**
+-   * Defines and returns map of categories for system-wide region metrics
+-   *
+-   * @return map with categories for system wide region metrics and display flag set to true
+-   */
+-  private Map<String, Boolean> getSystemRegionMetricsCategories() {
+-    Map<String, Boolean> categories = getRegionMetricsCategories();
+-    categories.put("cluster", true);
+-    return categories;
+-  }
+-
+-  /**
+-   * Defines and returns map of categories for member metrics
+-   *
+-   * @return map with categories for member metrics and display flag set to true
+-   */
+-  private Map<String, Boolean> getMemberMetricsCategories() {
+-    Map<String, Boolean> categories = new HashMap<>();
+-    categories.put("member", true);
+-    categories.put("jvm", true);
+-    categories.put("region", true);
+-    categories.put("serialization", true);
+-    categories.put("communication", true);
+-    categories.put("function", true);
+-    categories.put("transaction", true);
+-    categories.put("diskstore", true);
+-    categories.put("lock", true);
+-    categories.put("eviction", true);
+-    categories.put("distribution", true);
+-    categories.put("offheap", true);
+-    return categories;
++  private Set<Category> getCategorySet(String[] categories) {
++    return Stream.of(categories).map(String::toLowerCase).map(Category::valueOf)
++        .collect(Collectors.toSet());
+
+MOV26 MOV26 MOV26 MOV26 MOV26 MOV31 MOV31 MOV31 MOV31 MOV31 UPD40 UPD40 UPD40 UPD40 UPD40 UPD40 INS71 INS23 INS23 INS23 INS23 INS23 INS31 INS31 INS31 INS31 INS31 INS31 INS42 INS72 INS72 INS72 INS72 INS72 INS72 INS72 INS72 INS72 INS72 INS72 INS72 INS72 INS72 INS72 INS72 INS72 INS72 INS72 INS83 INS83 INS74 INS59 INS83 INS83 INS74 INS59 INS83 INS83 INS74 INS59 INS83 INS83 INS74 INS59 INS83 INS83 INS74 INS59 MOV29 MOV83 MOV43 MOV42 MOV44 MOV44 INS44 INS8 MOV29 INS83 MOV43 INS42 MOV44 MOV44 MOV44 MOV44 INS44 MOV43 INS8 MOV29 MOV43 UPD42 MOV44 MOV44 MOV44 MOV43 MOV29 MOV43 UPD42 MOV44 MOV44 MOV44 MOV44 MOV43 INS39 INS42 INS44 INS44 INS44 INS44 MOV8 INS39 UPD42 INS44 INS44 INS44 INS44 INS44 MOV8 INS39 INS42 INS44 INS44 INS44 INS44 MOV8 INS39 INS42 INS44 INS44 INS44 INS44 MOV8 INS39 UPD42 INS44 INS44 INS44 INS44 MOV8 INS39 INS42 INS44 INS44 MOV44 MOV44 MOV44 INS8 INS44 MOV8 MOV83 INS39 INS42 MOV44 MOV44 MOV44 MOV44 MOV44 INS8 INS83 INS39 INS42 MOV44 MOV44 MOV44 MOV44 MOV44 INS8 INS83 MOV43 INS42 MOV8 UPD42 INS44 INS44 INS44 INS44 INS83 UPD74 MOV74 INS42 MOV44 INS8 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS43 INS43 UPD42 MOV42 MOV32 INS43 INS43 UPD42 MOV42 MOV32 INS43 INS43 INS42 INS32 INS43 INS43 UPD42 MOV42 MOV32 INS43 INS43 INS42 INS32 UPD43 UPD42 INS60 INS25 INS43 INS42 MOV60 MOV60 MOV60 MOV25 MOV60 MOV60 MOV60 INS60 MOV21 MOV21 MOV25 MOV41 INS43 INS42 MOV60 MOV60 MOV60 MOV60 MOV60 MOV60 INS25 MOV25 MOV60 MOV60 MOV60 MOV60 MOV21 INS60 INS60 INS21 INS25 MOV25 MOV41 INS43 UPD42 MOV60 MOV60 MOV60 INS25 MOV60 MOV60 MOV60 MOV21 INS60 MOV21 MOV25 MOV41 UPD43 UPD42 MOV60 MOV60 MOV60 MOV60 INS25 MOV60 MOV60 MOV60 MOV21 INS60 INS21 MOV25 MOV41 INS43 INS42 INS43 INS42 INS43 INS42 UPD74 MOV74 INS42 INS43 INS42 INS43 INS42 INS43 INS42 INS43 INS42 UPD74 MOV74 INS42 INS43 INS42 INS43 INS42 INS43 INS42 UPD74 MOV74 INS42 INS25 INS25 INS25 INS43 INS42 INS43 INS42 INS43 INS42 UPD74 MOV74 INS42 INS43 INS42 INS43 INS42 INS43 INS42 UPD74 MOV74 INS42 INS43 INS42 INS43 INS42 MOV21 MOV21 MOV21 INS21 INS43 INS42 INS25 INS21 INS21 INS60 INS41 INS43 INS42 INS43 INS42 INS43 INS42 INS43 INS42 UPD43 INS41 INS42 UPD42 MOV42 UPD42 UPD42 INS40 INS40 INS40 INS40 UPD40 UPD42 MOV42 INS42 UPD42 UPD42 UPD40 INS40 INS40 INS40 INS42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 INS40 INS40 INS40 INS40 INS40 INS40 INS42 UPD42 MOV42 UPD42 UPD42 INS40 INS40 UPD40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS42 INS42 UPD42 MOV42 UPD42 MOV42 INS40 INS40 INS40 UPD40 MOV40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 UPD45 UPD42 MOV43 INS59 MOV43 INS43 INS27 MOV8 INS25 INS32 MOV42 UPD27 UPD74 MOV74 INS59 INS32 INS42 INS27 MOV8 INS74 INS59 UPD74 MOV74 INS59 INS32 MOV27 INS8 INS32 UPD42 MOV42 INS27 MOV8 UPD74 MOV74 INS59 INS32 UPD42 UPD27 MOV27 MOV8 UPD74 MOV74 INS59 INS32 INS32 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 UPD43 INS42 INS42 INS42 INS42 UPD43 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 UPD43 INS32 INS8 INS32 INS8 INS32 INS8 INS42 INS42 INS42 UPD43 INS42 INS42 INS42 UPD43 UPD42 MOV42 MOV42 INS32 INS42 INS32 INS8 INS32 INS32 MOV43 INS59 INS42 INS42 INS42 INS42 INS42 UPD42 INS32 INS42 INS16 UPD42 MOV42 UPD42 INS16 INS42 UPD42 MOV27 MOV27 MOV27 MOV8 MOV25 INS42 INS42 INS42 UPD43 INS42 INS16 UPD42 UPD42 INS42 UPD42 INS42 UPD42 MOV42 UPD42 MOV42 INS42 INS42 INS33 INS43 INS43 INS42 INS16 UPD43 INS42 INS16 INS42 INS42 INS42 INS42 INS42 INS42 MOV21 UPD42 MOV42 UPD42 MOV42 INS42 INS42 INS33 UPD43 INS42 INS16 INS42 INS42 UPD42 UPD42 UPD42 UPD42 MOV42 UPD42 MOV42 INS42 UPD42 UPD43 INS42 INS16 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 MOV42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 INS42 UPD42 UPD42 UPD42 INS40 UPD42 UPD42 INS40 UPD42 UPD42 INS40 UPD42 UPD42 INS40 UPD42 UPD42 UPD42 INS40 UPD42 UPD42 INS40 UPD42 UPD42 INS40 INS21 MOV21 UPD42 UPD42 INS40 UPD42 UPD42 INS40 UPD42 UPD42 INS40 UPD42 UPD42 INS40 UPD42 UPD42 INS40 UPD42 UPD42 INS40 UPD42 UPD42 INS40 UPD42 UPD42 INS40 UPD42 UPD42 INS40 UPD42 INS42 INS42 INS40 MOV21 MOV21 MOV21 MOV21 MOV21 MOV21 MOV21 MOV21 MOV21 MOV21 MOV21 MOV21 MOV21 INS42 INS42 INS40 MOV21 MOV21 MOV21 INS42 INS42 INS40 MOV21 MOV21 MOV21 MOV21 MOV21 UPD42 UPD42 UPD42 INS40 UPD42 UPD42 INS40 UPD42 UPD42 INS40 UPD42 UPD42 INS40 UPD42 UPD42 INS40 UPD42 UPD42 INS40 UPD42 UPD42 UPD42 INS40 UPD42 UPD42 INS40 UPD42 UPD42 INS40 UPD42 UPD42 INS40 UPD42 UPD42 INS40 INS42 INS42 UPD42 MOV42 INS32 INS42 INS42 INS42 INS42 INS41 INS42 INS42 INS42 INS42 INS32 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 INS32 UPD42 MOV42 INS42 MOV14 INS40 INS32 UPD42 MOV42 INS32 INS27 INS33 MOV32 INS32 INS33 INS32 UPD42 MOV42 MOV33 UPD42 INS32 INS32 MOV14 INS42 INS42 INS27 INS42 INS42 UPD42 INS32 INS32 MOV14 UPD42 INS32 INS32 MOV14 UPD42 INS32 INS32 MOV14 INS32 UPD42 MOV42 UPD42 MOV42 INS42 INS42 INS42 INS42 UPD42 MOV42 UPD42 MOV42 INS42 INS32 UPD42 MOV42 INS90 UPD42 MOV42 UPD42 MOV42 INS42 INS33 INS42 INS42 INS42 INS42 UPD42 INS32 INS60 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 INS42 INS42 INS33 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 INS42 UPD42 UPD42 INS42 UPD42 UPD42 INS42 INS42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 INS42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 INS42 UPD45 UPD45 MOV42 MOV42 INS45 MOV45 INS32 MOV42 INS45 MOV32 INS45 MOV32 INS45 MOV32 UPD45 INS45 UPD45 INS45 MOV32 INS45 INS32 UPD42 MOV42 INS90 INS42 INS42 MOV42 MOV42 MOV42 MOV42 MOV42 INS42 UPD42 INS32 MOV39 INS59 INS32 UPD42 MOV42 INS89 UPD42 MOV42 UPD42 MOV42 MOV42 INS42 INS42 MOV42 MOV42 MOV42 MOV42 INS42 MOV42 INS16 UPD42 INS32 UPD42 INS32 MOV32 UPD42 MOV42 INS86 MOV5 INS42 MOV2 INS45 MOV2 INS27 MOV38 INS42 MOV42 MOV42 MOV42 MOV42 MOV42 INS42 MOV42 MOV42 MOV42 INS42 INS42 UPD42 MOV32 INS59 INS32 MOV85 UPD42 MOV42 MOV33 INS42 INS42 MOV42 MOV34 MOV42 DEL40 DEL26 DEL83 DEL83 DEL83 DEL42 DEL43 DEL42 DEL42 DEL42 DEL32 DEL59 DEL23 DEL33 DEL42 DEL42 DEL32 DEL32 DEL42 DEL42 DEL32 DEL32 DEL59 DEL60 DEL27 DEL42 DEL42 DEL42 DEL42 DEL32 DEL7 DEL21 DEL8 DEL25 DEL42 DEL42 DEL32 DEL32 DEL42 DEL42 DEL32 DEL32 DEL27 DEL42 DEL7 DEL21 DEL8 DEL25 DEL25 DEL8 DEL25 DEL42 DEL42 DEL42 DEL32 DEL40 DEL42 DEL33 DEL27 DEL32 DEL38 DEL27 DEL42 DEL42 DEL32 DEL42 DEL33 DEL27 DEL32 DEL38 DEL27 DEL83 DEL83 DEL42 DEL42 DEL43 DEL42 DEL78 DEL83 DEL42 DEL43 DEL42 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL42 DEL42 DEL40 DEL32 DEL59 DEL60 DEL42 DEL33 DEL27 DEL42 DEL42 DEL45 DEL32 DEL38 DEL27 DEL42 DEL42 DEL42 DEL42 DEL40 DEL45 DEL32 DEL32 DEL41 DEL8 DEL25 DEL43 DEL59 DEL60 DEL43 DEL59 DEL60 DEL42 DEL33 DEL27 DEL42 DEL42 DEL42 DEL32 DEL21 DEL8 DEL43 DEL42 DEL44 DEL45 DEL32 DEL41 DEL8 DEL12 DEL54 DEL8 DEL25 DEL42 DEL33 DEL27 DEL27 DEL42 DEL42 DEL40 DEL32 DEL41 DEL8 DEL25 DEL43 DEL59 DEL60 DEL42 DEL33 DEL27 DEL42 DEL33 DEL27 DEL27 DEL32 DEL41 DEL8 DEL25 DEL42 DEL42 DEL45 DEL32 DEL41 DEL8 DEL31 DEL55 DEL42 DEL33 DEL59 DEL60 DEL8 DEL31 DEL83 DEL39 DEL42 DEL40 DEL32 DEL21 DEL40 DEL42 DEL32 DEL21 DEL42 DEL33 DEL27 DEL42 DEL42 DEL42 DEL32 DEL21 DEL42 DEL42 DEL13 DEL32 DEL21 DEL42 DEL42 DEL42 DEL32 DEL21 DEL42 DEL42 DEL13 DEL32 DEL21 DEL32 DEL21 DEL13 DEL32 DEL21 DEL8 DEL25 DEL8 DEL31 DEL83 DEL42 DEL43 DEL42 DEL43 DEL74 DEL42 DEL42 DEL43 DEL42 DEL43 DEL74 DEL42 DEL42 DEL43 DEL74 DEL14 DEL59 DEL60 DEL42 DEL41 DEL8 DEL31 DEL42 DEL43 DEL42 DEL43 DEL74 DEL42 DEL43 DEL43 DEL74 DEL42 DEL43 DEL42 DEL43 DEL74 DEL42 DEL44 DEL42 DEL42 DEL32 DEL42 DEL33 DEL27 DEL32 DEL38 DEL27 DEL42 DEL43 DEL42 DEL43 DEL74 DEL42 DEL42 DEL43 DEL74 DEL14 DEL59 DEL60 DEL42 DEL43 DEL42 DEL44 DEL42 DEL42 DEL32 DEL32 DEL36 DEL38 DEL8 DEL25 DEL8 DEL70 DEL42 DEL41 DEL66 DEL65 DEL29 DEL39 DEL42 DEL42 DEL32 DEL42 DEL33 DEL27 DEL32 DEL38 DEL27 DEL42 DEL42 DEL40 DEL45 DEL32 DEL21 DEL42 DEL42 DEL40 DEL42 DEL32 DEL21 DEL42 DEL42 DEL40 DEL42 DEL32 DEL21 DEL42 DEL42 DEL45 DEL32 DEL21 DEL42 DEL42 DEL13 DEL32 DEL21 DEL32 DEL21 DEL13 DEL32 DEL21 DEL32 DEL21 DEL13 DEL32 DEL21 DEL8 DEL25 DEL66 DEL65 DEL66 DEL65 DEL29 DEL42 DEL33 DEL27 DEL42 DEL42 DEL32 DEL38 DEL27 DEL42 DEL42 DEL43 DEL14 DEL7 DEL21 DEL42 DEL42 DEL45 DEL32 DEL21 DEL42 DEL42 DEL13 DEL32 DEL21 DEL42 DEL42 DEL40 DEL32 DEL21 DEL42 DEL42 DEL13 DEL32 DEL21 DEL42 DEL42 DEL40 DEL32 DEL21 DEL42 DEL42 DEL13 DEL32 DEL21 DEL8 DEL25 DEL42 DEL43 DEL42 DEL43 DEL42 DEL43 DEL74 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL33 DEL27 DEL40 DEL34 DEL27 DEL27 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL59 DEL60 DEL42 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL42 DEL32 DEL42 DEL43 DEL42 DEL44 DEL42 DEL42 DEL42 DEL42 DEL9 DEL32 DEL21 DEL8 DEL70 DEL42 DEL43 DEL42 DEL44 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL9 DEL32 DEL21 DEL8 DEL70 DEL8 DEL42 DEL43 DEL42 DEL42 DEL43 DEL14 DEL59 DEL60 DEL42 DEL42 DEL45 DEL32 DEL21 DEL42 DEL43 DEL42 DEL44 DEL42 DEL42 DEL42 DEL42 DEL32 DEL21 DEL42 DEL42 DEL13 DEL32 DEL21 DEL8 DEL70 DEL42 DEL42 DEL32 DEL42 DEL42 DEL42 DEL32 DEL32 DEL41 DEL8 DEL25 DEL8 DEL25 DEL45 DEL45 DEL45 DEL45 DEL42 DEL43 DEL43 DEL42 DEL43 DEL74 DEL42 DEL42 DEL43 DEL43 DEL42 DEL43 DEL74 DEL42 DEL43 DEL74 DEL14 DEL59 DEL60 DEL42 DEL42 DEL45 DEL9 DEL32 DEL21 DEL42 DEL42 DEL45 DEL9 DEL32 DEL21 DEL42 DEL42 DEL45 DEL9 DEL32 DEL21 DEL42 DEL42 DEL45 DEL9 DEL32 DEL21 DEL42 DEL42 DEL45 DEL9 DEL32 DEL21 DEL42 DEL42 DEL45 DEL9 DEL32 DEL21 DEL42 DEL42 DEL45 DEL9 DEL32 DEL21 DEL42 DEL42 DEL45 DEL9 DEL32 DEL21 DEL42 DEL41 DEL8 DEL42 DEL43 DEL42 DEL33 DEL59 DEL60 DEL42 DEL33 DEL27 DEL42 DEL42 DEL32 DEL38 DEL27 DEL42 DEL42 DEL43 DEL14 DEL7 DEL21 DEL42 DEL42 DEL45 DEL32 DEL21 DEL42 DEL42 DEL13 DEL32 DEL21 DEL42 DEL42 DEL40 DEL32 DEL21 DEL42 DEL42 DEL13 DEL32 DEL21 DEL42 DEL42 DEL40 DEL32 DEL21 DEL42 DEL42 DEL13 DEL32 DEL21 DEL8 DEL25 DEL42 DEL43 DEL42 DEL43 DEL42 DEL43 DEL74 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL33 DEL27 DEL40 DEL34 DEL27 DEL27 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL59 DEL60 DEL42 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL42 DEL32 DEL42 DEL43 DEL42 DEL44 DEL42 DEL42 DEL42 DEL42 DEL9 DEL32 DEL21 DEL8 DEL70 DEL42 DEL43 DEL42 DEL44 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL9 DEL32 DEL21 DEL8 DEL70 DEL8 DEL42 DEL43 DEL42 DEL42 DEL43 DEL14 DEL59 DEL60 DEL42 DEL42 DEL45 DEL32 DEL21 DEL42 DEL43 DEL42 DEL44 DEL42 DEL42 DEL42 DEL42 DEL32 DEL21 DEL42 DEL42 DEL13 DEL32 DEL21 DEL8 DEL70 DEL42 DEL42 DEL32 DEL42 DEL42 DEL42 DEL32 DEL32 DEL41 DEL8 DEL25 DEL8 DEL25 DEL45 DEL45 DEL45 DEL42 DEL42 DEL2 DEL34 DEL42 DEL42 DEL2 DEL42 DEL43 DEL85 DEL5 DEL42 DEL59 DEL60 DEL42 DEL33 DEL27 DEL39 DEL42 DEL34 DEL59 DEL58 DEL42 DEL40 DEL27 DEL42 DEL37 DEL42 DEL34 DEL27 DEL32 DEL21 DEL8 DEL42 DEL42 DEL45 DEL42 DEL42 DEL2 DEL32 DEL32 DEL21 DEL8 DEL25 DEL8 DEL24 DEL8 DEL25 DEL5 DEL42 DEL59 DEL60 DEL42 DEL33 DEL27 DEL39 DEL42 DEL34 DEL59 DEL58 DEL42 DEL40 DEL27 DEL42 DEL37 DEL42 DEL34 DEL27 DEL42 DEL42 DEL45 DEL42 DEL42 DEL2 DEL32 DEL21 DEL8 DEL8 DEL25 DEL8 DEL24 DEL8 DEL25 DEL45 DEL45 DEL42 DEL59 DEL60 DEL42 DEL42 DEL43 DEL85 DEL5 DEL42 DEL59 DEL60 DEL42 DEL45 DEL45 DEL45 DEL45 DEL45 DEL45 DEL45 DEL25 DEL42 DEL33 DEL27 DEL25 DEL8 DEL66 DEL65 DEL66 DEL65 DEL29 DEL42 DEL42 DEL43 DEL85 DEL5 DEL42 DEL59 DEL60 DEL42 DEL43 DEL42 DEL43 DEL43 DEL74 DEL42 DEL43 DEL42 DEL43 DEL43 DEL74 DEL42 DEL42 DEL43 DEL74 DEL14 DEL59 DEL60 DEL42 DEL42 DEL45 DEL9 DEL32 DEL21 DEL42 DEL42 DEL45 DEL9 DEL32 DEL21 DEL42 DEL42 DEL45 DEL9 DEL32 DEL21 DEL42 DEL42 DEL45 DEL9 DEL32 DEL21 DEL42 DEL41 DEL8 DEL42 DEL43 DEL42 DEL33 DEL59 DEL60 DEL42 DEL33 DEL27 DEL42 DEL42 DEL32 DEL38 DEL27 DEL42 DEL42 DEL43 DEL14 DEL7 DEL21 DEL42 DEL42 DEL45 DEL32 DEL21 DEL42 DEL42 DEL13 DEL32 DEL21 DEL42 DEL42 DEL40 DEL32 DEL21 DEL42 DEL42 DEL13 DEL32 DEL21 DEL42 DEL42 DEL40 DEL32 DEL21 DEL42 DEL42 DEL13 DEL32 DEL21 DEL8 DEL25 DEL42 DEL43 DEL42 DEL43 DEL42 DEL43 DEL74 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL33 DEL27 DEL40 DEL34 DEL27 DEL27 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL59 DEL60 DEL42 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL42 DEL32 DEL42 DEL43 DEL42 DEL44 DEL42 DEL42 DEL42 DEL42 DEL9 DEL32 DEL21 DEL8 DEL70 DEL42 DEL43 DEL42 DEL44 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL9 DEL32 DEL21 DEL8 DEL70 DEL8 DEL42 DEL43 DEL42 DEL42 DEL43 DEL14 DEL59 DEL60 DEL42 DEL42 DEL45 DEL32 DEL21 DEL42 DEL43 DEL42 DEL44 DEL42 DEL42 DEL42 DEL42 DEL32 DEL21 DEL42 DEL42 DEL13 DEL32 DEL21 DEL8 DEL70 DEL42 DEL42 DEL32 DEL42 DEL42 DEL42 DEL32 DEL32 DEL41 DEL8 DEL25 DEL8 DEL25 DEL45 DEL45 DEL45 DEL45 DEL45 DEL45 DEL42 DEL42 DEL33 DEL27 DEL25 DEL8 DEL42 DEL33 DEL59 DEL60 DEL42 DEL33 DEL27 DEL42 DEL42 DEL32 DEL38 DEL27 DEL25 DEL42 DEL43 DEL42 DEL43 DEL42 DEL43 DEL74 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL33 DEL27 DEL40 DEL34 DEL27 DEL27 DEL42 DEL43 DEL42 DEL43 DEL74 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL43 DEL42 DEL43 DEL74 DEL42 DEL59 DEL60 DEL42 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL42 DEL32 DEL42 DEL43 DEL42 DEL44 DEL42 DEL42 DEL42 DEL42 DEL9 DEL32 DEL21 DEL8 DEL70 DEL42 DEL43 DEL42 DEL44 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL9 DEL32 DEL21 DEL8 DEL70 DEL8 DEL42 DEL59 DEL60 DEL42 DEL42 DEL45 DEL32 DEL21 DEL42 DEL43 DEL42 DEL44 DEL42 DEL42 DEL42 DEL42 DEL32 DEL21 DEL42 DEL42 DEL13 DEL32 DEL21 DEL8 DEL70 DEL42 DEL42 DEL32 DEL42 DEL42 DEL42 DEL32 DEL32 DEL41 DEL8 DEL25 DEL8 DEL25 DEL45 DEL45 DEL45 DEL45 DEL45 DEL42 DEL33 DEL27 DEL25 DEL8 DEL66 DEL65 DEL66 DEL65 DEL29 DEL42 DEL43 DEL43 DEL42 DEL43 DEL74 DEL42 DEL42 DEL43 DEL43 DEL42 DEL43 DEL74 DEL42 DEL32 DEL59 DEL60 DEL45 DEL9 DEL32 DEL21 DEL42 DEL41 DEL8 DEL42 DEL33 DEL27 DEL25 DEL8 DEL42 DEL14 DEL7 DEL21 DEL45 DEL66 DEL65 DEL29 DEL66 DEL65 DEL66 DEL65 DEL29 DEL42 DEL43 DEL42 DEL43 DEL42 DEL43 DEL74 DEL42 DEL42 DEL43 DEL42 DEL43 DEL42 DEL43 DEL74 DEL42 DEL42 DEL43 DEL74 DEL14 DEL59 DEL60 DEL42 DEL45 DEL9 DEL32 DEL21 DEL45 DEL9 DEL32 DEL21 DEL45 DEL9 DEL32 DEL21 DEL45 DEL9 DEL32 DEL21 DEL42 DEL45 DEL9 DEL32 DEL21 DEL42 DEL45 DEL9 DEL32 DEL21 DEL42 DEL45 DEL9 DEL32 DEL21 DEL45 DEL9 DEL32 DEL21 DEL42 DEL42 DEL45 DEL9 DEL32 DEL21 DEL42 DEL45 DEL9 DEL32 DEL21 DEL42 DEL45 DEL9 DEL32 DEL21 DEL45 DEL9 DEL32 DEL21 DEL42 DEL41 DEL8 DEL31

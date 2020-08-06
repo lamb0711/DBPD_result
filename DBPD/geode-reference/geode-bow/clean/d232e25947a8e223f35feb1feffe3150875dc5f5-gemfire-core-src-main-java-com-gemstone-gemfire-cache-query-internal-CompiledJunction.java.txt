@@ -1,0 +1,113 @@
+GEODE-730: Optimize single filter join queries
+
+When executing a join query with additional filters on a single region, we now detect this scenario and
+instead of creating a CompositeGroupJunction, we create a regular GroupJunction.  When we being cutdown
+and expansion, we then create new compiled comparisons so that we can do an index lookup.
+
+For example "select * from /region1 a, /region2 b where a.name = "joe" and a.id = b.id"
+We will now execute the a.name first assuming an index is present on a.name
+
+During cutdown and expand, we determine that the comparison a.id = b.id can create a new compiled comparison
+because the alias a from a.id matches our original filter a.name.  We can evaluate a.id at this point, say id
+evaluated to 8.  So we create a compiled comparison of b.id = 8.  We can now do a lookup using the index on b.id.
+We retrieve these results and place them into a map.  This map will be used to continue to derive additional joins
+if they exist.  Such as b.id = c.id, etc...
+
+We can continue with the iteration but instead of iterating the entire b region, we can now go over derived results.
+
+This also includes a fix to not unlock an index lock when reevaluating an inner query.
+
+-import java.util.*;
++import java.util.ArrayList;
++import java.util.Arrays;
++import java.util.Collections;
++import java.util.HashMap;
++import java.util.HashSet;
++import java.util.Iterator;
++import java.util.LinkedHashMap;
++import java.util.List;
++import java.util.Map;
++import java.util.Set;
+-import com.gemstone.gemfire.cache.query.*;
++import com.gemstone.gemfire.cache.query.AmbiguousNameException;
++import com.gemstone.gemfire.cache.query.FunctionDomainException;
++import com.gemstone.gemfire.cache.query.NameResolutionException;
++import com.gemstone.gemfire.cache.query.QueryInvocationTargetException;
++import com.gemstone.gemfire.cache.query.QueryService;
++import com.gemstone.gemfire.cache.query.SelectResults;
++import com.gemstone.gemfire.cache.query.Struct;
++import com.gemstone.gemfire.cache.query.TypeMismatchException;
++import com.gemstone.gemfire.cache.query.internal.index.IndexManager;
+-
++  //A token to place into the samesort map.  This is to let the engine know there is more than one index
++  //being used for this junction but allows actual operands to form range junctions if enough exist. 
++  //The mechanism checks to see if the mapped object is an integer, if so, it increments, if it's not it sets as 1
++  //Because we are a string place holder, the next actual operand would just start at one.  If the join is added
++  //after a valid operand has already set the counter to an integer, we instead just ignore and do not set the place holder
++  private final static String PLACEHOLDER_FOR_JOIN = "join";  
++    boolean indexExistsOnNonJoinOp = false;
++          boolean operandEvalAsFilter = expndOperand.getPlanInfo(context).evalAsFilter;
+-              || expndOperand.getPlanInfo(context).evalAsFilter;
++              || operandEvalAsFilter;
+-            if ((expndOperand.getPlanInfo(context).evalAsFilter)) {
++            if (operandEvalAsFilter) {
++            if (operandEvalAsFilter && _operator == LITERAL_and) {
++              indexExistsOnNonJoinOp = true;
++            }
+-          evalOperands);
++          evalOperands, indexExistsOnNonJoinOp);
+-        Assert.assertTrue(indx.length == 1,
+-            "There should have been just one index for the condition");
+-        listOrPosition = sameIndexOperands.get(indx[0]._index);
++        //We are now sorting these for joins, therefore we need to weed out the join indexes
++        if (!IndexManager.JOIN_OPTIMIZATION || indx.length == 1) {
++          Assert.assertTrue(indx.length == 1,
++              "There should have been just one index for the condition");
++          listOrPosition = sameIndexOperands.get(indx[0]._index);
++        }
+-      if (listOrPosition != null) {
++    
++     if (listOrPosition != null) {
+-        else {
++        else if (listOrPosition instanceof List){
+-      }
+-      else {
++        else {
++          //a join was present here, let's now occupy that spot and remove the placeholder
++          listOrPosition = null;
++        }
++     }
++      if (listOrPosition == null) {
+-        // TODO: Enable only for AND junction for now
+-        if (evalAsFilter && this._operator == OQLLexerTokenTypes.LITERAL_and) {
+-          sameIndexOperands.put(indx[0]._index, Integer.valueOf(i));
++        if (indx != null && indx.length == 1) {
++          // TODO: Enable only for AND junction for now
++          if (evalAsFilter && this._operator == OQLLexerTokenTypes.LITERAL_and) {
++            sameIndexOperands.put(indx[0]._index, Integer.valueOf(i));
++          }
++        } else if (indx != null && indx.length == 2) {
++          if (evalAsFilter && this._operator == OQLLexerTokenTypes.LITERAL_and) {
++            if (!sameIndexOperands.containsKey(indx[0]._index)) {
++              sameIndexOperands.put(indx[0]._index, PLACEHOLDER_FOR_JOIN);
++            }
++            if (!sameIndexOperands.containsKey(indx[1]._index)) {
++              sameIndexOperands.put(indx[1]._index, PLACEHOLDER_FOR_JOIN);
++            }
++          }
+-    if( this.isDependentOnCurrentScope(context)) {	  
+-	return Integer.MAX_VALUE;
++    if( this.isDependentOnCurrentScope(context)) {    
++  return Integer.MAX_VALUE;
+-    	return 0;
++      return 0;
+-      int indexCount, List evalOperands) throws FunctionDomainException,
++      int indexCount, List evalOperands, boolean indexExistsOnNonJoinOp) throws FunctionDomainException,
+-    if (iterToOperands.size() == 1 && compositeFilterOpsMap.isEmpty()) {
++    if (iterToOperands.size() == 1 && (compositeFilterOpsMap.isEmpty()
++        || (indexExistsOnNonJoinOp && IndexManager.JOIN_OPTIMIZATION))) {
++      if ((indexExistsOnNonJoinOp && IndexManager.JOIN_OPTIMIZATION)) {
++        // For the optimization we will want to add the compositeFilterOpsMap 848
++        // without the optimization we only fall into here if it's empty anyways, but have not tested the removal of this if clause
++        evalOperands.addAll(compositeFilterOpsMap.keySet());
++      }

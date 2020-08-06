@@ -1,0 +1,277 @@
+GEODE-7971: Gw sender deliver TX events atomically to Gw receivers (#4928)
+
+* GEODE-7971: Gw sender deliver TX events atomically to Gw receivers
+
+A new flag is added to gateway senders: group-transaction-events.
+If set to true, events for the same transaction will not be
+spread across different batches, i.e. it is guaranteed that
+they will be delivered inside the same batch.
+
+In order to implement this behavior,
+the last event for each transaction is marked with a new flag
+and the transactionId before it is put in the sender's queue
+(new flag added to GatewaySenderEvent). That way, it is possible
+for the gateway senders to go through a
+batch ready to be sent and verify if the last event for
+each transaction is present in the batch.
+If not, the gateway sender will traverse the sender queue
+to get the missing events for the incomplete transactions
+and once they are added to the batch, the batch will be sent.
+
+This feature has the following restrictions:
+- The group-transaction-events can only be set on
+serial gateway senders with just 1 dispatcher thread
+or on parallel gateway senders.
+- In order to guarantee that the events of a transaction
+are to not spread
+across different batches, the regions involved in the
+transaction must all have the same senders with the
+group-transaction-events flag set to true configured.
+
+* GEODE-7971: small fix in gwSenderFactory + extra info on config error
+
+* GEODE-7971: Add logic for case when batches are redistributed
+
+Also added parameter for retries when not all
+events for a transaction can be read from the queue.
+
+* GEODE-7971: Undo changes on cache*.dtd files unneeded
+
+Also changed a couple of timeouts in test cases.
+
+* feature/GEODE-7971: Changes after review
+
+* feature/GEODE-7971: Simplify test JUnit test case
+
+* GEODE-7971: Update create document and refactor test case
+
+* GEODE-7971: Add check in serial gwsender creation with threads>1 and group-trans-events=true.
+
+Also corrected some documentation errors.
+
+* GEODE-7971: Add HA test cases and fix bug in SerialGatewaySenderQueue
+
+* feature/GEODE-7971: Documentation change after review and flaxy test fix
+
+* GEODE-7971: Doc changes after review
++import static org.apache.geode.cache.wan.GatewaySender.GET_TRANSACTION_EVENTS_FROM_QUEUE_RETRIES;
++import java.util.HashSet;
++import java.util.concurrent.ConcurrentHashMap;
++import java.util.function.Predicate;
++import org.apache.geode.annotations.VisibleForTesting;
++import org.apache.geode.cache.TransactionId;
++  /**
++   * Last key peeked from the queue excluding the keys peeked
++   * to complete transactions when group-transaction-events is enabled.
++   */
++  private final AtomicLong lastPeekedId = new AtomicLong(-1);
++
++   * Contains the set of peekedIds that were peeked to complete a transaction
++   * inside a batch when groupTransactionEvents is set.
++   */
++  private final Set<Long> extraPeekedIds = ConcurrentHashMap.newKeySet();
++
++  /**
+-   * The writeLock of this concurrent lock is used to protect access to the queue.
+-   * It is implemented as a fair lock to ensure FIFO ordering of queueing attempts.
+-   * Otherwise threads can be unfairly delayed.
++   * The writeLock of this concurrent lock is used to protect access to the queue. It is implemented
++   * as a fair lock to ensure FIFO ordering of queueing attempts. Otherwise threads can be unfairly
++   * delayed.
++  private MetaRegionFactory metaRegionFactory;
++
++    this(abstractSender, regionName, listener, cleanQueues, new MetaRegionFactory());
++  }
++
++  public SerialGatewaySenderQueue(AbstractGatewaySender abstractSender, String regionName,
++      CacheListener listener, boolean cleanQueues, MetaRegionFactory metaRegionFactory) {
+-
++    this.metaRegionFactory = metaRegionFactory;
+-      if (this.peekedIds.isEmpty()) {
++      if (peekedIds.isEmpty()) {
+-      Long key = this.peekedIds.remove();
++      Long key = peekedIds.remove();
++      extraPeekedIds.remove(key);
+-    Object object = peekAhead();
++    KeyAndEventPair object = peekAhead();
+-    return object;
++    return object.event;
++
++    Set<TransactionId> incompleteTransactionsInBatch = new HashSet<>();
++    long lastKey = -1;
+-      AsyncEvent object = peekAhead();
++      KeyAndEventPair pair = peekAhead();
+-      if (object != null) {
++      if (pair != null) {
++        AsyncEvent object = pair.event;
++        lastKey = pair.key;
++        if (object instanceof GatewaySenderEventImpl) {
++          GatewaySenderEventImpl event = (GatewaySenderEventImpl) object;
++          if (event.getTransactionId() != null) {
++            if (event.isLastEventInTransaction()) {
++              incompleteTransactionsInBatch.remove(event.getTransactionId());
++            } else {
++              incompleteTransactionsInBatch.add(event.getTransactionId());
++            }
++          }
++        }
++    if (batch.size() > 0) {
++      peekEventsFromIncompleteTransactions(batch, incompleteTransactionsInBatch, lastKey);
++    }
++
++  private void peekEventsFromIncompleteTransactions(List<AsyncEvent> batch,
++      Set<TransactionId> incompleteTransactionIdsInBatch, long lastKey) {
++    if (!mustGroupTransactionEvents()) {
++      return;
++    }
++
++    if (areAllTransactionsCompleteInBatch(incompleteTransactionIdsInBatch)) {
++      return;
++    }
++
++    for (TransactionId transactionId : incompleteTransactionIdsInBatch) {
++      boolean areAllEventsForTransactionInBatch = false;
++      int retries = 0;
++      long lastKeyForTransaction = lastKey;
++      while (!areAllEventsForTransactionInBatch
++          && retries++ < GET_TRANSACTION_EVENTS_FROM_QUEUE_RETRIES) {
++        EventsAndLastKey eventsAndKey =
++            peekEventsWithTransactionId(transactionId, lastKeyForTransaction);
++
++        for (Object object : eventsAndKey.events) {
++          GatewaySenderEventImpl event = (GatewaySenderEventImpl) object;
++          batch.add(event);
++          areAllEventsForTransactionInBatch = event.isLastEventInTransaction();
++
++          if (logger.isDebugEnabled()) {
++            logger.debug(
++                "Peeking extra event: {}, isLastEventInTransaction: {}, batch size: {}",
++                event.getKey(), event.isLastEventInTransaction(), batch.size());
++          }
++        }
++        lastKeyForTransaction = eventsAndKey.lastKey;
++      }
++      if (!areAllEventsForTransactionInBatch) {
++        logger.warn("Not able to retrieve all events for transaction {} after {} tries",
++            transactionId, retries);
++      }
++    }
++  }
++
++  protected boolean mustGroupTransactionEvents() {
++    return sender.mustGroupTransactionEvents();
++  }
++
++  private boolean areAllTransactionsCompleteInBatch(Set incompleteTransactions) {
++    return (incompleteTransactions.size() == 0);
++  }
++
++    extraPeekedIds.clear();
++    lastPeekedId.set(-1);
+-    if (this.peekedIds.isEmpty()) {
++    if (lastPeekedId.equals(-1)) {
+-      Long lastPeek = this.peekedIds.peekLast();
+-      if (lastPeek == null) {
+-        return null;
+-      }
+-      currentKey = lastPeek.longValue() + 1;
++      currentKey = inc(lastPeekedId.get());
+-  private AsyncEvent peekAhead() throws CacheException {
++  @VisibleForTesting
++  static class KeyAndEventPair {
++    public final long key;
++    public final AsyncEvent event;
++
++    KeyAndEventPair(Long key, AsyncEvent event) {
++      this.key = key;
++      this.event = event;
++    }
++  }
++
++  @VisibleForTesting
++  public KeyAndEventPair peekAhead() throws CacheException {
+-    while (before(currentKey, getTailKey())
+-        && (null == (object = getObjectInSerialSenderQueue(currentKey)))) {
++    while (before(currentKey, getTailKey())) {
++      if (!extraPeekedIds.contains(currentKey)) {
++        object = getObjectInSerialSenderQueue(currentKey);
++        if (object != null) {
++          break;
++        }
++      }
++
++      lastPeekedId.set(currentKey);
++      return new KeyAndEventPair(currentKey, object);
+-    return object;
++    return null;
++  }
++
++  private EventsAndLastKey peekEventsWithTransactionId(TransactionId transactionId, long lastKey) {
++    Predicate<GatewaySenderEventImpl> hasTransactionIdPredicate =
++        x -> x.getTransactionId().equals(transactionId);
++    Predicate<GatewaySenderEventImpl> isLastEventInTransactionPredicate =
++        x -> x.isLastEventInTransaction();
++
++    return getElementsMatching(hasTransactionIdPredicate, isLastEventInTransactionPredicate,
++        lastKey);
++  }
++
++  static class EventsAndLastKey {
++    public final List<Object> events;
++    public final long lastKey;
++
++    EventsAndLastKey(List<Object> events, long lastKey) {
++      this.events = events;
++      this.lastKey = lastKey;
++    }
++  }
++
++  EventsAndLastKey getElementsMatching(Predicate condition, Predicate stopCondition, long lastKey) {
++    Object object;
++    List elementsMatching = new ArrayList<>();
++
++    long currentKey = lastKey;
++
++    while ((currentKey = inc(currentKey)) != getTailKey()) {
++      if (extraPeekedIds.contains(currentKey)) {
++        continue;
++      }
++      object = optimalGet(currentKey);
++      if (object == null) {
++        continue;
++      }
++
++      if (condition.test(object)) {
++        elementsMatching.add(object);
++        peekedIds.add(currentKey);
++        extraPeekedIds.add(currentKey);
++        lastKey = currentKey;
++
++        if (stopCondition.test(object)) {
++          break;
++        }
++      }
++    }
++
++    return new EventsAndLastKey(elementsMatching, lastKey);
+-            new SerialGatewaySenderQueueMetaRegion(this.regionName, ra, null, gemCache, sender,
+-                sender.getStatisticsClock());
++            metaRegionFactory.newMetaRegion(gemCache, this.regionName, ra, sender);
++
+-  private void addOverflowStatisticsToMBean(Cache cache, AbstractGatewaySender sender) {
++  @VisibleForTesting
++  protected void addOverflowStatisticsToMBean(Cache cache, AbstractGatewaySender sender) {
++  static class MetaRegionFactory {
++    SerialGatewaySenderQueueMetaRegion newMetaRegion(InternalCache cache,
++        final String regionName,
++        final RegionAttributes ra,
++        AbstractGatewaySender sender) {
++      SerialGatewaySenderQueueMetaRegion meta =
++          new SerialGatewaySenderQueueMetaRegion(regionName, ra, null, cache, sender,
++              sender.getStatisticsClock());
++      return meta;
++    }
++  }
++
+
+INS26 INS26 INS26 INS26 INS26 INS26 INS40 INS40 INS40 INS40 INS40 INS40 INS23 INS23 INS23 INS31 INS31 INS31 INS31 INS31 INS55 INS31 INS55 INS31 INS55 INS29 INS83 INS83 INS43 INS59 INS29 INS83 INS83 INS74 INS59 INS83 INS43 INS59 INS83 INS42 INS44 INS44 INS44 INS44 INS8 INS44 INS83 INS39 INS42 INS44 INS44 INS44 INS8 INS83 INS39 INS42 INS8 INS83 INS39 INS42 INS44 INS8 MOV29 INS83 MOV43 MOV42 INS8 INS78 INS83 INS42 INS23 INS23 INS31 INS78 UPD83 INS43 INS83 INS43 INS42 INS44 INS44 INS8 INS83 INS42 INS23 INS23 INS31 INS43 INS42 INS44 INS44 INS44 INS8 INS78 UPD83 INS83 INS42 INS31 INS65 INS42 INS42 INS14 INS65 INS43 INS43 INS42 INS32 INS42 INS42 INS43 INS42 INS43 INS42 INS43 INS42 INS39 INS42 INS17 INS43 INS42 INS21 INS60 INS60 INS25 INS74 INS42 INS74 INS42 INS39 INS42 INS25 INS25 INS70 INS41 INS43 INS42 INS41 INS21 INS21 MOV60 INS25 MOV41 INS42 INS83 INS83 INS39 INS59 INS83 INS83 MOV43 INS59 INS42 INS44 INS44 INS8 INS42 INS42 MOV41 INS42 INS43 INS42 INS39 INS42 INS60 MOV60 INS41 INS83 INS83 INS74 INS59 INS83 INS83 INS39 INS59 INS42 INS44 INS44 INS8 INS42 INS43 INS42 INS43 INS42 INS39 INS42 INS60 INS60 INS60 INS61 INS41 INS42 INS43 INS42 INS44 INS44 INS44 INS44 INS8 INS66 INS66 INS43 INS38 INS66 INS66 INS42 INS42 INS42 INS42 UPD66 UPD66 UPD66 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS14 INS42 INS7 INS43 INS40 INS74 INS59 INS39 INS59 INS27 INS8 INS43 INS43 INS43 INS43 INS38 INS8 INS32 INS8 INS44 INS42 INS8 INS32 INS42 INS36 INS32 INS32 INS32 MOV8 INS8 INS42 INS42 MOV43 INS42 INS43 INS42 INS21 INS21 MOV32 INS42 INS74 INS59 INS74 INS32 INS43 INS43 INS42 INS42 INS74 INS42 INS39 INS42 INS21 INS21 INS42 INS42 INS43 INS59 INS43 INS59 INS39 INS59 INS27 INS8 INS14 INS42 INS43 INS42 INS83 INS43 INS42 INS83 INS43 INS42 INS43 INS42 INS60 INS41 INS42 INS34 INS43 INS22 INS42 INS21 INS42 INS43 INS43 INS42 INS14 INS42 INS38 INS32 INS34 INS21 INS42 INS42 INS42 INS42 INS32 INS41 INS42 INS42 INS41 INS43 INS42 INS60 INS60 INS60 INS61 INS25 INS42 INS42 INS27 INS42 INS42 INS42 INS42 INS38 INS42 INS42 INS38 INS21 INS42 INS7 INS7 INS25 INS21 INS41 INS43 INS43 INS42 INS86 INS43 INS43 UPD42 INS86 INS42 INS42 INS42 INS42 INS42 INS42 INS43 INS43 INS7 INS7 INS42 INS42 INS42 INS42 INS14 INS42 INS42 INS36 INS32 INS25 INS21 MOV25 INS25 INS43 INS42 INS42 INS42 INS42 INS42 INS42 INS43 INS59 INS42 INS42 INS52 INS42 INS32 INS42 INS42 INS74 INS34 INS43 INS27 INS8 INS42 INS42 INS32 INS42 INS42 INS39 INS59 INS39 INS59 INS39 INS59 INS27 INS8 INS38 INS8 INS32 INS34 INS34 INS34 INS7 INS22 INS42 INS22 INS42 INS38 INS8 INS32 INS14 INS42 INS42 INS59 INS32 INS42 INS42 INS59 INS32 INS42 INS42 INS22 INS42 INS22 INS42 INS74 INS7 INS42 INS32 INS8 INS7 INS32 INS8 INS42 INS42 INS42 INS14 INS42 INS42 INS42 INS42 INS43 INS42 UPD42 INS42 INS33 INS60 INS21 MOV21 INS25 INS42 INS42 INS42 INS42 INS42 INS9 INS42 INS34 INS42 INS42 INS38 INS27 INS60 INS70 INS21 INS42 INS21 INS42 INS42 INS42 INS32 MOV52 UPD42 MOV42 INS52 INS42 INS32 INS21 INS25 INS42 INS42 INS42 INS43 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS42 UPD42 MOV42 INS52 INS42 INS52 INS42 INS43 INS42 INS32 INS42 INS42 INS42 INS18 INS42 INS32 UPD42 INS18 INS42 INS42 INS42 INS21 INS21 INS21 MOV21 INS25 MOV43 INS42 INS42 INS33 INS42 INS42 MOV32 INS42 INS42 MOV43 INS59 INS7 INS62 INS8 INS42 INS37 INS42 INS43 INS59 INS44 INS40 INS8 INS7 INS32 INS42 INS32 INS42 INS42 INS42 MOV7 MOV27 INS8 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS32 INS32 INS32 INS8 INS42 INS40 INS42 INS40 INS42 INS43 INS60 INS25 INS42 INS42 INS42 INS32 MOV43 INS42 INS60 INS21 INS21 INS25 INS42 INS40 INS42 INS42 INS45 INS42 INS42 INS42 INS42 INS10 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS10 INS32 INS42 INS43 INS59 INS27 INS8 INS42 INS42 INS42 INS43 INS59 INS32 INS7 INS32 INS8 INS42 INS42 INS42 MOV22 INS42 INS42 INS42 INS42 INS11 INS32 INS33 INS25 INS42 INS42 INS11 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS21 INS43 INS42 INS42 INS42 INS32 MOV8 INS8 INS43 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS21 INS21 INS42 INS42 INS42 INS45 INS32 INS32 INS32 INS32 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS42 INS42 DEL52 DEL42 DEL22 DEL52 DEL42 DEL22 DEL42 DEL83 DEL22 DEL42 DEL32 DEL8 DEL25 DEL8 DEL31 DEL33 DEL36 DEL27 DEL36 DEL27 DEL42 DEL41 DEL52 DEL42 DEL22 DEL32 DEL42 DEL42 DEL42 DEL32 DEL34 DEL27 DEL42 DEL33 DEL42 DEL42 DEL14

@@ -1,0 +1,213 @@
+Merge branch 'release/1.0.0-incubating.M1'
+
+-/*=========================================================================
+- * Copyright (c) 2002-2014 Pivotal Software, Inc. All Rights Reserved.
+- * This product is protected by U.S. and international copyright
+- * and intellectual property laws. Pivotal products are covered by
+- * more patents listed at http://www.pivotal.io/patents.
+- *========================================================================
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++import com.gemstone.gemfire.internal.cache.TXEntryState.DistTxThinEntryState;
+-import com.gemstone.gemfire.internal.util.concurrent.StoppableReentrantReadWriteLock;
++import com.gemstone.gemfire.internal.logging.LogService;
++import org.apache.logging.log4j.Logger;
++
++  private static final Logger logger = LogService.getLogger();
++  
+-  private LocalRegion region;
++  private LocalRegion region;
+-  
++  /*
++   * For Distributed Tx
++   * Created during precommit, to apply changes on secondaries/replicates from coordinator.
++   */
++  private boolean createdDuringCommit;
+-    TXEntryState result = cache.getTXEntryStateFactory().createEntry(re, vId, pendingValue, entryKey, this);
++    boolean isDistributed = false;
++    if (cache.getTxManager().getTXState() != null) {
++      isDistributed = cache.getTxManager().getTXState().isDistTx(); 
++    }
++    else {
++      // TXCoordinator and datanode are same
++      isDistributed = cache.getTxManager().isDistributed();
++    }
++    TXEntryState result = cache.getTXEntryStateFactory().createEntry(re, vId, pendingValue, entryKey, this, isDistributed);
++  
++  TXEntryState getTXEntryState(Object key) {
++    return this.entryMods.get(key);
++  }
++    if (this.txState.logger.isDebugEnabled()) {
++      this.txState.logger.debug("TXRegionState.createLockRequest 1 "
++          + r.getClass().getSimpleName() + " region-state=" + this);
++    }
++      // [DISTTX] Do not take lock for RR on replicates
++      if (this.isCreatedDuringCommit()) {
++        return;
++      }
++    if (this.txState.logger.isDebugEnabled()) {
++      this.txState.logger.debug("TXRegionState.createLockRequest 2");
++    }
++    if (this.isCreatedDuringCommit()) {
++      return;
++    }
+-  
++
++  void buildMessageForAdjunctReceivers(LocalRegion r, TXCommitMessage msg) {
++    try {
++      if (!r.getScope().isLocal() && !this.entryMods.isEmpty()) {
++        
++        msg.startRegion(r, entryMods.size());
++        Iterator it = this.entryMods.entrySet().iterator();
++        Set<InternalDistributedMember> newMemberSet = new HashSet<InternalDistributedMember>();
++        
++        while (it.hasNext()) {
++          Map.Entry me = (Map.Entry)it.next();
++          Object eKey = me.getKey();
++          TXEntryState txes = (TXEntryState)me.getValue();
++          txes.buildMessage(r, eKey, msg,this.otherMembers);
++          if(txes.getFilterRoutingInfo()!=null) {
++            newMemberSet.addAll(txes.getFilterRoutingInfo().getMembers());
++          }
++          if(txes.getAdjunctRecipients()!=null) {
++            
++            Set adjunctRecipients = txes.getAdjunctRecipients();
++            newMemberSet.addAll(adjunctRecipients);  
++          }
++        }
++        
++        
++        if (!newMemberSet.equals(this.otherMembers)) 
++        { 
++          // r.getCache().getLogger().info("DEBUG: participants list has changed! bug 32999."); 
++          // Flag the message that the lock manager needs to be updated with the new member set
++          msg.setUpdateLockMembers();
++          this.otherMembers = newMemberSet;
++        }
++        
++        msg.finishRegion(this.otherMembers);
++      }
++    }
++    catch (RegionDestroyedException ex) {
++      // region was destroyed out from under us; after conflict checking
++      // passed. So act as if the region destroy happened right after the
++      // commit. We act this way by doing nothing; including distribution
++      // of this region's commit data.
++    }
++    catch (CancelException ex) {
++      // cache was closed out from under us; after conflict checking
++      // passed. So do nothing.
++    }
++  }
++
+-}
++
++  public void close() {
++    for (TXEntryState e: this.entryMods.values()) {
++      e.close();
++    }
++  }
++  
++  @Override
++  public String toString() {
++    StringBuilder str = new StringBuilder();
++    str.append("{").append(super.toString()).append(" ");
++    str.append(" ,entryMods=").append(this.entryMods);
++    str.append(" ,isCreatedDuringCommit=").append(this.isCreatedDuringCommit());
++    str.append("}");
++    return str.toString();
++  }
++
++  /**
++   * @return the createdDuringCommit
++   */
++  public boolean isCreatedDuringCommit() {
++    return createdDuringCommit;
++  }
++
++  /**
++   * @param createdDuringCommit
++   *          the createdDuringCommit to set
++   */
++  public void setCreatedDuringCommit(boolean createdDuringCommit) {
++    this.createdDuringCommit = createdDuringCommit;
++  }
++  
++  public boolean populateDistTxEntryStateList(
++      ArrayList<DistTxThinEntryState> entryStateList) {
++    String regionFullPath = this.getRegion().getFullPath();
++    try {
++      if (!this.entryMods.isEmpty()) {
++        // [DISTTX] TODO Sort this first
++        for (Entry<Object, TXEntryState> em : this.entryMods.entrySet()) {
++          Object mKey = em.getKey();
++          TXEntryState txes = em.getValue();
++          DistTxThinEntryState thinEntryState = txes.getDistTxEntryStates();
++          entryStateList.add(thinEntryState);
++          if (logger.isDebugEnabled()) {
++            logger.debug("TXRegionState.populateDistTxEntryStateList Added "
++                + thinEntryState + " for key=" + mKey + " ,op="
++                + txes.opToString() + " ,region=" + regionFullPath);
++          }
++        }
++      }
++      return true;
++    } catch (RegionDestroyedException ex) {
++      // region was destroyed out from under us; after conflict checking
++      // passed. So act as if the region destroy happened right after the
++      // commit. We act this way by doing nothing; including distribution
++      // of this region's commit data.
++    } catch (CancelException ex) {
++      // cache was closed out from under us; after conflict checking
++      // passed. So do nothing.
++    }
++    if (logger.isDebugEnabled()) {
++      logger
++          .debug("TXRegionState.populateDistTxEntryStateList Got exception for region "
++              + regionFullPath);
++    }
++    return false;
++  }
++  
++  public void setDistTxEntryStates(
++      ArrayList<DistTxThinEntryState> entryEventList) {
++    String regionFullPath = this.getRegion().getFullPath();
++    int entryModsSize = this.entryMods.size();
++    int entryEventListSize = entryEventList.size();
++    if (entryModsSize != entryEventListSize) {
++      throw new UnsupportedOperationInTransactionException(
++          LocalizedStrings.DISTTX_TX_EXPECTED.toLocalizedString(
++              "entry size of " + entryModsSize + " for region "
++                  + regionFullPath, entryEventListSize));
++    }
++
++    int index = 0;
++    // [DISTTX] TODO Sort this first
++    for (Entry<Object, TXEntryState> em : this.entryMods.entrySet()) {
++      Object mKey = em.getKey();
++      TXEntryState txes = em.getValue();
++      DistTxThinEntryState thinEntryState = entryEventList.get(index++);
++      txes.setDistTxEntryStates(thinEntryState);
++      if (logger.isDebugEnabled()) {
++        logger.debug("TxRegionState.setDistTxEntryStates Added "
++            + thinEntryState + " for key=" + mKey + " ,op=" + txes.opToString()
++            + " ,region=" + regionFullPath);
++      }
++    }
++  }
++}
+
+INS26 INS26 MOV23 INS40 UPD40 INS40 INS23 INS23 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS31 INS83 INS83 INS83 INS43 INS59 INS83 INS39 INS59 INS43 INS42 INS44 INS8 INS39 INS42 INS44 INS44 INS8 INS83 INS39 INS42 INS8 INS78 INS83 INS43 INS42 INS8 INS29 INS83 INS39 INS42 INS8 INS29 INS83 INS39 INS42 INS44 INS8 INS83 INS39 INS42 INS44 INS8 INS83 INS39 INS42 INS44 INS8 INS42 INS42 INS32 INS42 INS60 INS25 INS42 INS43 INS42 INS41 INS25 INS25 INS25 INS43 INS42 INS43 INS42 INS54 INS70 INS42 INS42 INS60 INS21 INS21 INS21 INS21 INS41 INS65 INS41 INS65 INS39 INS42 INS21 INS74 INS42 INS60 INS54 INS25 INS41 INS74 INS42 INS60 INS60 INS60 INS25 INS60 INS70 INS42 INS42 INS39 INS59 INS27 INS8 INS8 INS42 INS32 INS32 INS8 INS32 INS8 INS32 INS8 INS42 INS42 INS8 INS12 INS12 INS44 INS32 INS8 INS43 INS59 INS32 INS32 INS32 INS32 INS32 INS66 INS42 INS42 INS66 INS7 INS43 INS43 INS43 INS59 INS8 INS12 INS12 INS32 INS8 INS9 INS43 INS43 INS43 INS59 INS39 INS59 INS39 INS59 INS27 INS8 INS39 INS59 INS44 INS32 INS8 INS42 INS9 INS32 INS33 INS21 INS21 INS22 INS42 INS42 INS22 INS42 INS21 INS25 INS22 INS42 INS21 INS52 INS42 INS41 INS25 INS44 INS8 INS44 INS8 INS43 INS42 INS22 INS42 INS21 INS42 INS42 INS14 INS32 INS42 INS45 INS32 INS42 INS22 INS32 INS42 INS32 INS42 INS42 INS45 INS42 INS42 INS22 INS42 INS42 INS42 INS42 INS42 INS32 INS25 INS41 INS44 INS8 INS44 INS8 INS42 INS42 INS21 INS42 INS42 INS42 INS42 INS32 INS42 INS32 INS42 INS32 INS42 INS42 INS53 INS42 INS34 INS74 INS42 INS22 INS42 INS60 INS60 INS60 INS21 INS25 INS32 INS42 INS7 INS7 INS42 INS52 INS42 INS22 INS42 INS32 INS32 INS8 INS22 INS42 INS32 INS27 INS8 INS43 INS42 INS43 INS42 INS42 INS52 INS42 INS32 INS43 INS32 INS42 INS48 INS42 INS42 INS45 INS52 INS42 INS42 INS42 INS45 INS52 INS42 INS52 INS42 INS32 INS42 INS38 INS8 INS9 INS43 INS42 INS43 INS42 INS32 INS32 INS42 INS22 INS42 INS42 INS42 INS14 INS43 INS43 INS43 INS52 INS42 INS43 INS59 INS43 INS59 INS43 INS59 INS32 INS32 INS8 INS42 INS42 INS42 INS32 INS42 INS32 INS52 INS42 INS22 INS42 INS27 INS52 INS42 INS41 INS52 INS42 INS22 INS42 INS45 INS38 INS38 INS21 INS60 INS60 INS61 INS25 INS21 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS45 INS42 INS52 INS42 INS32 INS70 INS42 INS42 INS42 INS42 INS27 INS52 INS42 INS52 INS42 INS43 INS32 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS21 INS32 INS42 INS32 INS42 INS22 INS42 INS45 INS32 INS45 INS52 INS22 INS42 INS32 INS32 INS32 INS43 INS59 INS74 INS59 INS32 INS8 INS38 INS8 INS32 INS22 INS42 INS44 INS32 INS8 INS45 INS42 INS42 INS40 INS42 INS27 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS37 INS32 INS32 INS42 INS42 INS42 INS52 INS42 INS32 INS42 INS52 INS42 INS32 INS42 INS22 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS32 INS43 INS43 INS42 INS14 INS42 INS42 INS60 INS60 INS60 INS21 INS25 INS25 INS32 INS21 INS21 INS42 INS42 INS22 INS52 INS42 INS74 INS42 INS22 INS42 INS60 INS60 INS60 INS21 INS25 INS45 INS42 INS45 INS42 INS42 INS42 INS42 INS27 INS42 INS42 INS42 INS42 INS42 INS42 INS52 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS74 INS43 INS59 INS43 INS59 INS43 INS59 INS32 INS27 INS8 INS27 INS8 INS42 INS42 INS22 INS32 INS7 INS52 INS42 INS43 INS43 INS43 INS52 INS42 INS43 INS59 INS43 INS59 INS43 INS59 INS32 INS32 INS8 INS45 INS42 INS45 INS42 INS45 INS32 INS45 INS42 INS22 INS42 INS43 INS43 INS40 INS42 INS11 INS42 INS42 INS32 INS42 INS42 INS11 INS42 INS42 INS42 INS42 INS42 INS22 INS32 INS33 INS21 INS32 INS33 INS60 INS21 INS52 INS42 INS42 INS42 INS22 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS21 INS42 INS42 INS52 INS42 INS42 INS42 INS43 INS32 INS42 INS42 INS43 INS32 INS52 INS42 INS42 INS42 INS32 INS42 INS42 INS43 INS59 INS32 INS52 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS40 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS27 INS32 INS42 INS42 INS42 INS45 INS42 INS45 INS42 INS45 INS32 INS45 INS42 INS42 INS42 INS42 INS42

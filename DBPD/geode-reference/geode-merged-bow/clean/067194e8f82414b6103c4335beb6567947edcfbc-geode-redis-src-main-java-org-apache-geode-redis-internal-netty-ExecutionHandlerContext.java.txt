@@ -1,0 +1,209 @@
+GEODE-8333: Fix PUBSUB hang (#5349)
+
+PUBSUB hangs with concurrent publishers and subscribers on multiple
+servers. Changed Publish executor to execute publish on background
+thread. Removed separate separate subscriber group.  Added DUnit test to
+recreate failure.
+A commandQueue is now used to preserve the order
+in which commands are executed even if a command
+if executed async. Currently the only async command
+is PUBLISH.
+
+Co-authored-by: Murtuza Boxwala <mboxwala@pivotal.io>
+Co-authored-by: Sarah Abbey <sabbey@vmware.com>
++import java.util.concurrent.ExecutorService;
++import java.util.concurrent.LinkedBlockingQueue;
+-import io.netty.channel.ChannelFutureListener;
+-import io.netty.channel.EventLoopGroup;
+-  private final EventLoopGroup subscriberGroup;
++  private final ExecutorService backgroundExecutor;
++  private final LinkedBlockingQueue<Command> commandQueue = new LinkedBlockingQueue<>();
+-      EventLoopGroup subscriberGroup,
++      ExecutorService backgroundExecutor,
+-    this.subscriberGroup = subscriberGroup;
++    this.backgroundExecutor = backgroundExecutor;
+-  public ChannelFuture writeToChannel(ByteBuf message) {
+-    return channel.writeAndFlush(message, channel.newPromise());
+-  }
+-
+-    try {
+-      if (logger.isDebugEnabled()) {
+-        logger.debug("Executing Redis command: {}", command);
++    command.setChannelHandlerContext(ctx);
++    synchronized (commandQueue) {
++      if (!commandQueue.isEmpty()) {
++        commandQueue.offer(command);
++        return;
+-
+-      executeCommand(ctx, command);
+-    } catch (Exception e) {
+-      logger.warn("Execution of Redis command {} failed: {}", command, e);
+-      throw e;
++      if (command.getCommandType().isAsync()) {
++        commandQueue.offer(command);
++        startAsyncCommandExecution(command);
++        return;
++      }
++      executeCommand(command);
+-
+-  private void executeCommand(ChannelHandlerContext ctx, Command command) {
+-    RedisResponse response;
+-
+-    if (!isAuthenticated()) {
+-      response = handleUnAuthenticatedCommand(command);
+-      writeToChannel(response);
+-      return;
++  private void startAsyncCommandExecution(Command command) {
++    if (logger.isDebugEnabled()) {
++      logger.debug("Starting execution of async Redis command: {}", command);
+-
+-    if (command.isUnsupported() && !allowUnsupportedCommands()) {
+-      writeToChannel(
+-          RedisResponse.error(command.getCommandType() + RedisConstants.ERROR_UNSUPPORTED_COMMAND));
+-      return;
+-    }
+-
+-    if (command.isUnimplemented()) {
+-      logger.info("Failed " + command.getCommandType() + " because it is not implemented.");
+-      writeToChannel(RedisResponse.error(command.getCommandType() + " is not implemented."));
+-      return;
+-    }
+-
+-    try {
+-      response = command.execute(this);
+-      logResponse(response);
+-      writeToChannel(response);
+-    } finally {
+-      redisStats.endCommand(command.getCommandType(), start);
+-    }
++    command.setAsyncStartTime(start);
++    command.execute(this);
++  }
+-    if (command.isOfType(RedisCommandType.QUIT)) {
+-      channelInactive(ctx);
++  public void endAsyncCommandExecution(Command command, RedisResponse response) {
++    synchronized (commandQueue) {
++      Command head = takeFromCommandQueue();
++      if (head != command) {
++        throw new IllegalStateException(
++            "expected " + command + " but found " + head + " in the queue");
++      }
++      try {
++        writeToChannel(response);
++      } finally {
++        redisStats.endCommand(command.getCommandType(), command.getAsyncStartTime());
++      }
++      drainCommandQueue();
++    }
++  }
++
++  public void endAsyncCommandExecution(Command command, Throwable exception) {
++    synchronized (commandQueue) {
++      Command head = takeFromCommandQueue();
++      if (head != command) {
++        throw new IllegalStateException(
++            "expected " + command + " but found " + head + " in the queue");
++      }
++      try {
++        exceptionCaught(command.getChannelHandlerContext(), exception);
++      } finally {
++        redisStats.endCommand(command.getCommandType(), command.getAsyncStartTime());
++      }
++      drainCommandQueue();
++    }
++  }
++
++  private Command takeFromCommandQueue() {
++    try {
++      return commandQueue.take();
++    } catch (InterruptedException e) {
++      Thread.interrupted();
++      throw new IllegalStateException("unexpected interrupt");
++    }
++  }
++
++  /**
++   * execute all commands in the queue until an async one is found.
++   * If an async one is found start it.
++   */
++  private void drainCommandQueue() {
++    Command command;
++    while ((command = commandQueue.peek()) != null) {
++      if (command.getCommandType().isAsync()) {
++        startAsyncCommandExecution(command);
++        return;
++      } else {
++        takeFromCommandQueue();
++        try {
++          executeCommand(command);
++        } catch (Throwable ex) {
++          exceptionCaught(command.getChannelHandlerContext(), ex);
++        }
++      }
++    }
++  }
++
++  private void executeCommand(Command command) {
++    RedisResponse response;
++    try {
++      if (logger.isDebugEnabled()) {
++        logger.debug("Executing Redis command: {}", command);
++      }
++
++      if (!isAuthenticated()) {
++        response = handleUnAuthenticatedCommand(command);
++        writeToChannel(response);
++        return;
++      }
++
++      if (command.isUnsupported() && !allowUnsupportedCommands()) {
++        writeToChannel(
++            RedisResponse
++                .error(command.getCommandType() + RedisConstants.ERROR_UNSUPPORTED_COMMAND));
++        return;
++      }
++
++      if (command.isUnimplemented()) {
++        logger.info("Failed " + command.getCommandType() + " because it is not implemented.");
++        writeToChannel(RedisResponse.error(command.getCommandType() + " is not implemented."));
++        return;
++      }
++
++      final long start = redisStats.startCommand(command.getCommandType());
++      try {
++        response = command.execute(this);
++        if (response == null) {
++          return;
++        }
++        logResponse(response);
++        writeToChannel(response);
++      } finally {
++        redisStats.endCommand(command.getCommandType(), start);
++      }
++
++      if (command.isOfType(RedisCommandType.QUIT)) {
++        channelInactive(command.getChannelHandlerContext());
++      }
++    } catch (Exception e) {
++      logger.warn("Execution of Redis command {} failed: {}", command, e);
++      throw e;
+-  public EventLoopGroup getSubscriberGroup() {
+-    return subscriberGroup;
+-  }
+-
+-  public void changeChannelEventLoopGroup(EventLoopGroup newGroup) {
+-    if (newGroup.equals(channel.eventLoop())) {
+-      // already registered with newGroup
+-      return;
+-    }
+-    channel.deregister().addListener((ChannelFutureListener) future -> {
+-      newGroup.register(channel).sync();
+-    });
+-  }
+-
+-
++  public ExecutorService getBackgroundExecutor() {
++    return backgroundExecutor;
++  }
+
+MOV26 MOV26 MOV23 MOV31 MOV31 MOV31 MOV31 UPD40 UPD40 INS23 MOV44 INS31 INS31 INS31 UPD43 INS83 INS83 INS74 INS59 MOV21 MOV29 MOV78 INS83 INS39 INS42 MOV44 MOV44 MOV43 INS8 INS83 INS39 INS42 INS44 INS8 INS39 INS42 INS44 INS8 INS42 INS44 INS44 INS8 UPD83 UPD43 UPD42 INS8 INS29 UPD83 UPD42 INS8 INS8 INS83 INS43 INS42 INS8 UPD42 UPD42 INS43 INS43 INS42 INS14 UPD43 UPD42 MOV60 INS21 INS51 INS43 INS42 INS25 INS60 INS21 INS21 INS43 INS42 UPD43 UPD42 INS51 INS43 INS42 INS43 INS42 INS51 UPD42 INS54 INS65 INS60 INS61 MOV60 INS54 INS42 INS41 INS42 INS42 INS74 UPD42 INS32 INS42 INS8 INS42 INS32 INS8 INS83 INS39 INS59 INS32 INS32 UPD42 MOV42 UPD42 INS42 INS8 INS42 INS42 INS42 INS8 INS8 INS12 INS66 INS66 INS43 INS59 INS27 INS8 MOV8 MOV12 INS42 INS43 UPD42 INS42 INS42 INS42 INS25 INS25 INS21 INS42 INS42 INS21 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS52 INS60 INS25 INS54 INS21 INS60 INS25 MOV54 INS21 MOV41 INS44 INS8 UPD42 MOV42 INS42 INS36 INS33 INS25 MOV25 INS42 UPD42 INS38 INS8 INS32 INS8 INS32 INS32 INS42 INS42 INS32 INS43 INS59 INS27 INS8 INS8 INS8 INS32 INS43 INS59 INS27 INS8 INS8 INS32 INS32 INS43 INS42 INS21 INS53 INS7 INS32 MOV8 INS8 INS32 INS21 INS41 INS32 INS42 INS21 INS21 INS41 INS42 INS42 INS42 INS42 INS45 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS42 INS53 INS21 INS21 INS42 INS42 INS42 INS32 INS42 INS42 INS53 INS21 INS42 INS42 INS42 INS42 INS32 INS14 INS42 INS32 MOV32 INS42 INS21 INS21 INS54 INS25 INS42 INS42 INS32 INS42 INS42 INS32 INS32 INS42 INS14 INS32 INS32 INS42 INS14 INS32 INS42 INS42 INS43 INS45 UPD42 MOV42 INS42 UPD42 UPD42 INS32 INS32 INS8 INS12 INS27 INS8 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS43 INS27 INS42 INS42 UPD42 MOV42 UPD42 MOV42 INS32 MOV32 INS43 INS27 INS42 INS32 INS42 INS42 UPD42 INS32 INS32 INS42 INS42 INS42 INS42 INS21 INS44 INS8 INS42 INS33 INS41 INS32 INS42 INS45 INS42 INS45 INS42 INS45 INS42 UPD42 MOV42 UPD42 UPD42 INS42 INS45 INS42 INS45 INS42 INS45 INS42 INS42 UPD42 MOV42 INS42 MOV42 INS42 INS32 INS43 INS42 MOV21 UPD42 MOV42 INS42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 INS32 UPD42 UPD42 MOV42 UPD42 MOV42 DEL43 DEL42 DEL32 DEL41 DEL8 DEL42 DEL8 DEL42 DEL8 DEL32 DEL43 DEL42 DEL44 DEL42 DEL32 DEL25 DEL32 DEL42 DEL43 DEL42 DEL59 DEL8 DEL86 DEL11 DEL32 DEL21 DEL8 DEL42 DEL43 DEL42 DEL44

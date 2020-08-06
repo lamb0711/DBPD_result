@@ -1,0 +1,255 @@
+GEODE-1329 auto-reconnect attempts cease if kicked out during boot-up of the cache
+
+InternalDistributedSystem.reconnect() now includes cache-creation in its retry
+loop and, should the cache fail to start due to a CancelException it will shut
+down and try again.
+
+While creating a new test in ReconnectDUnitTest I found problems with the
+other tests in that class that I fixed.  Notably the method
+getDistributedSystemProperties() wasn't returning the correct properties
+for a lot of test cases because the dsProperties variable wasn't being set
+by them and they were using the getCache() method.  This was causing the
+current distributed system to be destroyed and a new one created with
+different properties than the test wanted.  That was causing periodic
+test failures.
+
+-    return this.reconnectCancelled;
++    synchronized(reconnectCancelledLock) {
++      return reconnectCancelled;
++    }
+-  public static int getReconnectAttemptCounter() {
+-    return reconnectAttemptCounter;
+-  }
+-  
++
+-    return attemptingToReconnect || (reconnectDS != null);
++    InternalDistributedSystem rds = this.reconnectDS;
++    if (!attemptingToReconnect) {
++      return false;
++    }
++    if (reconnectCancelled) {
++      return false;
++    }
++    boolean newDsConnected = (rds == null || !rds.isConnected());
++    if (!newDsConnected) {
++      return false;
++    }
++    return true;
+-  
++
++
++    if (this.isReconnectingDS && forcedDisconnect) {
++      return false;
++    }
+-  public static int getReconnectCount(){
++  public static int getReconnectAttemptCounter() {
+-    
+-//    logger.info("reconnecting IDS@"+System.identityHashCode(this));
+-        synchronized(this.reconnectCancelledLock) {
+-          if (this.reconnectCancelled) {
+-            break;
+-          }
++        if (isReconnectCancelled()) {
++          break;
++
+-              logger.debug("Stopping the checkrequiredrole thread becuase reconnect : {} reached the max number of reconnect tries : {}", reconnectAttemptCounter, maxTries);
++              logger.debug("Stopping the checkrequiredrole thread because reconnect : {} reached the max number of reconnect tries : {}", reconnectAttemptCounter, maxTries);
+-        synchronized(this.reconnectCancelledLock) { 
+-          if (this.reconnectCancelled) {
+-            if (isDebugEnabled) {
+-              logger.debug("reconnect can no longer be done because of an explicit disconnect");
+-            }
+-            return;
+-          }
++        if (isReconnectCancelled()) {
++          return;
+-//        logger.info("IDS@"+System.identityHashCode(this));
+-        
++
+-  //        log.fine("waiting " + timeOut + " before reconnecting to the distributed system");
+-        synchronized(this.reconnectCancelledLock) { 
+-          if (this.reconnectCancelled) {
+-            if (isDebugEnabled) {
+-              logger.debug("reconnect can no longer be done because of an explicit disconnect");
+-            }
+-            return;
+-          }
++
++        if (isReconnectCancelled()) {
++          return;
++
+-  //        log.fine("DistributedSystem@"+System.identityHashCode(this)+" reconnecting distributed system.  attempt #"+reconnectAttemptCounter);
++
++
+-          synchronized(this.reconnectCancelledLock) { 
+-            if (this.reconnectCancelled) {
+-              if (isDebugEnabled) {
+-                logger.debug("reconnect can no longer be done because of an explicit disconnect");
+-              }
+-              return;
+-            }
++          if (isReconnectCancelled()) {
++            return;
++
++
+-          } catch (DistributedSystemDisconnectedException e) {
+-            synchronized(this.reconnectCancelledLock) {
+-          	  if (this.reconnectCancelled) {
+-          	    return;
+-          	  } else {
+-          	    throw e;
+-          	  }
++
++          } catch (CancelException e) {
++            if (isReconnectCancelled()) {
++              return;
++            } else {
++              throw e;
+-          if (newDS != null) { // newDS will not be null here but findbugs requires this check
+-            boolean cancelled;
+-            synchronized(this.reconnectCancelledLock) { 
+-              cancelled = this.reconnectCancelled;
+-            }
+-            if (cancelled) {
+-              newDS.disconnect();
+-            } else {
+-              this.reconnectDS = newDS;
+-              newDS.isReconnectingDS = false;
+-              notifyReconnectListeners(this, this.reconnectDS, false);
+-            }
++
++          if (this.reconnectCancelled) {
++            newDS.disconnect();
++            continue;
++
++          this.reconnectDS = newDS;
+-          // retry;
+-          if (isDebugEnabled) {
+-            logger.debug("Attempt to reconnect failed with SystemConnectException");
+-          }
+-          if (e.getMessage().contains("Rejecting the attempt of a member using an older version")
+-              || e.getMessage().contains("15806")) { // 15806 is in the message if it's been localized to another language
++          logger.debug("Attempt to reconnect failed with SystemConnectException");
++
++          if (e.getMessage().contains("Rejecting the attempt of a member using an older version")) {
++          continue;
++          continue;
++
++
++        DM newDM = this.reconnectDS.getDistributionManager();
++        if ( !inhibitCacheForSQLFire && (newDM instanceof DistributionManager) ) {
++          // sqlfire will have already replayed DDL and recovered.
++          // Admin systems don't carry a cache, but for others we can now create
++          // a cache
++          if (((DistributionManager)newDM).getDMType() != DistributionManager.ADMIN_ONLY_DM_TYPE) {
++            try {
++              CacheConfig config = new CacheConfig();
++              if (cacheXML != null) {
++                config.setCacheXMLDescription(cacheXML);
++              }
++              cache = GemFireCacheImpl.create(this.reconnectDS, config);
++
++              createAndStartCacheServers(cacheServerCreation, cache);
++
++              if (cache.getCachePerfStats().getReliableRegionsMissing() == 0){
++                reconnectAttemptCounter = 0;
++              }
++              else {
++                // this try failed. The new cache will call reconnect again
++              }
++            }
++            catch (CancelException ignor) {
++              logger.warn("Exception occured while trying to create the cache during reconnect",ignor);
++              reconnectDS.disconnect();
++              reconnectDS = null;
++            }
++            catch (Exception e) {
++              logger.warn(LocalizedMessage.create(LocalizedStrings.InternalDistributedSystem_EXCEPTION_OCCURED_WHILE_TRYING_TO_CREATE_THE_CACHE_DURING_RECONNECT), e);
++            }
++          }
++        }
++
++        if (reconnectDS != null && reconnectDS.isConnected()) {
++          // make sure the new DS and cache are stable before exiting this loop
++          try {
++            Thread.sleep(config.getMemberTimeout() * 3);
++          } catch (InterruptedException e) {
++            logger.info("Reconnect thread has been interrupted - exiting");
++            Thread.currentThread().interrupt();
++            return;
++          }
++        }
++
++
++      if (isReconnectCancelled()) {
++        reconnectDS.disconnect();
++      } else {
++        reconnectDS.isReconnectingDS = false;
++        notifyReconnectListeners(this, this.reconnectDS, false);
++      }
++
++      attemptingToReconnect = false;
+-    
+-    boolean cancelled;
+-    synchronized(this.reconnectCancelledLock) { 
+-      cancelled = this.reconnectCancelled;
+-    }
+-    if (cancelled) {
+-      if (isDebugEnabled) {
+-        logger.debug("reconnect can no longer be done because of an explicit disconnect");
+-      }
++
++    if (isReconnectCancelled()) {
++      logger.debug("reconnect can no longer be done because of an explicit disconnect");
++    } else {
++      logger.info("Reconnect completed.\nNew DistributedSystem is {}\nNew Cache is {}", reconnectDS, cache);
+-    try {
+-      DM newDM = this.reconnectDS.getDistributionManager();
+-      if ( !inhibitCacheForSQLFire && (newDM instanceof DistributionManager) ) {
+-        // sqlfire will have already replayed DDL and recovered.
+-        // Admin systems don't carry a cache, but for others we can now create
+-        // a cache
+-        if (((DistributionManager)newDM).getDMType() != DistributionManager.ADMIN_ONLY_DM_TYPE) {
+-          try {
+-            CacheConfig config = new CacheConfig();
+-            if (cacheXML != null) {
+-              config.setCacheXMLDescription(cacheXML);
+-            }
+-            cache = GemFireCacheImpl.create(this.reconnectDS, config);
+-            
+-            createAndStartCacheServers(cacheServerCreation, cache);
+-
+-            if (cache.getCachePerfStats().getReliableRegionsMissing() == 0){
+-              reconnectAttemptCounter = 0;
+-              logger.info("Reconnected properly");
+-            }
+-            else {
+-              // this try failed. The new cache will call reconnect again
+-            }
+-          }
+-          catch (CancelException ignor) {
+-              //getLogWriter().warning("Exception occured while trying to create the cache during reconnect : "+ignor.toString());
+-              throw ignor;
+-              // this.reconnectDS.reconnect();
+-          }
+-          catch (Exception e) {
+-            logger.warn(LocalizedMessage.create(LocalizedStrings.InternalDistributedSystem_EXCEPTION_OCCURED_WHILE_TRYING_TO_CREATE_THE_CACHE_DURING_RECONNECT), e);
+-          }
+-        }
+-      }
+-    } finally {
+-      attemptingToReconnect = false;
+-    }
+-//      (new ManagerLogWriter(LogWriterImpl.FINE_LEVEL, System.out)).fine("IDS.waitUntilReconnected: reconnectCancelled = "+reconnectCancelled
+-//          +"; reconnectDS="+reconnectDS);
+-          
+-      while (attemptingToReconnect && (recon == null || !recon.isConnected())) {
++      while (isReconnecting()) {
+-        if (recon == null) {
+-          recon = this.reconnectDS;
+-        }
+-//          (new ManagerLogWriter(LogWriterImpl.FINE_LEVEL, System.out)).fine("IDS.waitUntilReconnected timed out");
+-//      (new ManagerLogWriter(LogWriterImpl.FINE_LEVEL, System.out)).fine("IDS.waitUntilReconnected finished & returning: attemptingToReconnect="
+-//                +attemptingToReconnect+"; reconnectDS=" + recon);
++
++      recon = this.reconnectDS;

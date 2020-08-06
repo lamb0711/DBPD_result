@@ -1,0 +1,122 @@
+GEODE-3024 race condition between server locator preparing membership views
+
+If a locator is preparing a conflicting membership view we now abandon
+preparation of a view in a cache server and pause before retrying.
+This gives the locator time to gather information from the cache server's
+view (which it receives in acks while preparing its own view),
+incorporate them into a new view and send it out.  When the cache
+server installs the new view from the locator it will shut down its
+ViewCreator thread.
+
+(cherry picked from commit 31b72ba48b2dda95954b30c14ae62a8730065b3f)
+
+-  private ViewReplyProcessor viewProcessor = new ViewReplyProcessor(false);
++  ViewReplyProcessor viewProcessor = new ViewReplyProcessor(false);
+-  private ViewReplyProcessor prepareProcessor = new ViewReplyProcessor(true);
++  ViewReplyProcessor prepareProcessor = new ViewReplyProcessor(true);
+-        services.getMessenger().send(new ViewAckMessage(m.getSender(), this.preparedView));
++        services.getMessenger()
++            .send(new ViewAckMessage(view.getViewId(), m.getSender(), this.preparedView));
++    // count of number of views abandoned due to conflicts
++    volatile int abandonedViews = 0;
++    int getAbandonedViewCount() {
++      return abandonedViews;
++    }
++
+-      try {
+-        if (initialView == null) {
+-          return;
+-        }
+-        NetView v = preparedView;
+-        if (v != null) {
+-          processPreparedView(v);
+-        }
++      boolean retry;
++      do {
++        retry = false;
+-          NetView iView;
+-          List<InternalDistributedMember> iJoins;
+-          Set<InternalDistributedMember> iLeaves;
+-          Set<InternalDistributedMember> iRemoves;
+-          synchronized (this) {
+-            iView = initialView;
+-            iJoins = initialJoins;
+-            iLeaves = initialLeaving;
+-            iRemoves = initialRemovals;
++          if (initialView == null) {
++            return;
+-          if (iView != null) {
+-            prepareAndSendView(iView, iJoins, iLeaves, iRemoves);
++          NetView v = preparedView;
++          if (v != null) {
++            processPreparedView(v);
+-        } finally {
+-          setInitialView(null, null, null, null);
++          try {
++            NetView iView;
++            List<InternalDistributedMember> iJoins;
++            Set<InternalDistributedMember> iLeaves;
++            Set<InternalDistributedMember> iRemoves;
++            synchronized (this) {
++              iView = initialView;
++              iJoins = initialJoins;
++              iLeaves = initialLeaving;
++              iRemoves = initialRemovals;
++            }
++            if (iView != null) {
++              prepareAndSendView(iView, iJoins, iLeaves, iRemoves);
++            }
++          } finally {
++            setInitialView(null, null, null, null);
++          }
++        } catch (ViewAbandonedException e) {
++          // another view creator is active - sleep a bit to let it finish or go away
++          retry = true;
++          try {
++            sleep(services.getConfig().getMemberTimeout());
++          } catch (InterruptedException e2) {
++            shutdown = true;
++            retry = false;
++          }
++        } catch (InterruptedException e) {
++          shutdown = true;
+-      } catch (InterruptedException e) {
+-        shutdown = true;
+-      }
++      } while (retry);
++            } catch (ViewAbandonedException e) {
++              synchronized (viewRequests) {
++                viewRequests.addAll(requests);
++              }
++              // pause before reattempting so that another view creator can either finish
++              // or fail
++              try {
++                sleep(services.getConfig().getMemberTimeout());
++              } catch (InterruptedException e2) {
++                shutdown = true;
++              }
+-    void createAndSendView(List<DistributionMessage> requests) throws InterruptedException {
++    void createAndSendView(List<DistributionMessage> requests)
++        throws InterruptedException, ViewAbandonedException {
+-        throws InterruptedException {
++        throws InterruptedException, ViewAbandonedException {
++        if (conflictingView == null) {
++          conflictingView = GMSJoinLeave.this.preparedView;
++        }
+-            logger.info(
+-                "adding these crashed members from a conflicting view to the crash-set for the next view: {}\nconflicting view: {}",
+-                unresponsive, conflictingView);
++            // if I am not a locator and the conflicting view is from a locator I should
++            // let it take control and stop sending membership views
++            if (localAddress.getVmKind() != DistributionManager.LOCATOR_DM_TYPE && conflictingView
++                .getCreator().getVmKind() == DistributionManager.LOCATOR_DM_TYPE) {
++              logger.info("View preparation interrupted - a locator is taking over as "
++                  + "membership coordinator in this view: {}", conflictingView);
++              abandonedViews++;
++              throw new ViewAbandonedException();
++            }
++            logger.info("adding these crashed members from a conflicting view to the crash-set "
++                + "for the next view: {}\nconflicting view: {}", unresponsive, conflictingView);
++
++  static class ViewAbandonedException extends Exception {
++  }

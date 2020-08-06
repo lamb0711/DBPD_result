@@ -1,0 +1,244 @@
+[GEODE-77] TCP check for final check in health monitor
+
++import java.io.DataInputStream;
++import java.io.DataOutputStream;
++import java.io.IOException;
++import java.io.InputStream;
++import java.io.OutputStream;
++import java.net.InetAddress;
++import java.net.InetSocketAddress;
++import java.net.ServerSocket;
++import java.net.Socket;
++import com.gemstone.gemfire.SystemConnectException;
++import com.gemstone.gemfire.distributed.internal.membership.gms.GMSMember;
++import com.gemstone.gemfire.internal.AvailablePort;
++import com.gemstone.gemfire.internal.Version;
++  
++  // For TCP check
++  private ExecutorService serverSocketExecutor;
++  private static final int OK = 0x01;
++  private static final int ERROR = 0x02;  
++  private InetAddress ip;
++  private volatile int socketPort;
++  private volatile ServerSocket serverSocket;
++  private Map<InternalDistributedMember, InetSocketAddress> socketInfo = new ConcurrentHashMap<InternalDistributedMember, InetSocketAddress>();
++  /**
++   * During final check, establish TCP connection between current member and suspect member.
++   * And exchange PING/PONG message to see if the suspect member is still alive.
++   * 
++   * @param suspectMember member that does not respond to CheckRequestMessage
++   * @return true if successfully exchanged PING/PONG with TCP connection, otherwise false.
++   */
++  private boolean doTCPCheckMember(InternalDistributedMember suspectMember, InetSocketAddress addr) {
++    logger.trace("Checking member {} with TCP socket connection.", suspectMember);
++    Socket clientSocket = new Socket();
++    try {
++      // establish TCP connection
++      for (Map.Entry<InternalDistributedMember, InetSocketAddress> entry : socketInfo.entrySet()) {
++        logger.info("socketInfo member:" + entry.getKey() + " port:" + entry.getValue().getPort());
++      }
++      logger.debug("Checking member {} with TCP socket connection {}:{}.", suspectMember, addr.getAddress(), addr.getPort());
++      clientSocket.connect(addr, (int) services.getConfig().getMemberTimeout());
++      if (clientSocket.isConnected()) {
++        clientSocket.setSoTimeout((int) services.getConfig().getMemberTimeout());
++        InputStream in = clientSocket.getInputStream();
++        DataOutputStream out = new DataOutputStream(clientSocket.getOutputStream());   
++        logger.info("TCP check: suspect member uuid: " + ((GMSMember) suspectMember.getNetMember()).getUUID());
++        out.writeShort(Version.CURRENT_ORDINAL);
++        out.writeLong(((GMSMember) suspectMember.getNetMember()).getUuidLSBs());
++        out.writeLong(((GMSMember) suspectMember.getNetMember()).getUuidMSBs());
++        out.flush();
++        clientSocket.shutdownOutput();
++        logger.debug("Send suspect member uuid to member {} with TCP socket connection.", suspectMember);
++        int b = in.read();
++        logger.debug("Received {} from member {} with TCP socket connection.", (b == OK ? "OK" : (b == ERROR ? "ERROR" : b)), suspectMember);
++        if (b == OK) {
++          CustomTimeStamp ts = memberVsLastMsgTS.get(suspectMember);
++          if (ts != null) {
++            ts.setTimeStamp(System.currentTimeMillis());
++          }
++          return true;
++        } else {
++          //received ERROR
++          return false;
++        }
++      } else {// cannot establish TCP connection with suspect member
++        return false;
++      }
++    } catch (IOException e) {
++      logger.trace("Unexpected exception", e);
++    } finally {
++      try {
++        if (clientSocket != null) {
++          clientSocket.close();
++        }
++      } catch (IOException e) {
++        logger.trace("Unexpected exception", e);
++      }
++    }
++
++    return false;
++  }
++  
+-    {
++    {      
++    
++    {
++      serverSocketExecutor = Executors.newCachedThreadPool(new ThreadFactory() {
++        AtomicInteger threadIdx = new AtomicInteger();
++
++        @Override
++        public Thread newThread(Runnable r) {
++          int id = threadIdx.getAndIncrement();
++          Thread th = new Thread(Services.getThreadGroup(), r, "TCP Check ServerSocket Thread " + id);
++          th.setDaemon(true);
++          return th;
++        }
++      });
++
++      serverSocketExecutor.execute(new Runnable() {
++        @Override
++        public void run() {
++          Socket socket = null;
++          try {
++            // start server socket for TCP check
++            if (serverSocket == null) {
++              localAddress = services.getMessenger().getMemberID();            
++              ip = localAddress.getInetAddress();
++              int[] portRange = services.getConfig().getMembershipPortRange();            
++              socketPort = AvailablePort.getAvailablePortInRange(portRange[0], portRange[1], AvailablePort.SOCKET);
++              if (socketPort == -1) {
++                throw new SystemConnectException("Unable to find a free port in the membership port range");
++              }
++              serverSocket = new ServerSocket();
++              serverSocket.bind(new InetSocketAddress(ip, socketPort));
++              logger.info("GMSHealthMonitor started server socket on {}:{}.", ip, socketPort);
++              socketInfo.put(localAddress, new InetSocketAddress(ip, socketPort));
++              while (!services.getCancelCriterion().isCancelInProgress() 
++                  && !GMSHealthMonitor.this.isStopping) {
++                try {
++                  socket = serverSocket.accept();
++                  if (GMSHealthMonitor.this.playingDead) {
++                    continue;
++                  }
++                  socket.setSoTimeout((int) services.getConfig().getMemberTimeout());
++                  new ClientSocketHandler(socket).start();
++                } catch (IOException e) {
++                  logger.trace("Unexpected exception", e);
++                  try {
++                    if (socket != null) {
++                      socket.close();
++                    }
++                  } catch (IOException ioe) {
++                    logger.trace("Unexpected exception", ioe);
++                  }
++                }
++              }
++              logger.info("GMSHealthMonitor server socket has done its jobs.");
++            }
++          } catch (IOException e) {
++            logger.trace("Unexpected exception", e);
++          } finally {
++            // close the server socket
++            if (serverSocket != null && !serverSocket.isClosed()) {
++              try {
++                serverSocket.close();
++                serverSocket = null;
++                logger.info("GMSHealthMonitor server socket closed.");
++              } catch (IOException e) {
++                logger.debug("Unexpected exception", e);
++              }
++            }
++          }
++        }
++      });
++    }
++  }
++
++  class ClientSocketHandler extends Thread {
++
++    private Socket socket;
++
++    public ClientSocketHandler(Socket socket) {
++      super(services.getThreadGroup(), "ClientSocketHandler");
++      this.socket = socket;
++      setDaemon(true);
++    }
++
++    public void run() {
++      try {
++        DataInputStream in = new DataInputStream(socket.getInputStream());
++        OutputStream out = socket.getOutputStream();
++        short version = in.readShort();
++        long uuidLSBs = in.readLong();
++        long uuidMSBs = in.readLong();
++        logger.debug("GMSHealthMonitor server socket received {} and {}.", uuidMSBs, uuidLSBs);
++        logger.debug("GMSHealthMonitor member uuid is {}", ((GMSMember) GMSHealthMonitor.this.localAddress.getNetMember()).getUUID());
++        if (uuidLSBs == ((GMSMember) GMSHealthMonitor.this.localAddress.getNetMember()).getUuidLSBs()
++            && uuidMSBs == ((GMSMember) GMSHealthMonitor.this.localAddress.getNetMember()).getUuidMSBs()) {
++          out.write(OK);
++          out.flush();
++          socket.shutdownOutput();
++          logger.debug("GMSHealthMonitor server socket replied OK.");
++        }
++        else {
++          out.write(ERROR);
++          out.flush();
++          socket.shutdownOutput();
++          logger.debug("GMSHealthMonitor server socket replied ERROR.");
++        }
++      } catch (IOException e) {
++        logger.trace("Unexpected exception", e);
++      } finally {
++        if (socket != null) {
++          try {
++            socket.close();
++          } catch (IOException e) {
++            logger.info("Unexpected exception", e);
++          }
++        }
++      }
++    }
++    if (serverSocketExecutor != null) {
++      if (serverSocket != null && !serverSocket.isClosed()) {
++        try {
++          serverSocket.close();
++          serverSocket = null;
++          logger.info("GMSHealthMonitor server socket is closed in stopServices().");
++        }
++        catch (IOException e) {
++          logger.trace("Unexpected exception", e);
++        }
++      }      
++      serverSocketExecutor.shutdownNow();
++      logger.info("GMSHealthMonitor serverSocketExecutor is " + (serverSocketExecutor.isTerminated() ? "terminated" : "not terminated"));
++    }
++    
+-    return scheduler.isShutdown() && checkExecutor.isShutdown() && !suspectRequestCollectorThread.isAlive();
++    return scheduler.isShutdown() && checkExecutor.isShutdown() && serverSocketExecutor.isShutdown() && !suspectRequestCollectorThread.isAlive();
+-              boolean pinged = GMSHealthMonitor.this.doCheckMember(mbr);
++              boolean pinged;
++              InetSocketAddress addr = socketInfo.get(mbr);
++              if (addr == null || addr.getPort() < 0) {
++                pinged = GMSHealthMonitor.this.doCheckMember(mbr);
++              } else {
++                pinged = GMSHealthMonitor.this.doTCPCheckMember(mbr, addr);
++              }
++  
++  public Map<InternalDistributedMember, InetSocketAddress> getSocketInfo() {
++    return this.socketInfo;
++  }
++
++  public void installSocketInfo(List<InternalDistributedMember> members, List<Integer> portsForMembers) {
++    logger.debug("installSocketInfo members=" + members + " portsForMembers=" + portsForMembers);    
++    for (int i = 0; i < members.size(); i++) {
++      if (portsForMembers.get(i).intValue() == -1) {
++        continue;
++      }
++      InetSocketAddress addr = new InetSocketAddress(members.get(i).getInetAddress(), portsForMembers.get(i).intValue());
++      socketInfo.put(members.get(i), addr);
++    }
++  }
++
+
+INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS26 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS40 INS83 INS42 INS23 INS23 INS23 INS23 INS23 INS23 INS23 INS31 INS55 INS31 INS31 INS83 INS43 INS59 INS83 INS83 INS83 INS39 INS59 INS83 INS83 INS83 INS39 INS59 INS83 INS43 INS59 INS83 INS83 INS39 INS59 INS83 INS83 INS43 INS59 INS83 INS74 INS59 INS29 INS83 INS39 INS42 INS44 INS44 INS8 INS42 INS43 INS23 INS31 INS31 INS83 INS74 INS42 INS8 INS83 INS39 INS42 INS44 INS44 INS8 INS42 INS42 INS42 INS34 INS42 INS34 INS42 INS42 INS42 INS42 INS42 INS43 INS43 INS43 INS42 INS14 INS65 INS65 INS65 INS43 INS42 INS43 INS42 INS21 INS60 INS54 INS41 INS8 INS42 INS83 INS43 INS59 INS83 INS42 INS44 INS8 INS83 INS39 INS42 INS8 INS25 INS43 INS43 INS43 INS41 INS74 INS42 INS74 INS42 INS21 INS24 INS42 INS42 INS42 INS74 INS66 INS66 INS42 INS66 INS66 INS42 INS42 INS32 INS43 INS59 INS8 INS12 INS8 INS9 INS21 INS21 INS42 INS42 INS43 INS42 INS46 INS21 INS21 INS54 INS27 INS8 INS42 INS42 INS42 INS22 INS43 INS43 INS43 INS43 INS32 INS58 INS27 INS37 INS8 INS43 INS43 INS43 INS42 INS42 INS45 INS42 INS42 INS42 INS14 INS70 INS21 INS21 INS25 INS44 INS8 INS54 INS7 INS32 INS42 INS32 INS45 INS7 INS32 INS8 INS12 INS8 INS42 INS33 INS25 INS21 INS21 INS32 INS52 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS27 INS39 INS59 INS42 INS32 INS42 INS25 INS60 INS21 INS42 INS42 INS42 INS43 INS44 INS32 INS8 INS32 INS32 INS32 INS8 INS8 INS43 INS42 INS21 INS8 INS12 INS42 INS32 INS42 INS42 INS14 INS42 INS42 INS22 INS42 INS42 INS9 INS60 INS60 INS60 INS60 INS60 INS21 INS21 INS25 INS44 INS8 INS25 INS27 INS8 INS32 INS32 INS42 INS42 INS45 INS42 INS45 INS42 INS42 INS34 INS42 INS42 INS27 INS8 INS43 INS59 INS32 INS42 INS74 INS42 INS42 INS42 INS21 INS42 INS42 INS45 INS42 INS32 INS32 INS42 INS42 INS42 INS11 INS42 INS42 INS21 INS60 INS60 INS21 INS21 INS21 INS21 INS21 INS21 INS21 INS60 INS21 INS25 INS41 INS42 INS32 INS25 INS44 INS8 INS42 INS42 INS14 INS43 INS1 INS52 INS42 INS43 INS59 INS43 INS59 INS39 INS59 INS39 INS59 INS39 INS59 INS32 INS32 INS27 INS8 INS8 INS43 INS42 INS21 INS27 INS8 INS27 INS38 INS54 INS42 INS42 INS42 INS42 INS27 INS32 INS38 INS18 INS42 INS42 INS14 INS42 INS42 INS32 INS42 INS43 INS43 INS43 INS32 INS42 INS42 INS42 INS42 INS39 INS32 INS32 INS43 INS59 INS43 INS59 INS32 INS32 INS32 INS32 INS32 INS32 INS32 INS39 INS59 INS32 INS27 INS8 INS8 INS9 INS42 INS42 INS45 INS42 INS27 INS8 INS43 INS42 INS21 INS43 INS1 INS42 INS31 INS42 INS42 INS14 INS42 INS42 INS32 INS42 INS32 INS42 INS32 INS42 INS32 INS42 INS42 INS45 INS42 INS42 INS42 INS42 INS45 INS32 INS27 INS27 INS21 INS21 INS21 INS21 INS21 INS21 INS21 INS21 INS42 INS32 INS42 INS33 INS54 INS42 INS33 INS32 INS8 INS12 INS45 INS36 INS32 INS42 INS34 INS43 INS32 INS32 INS42 INS42 INS42 INS40 INS42 INS42 INS42 INS42 INS27 INS32 INS42 INS42 INS42 INS11 INS42 INS42 INS32 INS42 INS42 INS14 INS42 INS42 INS27 INS42 INS42 INS40 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS45 INS42 INS42 INS32 INS42 INS42 INS45 INS36 INS42 INS42 INS42 INS60 INS25 INS41 INS41 INS42 INS33 INS21 INS42 INS32 INS42 INS23 INS31 INS78 INS83 INS39 INS42 INS8 INS43 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS36 INS42 INS42 INS32 INS42 INS32 INS32 INS32 INS32 INS32 INS32 INS32 INS32 INS32 INS42 INS42 INS45 INS42 INS8 INS12 INS42 INS42 INS21 INS21 INS21 INS44 INS8 INS16 INS42 INS42 INS42 INS42 INS32 INS42 INS32 INS42 INS45 INS32 INS45 INS32 INS42 INS42 INS39 INS32 INS42 INS42 INS43 INS32 INS45 INS32 INS36 INS42 INS36 INS42 INS42 INS42 INS16 INS43 INS59 INS27 INS8 INS9 INS9 INS32 INS42 INS42 INS45 INS42 INS43 INS59 INS78 INS83 INS43 INS42 INS44 INS8 INS42 INS60 INS54 INS42 INS42 INS42 INS11 INS36 INS42 INS36 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS45 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS45 INS21 INS44 INS8 INS32 INS7 INS32 INS43 INS42 INS21 INS32 INS45 INS45 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS32 INS42 INS32 INS42 INS42 INS42 INS42 INS36 INS42 INS11 INS11 INS27 INS45 INS36 INS42 INS42 INS32 INS42 INS33 INS21 INS42 INS42 INS42 INS42 INS14 INS42 INS42 INS43 INS42 INS60 INS60 INS21 INS41 INS43 INS59 INS8 INS12 INS8 INS43 INS32 INS11 INS11 INS32 INS43 INS42 INS21 INS42 INS42 INS42 INS33 INS42 INS42 INS45 INS42 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS11 INS43 INS32 INS43 INS32 INS42 INS42 INS16 INS42 INS42 INS42 INS32 INS43 INS42 INS39 INS59 INS43 INS59 INS32 INS42 INS42 INS42 INS33 INS25 INS44 INS8 INS25 INS42 INS22 INS42 INS43 INS32 INS43 INS32 INS42 INS42 INS42 INS32 INS42 INS42 INS45 INS42 INS43 INS32 INS42 INS42 INS42 INS42 INS42 INS42 INS27 INS45 INS42 INS42 INS42 INS32 INS42 INS42 INS32 INS42 INS42 INS14 INS42 INS42 INS9 INS27 INS8 INS43 INS42 INS21 INS27 INS8 INS52 INS42 INS42 INS22 INS42 INS42 INS22 INS42 INS42 INS42 INS45 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS42 INS43 INS32 INS42 INS27 INS42 INS33 INS21 INS21 INS60 INS21 INS25 INS21 INS21 INS21 INS21 INS61 INS21 INS42 INS32 INS27 INS38 INS54 INS42 INS52 INS42 INS52 INS42 INS42 INS42 INS42 INS45 INS42 INS7 INS7 INS5 INS59 INS7 INS27 INS8 INS7 INS32 INS32 INS32 INS27 INS8 INS32 INS42 INS42 INS45 INS42 INS42 INS33 INS32 INS8 INS12 INS42 INS42 INS60 INS25 INS42 INS32 INS42 INS32 INS39 INS85 INS42 INS32 INS42 INS32 INS42 INS38 INS53 INS42 INS14 INS42 INS42 INS14 INS42 INS42 INS45 INS42 INS42 INS42 INS42 INS42 INS14 INS38 INS38 INS54 INS42 INS42 INS45 INS42 INS42 INS21 INS21 INS21 INS44 INS8 INS43 INS59 INS27 INS8 INS8 INS32 INS42 INS42 INS42 INS32 INS42 INS42 INS42 INS2 INS2 INS40 INS34 INS14 INS43 INS43 INS42 INS42 INS43 INS42 INS42 INS32 INS22 INS8 INS12 INS32 INS7 INS32 INS43 INS42 INS21 INS42 INS42 INS32 INS27 INS27 INS21 INS21 INS42 INS42 INS42 INS42 INS42 INS34 INS42 INS34 INS43 INS45 INS42 INS42 INS42 INS32 INS42 INS52 INS42 INS21 INS25 INS21 INS21 INS44 INS8 INS42 INS42 INS42 INS33 INS42 INS42 INS45 INS42 INS32 INS42 INS42 INS42 INS42 INS33 INS32 INS34 INS7 INS7 INS42 INS42 INS42 INS42 INS7 INS22 INS8 INS32 INS32 INS43 INS42 INS21 INS54 INS42 INS42 INS45 INS42 INS42 INS42 INS42 MOV32 INS42 INS32 INS42 INS32 INS52 INS42 INS18 INS42 INS42 INS11 INS14 INS42 INS42 INS32 INS8 INS12 INS52 INS42 INS42 INS42 INS42 INS42 INS42 INS39 INS32 INS43 INS42 INS42 INS42 INS45 INS42 INS25 INS44 INS8 INS42 INS32 INS42 INS42 INS27 INS8 INS43 INS42 INS21 INS42 INS42 INS42 INS33 INS21 INS42 INS32 INS32 INS42 INS42 INS45 INS42 INS42 INS42 DEL83 DEL42

@@ -1,0 +1,176 @@
+Merge branch 'feature/GEODE-8' into develop
+
+-   * this keeps track of all the transactions that were initiated locally. Could have been
+-   * a set, is a Map to allow concurrent operations.
++   * this keeps track of all the transactions that were initiated locally.
+-  private ConcurrentMap<TXId, Boolean> localTxMap = new ConcurrentHashMap<TXId, Boolean>();
++  private ConcurrentMap<TXId, TXStateProxy> localTxMap = new ConcurrentHashMap<TXId, TXStateProxy>();
++  
++  /**
++   * Thread-specific flag to indicate whether the transactions managed by this
++   * CacheTransactionManager for this thread should be distributed
++   */
++  private final ThreadLocal<Boolean> isTXDistributed;
++  
++    this.isTXDistributed = new ThreadLocal<Boolean>();
+-    setTXState(new TXStateProxyImpl(this, id, null));
+-    this.localTxMap.put(id, Boolean.TRUE);
++    TXStateProxyImpl proxy = null;
++    if (isDistributed()) {
++      proxy = new DistTXStateProxyImplOnCoordinator(this, id, null);  
++    } else {
++      proxy = new TXStateProxyImpl(this, id, null);  
++    }
++    setTXState(proxy);
++    this.localTxMap.put(id, proxy);
+-    TXStateProxy newState = new TXStateProxyImpl(this, id, true);
++    TXStateProxy newState = null;
++    
++    if (isDistributed()) {
++      newState = new DistTXStateProxyImplOnCoordinator(this, id, true);
++    } else {
++      newState = new TXStateProxyImpl(this, id, true);
++    }
++  /*
++   * Only applicable for Distributed transaction.
++   */
++  public void precommit() throws CommitConflictException {
++    checkClosed();
++
++    final TXStateProxy tx = getTXState();
++    if (tx == null) {
++      throw new IllegalStateException(LocalizedStrings.TXManagerImpl_THREAD_DOES_NOT_HAVE_AN_ACTIVE_TRANSACTION.toLocalizedString());
++    }
++    
++    tx.checkJTA(LocalizedStrings.TXManagerImpl_CAN_NOT_COMMIT_THIS_TRANSACTION_BECAUSE_IT_IS_ENLISTED_WITH_A_JTA_TRANSACTION_USE_THE_JTA_MANAGER_TO_PERFORM_THE_COMMIT.toLocalizedString());
++  
++    tx.precommit();
++  }
++  
++      cleanup(tx.getTransactionId()); // fixes #52086
++      cleanup(tx.getTransactionId()); // fixes #52086
++      cleanup(tx.getTransactionId()); // fixes #52086
+-    if(tx.isFireCallbacks()) {
++    if (tx.isFireCallbacks() && listeners.length > 0) {
++      final TXEvent e = tx.getEvent();
++      try {
+-          listeners[i].afterFailedCommit(tx.getEvent());
++          listeners[i].afterFailedCommit(e);
++      } finally {
++        e.release();
++      }
+-    if(tx.isFireCallbacks()) {
+-      TransactionListener[] listeners = getListeners();
+-      for (int i=0; i < listeners.length; i++) {
++    TransactionListener[] listeners = getListeners();
++    if (tx.isFireCallbacks() && listeners.length > 0) {
++      final TXEvent e = tx.getEvent();
++      try {
++      for (final TransactionListener listener : listeners) {
+-          listeners[i].afterCommit(tx.getEvent());
++          listener.afterCommit(e);
++      } finally {
++        e.release();
++      }
+-    if(tx.isFireCallbacks()) {
+-      for (int i=0; i < listeners.length; i++) {
++    if (tx.isFireCallbacks() && listeners.length > 0) {
++      final TXEvent e = tx.getEvent();
++      try {
++      for (int i = 0; i < listeners.length; i++) {
+-          listeners[i].afterRollback(tx.getEvent());
++          listeners[i].afterRollback(e);
++      } finally {
++        e.release();
++      }
+-    this.localTxMap.remove(txId);
++    TXStateProxy proxy = this.localTxMap.remove(txId);
++    if (proxy != null) {
++      proxy.close();
++    }
++    for (TXStateProxy proxy: this.hostedTXStates.values()) {
++      proxy.close();
++    }
++    for (TXStateProxy proxy: this.localTxMap.values()) {
++      proxy.close();
++    }
+-          val = new TXStateProxyImpl(this, key, msg.getTXOriginatorClient());
+-          val.setLocalTXState(new TXState(val,true));
++          if (msg.isTransactionDistributed()) {
++            val = new DistTXStateProxyImplOnDatanode(this, key, msg.getTXOriginatorClient());
++            val.setLocalTXState(new DistTXState(val,true));
++          } else {
++            val = new TXStateProxyImpl(this, key, msg.getTXOriginatorClient());
++            val.setLocalTXState(new TXState(val,true));
++          }
++
+-          val = new TXStateProxyImpl(this, key,memberId);
+-//          val.setLocalTXState(new TXState(val,true));
++          // [sjigyasu] TODO: Conditionally create object based on distributed or non-distributed tx mode 
++          if (msg instanceof TransactionMessage && ((TransactionMessage)msg).isTransactionDistributed()) {
++            val = new DistTXStateProxyImplOnDatanode(this, key, memberId);
++            //val.setLocalTXState(new DistTXState(val,true));
++          } else {
++            val = new TXStateProxyImpl(this, key, memberId);
++            //val.setLocalTXState(new TXState(val,true));
++          }
+-      return this.hostedTXStates.remove(txId);
++      TXStateProxy result = this.hostedTXStates.remove(txId);
++      if (result != null) {
++        result.close();
++      }
++      return result;
++          entry.getValue().close();
++  public int localTransactionsInProgressForTest() {
++    return this.localTxMap.size();
++  }
+-      Iterator<TXId> iterator = this.hostedTXStates.keySet().iterator();
++      Iterator<Map.Entry<TXId,TXStateProxy>> iterator = this.hostedTXStates.entrySet().iterator();
+-        TXId txId = iterator.next();
++        Map.Entry<TXId,TXStateProxy> me = iterator.next();
++        TXId txId = me.getKey();
++          me.getValue().close();
++          entry.getValue().close();
++
++  // Used by tests
++  public Set<TXId> getLocalTxIds() {
++    return this.localTxMap.keySet();
++  }
++
++  // Used by tests
++  public ArrayList<TXId> getHostedTxIds() {
++    synchronized (this.hostedTXStates) {
++      return new ArrayList<TXId>(this.hostedTXStates.keySet());
++    }
++  }
++  
++  public void setDistributed(boolean flag) {
++    checkClosed();
++    TXStateProxy tx = getTXState();
++    // Check whether given flag and current flag are different and whether a transaction is in progress
++    if (tx != null && flag != isDistributed()) {
++      // Cannot change mode in the middle of a transaction
++      throw new java.lang.IllegalStateException(
++          LocalizedStrings.TXManagerImpl_CANNOT_CHANGE_TRANSACTION_MODE_WHILE_TRANSACTIONS_ARE_IN_PROGRESS
++              .toLocalizedString());
++    } else {
++      isTXDistributed.set(new Boolean(flag));
++    }
++  }
++
++  /*
++   * If explicitly set using setDistributed, this returns that value.
++   * If not, it returns the value of gemfire property "distributed-transactions" if set.
++   * If this is also not set, it returns the default value of this property.
++   */
++  public boolean isDistributed() {
++    
++     Boolean value = isTXDistributed.get();
++    // This can be null if not set in setDistributed().
++    if (value == null) {
++      return InternalDistributedSystem.getAnyInstance().getOriginalConfig().getDistributedTransactions();
++    } else {
++      return value.booleanValue();
++    }
++  }
++  

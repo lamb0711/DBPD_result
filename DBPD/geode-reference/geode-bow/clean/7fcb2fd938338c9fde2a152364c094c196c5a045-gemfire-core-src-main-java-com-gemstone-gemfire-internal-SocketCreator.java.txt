@@ -1,0 +1,142 @@
+GEODE-332: use thread pools for p2p readers and async close
+
+The old code always created a brand new thread when it
+wanted to async close a socket or create a new p2p reader
+or handshake with a p2p reader. Now it will reuse threads
+which improves latency and having a hard cap on the maximum
+number of closer threads prevents a large number of close
+threads causing an OutOfMemory exception.
+
+Introduced a new SocketCloser class for async close.
+The ConnectionTable has a SocketCloser instance
+for closing peer-to-peer sockets and the
+CacheClientNotifier has one for closing sockets
+used by a cache server to send queue data to clients.
+
+The ConnectionTable closer will have at most 8 threads
+per address its sockets are connected to. If these
+threads are not used for 120 seconds they will timeout.
+This timeout can be configured using the
+p2p.ASYNC_CLOSE_POOL_KEEP_ALIVE_SECONDS system property.
+The maximum threads per address can be changed from 8
+using the p2p.ASYNC_CLOSE_POOL_MAX_THREADS system property.
+By default when an async socket close request is made
+the requestor does not wait for request to be done.
+In previous releases the requestor waited 50 milliseconds.
+Now a wait can be configured using the
+p2p.ASYNC_CLOSE_WAIT_MILLISECONDS system property.
+
+The CacheClientNotifier closer will have at most 1 thread
+per address its sockets are connected to. If these
+threads are not used for 120 seconds they will timeout.
+This timeout can be configured using the
+p2p.ASYNC_CLOSE_POOL_KEEP_ALIVE_SECONDS system property.
+Also this closer forces all requestors to wait 50 milliseconds
+for the close to be done.
+
+ConnectionTable also uses a thread pool for when ever
+it needs a thread for a p2p reader or when a p2p sender
+needs a thread to do the initial handshake. This pool
+has an unlimited number of threads but if a thread is
+not used for 120 seconds it will timeout. This timeout
+can be configured using the p2p.READER_POOL_KEEP_ALIVE_TIME
+system property.
+
+-import com.gemstone.gemfire.internal.logging.LoggingThreadGroup;
+-  /**
+-   * Closes the specified socket in a background thread and waits a limited
+-   * amount of time for the close to complete. In some cases we see close
+-   * hang (see bug 33665).
+-   * Made public so it can be used from CacheClientProxy.
+-   * @param sock the socket to close
+-   * @param who who the socket is connected to
+-   * @param extra an optional Runnable with stuff to execute in the async thread
+-   */
+-  public static void asyncClose(final Socket sock, String who, final Runnable extra) {
+-    if (sock == null || sock.isClosed()) {
+-      return;
+-    }
+-    try {
+-    ThreadGroup tg = LoggingThreadGroup.createThreadGroup("Socket asyncClose", logger);
+-
+-    Thread t = new Thread(tg, new Runnable() {
+-        public void run() {
+-          if (extra != null) {
+-            extra.run();
+-          }
+-          inlineClose(sock);
+-        }
+-      }, "AsyncSocketCloser for " + who);
+-    t.setDaemon(true);
+-    try {
+-      t.start();
+-    } catch (OutOfMemoryError ignore) {
+-      // If we can't start a thread to close the socket just do it inline.
+-      // See bug 50573.
+-      inlineClose(sock);
+-      return;
+-    }
+-    try {
+-      // [bruce] if the network fails, this will wait the full amount of time
+-      // on every close, so it must be kept very short.  it was 750ms before,
+-      // causing frequent hangs in net-down hydra tests
+-      t.join(50/*ms*/);
+-    } catch (InterruptedException ex) {
+-      Thread.currentThread().interrupt();
+-    }
+-    }
+-    catch (VirtualMachineError e) {
+-      SystemFailure.initiateFailure(e);
+-      // NOTREACHED
+-      throw e;
+-    }
+-  }
+-  
+-
+-  /**
+-   * Closes the specified socket
+-   * @param sock the socket to close
+-   */
+-  public static void inlineClose(final Socket sock) {
+-    
+-    // the next two statements are a mad attempt to fix bug
+-    // 36041 - segv in jrockit in pthread signaling code.  This
+-    // seems to alleviate the problem.
+-    try {
+-      sock.shutdownInput();
+-      sock.shutdownOutput();
+-    }
+-    catch (Exception e) {
+-    }
+-    try {
+-      sock.close();
+-    } catch (IOException ignore) {
+-    } 
+-    catch (VirtualMachineError err) {
+-      SystemFailure.initiateFailure(err);
+-      // If this ever returns, rethrow the error.  We're poisoned
+-      // now, so don't let this thread continue.
+-      throw err;
+-    }
+-    catch (java.security.ProviderException pe) {
+-      // some ssl implementations have trouble with termination and throw
+-      // this exception.  See bug #40783
+-    }
+-    catch (Error e) {
+-      // Whenever you catch Error or Throwable, you must also
+-      // catch VirtualMachineError (see above).  However, there is
+-      // _still_ a possibility that you are dealing with a cascading
+-      // error condition, so you also need to check to see if the JVM
+-      // is still usable:
+-      SystemFailure.checkFailure();
+-      // Sun's NIO implementation has been known to throw Errors
+-      // that are caused by IOExceptions.  If this is the case, it's
+-      // okay.
+-      if (e.getCause() instanceof IOException) {
+-        // okay...
+-
+-      } else {
+-        throw e;
+-      }
+-    }
+-  }

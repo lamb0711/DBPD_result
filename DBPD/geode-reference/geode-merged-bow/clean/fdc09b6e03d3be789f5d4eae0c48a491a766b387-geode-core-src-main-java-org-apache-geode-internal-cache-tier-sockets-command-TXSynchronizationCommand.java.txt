@@ -1,0 +1,252 @@
+ GEODE-5376: Remove SynchronizationRunnable (#2122)
+
+
+  Remove TXSynchronizationRunnable to handle JTA beforeCompletion and afterCompletion can be executed on different member after client failover.
+
+
+
+-import java.util.concurrent.Executor;
+-
+-import javax.transaction.Status;
+-import org.apache.geode.distributed.internal.InternalDistributedSystem;
+-import org.apache.geode.internal.cache.TXSynchronizationRunnable;
+-   * org.apache.geode.internal.cache.tier.sockets.BaseCommand#shouldMasqueradeForTx(org.apache.geode
+-   * .internal.cache.tier.sockets.Message,
+-   * org.apache.geode.internal.cache.tier.sockets.ServerConnection)
+-   */
+-  @Override
+-  protected boolean shouldMasqueradeForTx(Message clientMessage,
+-      ServerConnection serverConnection) {
+-    // masquerading is done in the waiting thread pool
+-    return false;
+-  }
+-
+-  /*
+-   * (non-Javadoc)
+-   *
+-   * @see
+-    final TXManagerImpl txMgr =
+-        (TXManagerImpl) serverConnection.getCache().getCacheTransactionManager();
+-    final InternalDistributedMember member =
+-        (InternalDistributedMember) serverConnection.getProxyID().getDistributedMember();
++    final TXManagerImpl txMgr = getTXManager(serverConnection);
++    final InternalDistributedMember member = getDistributedMember(serverConnection);
+-    // get the tx state without associating it with this thread. That's done later
+-    final TXStateProxy txProxy = txMgr.masqueradeAs(clientMessage, member, true);
++    final TXStateProxy txProxy = txMgr.getTXState();
++    assert txProxy != null;
+-        CommitCommand.writeCommitResponse(commitMessage, clientMessage, serverConnection);
++        writeCommitResponse(clientMessage, serverConnection, commitMessage);
+-    // we have to run beforeCompletion and afterCompletion in the same thread
+-    // because beforeCompletion obtains locks for the thread and afterCompletion
+-    // releases them
+-    if (txProxy != null) {
+-      try {
+-        if (type == CompletionType.BEFORE_COMPLETION) {
+-          Runnable beforeCompletion = new Runnable() {
+-            @SuppressWarnings("synthetic-access")
+-            public void run() {
+-              TXStateProxy txState = null;
+-              Throwable failureException = null;
+-              try {
+-                txState = txMgr.masqueradeAs(clientMessage, member, false);
+-                if (isDebugEnabled) {
+-                  logger.debug("Executing beforeCompletion() notification for transaction {}",
+-                      clientMessage.getTransactionId());
+-                }
+-                txState.setIsJTA(true);
+-                txState.beforeCompletion();
+-                try {
+-                  writeReply(clientMessage, serverConnection);
+-                } catch (IOException e) {
+-                  if (isDebugEnabled) {
+-                    logger.debug("Problem writing reply to client", e);
+-                  }
+-                }
+-                serverConnection.setAsTrue(RESPONDED);
+-              } catch (ReplyException e) {
+-                failureException = e.getCause();
+-              } catch (InterruptedException e) {
+-                Thread.currentThread().interrupt();
+-              } catch (Exception e) {
+-                failureException = e;
+-              } finally {
+-                txMgr.unmasquerade(txState);
+-              }
+-              if (failureException != null) {
+-                try {
+-                  writeException(clientMessage, failureException, false, serverConnection);
+-                } catch (IOException ioe) {
+-                  if (isDebugEnabled) {
+-                    logger.debug("Problem writing reply to client", ioe);
+-                  }
+-                }
+-                serverConnection.setAsTrue(RESPONDED);
+-              }
+-            }
+-          };
+-          TXSynchronizationRunnable sync =
+-              new TXSynchronizationRunnable(serverConnection.getCache().getCancelCriterion(),
+-                  serverConnection.getAcceptor(), beforeCompletion);
+-          txProxy.setSynchronizationRunnable(sync);
+-          Executor exec = InternalDistributedSystem.getConnectedInstance().getDistributionManager()
+-              .getWaitingThreadPool();
+-          exec.execute(sync);
+-          sync.waitForFirstExecution();
+-        } else {
+-          Runnable afterCompletion = new Runnable() {
+-            @SuppressWarnings("synthetic-access")
+-            public void run() {
+-              TXStateProxy txState = null;
+-              try {
+-                txState = txMgr.masqueradeAs(clientMessage, member, false);
+-                int status = statusPart.getInt();
+-                if (isDebugEnabled) {
+-                  logger.debug("Executing afterCompletion({}) notification for transaction {}",
+-                      status, clientMessage.getTransactionId());
+-                }
+-                txState.setIsJTA(true);
+-                txState.afterCompletion(status);
+-                // GemFire commits during afterCompletion - send the commit info back to the client
+-                // where it can be applied to the local cache
+-                TXCommitMessage cmsg = txState.getCommitMessage();
+-                try {
+-                  CommitCommand.writeCommitResponse(cmsg, clientMessage, serverConnection);
+-                  txMgr.removeHostedTXState(txState.getTxId());
+-                } catch (IOException e) {
+-                  // not much can be done here
+-                  if (isDebugEnabled || (e instanceof MessageTooLargeException)) {
+-                    logger.warn("Problem writing reply to client", e);
+-                  }
+-                }
+-                serverConnection.setAsTrue(RESPONDED);
+-              } catch (RuntimeException e) {
+-                try {
+-                  writeException(clientMessage, e, false, serverConnection);
+-                } catch (IOException ioe) {
+-                  if (isDebugEnabled) {
+-                    logger.debug("Problem writing reply to client", ioe);
+-                  }
+-                }
+-                serverConnection.setAsTrue(RESPONDED);
+-              } catch (InterruptedException e) {
+-                Thread.currentThread().interrupt();
+-              } finally {
+-                txMgr.unmasquerade(txState);
+-              }
+-            }
+-          };
+-          // if there was a beforeCompletion call then there will be a thread
+-          // sitting in the waiting pool to execute afterCompletion. Otherwise
+-          // we have failed-over and may need to do beforeCompletion & hope that it works
+-          TXSynchronizationRunnable sync = txProxy.getSynchronizationRunnable();
+-          if (sync != null) {
+-            sync.runSecondRunnable(afterCompletion);
+-          } else {
+-            if (statusPart.getInt() == Status.STATUS_COMMITTED) {
+-              TXStateProxy txState = txMgr.masqueradeAs(clientMessage, member, false);
+-              try {
+-                if (isDebugEnabled) {
+-                  logger.debug(
+-                      "Executing beforeCompletion() notification for transaction {} after failover",
+-                      clientMessage.getTransactionId());
+-                }
+-                txState.setIsJTA(true);
+-                txState.beforeCompletion();
+-              } finally {
+-                txMgr.unmasquerade(txState);
+-              }
+-            }
+-            afterCompletion.run();
+-          }
++    try {
++      if (type == CompletionType.BEFORE_COMPLETION) {
++        if (isDebugEnabled) {
++          logger.debug("Executing beforeCompletion() notification for transaction {}",
++              clientMessage.getTransactionId());
+-      } catch (Exception e) {
+-        writeException(clientMessage, MessageType.EXCEPTION, e, false, serverConnection);
+-        serverConnection.setAsTrue(RESPONDED);
++        Throwable failureException = null;
++        try {
++          txProxy.setIsJTA(true);
++          txProxy.beforeCompletion();
++          try {
++            writeReply(clientMessage, serverConnection);
++          } catch (IOException e) {
++            if (isDebugEnabled) {
++              logger.debug("Problem writing reply to client", e);
++            }
++          }
++          serverConnection.setAsTrue(RESPONDED);
++        } catch (ReplyException e) {
++          failureException = e.getCause();
++        } catch (Exception e) {
++          failureException = e;
++        }
++        if (failureException != null) {
++          try {
++            writeException(clientMessage, failureException, false, serverConnection);
++          } catch (IOException ioe) {
++            if (isDebugEnabled) {
++              logger.debug("Problem writing reply to client", ioe);
++            }
++          }
++          serverConnection.setAsTrue(RESPONDED);
++        }
++      } else {
++        try {
++          int status = statusPart.getInt();
++          if (isDebugEnabled) {
++            logger.debug("Executing afterCompletion({}) notification for transaction {}",
++                status, clientMessage.getTransactionId());
++          }
++          txProxy.setIsJTA(true);
++          txProxy.setCommitOnBehalfOfRemoteStub(true);
++          txProxy.afterCompletion(status);
++          // GemFire commits during afterCompletion - send the commit info back to the client
++          // where it can be applied to the local cache
++          TXCommitMessage cmsg = txProxy.getCommitMessage();
++          try {
++            writeCommitResponse(clientMessage, serverConnection, cmsg);
++            txMgr.removeHostedTXState(txProxy.getTxId());
++          } catch (IOException e) {
++            // not much can be done here
++            if (isDebugEnabled || (e instanceof MessageTooLargeException)) {
++              logger.warn("Problem writing reply to client", e);
++            }
++          }
++          serverConnection.setAsTrue(RESPONDED);
++        } catch (RuntimeException e) {
++          try {
++            writeException(clientMessage, e, false, serverConnection);
++          } catch (IOException ioe) {
++            if (isDebugEnabled) {
++              logger.debug("Problem writing reply to client", ioe);
++            }
++          }
++          serverConnection.setAsTrue(RESPONDED);
++        }
+-      if (isDebugEnabled) {
+-        logger.debug("Sent tx synchronization response");
+-      }
++    } catch (Exception e) {
++      writeException(clientMessage, MessageType.EXCEPTION, e, false, serverConnection);
++      serverConnection.setAsTrue(RESPONDED);
++    }
++    if (isDebugEnabled) {
++      logger.debug("Sent tx synchronization response");
++  void writeCommitResponse(Message clientMessage, ServerConnection serverConnection,
++      TXCommitMessage commitMessage) throws IOException {
++    CommitCommand.writeCommitResponse(commitMessage, clientMessage, serverConnection);
++  }
++
++  InternalDistributedMember getDistributedMember(ServerConnection serverConnection) {
++    return (InternalDistributedMember) serverConnection.getProxyID().getDistributedMember();
++  }
++
++  TXManagerImpl getTXManager(ServerConnection serverConnection) {
++    return (TXManagerImpl) serverConnection.getCache().getCacheTransactionManager();
++  }
+
+MOV31 INS31 INS31 MOV8 INS39 INS42 MOV44 MOV44 INS44 INS43 MOV8 MOV43 INS42 INS44 MOV43 INS42 INS44 INS8 MOV60 MOV21 MOV60 MOV21 MOV60 MOV25 INS60 INS60 MOV60 INS6 MOV60 MOV60 MOV25 INS54 MOV25 MOV43 INS42 INS42 INS43 INS42 INS43 INS42 INS41 INS83 UPD43 MOV43 INS59 INS83 INS43 INS59 INS83 MOV43 MOV27 MOV8 MOV12 MOV42 INS42 MOV11 INS42 MOV11 UPD42 INS42 INS32 INS42 INS42 INS32 UPD42 INS25 MOV21 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 UPD42 UPD42 INS8 MOV27 MOV8 INS8 UPD43 MOV21 MOV32 INS21 MOV25 INS54 UPD42 MOV32 UPD45 INS32 INS8 INS12 MOV42 MOV40 MOV42 MOV42 MOV42 MOV42 INS42 INS42 INS42 INS42 MOV60 MOV25 INS21 INS21 INS21 INS60 INS54 MOV21 INS44 INS8 INS32 INS32 INS32 INS43 INS59 INS8 MOV12 MOV32 INS43 INS42 MOV54 MOV21 UPD42 UPD42 INS42 INS42 INS9 INS42 INS42 INS9 INS42 INS42 INS42 UPD42 MOV42 INS42 INS32 INS21 INS21 MOV42 MOV42 MOV42 UPD42 MOV42 INS42 INS42 INS32 INS32 INS21 INS42 UPD42 UPD42 INS42 INS42 INS42 MOV42 UPD42 MOV42 UPD42 MOV42 INS42 INS32 INS32 INS42 UPD42 MOV42 UPD42 MOV42 UPD42 MOV42 INS42 INS42 INS9 UPD42 MOV42 MOV32 MOV42 UPD42 MOV45 MOV42 DEL40 DEL26 DEL40 DEL26 DEL40 DEL26 DEL40 DEL26 DEL42 DEL43 DEL42 DEL33 DEL59 DEL60 DEL42 DEL42 DEL42 DEL42 DEL42 DEL9 DEL32 DEL7 DEL21 DEL42 DEL43 DEL42 DEL44 DEL42 DEL42 DEL32 DEL42 DEL32 DEL21 DEL8 DEL12 DEL42 DEL42 DEL42 DEL32 DEL21 DEL8 DEL42 DEL43 DEL42 DEL42 DEL43 DEL42 DEL45 DEL79 DEL83 DEL39 DEL42 DEL31 DEL1 DEL14 DEL59 DEL60 DEL42 DEL43 DEL42 DEL43 DEL32 DEL32 DEL32 DEL42 DEL14 DEL59 DEL60 DEL43 DEL42 DEL32 DEL42 DEL32 DEL42 DEL32 DEL59 DEL60 DEL42 DEL42 DEL32 DEL42 DEL43 DEL42 DEL42 DEL43 DEL42 DEL45 DEL79 DEL83 DEL39 DEL42 DEL42 DEL33 DEL59 DEL60 DEL42 DEL42 DEL42 DEL42 DEL42 DEL9 DEL32 DEL7 DEL21 DEL42 DEL42 DEL9 DEL32 DEL21 DEL42 DEL32 DEL21 DEL42 DEL42 DEL42 DEL42 DEL42 DEL32 DEL21 DEL42 DEL42 DEL42 DEL42 DEL32 DEL32 DEL21 DEL8 DEL54 DEL8 DEL42 DEL43 DEL42 DEL44 DEL42 DEL42 DEL32 DEL42 DEL32 DEL21 DEL8 DEL12 DEL42 DEL42 DEL42 DEL32 DEL21 DEL8 DEL54 DEL8 DEL31 DEL1 DEL14 DEL59 DEL60 DEL42 DEL43 DEL42 DEL42 DEL42 DEL32 DEL59 DEL60 DEL42 DEL33 DEL27 DEL42 DEL42 DEL42 DEL32 DEL21 DEL8 DEL42 DEL42 DEL32 DEL40 DEL27 DEL42 DEL43 DEL42 DEL42 DEL42 DEL42 DEL42 DEL9 DEL32 DEL59 DEL60 DEL42 DEL42 DEL9 DEL32 DEL21 DEL42 DEL42 DEL32 DEL21 DEL8 DEL42 DEL42 DEL42 DEL32 DEL21 DEL8 DEL54 DEL8 DEL25 DEL42 DEL42 DEL32 DEL21 DEL8 DEL25 DEL8 DEL25 DEL83 DEL42 DEL59 DEL60 DEL83 DEL42 DEL59 DEL60 DEL83 DEL42 DEL42 DEL42 DEL42 DEL42 DEL9 DEL32 DEL59 DEL60 DEL54 DEL8 DEL25 DEL8 DEL42 DEL78 DEL83 DEL39 DEL42 DEL9

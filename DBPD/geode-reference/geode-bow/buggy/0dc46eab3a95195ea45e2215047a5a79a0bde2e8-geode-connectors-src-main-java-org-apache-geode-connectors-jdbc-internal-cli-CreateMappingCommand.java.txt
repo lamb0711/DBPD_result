@@ -1,0 +1,226 @@
+GEODE-6010: change create jdbc-mapping to alter region and create async-queue (#2836)
+
+create jdbc-mapping now also does the following:
+-- alters the region to have a JdbcLoader as its cache-loader
+-- if synchronous, alters the region to have a JdbcWriter as its cache-writer
+-- if asynchronous, creates an async-event-queue and alters regions to have it
+The async-event-queue is created parallel for partitioned regions, and serial for all other regions.
+
+create jdbc-mapping now requires cluster configuration and uses it to check
+all required preconditions before the command starts changing things.
+ 
+Co-authored-by: Darrel Schneider <dschneider@pivotal.io>
+Co-authored-by: Jianxia Chen <jchen@pivotal.io>
+Co-authored-by: Scott Jewell <sjewell@pivotal.io>
+
++
++
++import org.apache.geode.cache.configuration.CacheConfig.AsyncEventQueue;
++import org.apache.geode.cache.configuration.DeclarableType;
++import org.apache.geode.cache.configuration.RegionAttributesDataPolicy;
++import org.apache.geode.cache.configuration.RegionAttributesType;
++import org.apache.geode.cache.configuration.RegionConfig;
++import org.apache.geode.connectors.jdbc.JdbcAsyncWriter;
++import org.apache.geode.connectors.jdbc.JdbcLoader;
++import org.apache.geode.connectors.jdbc.JdbcWriter;
++import org.apache.geode.distributed.ConfigurationPersistenceService;
++  static final String CREATE_MAPPING__SYNCHRONOUS_NAME = "synchronous";
++  static final String CREATE_MAPPING__SYNCHRONOUS_NAME__HELP =
++      "By default, writes will be asynchronous. If true, writes will be synchronous.";
++
++  public static String createAsyncEventQueueName(String regionPath) {
++    return "JDBC#" + regionPath.replace('/', '_');
++  }
+-          help = CREATE_MAPPING__PDX_NAME__HELP) String pdxName) {
++          help = CREATE_MAPPING__PDX_NAME__HELP) String pdxName,
++      @CliOption(key = CREATE_MAPPING__SYNCHRONOUS_NAME,
++          help = CREATE_MAPPING__SYNCHRONOUS_NAME__HELP,
++          specifiedDefaultValue = "true", unspecifiedDefaultValue = "false") boolean synchronous) {
+-    RegionMapping mapping = new RegionMapping(regionName,
+-        pdxName, table, dataSourceName);
++    RegionMapping mapping = new RegionMapping(regionName, pdxName, table, dataSourceName);
++
++    try {
++      ConfigurationPersistenceService configurationPersistenceService =
++          checkForClusterConfiguration();
++      CacheConfig cacheConfig = configurationPersistenceService.getCacheConfig(null);
++      RegionConfig regionConfig = checkForRegion(regionName, cacheConfig);
++      checkForExistingMapping(regionName, regionConfig);
++      checkForCacheLoader(regionName, regionConfig);
++      checkForCacheWriter(regionName, synchronous, regionConfig);
++      checkForAsyncQueue(regionName, synchronous, cacheConfig);
++    } catch (PreconditionException ex) {
++      return ResultModel.createError(ex.getMessage());
++    }
++    Object[] arguments = new Object[] {mapping, synchronous};
+-        executeAndGetFunctionResult(new CreateMappingFunction(), mapping, targetMembers);
++        executeAndGetFunctionResult(new CreateMappingFunction(), arguments, targetMembers);
+-    result.setConfigObject(mapping);
++    result.setConfigObject(arguments);
++  private ConfigurationPersistenceService checkForClusterConfiguration()
++      throws PreconditionException {
++    ConfigurationPersistenceService result = getConfigurationPersistenceService();
++    if (result == null) {
++      throw new PreconditionException("Cluster Configuration must be enabled.");
++    }
++    return result;
++  }
++
++  private RegionConfig checkForRegion(String regionName, CacheConfig cacheConfig)
++      throws PreconditionException {
++    RegionConfig regionConfig = findRegionConfig(cacheConfig, regionName);
++    if (regionConfig == null) {
++      throw new PreconditionException("A region named " + regionName + " must already exist.");
++    }
++    return regionConfig;
++  }
++
++  private void checkForExistingMapping(String regionName, RegionConfig regionConfig)
++      throws PreconditionException {
++    if (regionConfig.getCustomRegionElements().stream()
++        .anyMatch(element -> element instanceof RegionMapping)) {
++      throw new PreconditionException("A jdbc-mapping for " + regionName + " already exists.");
++    }
++  }
++
++  private void checkForCacheLoader(String regionName, RegionConfig regionConfig)
++      throws PreconditionException {
++    RegionAttributesType regionAttributes = regionConfig.getRegionAttributes().stream()
++        .filter(attributes -> attributes.getCacheLoader() != null).findFirst().orElse(null);
++    if (regionAttributes != null) {
++      DeclarableType loaderDeclarable = regionAttributes.getCacheLoader();
++      if (loaderDeclarable != null) {
++        throw new PreconditionException("The existing region " + regionName
++            + " must not already have a cache-loader, but it has "
++            + loaderDeclarable.getClassName());
++      }
++    }
++  }
++
++  private void checkForCacheWriter(String regionName, boolean synchronous,
++      RegionConfig regionConfig) throws PreconditionException {
++    if (synchronous) {
++      RegionAttributesType writerAttributes = regionConfig.getRegionAttributes().stream()
++          .filter(attributes -> attributes.getCacheWriter() != null).findFirst().orElse(null);
++      if (writerAttributes != null) {
++        DeclarableType writerDeclarable = writerAttributes.getCacheWriter();
++        if (writerDeclarable != null) {
++          throw new PreconditionException("The existing region " + regionName
++              + " must not already have a cache-writer, but it has "
++              + writerDeclarable.getClassName());
++        }
++      }
++    }
++  }
++
++  private void checkForAsyncQueue(String regionName, boolean synchronous, CacheConfig cacheConfig)
++      throws PreconditionException {
++    if (!synchronous) {
++      String queueName = createAsyncEventQueueName(regionName);
++      AsyncEventQueue asyncEventQueue = cacheConfig.getAsyncEventQueues().stream()
++          .filter(queue -> queue.getId().equals(queueName)).findFirst().orElse(null);
++      if (asyncEventQueue != null) {
++        throw new PreconditionException(
++            "An async-event-queue named " + queueName + " must not already exist.");
++      }
++    }
++  }
++
+-    RegionMapping newCacheElement = (RegionMapping) element;
+-    RegionMapping existingCacheElement = cacheConfig.findCustomRegionElement(
+-        newCacheElement.getRegionName(), newCacheElement.getId(), RegionMapping.class);
+-
+-    if (existingCacheElement != null) {
+-      cacheConfig
+-          .getRegions()
+-          .stream()
+-          .filter(regionConfig -> regionConfig.getName().equals(newCacheElement.getRegionName()))
+-          .forEach(
+-              regionConfig -> regionConfig.getCustomRegionElements().remove(existingCacheElement));
++    Object[] arguments = (Object[]) element;
++    RegionMapping regionMapping = (RegionMapping) arguments[0];
++    boolean synchronous = (Boolean) arguments[1];
++    String regionName = regionMapping.getRegionName();
++    String queueName = createAsyncEventQueueName(regionName);
++    RegionConfig regionConfig = findRegionConfig(cacheConfig, regionName);
++    if (regionConfig == null) {
++      return;
++    RegionAttributesType attributes = getRegionAttributes(regionConfig);
++    addMappingToRegion(regionMapping, regionConfig);
++    if (!synchronous) {
++      createAsyncQueue(cacheConfig, attributes, queueName);
++    }
++    alterRegion(queueName, attributes, synchronous);
++  }
+-    cacheConfig
+-        .getRegions()
+-        .stream()
+-        .filter(regionConfig -> regionConfig.getName().equals(newCacheElement.getRegionName()))
+-        .forEach(regionConfig -> regionConfig.getCustomRegionElements().add(newCacheElement));
++  private void alterRegion(String queueName, RegionAttributesType attributes, boolean synchronous) {
++    setCacheLoader(attributes);
++    if (synchronous) {
++      setCacheWriter(attributes);
++    } else {
++      addAsyncEventQueueId(queueName, attributes);
++    }
++  }
++
++  private void addMappingToRegion(RegionMapping newCacheElement, RegionConfig regionConfig) {
++    regionConfig.getCustomRegionElements().add(newCacheElement);
++  }
++
++  private RegionConfig findRegionConfig(CacheConfig cacheConfig, String regionName) {
++    return cacheConfig.getRegions().stream()
++        .filter(region -> region.getName().equals(regionName)).findFirst().orElse(null);
++  }
++
++  private void createAsyncQueue(CacheConfig cacheConfig, RegionAttributesType attributes,
++      String queueName) {
++    AsyncEventQueue asyncEventQueue = new AsyncEventQueue();
++    asyncEventQueue.setId(queueName);
++    boolean isPartitioned = attributes.getDataPolicy().equals(RegionAttributesDataPolicy.PARTITION)
++        || attributes.getDataPolicy().equals(RegionAttributesDataPolicy.PERSISTENT_PARTITION);
++    asyncEventQueue.setParallel(isPartitioned);
++    DeclarableType listener = new DeclarableType();
++    listener.setClassName(JdbcAsyncWriter.class.getName());
++    asyncEventQueue.setAsyncEventListener(listener);
++    cacheConfig.getAsyncEventQueues().add(asyncEventQueue);
++  }
++
++  private void addAsyncEventQueueId(String queueName, RegionAttributesType attributes) {
++    String asyncEventQueueList = attributes.getAsyncEventQueueIds();
++    if (asyncEventQueueList == null) {
++      asyncEventQueueList = "";
++    }
++    if (!asyncEventQueueList.contains(queueName)) {
++      if (asyncEventQueueList.length() > 0) {
++        asyncEventQueueList += ',';
++      }
++      asyncEventQueueList += queueName;
++      attributes.setAsyncEventQueueIds(asyncEventQueueList);
++    }
++  }
++
++  private void setCacheLoader(RegionAttributesType attributes) {
++    DeclarableType loader = new DeclarableType();
++    loader.setClassName(JdbcLoader.class.getName());
++    attributes.setCacheLoader(loader);
++  }
++
++  private void setCacheWriter(RegionAttributesType attributes) {
++    DeclarableType writer = new DeclarableType();
++    writer.setClassName(JdbcWriter.class.getName());
++    attributes.setCacheWriter(writer);
++  }
++
++  private RegionAttributesType getRegionAttributes(RegionConfig regionConfig) {
++    RegionAttributesType attributes;
++    List<RegionAttributesType> attributesList = regionConfig.getRegionAttributes();
++    if (attributesList.isEmpty()) {
++      attributes = new RegionAttributesType();
++      attributesList.add(attributes);
++    } else {
++      attributes = attributesList.get(0);
++    }
++    return attributes;

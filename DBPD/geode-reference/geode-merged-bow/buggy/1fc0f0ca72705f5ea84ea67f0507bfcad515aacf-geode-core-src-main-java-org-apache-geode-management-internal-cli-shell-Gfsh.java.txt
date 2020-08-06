@@ -1,0 +1,526 @@
+GEODE-1597: use Spring shell's parser and delete our own parsing code
+
+* Use Spring's SimpleParser as a basis for command parsing
+* reworked help/hint
+* removing singleton CommandManager
+
+-import org.apache.geode.management.internal.cli.CommandManager;
+-import org.apache.geode.management.internal.cli.parser.SyntaxConstants;
+-import org.springframework.shell.core.CommandMarker;
+-import org.springframework.shell.core.Converter;
+-import java.util.Set;
+- * 
++ *
+-
+-  private static final String DEFAULT_SECONDARY_PROMPT = ">";
+-
+-  private static final int DEFAULT_HEIGHT = 100;
+-
+-
+-
+-  protected static PrintStream gfshout = System.out;
+-  protected static PrintStream gfsherr = System.err;
++  private static final String DEFAULT_SECONDARY_PROMPT = ">";
++  private static final int DEFAULT_HEIGHT = 100;
++  private static final Object INSTANCE_LOCK = new Object();
++  public static boolean SUPPORT_MUTLIPLESHELL = false;
+-
++  protected static PrintStream gfshout = System.out;
++  protected static PrintStream gfsherr = System.err;
++  protected static ThreadLocal<Gfsh> gfshThreadLocal = new ThreadLocal<Gfsh>();
+-  private static final Object INSTANCE_LOCK = new Object();
+-
++  // This flag is used to restrict column trimming to table only types
++  private static ThreadLocal<Boolean> resultTypeTL = new ThreadLocal<Boolean>();
++  private static String OS = System.getProperty("os.name").toLowerCase();
+-
+-
+-  private final CommandManager commandManager;
+-  private OperationInvoker operationInvoker;
+-  private int lastExecutionStatus;
+-  private Thread runner;
+-  private boolean debugON;
+-  private Terminal terminal;
++  private OperationInvoker operationInvoker;
++  private int lastExecutionStatus;
++  private Thread runner;
++  private boolean debugON;
++  private Terminal terminal;
+-
+-  // This flag is used to restrict column trimming to table only types
+-  private static ThreadLocal<Boolean> resultTypeTL = new ThreadLocal<Boolean>();
+-   * 
++   *
+-   * 
++   *
+-    // 5. Create CommandManager & load Commands & Converters
+-    this.commandManager = CommandManager.getInstance();
+-
+-    this.parser = new GfshParser(commandManager);
++    this.parser = new GfshParser();
++  public static Gfsh getInstance(boolean launchShell, String[] args, GfshConfig gfshConfig)
++      throws ClassNotFoundException, IOException {
++    if (instance == null) {
++      synchronized (INSTANCE_LOCK) {
++        if (instance == null) {
++          instance = new Gfsh(launchShell, args, gfshConfig);
++          instance.executeInitFileIfPresent();
++        }
++      }
++    }
++
++    return instance;
++  }
++
++  public static boolean isInfoResult() {
++    if (resultTypeTL.get() == null) {
++      return false;
++    }
++    return resultTypeTL.get();
++  }
++
++  public static void println() {
++    gfshout.println();
++  }
++
++  public static <T> void println(T toPrint) {
++    gfshout.println(toPrint);
++  }
++
++  public static <T> void print(T toPrint) {
++    gfshout.print(toPrint);
++  }
++
++  public static <T> void printlnErr(T toPrint) {
++    gfsherr.println(toPrint);
++  }
++
++  // See 46369
++  private static String readLine(ConsoleReader reader, String prompt) throws IOException {
++    String earlierLine = reader.getCursorBuffer().toString();
++    String readLine = null;
++    try {
++      readLine = reader.readLine(prompt);
++    } catch (IndexOutOfBoundsException e) {
++      if (earlierLine.length() == 0) {
++        reader.println();
++        readLine = LINE_SEPARATOR;
++        reader.getCursorBuffer().cursor = 0;
++      } else {
++        readLine = readLine(reader, prompt);
++      }
++    }
++    return readLine;
++  }
++
++  private static String removeBackslash(String result) {
++    if (result.endsWith(GfshParser.CONTINUATION_CHARACTER)) {
++      result = result.substring(0, result.length() - 1);
++    }
++    return result;
++  }
++
++  public static void redirectInternalJavaLoggers() {
++    // Do we need to this on re-connect?
++    LogManager logManager = LogManager.getLogManager();
++
++    try {
++      Enumeration<String> loggerNames = logManager.getLoggerNames();
++
++      while (loggerNames.hasMoreElements()) {
++        String loggerName = loggerNames.nextElement();
++        if (loggerName.startsWith("java.") || loggerName.startsWith("javax.")) {
++          // System.out.println(loggerName);
++          Logger javaLogger = logManager.getLogger(loggerName);
++          /*
++           * From Java Docs: It is also important to note that the Logger associated with the String
++           * name may be garbage collected at any time if there is no strong reference to the
++           * Logger. The caller of this method must check the return value for null in order to
++           * properly handle the case where the Logger has been garbage collected.
++           */
++          if (javaLogger != null) {
++            LogWrapper.getInstance().setParentFor(javaLogger);
++          }
++        }
++      }
++    } catch (SecurityException e) {
++      LogWrapper.getInstance().warning(e.getMessage(), e);
++    }
++  }
++
++  public static Gfsh getCurrentInstance() {
++    if (!SUPPORT_MUTLIPLESHELL) {
++      return instance;
++    } else {
++      return gfshThreadLocal.get();
++    }
++  }
++
++  private static String extractKey(String input) {
++    return input.substring("${".length(), input.length() - "}".length());
++  }
++
++  public static ConsoleReader getConsoleReader() {
++    Gfsh gfsh = Gfsh.getCurrentInstance();
++    return (gfsh == null ? null : gfsh.reader);
++  }
++
++  /**
++   * Take a string and wrap it into multiple lines separated by CliConstants.LINE_SEPARATOR. Lines
++   * are separated based upon the terminal width, separated on word boundaries and may have extra
++   * spaces added to provide indentation.
++   *
++   * For example: if the terminal width were 5 and the string "123 456789 01234" were passed in with
++   * an indentation level of 2, then the returned string would be:
++   *
++   * <pre>
++   *         123
++   *         45678
++   *         9
++   *         01234
++   * </pre>
++   *
++   * @param string String to wrap (add breakpoints and indent)
++   * @param indentationLevel The number of indentation levels to use.
++   * @return The wrapped string.
++   */
++  public static String wrapText(final String string, final int indentationLevel,
++      final int terminalWidth) {
++    if (terminalWidth <= 1) {
++      return string;
++    }
++
++    final int maxLineLength = terminalWidth - 1;
++    final StringBuffer stringBuf = new StringBuffer();
++    int index = 0;
++    int startOfCurrentLine = 0;
++    while (index < string.length()) {
++      // Add the indentation
++      for (int i = 0; i < indentationLevel; i++) {
++        stringBuf.append(LINE_INDENT);
++      }
++      int currentLineLength = LINE_INDENT.length() * indentationLevel;
++
++      // Find the end of a line:
++      // 1. If the end of string is reached
++      // 2. If the width of the terminal has been reached
++      // 3. If a newline character was found in the string
++      while (index < string.length() && currentLineLength < maxLineLength
++          && string.charAt(index) != '\n') {
++        index++;
++        currentLineLength++;
++      }
++
++      // If the line was terminated with a newline character
++      if (index != string.length() && string.charAt(index) == '\n') {
++        stringBuf.append(string.substring(startOfCurrentLine, index));
++        stringBuf.append(LINE_SEPARATOR);
++        index++;
++        startOfCurrentLine = index;
++
++        // If the end of the string was reached or the last character just happened to be a space
++        // character
++      } else if (index == string.length() || string.charAt(index) == ' ') {
++        stringBuf.append(string.substring(startOfCurrentLine, index));
++        if (index != string.length()) {
++          stringBuf.append(LINE_SEPARATOR);
++          index++;
++        }
++
++      } else {
++        final int spaceCharIndex = string.lastIndexOf(" ", index);
++
++        // If no spaces were found then there's no logical wayto split the string
++        if (spaceCharIndex == -1) {
++          stringBuf.append(string.substring(startOfCurrentLine, index)).append(LINE_SEPARATOR);
++
++          // Else split the string cleanly between words
++        } else {
++          stringBuf.append(string.substring(startOfCurrentLine, spaceCharIndex))
++              .append(LINE_SEPARATOR);
++          index = spaceCharIndex + 1;
++        }
++      }
++
++      startOfCurrentLine = index;
++    }
++    return stringBuf.toString();
++  }
++
+-  public static Gfsh getInstance(boolean launchShell, String[] args, GfshConfig gfshConfig)
+-      throws ClassNotFoundException, IOException {
+-    if (instance == null) {
+-      synchronized (INSTANCE_LOCK) {
+-        if (instance == null) {
+-          instance = new Gfsh(launchShell, args, gfshConfig);
+-          instance.executeInitFileIfPresent();
+-        }
+-      }
+-    }
+-
+-    return instance;
+-  }
+-
+-  //////////////////// JLineShell Class Methods Start //////////////////////////
+-  //////////////////////// Implemented Methods ////////////////////////////////
+-   * 
++   *
+-   * 
++   *
+-  protected Parser getParser() {
++  public Parser getParser() {
+-  //////////////////////// Overridden Behavior /////////////////////////////////
++  public GfshParser getGfshParser() {
++    return parser;
++  }
++
+-   * 
++   *
+-  public void add(final CommandMarker command) {
+-    commandManager.add(command);
+-  }
+-
+-  public void add(final Converter<?> converter) {
+-    commandManager.add(converter);
+-  }
+-
+-  public static boolean isInfoResult() {
+-    if (resultTypeTL.get() == null)
+-      return false;
+-    return resultTypeTL.get();
+-  }
+-
+-  private static String OS = System.getProperty("os.name").toLowerCase();
+-
+-  /////// Save multiple-line commands as single line in history - starts ///////
+-  // causes instability on MacOS See #46072
+-  // public void flashMessage(String message) {
+-  // if (reader != null) {
+-  // flash(Level.FINE, message, ANIMATION_SLOT);
+-  // }
+-  // }
+-  /////// Save multiple-line commands as single line in history - ends /////////
+-  ///////////////////// JLineShell Class Methods End //////////////////////////
+-
+-  public static void println() {
+-    gfshout.println();
+-  }
+-
+-  public static <T> void println(T toPrint) {
+-    gfshout.println(toPrint);
+-  }
+-
+-  public static <T> void print(T toPrint) {
+-    gfshout.print(toPrint);
+-  }
+-
+-  public static <T> void printlnErr(T toPrint) {
+-    gfsherr.println(toPrint);
+-  }
+-
+-   * 
++   *
+-          if (!linesBufferString.endsWith(SyntaxConstants.CONTINUATION_CHARACTER)) { // see 45893
++          if (!linesBufferString.endsWith(GfshParser.CONTINUATION_CHARACTER)) { // see 45893
+-  /////////////// For setting shell environment properties START ///////////////
++
+-    // System.out.println(env.get(CliConstants.ENV_APP_QUIET_EXECUTION));
+-  ////////////////// Providing Multiple-line support starts ///////////////////
+-        if (!line.endsWith(SyntaxConstants.CONTINUATION_CHARACTER)) { // see 45893
++        if (!line.endsWith(GfshParser.CONTINUATION_CHARACTER)) { // see 45893
+-  // See 46369
+-  private static String readLine(ConsoleReader reader, String prompt) throws IOException {
+-    String earlierLine = reader.getCursorBuffer().toString();
+-    String readLine = null;
+-    try {
+-      readLine = reader.readLine(prompt);
+-    } catch (IndexOutOfBoundsException e) {
+-      if (earlierLine.length() == 0) {
+-        reader.println();
+-        readLine = LINE_SEPARATOR;
+-        reader.getCursorBuffer().cursor = 0;
+-      } else {
+-        readLine = readLine(reader, prompt);
+-      }
+-    }
+-    return readLine;
+-  }
+-
+-  private static String removeBackslash(String result) {
+-    if (result.endsWith(SyntaxConstants.CONTINUATION_CHARACTER)) {
+-      result = result.substring(0, result.length() - 1);
+-    }
+-    return result;
+-  }
+-
+-  ///////////////// Providing Multiple-line support ends //////////////////////
+-  /////////////// For setting shell environment properties END /////////////////
+-
+-  /////////////////////// OperationInvoker code START //////////////////////////
+-  //////////////////////// OperationInvoker code END //////////////////////////
+-
+-  //////////////////////// Fields for TestableShell Start //////////////////////
+-  public static boolean SUPPORT_MUTLIPLESHELL = false;
+-  protected static ThreadLocal<Gfsh> gfshThreadLocal = new ThreadLocal<Gfsh>();
+-  //////////////////////// Fields for TestableShell End ////////////////////////
+-
+-  public static void redirectInternalJavaLoggers() {
+-    // Do we need to this on re-connect?
+-    LogManager logManager = LogManager.getLogManager();
+-
+-    try {
+-      Enumeration<String> loggerNames = logManager.getLoggerNames();
+-
+-      while (loggerNames.hasMoreElements()) {
+-        String loggerName = loggerNames.nextElement();
+-        if (loggerName.startsWith("java.") || loggerName.startsWith("javax.")) {
+-          // System.out.println(loggerName);
+-          Logger javaLogger = logManager.getLogger(loggerName);
+-          /*
+-           * From Java Docs: It is also important to note that the Logger associated with the String
+-           * name may be garbage collected at any time if there is no strong reference to the
+-           * Logger. The caller of this method must check the return value for null in order to
+-           * properly handle the case where the Logger has been garbage collected.
+-           */
+-          if (javaLogger != null) {
+-            LogWrapper.getInstance().setParentFor(javaLogger);
+-          }
+-        }
+-      }
+-    } catch (SecurityException e) {
+-      // e.printStackTrace();
+-      LogWrapper.getInstance().warning(e.getMessage(), e);
+-    }
+-  }
+-
+-  public static Gfsh getCurrentInstance() {
+-    if (!SUPPORT_MUTLIPLESHELL) {
+-      return instance;
+-    } else {
+-      return gfshThreadLocal.get();
+-    }
+-  }
+-
+-  public String obtainHelp(String userInput, Set<String> requiredCommandNames) {
+-    return parser.obtainHelp(userInput, requiredCommandNames);
+-  }
+-
+-  public List<String> obtainHelpCommandNames(String userInput) {
+-    return parser.obtainHelpCommandNames(userInput);
+-  }
+-  public List<String> getCommandNames(String matchingWith) {
+-    return parser.getCommandNames(matchingWith);
+-  }
+-
+-    defaultPrompt = MessageFormat.format(defaultPrompt, new Object[] {clusterString, contextPath});
++    defaultPrompt = MessageFormat.format(defaultPrompt, clusterString, contextPath);
+-
+-  private static String extractKey(String input) {
+-    return input.substring("${".length(), input.length() - "}".length());
+-  }
+-
+-  public static ConsoleReader getConsoleReader() {
+-    Gfsh gfsh = Gfsh.getCurrentInstance();
+-    return (gfsh == null ? null : gfsh.reader);
+-  }
+-
+-  /**
+-   * Take a string and wrap it into multiple lines separated by CliConstants.LINE_SEPARATOR. Lines
+-   * are separated based upon the terminal width, separated on word boundaries and may have extra
+-   * spaces added to provide indentation.
+-   *
+-   * For example: if the terminal width were 5 and the string "123 456789 01234" were passed in with
+-   * an indentation level of 2, then the returned string would be:
+-   *
+-   * <pre>
+-   *         123
+-   *         45678
+-   *         9
+-   *         01234
+-   * </pre>
+-   *
+-   * @param string String to wrap (add breakpoints and indent)
+-   * @param indentationLevel The number of indentation levels to use.
+-   * @return The wrapped string.
+-   */
+-  public static String wrapText(final String string, final int indentationLevel) {
+-    Gfsh gfsh = getCurrentInstance();
+-    if (gfsh == null) {
+-      return string;
+-    }
+-
+-    final int maxLineLength = gfsh.getTerminalWidth() - 1;
+-    final StringBuffer stringBuf = new StringBuffer();
+-    int index = 0;
+-    int startOfCurrentLine = 0;
+-    while (index < string.length()) {
+-      // Add the indentation
+-      for (int i = 0; i < indentationLevel; i++) {
+-        stringBuf.append(LINE_INDENT);
+-      }
+-      int currentLineLength = LINE_INDENT.length() * indentationLevel;
+-
+-      // Find the end of a line:
+-      // 1. If the end of string is reached
+-      // 2. If the width of the terminal has been reached
+-      // 3. If a newline character was found in the string
+-      while (index < string.length() && currentLineLength < maxLineLength
+-          && string.charAt(index) != '\n') {
+-        index++;
+-        currentLineLength++;
+-      }
+-
+-      // If the line was terminated with a newline character
+-      if (index != string.length() && string.charAt(index) == '\n') {
+-        stringBuf.append(string.substring(startOfCurrentLine, index));
+-        stringBuf.append(LINE_SEPARATOR);
+-        index++;
+-        startOfCurrentLine = index;
+-
+-        // If the end of the string was reached or the last character just happened to be a space
+-        // character
+-      } else if (index == string.length() || string.charAt(index) == ' ') {
+-        stringBuf.append(string.substring(startOfCurrentLine, index));
+-        if (index != string.length()) {
+-          stringBuf.append(LINE_SEPARATOR);
+-          index++;
+-        }
+-
+-      } else {
+-        final int spaceCharIndex = string.lastIndexOf(" ", index);
+-
+-        // If no spaces were found then there's no logical wayto split the string
+-        if (spaceCharIndex == -1) {
+-          stringBuf.append(string.substring(startOfCurrentLine, index)).append(LINE_SEPARATOR);
+-
+-          // Else split the string cleanly between words
+-        } else {
+-          stringBuf.append(string.substring(startOfCurrentLine, spaceCharIndex))
+-              .append(LINE_SEPARATOR);
+-          index = spaceCharIndex + 1;
+-        }
+-      }
+-
+-      startOfCurrentLine = index;
+-    }
+-    return stringBuf.toString();
+-  }
+-
+-  // // for testing only
+-  // public static void main(String[] args) {
+-  // try {
+-  // Gfsh gfsh = new Gfsh();
+-  // String expandProperties = gfsh.expandProperties("execute function
+-  // --id=group-with-arguments-with-result-collector
+-  // --result-collector=management.operations.ops.FunctionOperations$CustomResultCollector
+-  // --arguments=group-with-arguments-with-result-collector --group=managed1");
+-  //// String expandProperties = gfsh.expandProperties("My name is ${NAME}");
+-  // System.out.println(expandProperties);
+-  // } catch (ClassNotFoundException e) {
+-  // e.printStackTrace();
+-  // } catch (IOException e) {
+-  // e.printStackTrace();
+-  // }
+-  // }
+
+MOV23 MOV23 MOV23 MOV23 MOV23 MOV23 MOV23 MOV23 MOV23 MOV31 MOV31 MOV23 MOV31 MOV31 MOV31 MOV31 MOV31 MOV31 MOV23 MOV23 MOV31 MOV31 MOV31 MOV31 MOV31 MOV31 INS44 UPD83 INS43 UPD42 INS83 INS39 INS42 UPD42 MOV42 INS8 UPD27 INS42 MOV41 UPD40 UPD42 INS34 INS42 INS42 INS42 UPD40 UPD40 DEL40 DEL26 DEL40 DEL26 DEL40 DEL26 DEL40 DEL26 DEL40 DEL26 DEL83 DEL83 DEL42 DEL43 DEL42 DEL59 DEL23 DEL52 DEL42 DEL22 DEL42 DEL42 DEL32 DEL7 DEL21 DEL42 DEL42 DEL43 DEL42 DEL42 DEL32 DEL59 DEL60 DEL33 DEL42 DEL42 DEL32 DEL43 DEL42 DEL43 DEL74 DEL42 DEL43 DEL42 DEL44 DEL42 DEL42 DEL42 DEL32 DEL83 DEL39 DEL42 DEL83 DEL42 DEL43 DEL42 DEL44 DEL42 DEL42 DEL42 DEL32 DEL21 DEL8 DEL31 DEL83 DEL39 DEL42 DEL83 DEL42 DEL43 DEL76 DEL74 DEL42 DEL44 DEL42 DEL42 DEL42 DEL32 DEL21 DEL8 DEL31 DEL83 DEL42 DEL43 DEL42 DEL42 DEL43 DEL42 DEL44 DEL42 DEL43 DEL42 DEL43 DEL74 DEL42 DEL44 DEL42 DEL42 DEL42 DEL42 DEL32 DEL41 DEL8 DEL31 DEL83 DEL42 DEL43 DEL42 DEL43 DEL74 DEL42 DEL42 DEL43 DEL42 DEL44 DEL42 DEL42 DEL42 DEL32 DEL41 DEL8 DEL31 DEL42 DEL43 DEL85 DEL5 DEL42 DEL42 DEL4 DEL3
